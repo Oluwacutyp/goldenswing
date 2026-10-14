@@ -1,0 +1,34 @@
+{
+  "alert_id": "XAU6132S",
+  "instrument": "XAUUSD",
+  "mode": "swing",
+  "direction": -1,
+  "kind": "sweep_reversal",
+  "score": 83.0,
+  "is_golden": true,
+  "entry_ref": 3966.5,
+  "entry_zone": [
+    3966.5,
+    3970.2192327504645
+  ],
+  "invalidation": 4014.3895222190986,
+  "targets": [
+    3925.10009765625,
+    3901.300048828125,
+    3877.60009765625
+  ],
+  "factors": [
+    "BOS confirms the sweep reversal",
+    "momentum aligned (-1.5 ATR)",
+    "liquidity sweep of buy-side pool @ 4009.2, 6 bars ago",
+    "displacement 1.0x ATR",
+    "room to next liquidity pool: 2.2x ATR",
+    "volatility compressed (ATR p8) \u2014 coiled",
+    "overlap killzone",
+    "distribution base \u2014 shorts favoured",
+    "volume confirming (RVOL 4.9)"
+  ],
+  "bar_index": 6132,
+  "timestamp": "2025-11-04 14:00:00+00:00",
+  "forecast_note": "Forecaster: ensemble 3-day big-down-move prob \u00b7 P(move) 0.45 \u00b7 rank: top 31% of bars"
+}
