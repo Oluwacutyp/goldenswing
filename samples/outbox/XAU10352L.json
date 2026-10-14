@@ -1,0 +1,33 @@
+{
+  "alert_id": "XAU10352L",
+  "instrument": "XAUUSD",
+  "mode": "swing",
+  "direction": 1,
+  "kind": "continuation",
+  "score": 67.0,
+  "is_golden": true,
+  "entry_ref": 4186.60009765625,
+  "entry_zone": [
+    4158.5,
+    4184.2998046875
+  ],
+  "invalidation": 4156.031776233756,
+  "targets": [
+    4216.0,
+    4233.7001953125,
+    4238.10009765625
+  ],
+  "factors": [
+    "trend-aligned continuation (up)",
+    "fresh BOS 2 bars ago",
+    "momentum aligned (+2.2 ATR)",
+    "liquidity sweep of sell-side pool @ 4192.4, 1 bars ago",
+    "strong displacement 1.7x ATR",
+    "room to next liquidity pool: 1.8x ATR",
+    "volatility expanded (ATR p73)",
+    "but price is extended at the range extreme"
+  ],
+  "bar_index": 10352,
+  "timestamp": "2026-08-05 03:00:00+00:00",
+  "forecast_note": "Forecaster: ensemble 3-day big-up-move prob \u00b7 P(move) 0.61 \u00b7 rank: top 7% of bars"
+}

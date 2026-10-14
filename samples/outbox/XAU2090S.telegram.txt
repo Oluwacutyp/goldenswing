@@ -1,0 +1,17 @@
+[OFFLINE OUTBOX — telegram alert NOT sent: no credentials configured]
+
+🔴 ▼ SHORT XAUUSD — score 78 ★ GOLDEN SWING
+Mode: swing · Setup: sweep_reversal · 2025-02-25 17:00 UTC
+
+Entry: 2,920.9 (zone 2,920.9–2,923.3)
+Stop (invalidation): 2,961.5
+Targets: T1 2,887.6 · T2 2,886.5 · T3 2,879.9
+Risk distance: 40.6 (3.33x ATR)
+
+Backing:
+• BOS confirms the sweep reversal
+• momentum aligned (-2.0 ATR)
+• liquidity sweep of buy-side pool @ 2956.8, 3 bars ago
+• strong displacement 2.6x ATR
+• room to next liquidity pool: 2.7x ATR
+• volatility expanded (ATR p100)

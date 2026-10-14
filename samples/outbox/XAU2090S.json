@@ -1,0 +1,31 @@
+{
+  "alert_id": "XAU2090S",
+  "instrument": "XAUUSD",
+  "mode": "swing",
+  "direction": -1,
+  "kind": "sweep_reversal",
+  "score": 78.0,
+  "is_golden": true,
+  "entry_ref": 2920.89990234375,
+  "entry_zone": [
+    2920.89990234375,
+    2923.34318626692
+  ],
+  "invalidation": 2961.5324141142523,
+  "targets": [
+    2887.60009765625,
+    2886.5,
+    2879.89990234375
+  ],
+  "factors": [
+    "BOS confirms the sweep reversal",
+    "momentum aligned (-2.0 ATR)",
+    "liquidity sweep of buy-side pool @ 2956.8, 3 bars ago",
+    "strong displacement 2.6x ATR",
+    "room to next liquidity pool: 2.7x ATR",
+    "volatility expanded (ATR p100)"
+  ],
+  "bar_index": 2090,
+  "timestamp": "2025-02-25 17:00:00+00:00",
+  "forecast_note": null
+}

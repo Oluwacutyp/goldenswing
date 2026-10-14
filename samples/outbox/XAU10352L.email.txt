@@ -1,0 +1,21 @@
+[OFFLINE OUTBOX — email alert NOT sent: no credentials configured]
+
+🟢 ▲ LONG XAUUSD — score 67 ★ GOLDEN SWING
+Mode: swing · Setup: continuation · 2026-08-05 03:00 UTC
+
+Entry: 4,186.6 (zone 4,158.5–4,184.3)
+Stop (invalidation): 4,156.0
+Targets: T1 4,216.0 · T2 4,233.7 · T3 4,238.1
+Risk distance: 30.6 (1.86x ATR)
+
+Backing:
+• trend-aligned continuation (up)
+• fresh BOS 2 bars ago
+• momentum aligned (+2.2 ATR)
+• liquidity sweep of sell-side pool @ 4192.4, 1 bars ago
+• strong displacement 1.7x ATR
+• room to next liquidity pool: 1.8x ATR
+• volatility expanded (ATR p73)
+• but price is extended at the range extreme
+
+Forecaster: ensemble 3-day big-up-move prob · P(move) 0.61 · rank: top 7% of bars
