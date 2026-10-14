@@ -68,12 +68,16 @@ class FakeMT5:
                  base_price: float = 2000.0,
                  trade_mode: int = 0,
                  real_volume_on: bool = False,
-                 tick_script: list | None = None):
+                 tick_script: list | None = None,
+                 symbols: list | None = None):
         self.server_offset_seconds = server_offset_seconds
         self.base_price = base_price
         self.trade_mode = trade_mode
         self.real_volume_on = real_volume_on
         self.tick_script = list(tick_script) if tick_script else []
+        # Broker symbol universe: symbol_select only succeeds for a
+        # listed symbol (default: plain XAUUSD, like most brokers).
+        self.symbols = list(symbols) if symbols is not None else ["XAUUSD"]
         self._tick_calls = 0
         # Fixed base for scripted ticks: identical script entries must
         # carry identical timestamps (else pump dedup is untestable).
@@ -97,7 +101,10 @@ class FakeMT5:
         return SimpleNamespace(connected=True, build=3815)
 
     def symbol_select(self, symbol, flag):
-        return True
+        return symbol in self.symbols
+
+    def symbols_get(self):
+        return [SimpleNamespace(name=n) for n in self.symbols]
 
     def symbol_info(self, symbol):
         return SimpleNamespace(

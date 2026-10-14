@@ -60,6 +60,12 @@ class MT5Unavailable(RuntimeError):
 @dataclass
 class MT5FeedConfig:
     symbol: str = "XAUUSD"
+    #: True when the symbol came from an explicit override (--symbol /
+    #: GS_SYMBOL).  Explicit config always wins: if symbol_select fails
+    #: for an explicit symbol, connect fails instead of auto-detecting
+    #: a different broker symbol.  Auto-detect is only the fallback
+    #: for the built-in default.
+    symbol_explicit: bool = False
     granularities: tuple[str, ...] = STACK_TFS
     #: Credentials: None means attach to the already-logged-in terminal
     #: (the normal EC2 case — the owner logs the terminal in by hand).
@@ -128,6 +134,14 @@ class MT5Feed:
         With no credentials it attaches to the terminal as-is (the
         normal case).  Calibrates the server->UTC offset from a fresh
         tick so bars are stamped in UTC.
+
+        Broker symbol names differ (Exness calls gold ``XAUUSDm``,
+        not ``XAUUSD``).  When the configured symbol is NOT an
+        explicit override and ``symbol_select`` fails for it, connect
+        auto-detects the broker's gold symbol from ``symbols_get()``
+        and switches to it, logging the switch.  An explicit symbol
+        (--symbol / GS_SYMBOL) is never second-guessed: if it fails,
+        connect fails with a clear error.
         """
         mt5 = self._lib()
         last_err = ""
@@ -142,20 +156,86 @@ class MT5Feed:
             if mt5.initialize(**kwargs):
                 info = mt5.terminal_info()
                 if info is not None and getattr(info, "connected", False):
-                    if not mt5.symbol_select(self.cfg.symbol, True):
-                        last_err = f"symbol_select({self.cfg.symbol}) failed"
-                        mt5.shutdown()
-                        time.sleep(2 ** attempt)
-                        continue
-                    self.connected = True
-                    self._calibrate_utc_offset()
-                    return True, "MT5 connected"
-                last_err = "terminal not connected to a broker server"
+                    ok, msg = self._select_symbol(mt5)
+                    if ok:
+                        self.connected = True
+                        self._calibrate_utc_offset()
+                        return True, msg
+                    last_err = msg
+                else:
+                    last_err = "terminal not connected to a broker server"
             else:
                 last_err = f"initialize failed: {mt5.last_error()}"
+            mt5.shutdown()
             time.sleep(2 ** attempt)
         self.connected = False
         return False, f"MT5 connect failed after {self.cfg.max_connect_attempts} attempts: {last_err}"
+
+    def _select_symbol(self, mt5) -> tuple[bool, str]:
+        """Select the configured symbol, auto-detecting the broker's
+        gold symbol as fallback (non-explicit config only).
+
+        Returns (ok, message).  On auto-detect success the message
+        names both the requested and the chosen symbol, and
+        ``cfg.symbol`` is updated so every later call (bars, ticks,
+        orders via the runner) uses the detected symbol.
+        """
+        requested = self.cfg.symbol
+        if mt5.symbol_select(requested, True):
+            return True, "MT5 connected"
+        if self.cfg.symbol_explicit:
+            return False, (
+                f"symbol_select({requested}) failed — explicit symbol, "
+                "auto-detect disabled; pass a valid broker symbol with "
+                "--symbol (or omit --symbol / GS_SYMBOL to auto-detect "
+                "the broker's gold symbol)")
+        detected, note = self._detect_gold_symbol(mt5)
+        if detected is None:
+            return False, note
+        if detected == requested:
+            return False, f"symbol_select({requested}) failed"
+        self.cfg.symbol = detected
+        if mt5.symbol_select(detected, True):
+            return True, (f"MT5 connected (symbol {requested} not found, "
+                          f"using {detected})")
+        return False, f"symbol_select({detected}) failed after auto-detect"
+
+    def _detect_gold_symbol(self, mt5) -> tuple[str | None, str]:
+        """Find the broker's gold symbol from ``symbols_get()``.
+
+        Preference: exact ``XAUUSD``, then ``XAUUSDm``, then any
+        other ``XAUUSD*`` variant (sorted, deterministic).  Returns
+        (symbol, note) — or (None, error) when no gold symbol exists,
+        with gold-like candidates listed so the owner can pass
+        ``--symbol`` explicitly.
+        """
+        try:
+            symbols = mt5.symbols_get()
+        except Exception as exc:
+            return None, (f"symbol {self.cfg.symbol} not found; "
+                          f"symbols_get failed: {exc}")
+        if not symbols:
+            return None, (f"symbol {self.cfg.symbol} not found; terminal "
+                          "returned no symbols")
+        names = [str(getattr(s, "name", "") or "") for s in symbols]
+        gold = [n for n in names if n.startswith("XAUUSD")]
+        if not gold:
+            like = [n for n in names
+                    if "XAU" in n.upper() or "GOLD" in n.upper()]
+            hint = (f" gold-like symbols: {', '.join(like[:10])}"
+                    if like else "")
+            return None, (f"symbol {self.cfg.symbol} not found and no "
+                          f"XAUUSD* symbol exists on this broker "
+                          f"({len(names)} symbols).{hint} Pass the "
+                          "broker's gold symbol with --symbol.")
+        if "XAUUSD" in gold:
+            chosen = "XAUUSD"
+        elif "XAUUSDm" in gold:
+            chosen = "XAUUSDm"
+        else:
+            chosen = sorted(gold)[0]
+        return chosen, (f"symbol {self.cfg.symbol} not found, "
+                        f"using {chosen}")
 
     def _calibrate_utc_offset(self) -> None:
         """Server->UTC offset from a fresh tick (seconds, server - UTC).

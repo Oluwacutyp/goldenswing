@@ -39,9 +39,23 @@ from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
 from goldenswing.feed.mt5 import MT5Feed, MT5FeedConfig
 
 
+def _resolve_symbol(args_symbol: str | None, environ) -> tuple[str, bool]:
+    """CLI/env -> (symbol, explicit).
+
+    Explicit = passed on the command line OR set via GS_SYMBOL.
+    Only a non-explicit (default) symbol gets auto-detect fallback.
+    """
+    explicit = args_symbol is not None or "GS_SYMBOL" in environ
+    symbol = args_symbol or environ.get("GS_SYMBOL") or "XAUUSD"
+    return symbol, explicit
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--symbol", default=os.environ.get("GS_SYMBOL", "XAUUSD"))
+    ap.add_argument("--symbol", default=None,
+                    help="broker gold symbol (default: XAUUSD with "
+                         "auto-detect fallback; explicit --symbol / "
+                         "GS_SYMBOL always wins, never auto-detected)")
     ap.add_argument("--max-ticks", type=int, default=None)
     ap.add_argument("--fixed-lots", type=float, default=None)
     ap.add_argument("--risk-pct", type=float, default=None)
@@ -63,14 +77,18 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     login = os.environ.get("GS_MT5_LOGIN")
+    # Explicit symbol = passed on the command line OR set via GS_SYMBOL.
+    # Only a non-explicit (default) symbol gets auto-detect fallback.
+    symbol, symbol_explicit = _resolve_symbol(args.symbol, os.environ)
     feed_cfg = MT5FeedConfig(
-        symbol=args.symbol,
+        symbol=symbol,
+        symbol_explicit=symbol_explicit,
         login=int(login) if login else None,
         password=os.environ.get("GS_MT5_PASSWORD"),
         server=os.environ.get("GS_MT5_SERVER"),
         tick_interval=args.tick_interval)
     cfg = MT5RunnerConfig.from_env(
-        symbol=args.symbol,
+        symbol=symbol,
         fixed_lots=args.fixed_lots,
         allow_live=args.allow_live,
         tick_interval=args.tick_interval)

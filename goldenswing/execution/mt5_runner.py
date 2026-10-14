@@ -187,6 +187,15 @@ class MT5Runner:
         ok, msg = feed.connect()
         if not ok:
             raise RuntimeError(f"MT5 runner: feed connect failed: {msg}")
+        feed_msg = msg  # executor.connect() below reuses `msg`
+        # The feed is the source of truth for the broker's gold symbol:
+        # auto-detect may have resolved XAUUSD -> XAUUSDm.  Orders,
+        # positions, and specs below must use the resolved symbol, so
+        # adopt it when the feed was not explicitly configured (an
+        # explicit feed symbol already matches the runner's).
+        if not feed.cfg.symbol_explicit \
+                and feed.cfg.symbol != self.cfg.symbol:
+            self.cfg.symbol = feed.cfg.symbol
         acct = feed.account_state()
         if acct.get("trade_mode") == TRADE_MODE_REAL \
                 and not self.cfg.allow_live:
@@ -218,9 +227,11 @@ class MT5Runner:
         self.executor = executor
         self.journal.log_note(
             "mt5 runner: started "
+            f"(symbol={self.cfg.symbol}) "
             f"({', '.join(f'{tf}:{len(self._stack.frames.get(tf, []))}' for tf in self._stack.frames)}) "
             f"account login={acct.get('login')} equity={acct.get('equity')} "
-            f"trade_mode={acct.get('trade_mode')}")
+            f"trade_mode={acct.get('trade_mode')}"
+            + (f" connect: {feed_msg}" if feed_msg != "MT5 connected" else ""))
 
         # Fast-forward playbook streaming state over history; past
         # signals are discarded — only the latest close trades.
