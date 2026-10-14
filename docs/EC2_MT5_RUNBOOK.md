@@ -137,10 +137,12 @@ real_volume, spread), next to the journal. Disable with
 ### Charts on signals and fills
 
 Every MT5 signal alert and every fill generates a chart PNG
-(`data\mt5_charts\<alert_id>[ -fill].png`) — H1 candles, the H4 POI
-zone band, entry / stop / targets, the actual fill price on fill
-charts, and the hierarchy verdict (D1/H4 bias, trigger, entry
-clock, AMD, QM, volume). The PNG is attached to the Telegram
+(`data\mt5_charts\<alert_id>[ -fill].png`) — three stacked panels: H4
+structure (candles + H4 POI zone band + D1/H4 bias), H1 trigger (trigger
+bar marked), entry timeframe (M15/M30, entry bar marked), all sharing
+entry / stop / targets / 2R lines, plus the hierarchy verdict (D1/H4
+bias, trigger, entry clock, AMD, QM, volume) and the actual fill price
+on fill charts. The PNG is attached to the Telegram
 message as a photo; if the photo fails, the text still arrives.
 
 ## Safety — read before touching
