@@ -1,77 +1,72 @@
 # GoldenSwing
 
-Not a pile of strategies. One **aware system** that reads the chart and the
-market itself — structure, liquidity, regime, session — and identifies a
-**Golden Swing**: a *big* move (expected expansion ≥ ~2× ATR over the next
-~72 H1 bars / 3 days) that is *backed* by verifiable confluence. A move
-without backing is not a Golden Swing, no matter how big it later gets.
-The system's edge is supposed to live in that discrimination — and the
-backtest grades exactly that claim (see `BACKTEST.md`).
+One engine that trades like a real trader. **MT5 is the source of truth** —
+prices, bars, ticks, volumes, account, and positions all come from the
+MT5 terminal. The engine reads **all timeframes together, with hierarchy**:
+daily sets the direction, 4-hour marks the zones, 1-hour gives the trigger,
+15/30-minute times the entry, 5-minute supplies the fine entry leg. A higher
+timeframe can block a lower one; a lower one can never overrule a higher
+one. Trades are managed on **tick**, not on poll — breakeven, trailing,
+and partials fire the moment price crosses the level.
 
-## Architecture
+## How it trades
 
-```
-OHLCV bars
-   │
-   ▼
-MarketReader  (goldenswing/reader/)      — the awareness layer
-   │  one causal pass → MarketState per bar:
-   │  • Structure   fractal swings, BOS / CHoCH, trend state
-   │  • Liquidity   pools of resting stops (equal highs/lows, swing
-   │                extremes), sweep events (wick through + close back)
-   │  • ICT levels  fair value gaps (3-candle), order blocks (last
-   │                opposite candle before displacement), premium /
-   │                discount position in the dealing range
-   │  • Regime      ATR percentile (compressed / normal / expanded),
-   │                ATR-normalised momentum, displacement strength
-   │  • Sessions    Asia / London / overlap / New York, ICT killzones,
-   │                running session range
-   ▼
-GoldenSwingDetector  (goldenswing/golden/)
-   │  scores each bar 0–100 across five backing families:
-   │  structure alignment · liquidity event · displacement ·
-   │  room-to-run · regime support · session timing
-   │  hard gates: minimum room to the next liquidity pool, sane
-   │  structural invalidation distance, a real directional thesis
-   │  output: direction, score, human-readable backing factors,
-   │  entry zone, invalidation level, targets (liquidity pools ahead)
-   ▼
-Backtest harness  (goldenswing/backtest/)
-      next-bar entry, invalidation stop, target = nearest opposing
-      pool (2R floor), stop wins ties, 72-bar time stop, $0.45/oz cost,
-      1% risk — plus a shadow book that grades every score band.
+- **Hierarchy (never democracy):** D1 bias → H4 agreement + H4 zone →
+  H1 trigger (BOS / MSCH / CHoCH) → session entry clock (M15 in killzone,
+  M30 elsewhere) → M5 entry leg. No zone, no trade. No trigger, no trade.
+- **Executed sleeves:** `fvg_midline` + `trendline_retest`, gated by the
+  whole hierarchy. The sweep-reversal anchor stays shadow-only.
+- **AMD phase** rides as a tag on the stack, never a veto. Hard veto is OFF.
+- **Volume** comes from MT5 (tick volume, real volume where the symbol
+  provides it) and nudges the score — it never gates a trade.
+- **Tick management:** breakeven at +1R (stop to entry), trailing,
+  partials, stops — all applied on the crossing tick, with failed
+  modifies retried on the next tick, never booked as done.
+
+## Run it (Windows EC2, MT5 terminal logged into demo)
+
+```powershell
+git clone https://github.com/Oluwacutyp/goldenswing.git
+cd goldenswing
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install MetaTrader5 pandas numpy
+# + repo requirements
+.\.venv\Scripts\python.exe scripts\run_mt5.py
 ```
 
-**Causality is a hard contract.** Every event is timestamped at the bar it
-became *knowable* (a fractal swing at bar `i` confirms at `i+n`; an FVG at
-its third candle's close). `tests/test_no_lookahead.py` proves truncating
-the series cannot change earlier states.
+Set `GS_TELEGRAM_BOT_TOKEN` and `GS_TELEGRAM_CHAT_ID` in the environment
+for Telegram. See `docs/EC2_MT5_RUNBOOK.md` for the full steps, cutover,
+and verification.
 
-## Quick start
+## Telegram
 
-```bash
-pip install -e .            # or just use the source tree
-python scripts/backtest.py  # fetches GC=F H1 (2y, cached in data/), writes BACKTEST.md
-pytest                      # unit + causality tests
-```
+The engine listens and answers: `/status /report /db /trades /harvest
+/ticks`. Every signal and every fill sends a **multi-timeframe chart**
+(H4 structure, H1 trigger, entry timeframe) with the zone, entry, stop,
+targets, and verdict. `/harvest` bundles the journal, state, tick CSVs,
+and results into a ZIP. `/ticks` exports tick history for backtesting.
 
-Data note: GC=F is COMEX front-month gold futures — a proxy for spot
-XAUUSD. Spreads, rolls and the daily settlement gap differ from a spot
-feed; results should be read with that in mind.
+## Safety
 
-## Roadmap (later phases — not in this repo yet)
+- Demo only by default — the engine **refuses real accounts** unless
+  explicitly allowed.
+- One position at a time.
+- Stop with `Ctrl+C` or by creating `data\mt5_KILL`.
 
-- **Phase 2:** ensemble ML forecaster — 3-day big-move probability model
-  (gradient boosting + DRL position/exit agent) layered on the reader's
-  state features, retraining on the system's own trade history.
-- **Phase 3:** execution — MT5 Expert Advisor bridge (brain on Linux/AWS,
-  EA inside a terminal on demo or real Exness), paper mode by default.
-- **Phase 4:** Telegram alerts — every signal with the setup *drawn* on a
-  chart image (levels shaded, entry/SL/TP zones) and inline
-  Execute / Skip / Paper buttons.
+## Layout
 
-## Phase 1 status
+- `goldenswing/feed/mt5.py` — MT5 feed: bars, ticks, volumes, account.
+- `goldenswing/live/hierarchy.py` — the one hierarchy behind live +
+  backtest.
+- `goldenswing/execution/mt5_runner.py` — the engine loop.
+- `goldenswing/execution/tick_manager.py` — tick-driven management.
+- `goldenswing/execution/mt5_commands.py` — Telegram commands.
+- `goldenswing/charts/engine.py` — multi-timeframe signal/fill charts.
 
-MarketReader + GoldenSwing detector + backtest harness are implemented
-and tested. Results — including the score-discrimination test of the core
-concept — are in `BACKTEST.md`. The honest summary lives there, not here.
+## Status
+
+The engine has been tested on a fake terminal (900+ tests green). It has
+not yet run against a real terminal or real Telegram — the first live run
+needs watching. The old OANDA paper loop remains in the repo for local
+paper trading; it is not the engine.
