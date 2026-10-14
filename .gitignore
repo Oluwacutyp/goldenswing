@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+data/*.csv
+*.egg-info/
+forecast_models.joblib
+forecast_oof_probs.csv
+# Phase-8 runtime state (journal, guard state, outbox, kill switch)
+data/trade_journal.jsonl
+data/risk_state.json
+data/risk_state.json.tmp
+data/alert_outbox/
+data/KILL
+.oanda_token
