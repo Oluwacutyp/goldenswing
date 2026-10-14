@@ -232,6 +232,10 @@ class MT5Runner:
         self._tick_count = 0
         self._last_tick: dict | None = None
         self._stopped = False
+        # Startup ping: exactly one Telegram "engine started" message
+        # per process start (see _send_startup_ping).  Guarded so a
+        # second run() call on the same runner never double-pings.
+        self._startup_ping_sent = False
         # Per-day tick CSV logger (next to the journal; None = disabled).
         self._tick_logger = TickLogger(self.cfg.journal_path.parent) \
             if self.cfg.tick_log else None
@@ -403,6 +407,11 @@ class MT5Runner:
         # Adopt pending orders the broker still holds with our magic:
         # a restart must not orphan a resting limit/stop.
         self._adopt_existing_pending(executor)
+
+        # Startup ping: ONE Telegram "engine started" message, after
+        # feed connect + runner start, independent of command polling
+        # (it fires even with --no-poll-commands).  Never raises.
+        self._send_startup_ping(acct)
 
         stats: dict = {"ticks": 0, "bars": 0, "signals": 0,
                        "executed": 0, "shadow": 0, "gated": 0,
@@ -1914,6 +1923,47 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: chart build failed for {alert_id}: {exc}")
             return None, None
+
+    def _send_startup_ping(self, acct: dict) -> None:
+        """One Telegram 'engine started' ping per process start.
+
+        Fires after feed connect + runner start (feed, executor,
+        warm start, adoption all done).  Sending is INDEPENDENT of
+        command polling (getUpdates): the ping goes out even with
+        --no-poll-commands — the owner must be able to tell the
+        engine is alive while the OANDA loop still owns getUpdates.
+        Never raises: no senders configured -> journal note only;
+        a send failure is journaled and start continues.
+        """
+        if self._startup_ping_sent:
+            return
+        self._startup_ping_sent = True
+        if not self.senders:
+            self.journal.log_note(
+                "mt5: startup ping skipped (no Telegram sender "
+                "configured)")
+            return
+        try:
+            mode = acct.get("trade_mode")
+            mode_txt = ("demo" if mode == 0 else
+                        "live" if mode == 2 else f"mode={mode}")
+            executing = [p for p in self.cfg.execute_playbooks
+                         if p not in self.cfg.disabled_playbooks]
+            state = "PAUSED" if self.cfg.paused else "RUNNING"
+            polling = ("ON" if self.cfg.poll_commands else
+                       "OFF (overlap — OANDA loop owns getUpdates)")
+            text = (
+                "MT5 engine started\n"
+                f"symbol: {self.cfg.symbol}\n"
+                f"trade_mode: {mode} ({mode_txt})\n"
+                f"equity: {acct.get('equity')}\n"
+                f"playbooks: {', '.join(executing) if executing else '(none)'}\n"
+                f"state: {state}\n"
+                f"command polling: {polling}"
+            )
+            self._send_alert(text)
+        except Exception as exc:
+            self.journal.log_note(f"mt5: startup ping failed: {exc}")
 
     def _send_alert(self, text: str, *,
                     chart_png: bytes | None = None) -> None:
