@@ -324,6 +324,36 @@ class TelegramSender:
         return SendResult("telegram", ok, "live",
                           f"sendDocument {p.name}: {detail}")
 
+    def send_photo(self, png: bytes, caption: str | None = None, *,
+                   filename: str = "chart.png") -> SendResult:
+        """Send raw PNG bytes as a Telegram photo (MT5 signal/fill charts).
+
+        Same retry/backoff contract as the other sends.  A photo that
+        will not send falls back to the caption as a text message, so
+        the thesis still arrives when the chart doesn't.
+        """
+        if self.mode == "outbox":
+            return SendResult(
+                "telegram", False, "outbox",
+                "no GS_TELEGRAM_BOT_TOKEN/GS_TELEGRAM_CHAT_ID — "
+                "photo not queued (outbox is for chart alerts)")
+        cap = caption or ""
+        if len(cap) > _CAPTION_LIMIT:
+            cap = cap[:_CAPTION_LIMIT - 1] + "…"
+        ok, detail = self._post_with_retry(
+            _API_PHOTO.format(token=self.bot_token),
+            data={"chat_id": self.chat_id, "caption": cap},
+            files={"photo": (filename, png, "image/png")})
+        if ok:
+            return SendResult("telegram", True, "live",
+                              f"sendPhoto {detail}")
+        text_res = self.send_text(cap)
+        return SendResult(
+            "telegram", text_res.delivered, "live",
+            f"photo failed ({detail}); text fallback "
+            f"{'sent' if text_res.delivered else 'failed'}: "
+            f"{text_res.detail}")
+
     def send(self, alert: Alert) -> SendResult:
         if self.mode == "outbox":
             paths = outbox.write_alert(self.outbox_dir, alert, "telegram")

@@ -1439,12 +1439,18 @@ class LiveRunner:
         CommandRouter.  A second poller would race on the update offset
         and starve one of the two — never add one.
 
+        CUTOVER: when the MT5 engine takes over, set
+        ``GS_TELEGRAM_POLL=0`` in this loop's environment — the MT5
+        engine owns getUpdates then, and this poller stays silent.
+
         Transport: env token when configured, otherwise the telegram
         skill's tg-call CLI (vault-backed).  No token, no CLI, no poll.
         """
         import json as _json
         import subprocess as _sp
 
+        if os.environ.get("GS_TELEGRAM_POLL", "1") == "0":
+            return  # cutover: the MT5 engine owns getUpdates now
         token = os.environ.get("GS_TELEGRAM_BOT_TOKEN")
         tg_call = os.path.expanduser(
             "~/workspace/skills/telegram/bin/tg-call")

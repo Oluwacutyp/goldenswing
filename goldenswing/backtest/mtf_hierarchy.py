@@ -50,6 +50,7 @@ import pandas as pd
 
 from ..live.hierarchy import (STACK_TFS, TF_MINUTES, TimeframeStack,
                               evaluate_hierarchy)
+from ..live.volume import volume_features
 from .mtf12 import _summarize, load_ohlc_csv
 
 #: Resample rules incl. M30 (``mtf12.resample_bars`` has no M30 rule —
@@ -264,6 +265,8 @@ def run_hierarchy_backtest(frames: dict[str, pd.DataFrame], *,
             qm_touch=_latest_qm_touch(qm_touches, asof),
             swing_n=swing_n, window=window, stamps=stamps)
         evaluated += 1
+        # MT5 volume on the trigger frame (same helper as live).
+        vol = volume_features(stack_frames["H1"])
         verdicts.append({
             "i": int(i), "ts": asof.isoformat(),
             "allowed": bool(verdict["allowed"]),
@@ -275,6 +278,8 @@ def run_hierarchy_backtest(frames: dict[str, pd.DataFrame], *,
             "amd_phase": verdict.get("amd_phase"),
             "qm_status": verdict.get("qm", {}).get("status"),
             "trigger": verdict.get("trigger"),
+            "volume_ratio": vol.get("volume_ratio"),
+            "volume_confirms": vol.get("volume_confirms"),
         })
         if not verdict["allowed"]:
             gate_counts[verdict["blocked_leg"]] += 1

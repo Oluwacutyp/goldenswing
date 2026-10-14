@@ -76,6 +76,8 @@ class CommandContext:
     last_bar_time: str | None = None
     measured_oos: list[dict] = field(default_factory=list)
     reports_dir: Path | None = None
+    feed: object = None                  # live feed (MT5 /ticks export)
+    live_positions: list = field(default_factory=list)  # MT5 truth: open positions
 
 
 def _is_owner(update: dict, owner_chat_id: str | int | None) -> bool:
@@ -87,10 +89,18 @@ def _is_owner(update: dict, owner_chat_id: str | int | None) -> bool:
 
 
 class CommandRouter:
-    """Parse + gate + dispatch one raw getUpdates update."""
+    """Parse + gate + dispatch one raw getUpdates update.
 
-    def __init__(self, owner_chat_id: str | int | None = None):
+    ``registry`` defaults to the global :data:`COMMANDS` (the OANDA
+    loop).  The MT5 engine passes its own registry so the two loops
+    answer different commands from their own journal/state without
+    clobbering each other's handlers in-process.
+    """
+
+    def __init__(self, owner_chat_id: str | int | None = None,
+                 registry: dict | None = None):
         self.owner_chat_id = owner_chat_id
+        self.registry = COMMANDS if registry is None else registry
 
     def dispatch(self, update: dict, ctx: CommandContext
                  ) -> tuple[CommandResult | None, str | None]:
@@ -105,7 +115,7 @@ class CommandRouter:
         chat_id = str((msg.get("chat") or {}).get("id"))
         parts = text.split()
         name, args = parts[0].split("@")[0].lower(), parts[1:]
-        entry = COMMANDS.get(name)
+        entry = self.registry.get(name)
         if entry is None:
             return CommandResult(
                 text=f"unknown command {name} — /help lists the commands."), \
@@ -414,44 +424,30 @@ def _harvest_results_md(ctx: CommandContext, scope: str,
     return "\n".join(lines)
 
 
-def build_harvest_bundle(ctx: CommandContext, scope: str = "all") -> tuple[Path, dict]:
-    """Build the harvest ZIP. Returns (zip_path, manifest)."""
-    if scope not in HARVEST_SCOPES:
-        raise ValueError(f"unknown scope {scope!r}; use one of {HARVEST_SCOPES}")
-    data_dir, candidates = _harvest_candidates(ctx)
-    chosen = _harvest_filter(candidates, scope)
-    out_dir = Path(ctx.reports_dir) if ctx.reports_dir else data_dir / "reports"
+def build_zip_bundle(*, out_dir: Path, zip_prefix: str,
+                     files: list[Path], data_dir: Path,
+                     manifest_base: dict, results_md_fn,
+                     slim_files: list[Path] | None = None
+                     ) -> tuple[Path, dict]:
+    """Generic bundle-ZIP writer shared by the OANDA + MT5 /harvest.
+
+    ``results_md_fn(manifest)`` returns the RESULTS.md text and is
+    called with ``files``/``skipped`` already filled in.  Same caps as
+    the OANDA /harvest: 20MB/file, 45MB ZIP; oversize rebuilds the
+    slim fallback (``slim_files`` + RESULTS.md + manifest) once.
+    Returns (zip_path, manifest).
+    """
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    harvested_utc = datetime.now(timezone.utc).isoformat()
+    manifest: dict = {**manifest_base, "files": [], "skipped": [],
+                      "fallback_slim": False}
 
-    # Paper state snapshot for RESULTS.md (best effort, never fatal).
-    paper_state = None
-    paper_path = data_dir / "paper_state" / "paper.json"
-    if paper_path.is_file():
-        try:
-            paper_state = json.loads(paper_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            paper_state = None
-
-    manifest: dict = {
-        "harvested_utc": harvested_utc,
-        "scope": scope,
-        "journal": str(ctx.journal_path) if ctx.journal_path else None,
-        "feed": str(ctx.feed_status) if ctx.feed_status else None,
-        "last_bar_time": ctx.last_bar_time,
-        "last_price": ctx.last_price,
-        "paper_state": paper_state,
-        "files": [],
-        "skipped": [],
-        "fallback_slim": False,
-    }
-
-    def _write_zip(zip_path: Path, files: list[Path]) -> dict:
+    def _write_zip(zip_path: Path, file_list: list[Path]) -> dict:
         entries: list[dict] = []
         skipped: list[dict] = []
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for p in files:
+            for p in file_list:
                 try:
                     arc = str(p.relative_to(data_dir))
                 except ValueError:
@@ -464,10 +460,8 @@ def build_harvest_bundle(ctx: CommandContext, scope: str = "all") -> tuple[Path,
                 zf.write(p, arc)
                 entries.append({"arcname": arc, "bytes": size,
                                 "sha256": _sha256_file(p)})
-            # RESULTS.md + manifest.json go inside the ZIP itself.
-            results_md = _harvest_results_md(
-                ctx, scope, {**manifest, "files": entries,
-                             "skipped": skipped})
+            results_md = results_md_fn(
+                {**manifest, "files": entries, "skipped": skipped})
             zf.writestr("RESULTS.md", results_md)
             full_manifest = {**manifest, "files": entries,
                              "skipped": skipped,
@@ -476,17 +470,19 @@ def build_harvest_bundle(ctx: CommandContext, scope: str = "all") -> tuple[Path,
                          json.dumps(full_manifest, indent=2, default=str))
         return {"files": entries, "skipped": skipped}
 
-    zip_path = out_dir / f"goldenswing-harvest-{stamp}.zip"
-    outcome = _write_zip(zip_path, chosen)
+    zip_path = out_dir / f"{zip_prefix}-{stamp}.zip"
+    outcome = _write_zip(zip_path, files)
     manifest["files"] = outcome["files"]
     manifest["skipped"] = outcome["skipped"]
-    # Oversize guard: rebuild slim (journal + RESULTS + manifest) once.
     if zip_path.stat().st_size > HARVEST_MAX_ZIP_BYTES:
-        journal_only = [p for p in chosen if "journal" in p.name]
+        if slim_files is None:
+            zip_path.unlink(missing_ok=True)
+            raise ValueError("bundle exceeds the 45MB ZIP cap "
+                             "and no slim fallback was provided")
         zip_path.unlink(missing_ok=True)
-        slim_path = out_dir / f"goldenswing-harvest-{stamp}-slim.zip"
+        slim_path = out_dir / f"{zip_prefix}-{stamp}-slim.zip"
         manifest["fallback_slim"] = True
-        outcome = _write_zip(slim_path, journal_only)
+        outcome = _write_zip(slim_path, slim_files)
         manifest["files"] = outcome["files"]
         manifest["skipped"] = outcome["skipped"] + [{
             "arcname": "(full bundle)",
@@ -498,6 +494,41 @@ def build_harvest_bundle(ctx: CommandContext, scope: str = "all") -> tuple[Path,
     manifest["zip_bytes"] = zip_path.stat().st_size
     manifest["zip_name"] = zip_path.name
     return zip_path, manifest
+
+
+def build_harvest_bundle(ctx: CommandContext, scope: str = "all") -> tuple[Path, dict]:
+    """Build the harvest ZIP. Returns (zip_path, manifest)."""
+    if scope not in HARVEST_SCOPES:
+        raise ValueError(f"unknown scope {scope!r}; use one of {HARVEST_SCOPES}")
+    data_dir, candidates = _harvest_candidates(ctx)
+    chosen = _harvest_filter(candidates, scope)
+    out_dir = Path(ctx.reports_dir) if ctx.reports_dir else data_dir / "reports"
+    harvested_utc = datetime.now(timezone.utc).isoformat()
+
+    # Paper state snapshot for RESULTS.md (best effort, never fatal).
+    paper_state = None
+    paper_path = data_dir / "paper_state" / "paper.json"
+    if paper_path.is_file():
+        try:
+            paper_state = json.loads(paper_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            paper_state = None
+
+    manifest_base: dict = {
+        "harvested_utc": harvested_utc,
+        "scope": scope,
+        "journal": str(ctx.journal_path) if ctx.journal_path else None,
+        "feed": str(ctx.feed_status) if ctx.feed_status else None,
+        "last_bar_time": ctx.last_bar_time,
+        "last_price": ctx.last_price,
+        "paper_state": paper_state,
+    }
+    journal_only = [p for p in chosen if "journal" in p.name]
+    return build_zip_bundle(
+        out_dir=out_dir, zip_prefix="goldenswing-harvest",
+        files=chosen, data_dir=data_dir, manifest_base=manifest_base,
+        results_md_fn=lambda m: _harvest_results_md(ctx, scope, m),
+        slim_files=journal_only)
 
 
 @command("/harvest", "harvest database + journal + state + results as one ZIP")

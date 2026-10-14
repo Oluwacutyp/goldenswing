@@ -455,10 +455,19 @@ class ConfluenceEngine:
         return True, ""
 
     def score_live_signal(self, pb: Playbook, signal,
-                          ctx: EngineContext) -> tuple[float, list[str]]:
+                          ctx: EngineContext,
+                          hierarchy_verdict: dict | None = None
+                          ) -> tuple[float, list[str]]:
         """Confluence for a live signal: base + feature bonuses + map
         bonuses + forecaster quality dial.  Same arithmetic as the batch
-        :meth:`score`."""
+        :meth:`score`.
+
+        When ``hierarchy_verdict`` carries ``volume`` (MT5 bars — see
+        ``live/volume.py``), the old bots' bounded volume confirmation
+        (``clip((ratio - 1) / 2, -0.5, 0.5)``) is added UNSCALED:
+        the scale is the old bots', not a new invented weight.  Volume
+        never gates — it only nudges the score.
+        """
         bonus, notes = _signal_bonuses(
             signal.index, signal.direction, signal, ctx, self.cfg)
         mb, mnotes = self._map_bonuses_signal(pb, signal, ctx)
@@ -467,6 +476,12 @@ class ConfluenceEngine:
         fb, fnotes = forecast_bonuses(
             signal.index, signal.direction,
             getattr(ctx, "forecast_table", None), self.cfg)
+        if hierarchy_verdict is not None:
+            from .live.volume import volume_bonus
+            vb, vnote = volume_bonus(hierarchy_verdict.get("volume"))
+            if vb != 0.0:
+                bonus += vb
+                notes.append(f"{vb:+g} volume confirmation ({vnote})")
         return signal.score + bonus + mb + tb + fb, notes + mnotes + tnotes + fnotes
 
     @staticmethod

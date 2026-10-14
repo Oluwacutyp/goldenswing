@@ -650,3 +650,245 @@ def render_to_file(path, df, state, signal=None, **kwargs) -> str:
     with open(path, "wb") as fh:
         fh.write(data)
     return str(path)
+
+
+# ------------------------------------------------------------------ MT5
+# Multi-timeframe signal chart for the MT5 engine: the WHOLE hierarchy
+# stack, never H1-only.  Panels, top to bottom:
+#   H4  — structure: H4 candles + H4 POI zone band + D1 bias note.
+#   H1  — trigger: H1 candles + trigger bar marked (BOS/MSCH/CHoCH).
+#   M15/M30 — entry: entry-clock candles + entry bar marked.
+# Every panel shares the same entry / stop / targets / 2R / fill lines,
+# so the trade reads identically at every timeframe.  A missing frame
+# renders its panel with an explicit "unavailable" label — bars are
+# never invented.  Every level drawn comes from the caller.
+_MT5_STYLES = ("classic", "blueprint")
+
+
+def _mt5_candles(ax, view, xs, theme) -> None:
+    """Candlesticks for one panel's window view."""
+    o = view["open"].to_numpy(dtype=float)
+    h = view["high"].to_numpy(dtype=float)
+    l = view["low"].to_numpy(dtype=float)  # noqa: E741
+    c = view["close"].to_numpy(dtype=float)
+    for i in range(len(xs)):
+        up = c[i] >= o[i]
+        col = theme["up"] if up else theme["down"]
+        ax.plot([xs[i], xs[i]], [l[i], h[i]], color=col, linewidth=0.9,
+                zorder=3, solid_capstyle="round")
+        lo_b, hi_b = min(o[i], c[i]), max(o[i], c[i])
+        ax.add_patch(Rectangle(
+            (xs[i] - 0.32, lo_b), 0.64, max(hi_b - lo_b, 1e-9),
+            facecolor=col, edgecolor=col, zorder=3))
+
+
+def _mt5_trade_levels(ax, x_hi, *, entry: float, stop: float,
+                      targets: list[float], direction: int, risk: float,
+                      fill_price: float | None, theme) -> None:
+    """Shared entry / stop / targets / 2R / fill lines on one panel."""
+    ax.axhline(entry, color="#f7b924", linewidth=1.6, zorder=4)
+    ax.text(x_hi - 0.3, entry, f" ENTRY {_fmt(entry)}", ha="right",
+            va="bottom" if direction == 1 else "top", fontsize=9,
+            color="#8a6d00", fontweight="bold")
+    ax.axhline(stop, color="#d32f2f", linewidth=1.6, zorder=4)
+    ax.text(x_hi - 0.3, stop, " STOP ", ha="right",
+            va="top" if direction == 1 else "bottom", fontsize=9,
+            color="#d32f2f", fontweight="bold")
+    for j, t in enumerate(targets):
+        ax.axhline(t, color="#2e7d32", linewidth=1.1,
+                   linestyle=(0, (6, 3)), zorder=3)
+        ax.text(x_hi - 0.3, t, f" T{j + 1} {_fmt(t)}", ha="right",
+                va="bottom" if direction == 1 else "top", fontsize=9,
+                color="#2e7d32")
+    if risk > 0:
+        t2r = entry + direction * 2.0 * risk
+        ax.axhline(t2r, color="#2e7d32", linewidth=0.8,
+                   linestyle=(0, (2, 2)), alpha=0.7, zorder=3)
+        ax.text(x_hi - 0.3, t2r, " 2R ", ha="right",
+                va="bottom" if direction == 1 else "top", fontsize=8,
+                color="#2e7d32")
+    if fill_price is not None:
+        ax.axhline(fill_price, color="#7e57c2", linewidth=1.4,
+                   linestyle=(0, (8, 3)), zorder=4)
+        ax.text(x_hi - 0.3, fill_price, f" FILL {_fmt(fill_price)}",
+                ha="right", va="bottom", fontsize=9, color="#7e57c2",
+                fontweight="bold")
+
+
+def _mt5_panel_ylim(view, *, entry: float, stop: float,
+                    targets: list[float], fill_price: float | None,
+                    zone: dict | None) -> tuple[float, float]:
+    """Y limits from the panel's own candles + the shared levels."""
+    l = view["low"].to_numpy(dtype=float)
+    h = view["high"].to_numpy(dtype=float)
+    lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
+    span = max(hi_v - lo_v, 1e-9)
+    cand = [lo_v, hi_v, stop, entry] + list(targets)
+    if fill_price is not None:
+        cand.append(fill_price)
+    if zone is not None and zone.get("top") and zone.get("bottom"):
+        cand += [float(zone["top"]), float(zone["bottom"])]
+    for v in cand:
+        if lo_v - 1.6 * span <= v <= hi_v + 1.6 * span:
+            lo_v, hi_v = min(lo_v, v), max(hi_v, v)
+    pad = 0.07 * max(hi_v - lo_v, 1e-9)
+    return lo_v - pad, hi_v + pad
+
+
+def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
+                       entry: float, stop: float,
+                       targets: list[float] | None = None,
+                       direction: int = 0, verdict: dict | None = None,
+                       playbook: str = "", score: float = 0.0,
+                       instrument: str = "XAUUSD",
+                       fill_price: float | None = None,
+                       window: int = 120,
+                       h4: pd.DataFrame | None = None,
+                       entry_frame: pd.DataFrame | None = None,
+                       entry_clock: str | None = None,
+                       style: str = "classic",
+                       h4_window: int = 60,
+                       entry_window: int = 60) -> bytes:
+    """Render the MT5 multi-timeframe signal chart to PNG bytes.
+
+    Three stacked panels (H4 structure / H1 trigger / entry-TF entry),
+    all sharing the same trade levels.  ``h1`` is required; ``h4`` and
+    ``entry_frame`` are optional — a missing frame renders its panel
+    with an explicit "unavailable" label, never with invented bars.
+    ``entry_clock`` defaults to the verdict's entry clock (M15/M30).
+    ``style`` is ``"classic"`` or ``"blueprint"`` (the two MT5 chart
+    classes).  Every level drawn comes from the caller — nothing is
+    inferred, estimated, or defaulted.
+    """
+    if style not in _MT5_STYLES:
+        raise ValueError(
+            f"unknown MT5 chart style {style!r}; expected one of "
+            f"{_MT5_STYLES}")
+    theme = _THEMES[style]
+    if h1 is None or len(h1) == 0:
+        raise ValueError("render_mt5_signal needs a non-empty H1 frame")
+    targets = list(targets or [])
+    risk = abs(entry - stop)
+    clock = entry_clock or (verdict or {}).get("entry_clock") or "M15"
+    bias_d1 = (verdict or {}).get("bias_d1", 0)
+    bias_h4 = (verdict or {}).get("bias_h4", 0)
+    trigger = (verdict or {}).get("trigger") or "?"
+    arrow = "▲ LONG" if direction == 1 else "▼ SHORT" if direction == -1 \
+        else "FLAT"
+
+    fig = plt.figure(figsize=(16, 13), dpi=_DPI)
+    fig.patch.set_facecolor(theme["bg"])
+    fig.suptitle(f"{instrument} · MT5 signal · {playbook} · "
+                 f"score {score:.0f}",
+                 fontsize=13, color=theme["text"], x=0.02, ha="left")
+    gs = fig.add_gridspec(3, 1, height_ratios=[2.2, 2.2, 1.8],
+                          hspace=0.45, left=0.05, right=0.97,
+                          top=0.93, bottom=0.05)
+    axes = [fig.add_subplot(gs[i]) for i in range(3)]
+
+    panels = [
+        # (frame, window, title, zone band?, marker label)
+        (h4, h4_window,
+         f"H4 — structure · D1 bias {bias_d1:+d} · H4 bias {bias_h4:+d}",
+         True, None),
+        (h1, window, f"H1 — trigger: {trigger}", False,
+         f"TRIGGER {trigger}"),
+        (entry_frame, entry_window, f"{clock} — entry", False, "ENTRY"),
+    ]
+    verdict_box_done = False
+    for ax, (frame, win, title, show_zone, marker) in zip(axes, panels):
+        ax.set_facecolor(theme["bg"])
+        ax.tick_params(colors=theme["text"], labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(theme["grid"])
+        ax.grid(True, color=theme["grid"], linewidth=0.5, alpha=0.7)
+        ax.set_title(title, fontsize=11, color=theme["text"], loc="left")
+        if frame is None or len(frame) == 0:
+            # Missing frame: label the gap, never invent bars.
+            ax.set_xlim(0, 10)
+            ax.set_ylim(0, 1)
+            ax.text(5, 0.5, f"{title.split(' —')[0]} frame unavailable — "
+                    "panel not charted (no bars invented)",
+                    ha="center", va="center", fontsize=10,
+                    color=theme["text"], alpha=0.8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
+        view = frame.iloc[-win:]
+        xs = np.arange(len(view), dtype=float)
+        x_lo, x_hi = -0.6, len(view) - 1 + 12.4
+        ax.set_xlim(x_lo, x_hi)
+        _mt5_candles(ax, view, xs, theme)
+        if show_zone and zone is not None:
+            ztop = float(zone.get("top", 0) or 0)
+            zbot = float(zone.get("bottom", 0) or 0)
+            if ztop > zbot > 0:
+                ax.axhspan(zbot, ztop, color="#f7b924", alpha=0.25,
+                           zorder=1)
+                ax.axhline(ztop, color="#b8860b", linewidth=0.9,
+                           linestyle=(0, (4, 3)), zorder=2)
+                ax.axhline(zbot, color="#b8860b", linewidth=0.9,
+                           linestyle=(0, (4, 3)), zorder=2)
+                ax.text(x_lo + 0.4, ztop,
+                        f" H4 ZONE {zone.get('kind', '')} "
+                        f"{_fmt(zbot)}–{_fmt(ztop)}",
+                        va="bottom", fontsize=8.5, color="#8a6d00",
+                        fontweight="bold")
+        _mt5_trade_levels(ax, x_hi, entry=entry, stop=stop,
+                          targets=targets, direction=direction, risk=risk,
+                          fill_price=fill_price, theme=theme)
+        lo_v, hi_v = _mt5_panel_ylim(
+            view, entry=entry, stop=stop, targets=targets,
+            fill_price=fill_price, zone=zone if show_zone else None)
+        ax.set_ylim(lo_v, hi_v)
+        if marker is not None:
+            last = len(view) - 1
+            ax.axvspan(last - 0.5, last + 0.5, color="#7e57c2",
+                       alpha=0.12, zorder=1)
+            ax.text(last, hi_v - 0.02 * (hi_v - lo_v), f" {marker} ",
+                    ha="center", va="top", fontsize=8.5,
+                    color="#ffffff", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25",
+                              facecolor="#7e57c2", edgecolor="none",
+                              alpha=0.95), zorder=6)
+            if fill_price is not None:
+                ax.plot([last], [fill_price], marker="o", markersize=7,
+                        color="#7e57c2",
+                        markeredgecolor=theme["text"], zorder=6)
+        # Verdict box on the first available panel (H4 preferred).
+        if not verdict_box_done:
+            vlines = [f"{arrow} {instrument} — {playbook} · "
+                      f"score {score:.0f}"]
+            if verdict is not None:
+                vlines.append(
+                    f"D1 {bias_d1:+d} / H4 {bias_h4:+d} / {trigger} / "
+                    f"{clock}")
+                vlines.append(
+                    f"AMD: {verdict.get('amd_phase', '?')} · "
+                    f"QM: {(verdict.get('qm') or {}).get('status', '?')} · "
+                    f"vol: {(verdict.get('volume') or {}).get('volume_ratio', '?')}")
+            vlines.append(f"Entry {_fmt(entry)} · Stop {_fmt(stop)}"
+                          + (f" · Fill {_fmt(fill_price)}"
+                             if fill_price is not None else ""))
+            ax.text(0.008, 0.992, "\n".join(vlines),
+                    transform=ax.transAxes, va="top", ha="left",
+                    fontsize=8.6, family="monospace",
+                    color=theme["text"], zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.45",
+                              facecolor=theme["bg"],
+                              edgecolor=theme["text"], alpha=0.88))
+            verdict_box_done = True
+        ticks = np.linspace(0, len(view) - 1, 5).astype(int)
+        ts = frame.index[-len(view):]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(
+            [ts[i].strftime("%m-%d %H:%M")
+             if hasattr(ts[i], "strftime") else str(ts[i])
+             for i in ticks], fontsize=8)
+        ax.set_ylabel("Price", fontsize=9, color=theme["text"])
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=_DPI, facecolor=theme["bg"],
+                metadata={"Software": "GoldenSwing charts"})
+    plt.close(fig)
+    return buf.getvalue()
