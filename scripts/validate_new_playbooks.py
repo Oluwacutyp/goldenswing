@@ -1,10 +1,11 @@
 """Validate the new MT5 playbooks on OANDA XAUUSD H1 (2024-10 -> 2026-10).
 
 Each new setup (V-reversal, retracement trap, inversion, order block,
-killzone open) runs its own ``candidates()`` over the full window with
-its own entry rules and the shared exit discipline (1.5R target, stop
-= invalidation +/- 0.25 ATR, invalidation exit at close, 48-bar max
-hold).  The iron rule is applied mechanically:
+killzone open, turtle soup, Judas swing) runs its own
+``candidates()`` over the full window with its own entry rules and
+the shared exit discipline (1.5R target, stop = invalidation +/-
+0.25 ATR, invalidation exit at close, 48-bar max hold).  The iron
+rule is applied mechanically:
 
     PASS (executes):  PF >= 1.10 AND total R > 0 AND trades >= 30
     FAIL (stays shadow): anything else
@@ -27,9 +28,11 @@ from goldenswing.playbooks.base import EngineContext
 from goldenswing.playbooks.common import (
     MIN_PF, MIN_TRADES, promotion_verdict, summarize)
 from goldenswing.playbooks.inversion import InversionPlaybook
+from goldenswing.playbooks.judas_swing import JudasSwingPlaybook
 from goldenswing.playbooks.killzone_open import KillzoneOpenPlaybook
 from goldenswing.playbooks.order_block import OrderBlockPlaybook
 from goldenswing.playbooks.retracement_trap import RetracementTrapPlaybook
+from goldenswing.playbooks.turtle_soup import TurtleSoupPlaybook
 from goldenswing.playbooks.v_reversal import VReversalPlaybook
 
 DATA = Path(__file__).resolve().parents[1] / "data" \
@@ -41,6 +44,8 @@ PLAYBOOKS = [
     InversionPlaybook,
     OrderBlockPlaybook,
     KillzoneOpenPlaybook,
+    TurtleSoupPlaybook,
+    JudasSwingPlaybook,
 ]
 
 

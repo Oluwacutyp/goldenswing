@@ -15,12 +15,14 @@ from .base import Candidate, EngineContext, Playbook
 from .fvg_limit import FVGLimitPlaybook
 from .fvg_midline import FVGMidlinePlaybook
 from .inversion import InversionPlaybook
+from .judas_swing import JudasSwingPlaybook
 from .killzone_open import KillzoneOpenPlaybook
 from .order_block import OrderBlockPlaybook
 from .qm_m5 import QMM5Playbook
 from .retracement_trap import RetracementTrapPlaybook
 from .sweep_reversal import SweepReversalPlaybook
 from .trendline_retest import TrendlineRetestPlaybook
+from .turtle_soup import TurtleSoupPlaybook
 from .v_reversal import VReversalPlaybook
 
 __all__ = [
@@ -28,6 +30,7 @@ __all__ = [
     "EngineContext",
     "Playbook",
     "SweepReversalPlaybook",
+    "TurtleSoupPlaybook",
     "FVGMidlinePlaybook",
     "FVGLimitPlaybook",
     "TrendlineRetestPlaybook",
@@ -35,6 +38,7 @@ __all__ = [
     "VReversalPlaybook",
     "RetracementTrapPlaybook",
     "InversionPlaybook",
+    "JudasSwingPlaybook",
     "OrderBlockPlaybook",
     "KillzoneOpenPlaybook",
 ]

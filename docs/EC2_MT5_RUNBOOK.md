@@ -79,12 +79,76 @@ console. The engine stops at the next tick.
 Command polling is ON by default — the MT5 engine IS the engine.
 `/status` / `/report` / `/db` / `/trades` / `/harvest` / `/ticks`
 are answered from the MT5 journal/state (`data/mt5_*`), never the
-OANDA loop's files.
+OANDA loop's files.  Only the owner chat may use any of this;
+everyone else is ignored (commands) or refused (buttons).
+
+### Persistent bottom menu
+
+`/start` (or `/menu`) shows the always-visible reply-keyboard menu
+under the message box — it stays there across messages (Telegram
+`is_persistent` + `resize_keyboard`):
+
+```
+[Status]    [Positions]  [Pendings]
+[Playbooks] [Config]     [Trades]
+[Harvest]   [Pause]      [Resume]
+```
+
+Each button runs the same handler as its slash command.  The menu
+is NOT re-sent with every reply (a message carries exactly one
+`reply_markup`, and the inline buttons below need theirs) — sending
+a message with an inline keyboard leaves the reply keyboard in
+place, so both surfaces coexist.
+
+### Inline buttons on status / position / pending messages
+
+`⏸ Pause` `▶ Resume` `✂️ Trim` `❌ Cancel pending` `🔄 Refresh`
+`⚙️ Config`.  Refresh / Config re-render the message in place.
+
+### Confirm before anything mutates
+
+Pause, Resume, Trim, Cancel pending, and every `/set` change
+require a Confirm tap: the button / command sends a "confirm?"
+message with Confirm / Cancel buttons, and NOTHING acts until
+Confirm is tapped.  Cancel aborts.  Read-only commands
+(`/status`, `/config`, `/report`, `/db`, `/trades`, `/ticks`,
+`/harvest`, `/position`, `/pending`, `/playbooks`) need no confirm.
 
 `/trim` closes the top (most recent) added layer early while the base
 layer rides — the manual version of "close some".  With only the base
-layer it replies "nothing to trim".  It is the one mutating command:
-it executes a broker partial close.
+layer it replies "nothing to trim".
+
+### /status answers "why no trades"
+
+`/status` shows engine state (RUNNING / PAUSED), positions WITH
+layers, pending orders, today's P&L, BLOCKED-LEG STATS (per-leg
+block counts + last blocked reason), manipulation-filter blocks,
+and per-playbook signal counts.  `/position` and `/pending` show
+the same positions / pendings slices with the action buttons.
+`/playbooks` shows every playbook: executing vs shadow, on/off,
+signal counts.
+
+### /config / /set (safe keys only, persisted)
+
+`/config` shows the live config.  `/set <key> <value>` changes one
+safe key at runtime (confirm required) and persists it to
+`data/mt5_config.json` — it survives a restart (the runner loads
+the file at startup; an explicit `--fixed-lots` on the command line
+wins over the file and is itself persisted):
+
+```
+fixed_lots           0.01–1.0, or auto (risk-% sizing)
+max_layers           0–3
+manipulation_filter  on/off (the liquidity-test entry filter)
+pending_expiry_bars  1–24 (applies to pendings placed after the change)
+playbook.<name>      on/off (only playbooks that exist)
+```
+
+Pause is NOT a `/set` key — use Pause / Resume.  There is NO key,
+command, or button for live-trading permission, tokens, or paths:
+`/set` rejects them, and no command prints them.  Pause blocks new
+signals only — tick management (breakeven / trail / partial) of the
+held position keeps running.
 
 ```powershell
 .\\.venv\\Scripts\\python.exe scripts\\run_mt5.py   # polling ON (default)

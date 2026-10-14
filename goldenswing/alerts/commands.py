@@ -64,6 +64,7 @@ class CommandResult:
     text: str | None = None
     document: str | Path | None = None   # sent via sendDocument
     caption: str | None = None
+    reply_markup: dict | None = None     # inline keyboard, if any
 
 
 @dataclass
@@ -79,6 +80,8 @@ class CommandContext:
     feed: object = None                  # live feed (MT5 /ticks export)
     live_positions: list = field(default_factory=list)  # MT5 truth: open positions
     trim_callback: object = None         # MT5 runner.trim_top_layer (bound)
+    mt5_control: object = None           # MT5 runner (pause/config/confirm)
+    pending_orders: list = field(default_factory=list)  # MT5 pendings
 
 
 def _is_owner(update: dict, owner_chat_id: str | int | None) -> bool:
@@ -87,6 +90,24 @@ def _is_owner(update: dict, owner_chat_id: str | int | None) -> bool:
     msg = update.get("message") or {}
     chat = msg.get("chat") or {}
     return str(chat.get("id")) == str(owner_chat_id)
+
+
+def is_owner_callback(update: dict, owner_chat_id: str | int | None) -> bool:
+    """Owner check for a ``callback_query`` update: the TAPPER
+    (``callback_query.from.id``) must be the owner, and when the
+    source message carries a chat it must be the owner chat too.
+    Fail closed, same as :func:`_is_owner`."""
+    if owner_chat_id in (None, ""):
+        return False
+    query = update.get("callback_query") or {}
+    from_id = (query.get("from") or {}).get("id")
+    if str(from_id) != str(owner_chat_id):
+        return False
+    msg = query.get("message") or {}
+    chat = msg.get("chat") or {}
+    if chat and str(chat.get("id")) != str(owner_chat_id):
+        return False
+    return True
 
 
 class CommandRouter:
@@ -99,9 +120,16 @@ class CommandRouter:
     """
 
     def __init__(self, owner_chat_id: str | int | None = None,
-                 registry: dict | None = None):
+                 registry: dict | None = None,
+                 aliases: dict | None = None):
         self.owner_chat_id = owner_chat_id
         self.registry = COMMANDS if registry is None else registry
+        # Plain-text aliases for reply-keyboard menu buttons
+        # (``"Status"`` -> ``"/status"``): button taps arrive as
+        # ordinary message text, not slash commands.  Keys are
+        # matched case-insensitively; the owner check below still
+        # applies exactly as for slash commands.
+        self.aliases = {str(k).lower(): v for k, v in (aliases or {}).items()}
 
     def dispatch(self, update: dict, ctx: CommandContext
                  ) -> tuple[CommandResult | None, str | None]:
@@ -109,6 +137,11 @@ class CommandRouter:
         silently (not a command, not the owner, nothing to say)."""
         msg = update.get("message") or {}
         text = (msg.get("text") or "").strip()
+        if not text.startswith("/"):
+            alias = self.aliases.get(text.lower())
+            if alias is None:
+                return None, None
+            text = alias
         if not text.startswith("/"):
             return None, None
         if not _is_owner(update, self.owner_chat_id):

@@ -34,34 +34,38 @@ def test_mt5_execute_list_is_exactly_the_validated_set():
         FVGLimitPlaybook,
         FVGMidlinePlaybook,
         InversionPlaybook,
+        JudasSwingPlaybook,
         KillzoneOpenPlaybook,
         OrderBlockPlaybook,
         QMM5Playbook,
         RetracementTrapPlaybook,
         SweepReversalPlaybook,
         TrendlineRetestPlaybook,
+        TurtleSoupPlaybook,
         VReversalPlaybook,
     )
 
     executed = set(MT5RunnerConfig().execute_playbooks)
-    # Validated set: the promoted anchor + sleeves + the two new
-    # setups that passed the iron rule (inversion PF 1.11,
-    # killzone_open PF 2.23).
+    # Validated set: the promoted anchor + sleeves + the setups
+    # that passed the iron rule (inversion PF 1.11, killzone_open
+    # PF 2.23, judas_swing PF 1.93).
     assert executed == {"sweep_reversal", "fvg_midline",
                         "trendline_retest", "fvg_limit",
-                        "inversion", "killzone_open"}
+                        "inversion", "killzone_open", "judas_swing"}
     # QM M5 stays shadow: unvalidated, annotation only.
     assert "qm_m5" not in executed
     assert QMM5Playbook.live is False
     # Failed validation stays shadow: never executed, live=False.
     for name, cls in (("v_reversal", VReversalPlaybook),
                       ("retracement_trap", RetracementTrapPlaybook),
-                      ("order_block", OrderBlockPlaybook)):
+                      ("order_block", OrderBlockPlaybook),
+                      ("turtle_soup", TurtleSoupPlaybook)):
         assert name not in executed
         assert cls.live is False
     # Every executed playbook must be live-capable (the runner only
     # runs pb.live playbooks through the signal path).
     for cls in (SweepReversalPlaybook, FVGMidlinePlaybook,
                 TrendlineRetestPlaybook, FVGLimitPlaybook,
-                InversionPlaybook, KillzoneOpenPlaybook):
+                InversionPlaybook, KillzoneOpenPlaybook,
+                JudasSwingPlaybook):
         assert cls.live is True

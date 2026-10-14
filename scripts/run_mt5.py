@@ -104,6 +104,12 @@ def main(argv: list[str] | None = None) -> int:
         from goldenswing.alerts.telegram import TelegramSender
         senders = [TelegramSender.from_env()]
     runner = MT5Runner(cfg, feed=MT5Feed(feed_cfg), senders=senders)
+    # An explicit --fixed-lots wins over the persisted Telegram
+    # config (data/mt5_config.json) the runner just loaded, and is
+    # itself persisted for the next start.
+    if args.fixed_lots is not None:
+        runner.set_live_config(
+            {"field": "fixed_lots", "value": args.fixed_lots})
     stats = runner.run(max_ticks=args.max_ticks)
     print(f"MT5 engine stopped: {stats}")
     return 0

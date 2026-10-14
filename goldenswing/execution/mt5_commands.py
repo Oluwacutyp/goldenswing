@@ -32,6 +32,8 @@ from pathlib import Path
 from ..feed.tick_log import export_tick_history
 from ..alerts.commands import (CommandContext, CommandResult,
                               CommandRouter, build_zip_bundle)
+from .mt5_config import (EXECUTE_PLAYBOOK_NAMES, SHADOW_PLAYBOOK_NAMES,
+                        describe_change, parse_set)
 
 #: name -> (description, handler).  Populated by @mt5_command.
 MT5_COMMANDS: dict = {}
@@ -50,43 +52,112 @@ def mt5_command(name: str, description: str):
 
 
 def mt5_router(owner_chat_id) -> CommandRouter:
-    """CommandRouter bound to the MT5 registry (owner-gated)."""
-    return CommandRouter(owner_chat_id=owner_chat_id, registry=MT5_COMMANDS)
+    """CommandRouter bound to the MT5 registry (owner-gated), with
+    the persistent-menu button texts aliased to slash commands."""
+    return CommandRouter(owner_chat_id=owner_chat_id,
+                         registry=MT5_COMMANDS, aliases=MENU_ALIASES)
 
 
 def _today_utc() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-# ------------------------------------------------------------------ commands
+# ------------------------------------------------------- inline keyboards
+# Callback data is ``mt5:<action>`` / ``mt5:confirm:<token>`` /
+# ``mt5:cancel:<token>`` — short (Telegram caps callback_data at 64
+# bytes) and namespaced so the MT5 poller never mistakes a legacy
+# ``gs:<action>:<alert_id>`` button for its own.
 
-@mt5_command("/help", "list the MT5 engine commands")
-def _mt5_help(ctx: CommandContext, args: list[str]) -> CommandResult:
-    lines = ["MT5 engine commands (this engine's own journal/state):"]
-    for name in sorted(MT5_COMMANDS):
-        desc, _ = MT5_COMMANDS[name]
-        lines.append(f"{name} — {desc}")
-    return CommandResult(text="\n".join(lines))
+MT5_CALLBACK_PREFIX = "mt5"
 
 
-@mt5_command("/status", "MT5 engine health: terminal, open positions, today's P&L")
-def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
-    from ..execution.reporting import (iter_paper_trades, open_positions)
-    fs = ctx.feed_status or {}
-    feed_line = ("feed: OK (MT5 terminal connected)" if fs.get("ok")
-                 else f"feed: STALE — {fs.get('reason', 'no status yet')}")
-    if ctx.last_bar_time:
-        feed_line += f" (last bar {ctx.last_bar_time})"
-    if ctx.last_price:
-        feed_line += f" last price {ctx.last_price:,.1f}"
+def mt5_control_keyboard() -> dict:
+    """Pause / Resume / Trim / Cancel pending / Refresh (+ Config)."""
+    return {"inline_keyboard": [
+        [{"text": "⏸ Pause", "callback_data": "mt5:pause"},
+         {"text": "▶ Resume", "callback_data": "mt5:resume"}],
+        [{"text": "✂️ Trim", "callback_data": "mt5:trim"},
+         {"text": "❌ Cancel pending",
+          "callback_data": "mt5:cancel_pending"}],
+        [{"text": "🔄 Refresh", "callback_data": "mt5:refresh"},
+         {"text": "⚙️ Config", "callback_data": "mt5:config"}],
+    ]}
 
-    lines = ["MT5 ENGINE STATUS", feed_line, "",
-             "open MT5 positions:"]
-    # Live positions from the terminal (MT5 = source of truth) win
-    # over journal opens: they include restart-adopted positions that
-    # have no signal record.  Journal opens are the fallback.
+
+def mt5_confirm_keyboard(token: str) -> dict:
+    """Confirm / Cancel for one pending mutating action."""
+    return {"inline_keyboard": [[
+        {"text": "✅ Confirm", "callback_data": f"mt5:confirm:{token}"},
+        {"text": "❌ Cancel", "callback_data": f"mt5:cancel:{token}"},
+    ]]}
+
+
+# ------------------------------------------------- persistent reply menu
+# The always-visible bottom menu (reply keyboard, not inline): sent
+# on /start and /menu, then KEPT by Telegram (is_persistent) across
+# every later message.  It is NOT re-sent with every reply — a
+# message carries exactly one reply_markup, and the inline buttons
+# on status/position/pending messages need theirs; re-sending the
+# menu there would clobber the inline keyboards.  Sending a message
+# with an inline keyboard (or with no markup) leaves the reply
+# keyboard in place, so both surfaces coexist.
+MENU_KEYBOARD: dict = {
+    "keyboard": [
+        [{"text": "Status"}, {"text": "Positions"}, {"text": "Pendings"}],
+        [{"text": "Playbooks"}, {"text": "Config"}, {"text": "Trades"}],
+        [{"text": "Harvest"}, {"text": "Pause"}, {"text": "Resume"}],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": False,
+    "is_persistent": True,
+}
+
+#: Reply-keyboard button text (case-insensitive) -> slash command.
+#: Pause / Resume go through the same confirm flow as /pause /resume.
+MENU_ALIASES: dict[str, str] = {
+    "status": "/status",
+    "positions": "/position",
+    "pendings": "/pending",
+    "playbooks": "/playbooks",
+    "config": "/config",
+    "trades": "/trades",
+    "harvest": "/harvest",
+    "pause": "/pause",
+    "resume": "/resume",
+}
+
+
+def parse_mt5_callback(data: str) -> tuple[str, str | None] | None:
+    """Parse ``mt5:<action>[:<arg>]``; None when not an MT5 callback."""
+    if not isinstance(data, str) or not data.startswith("mt5:"):
+        return None
+    parts = data.split(":", 2)
+    if len(parts) < 2 or not parts[1]:
+        return None
+    return parts[1], (parts[2] if len(parts) > 2 else None)
+
+
+def _control(ctx: CommandContext):
+    return getattr(ctx, "mt5_control", None)
+
+
+def _confirm_result(ctx: CommandContext, action: str, label: str,
+                    arg=None) -> CommandResult:
+    """Ask for confirmation before a mutating action (never acts here)."""
+    ctrl = _control(ctx)
+    if ctrl is None:
+        return CommandResult(
+            text=f"{label} unavailable (no live runner attached)")
+    token = ctrl.request_confirm(action, arg)
+    return CommandResult(
+        text=f"{label} — tap Confirm to act, Cancel to abort.",
+        reply_markup=mt5_confirm_keyboard(token))
+
+
+def _position_lines(ctx: CommandContext) -> list[str]:
+    """Open positions with layers (live terminal truth wins)."""
     live = list(getattr(ctx, "live_positions", None) or [])
-    journal_opens = open_positions(ctx.journal) if ctx.journal else []
+    lines: list[str] = []
     if live:
         for p in live:
             side = "LONG" if (p.get("direction") or 0) > 0 else "SHORT"
@@ -98,20 +169,164 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
                 r_now = (f"{(p.get('direction') or 0) * (ctx.last_price - entry) / risk:+.2f}R")
             lines.append(f"#{p.get('ticket', '?')} {p.get('playbook', '?')} "
                          f"{side} @ {entry:,.1f} sl {stop:,.1f} now ≈{r_now}")
+            layers = p.get("layers") or []
+            if len(layers) > 1:
+                legs = " + ".join(
+                    f"{ly.get('playbook', '?')} @ "
+                    f"{float(ly.get('entry') or 0):,.1f} "
+                    f"({float(ly.get('volume') or 0)} lots)"
+                    for ly in layers)
+                lines.append(f"   layers ({len(layers)}): {legs}")
+        return lines
+    from ..execution.reporting import open_positions
+    journal_opens = open_positions(ctx.journal) if ctx.journal else []
+    if not journal_opens:
+        return ["(none)"]
+    for o in journal_opens:
+        side = "LONG" if (o.get("direction") or 0) > 0 else "SHORT"
+        entry = float(o.get("entry") or 0)
+        stop = float(o.get("stop") or 0)
+        risk = abs(entry - stop)
+        r_now = "?"
+        if ctx.last_price and risk > 0:
+            r_now = (f"{(o.get('direction') or 0) * (ctx.last_price - entry) / risk:+.2f}R")
+        lines.append(f"#{o.get('ticket', '?')} {o.get('playbook', '?')} {side} "
+                     f"@ {entry:,.1f} sl {stop:,.1f} now ≈{r_now}")
+    return lines
+
+
+def _pending_lines(ctx: CommandContext) -> list[str]:
+    """Resting LIMIT / STOP orders the engine is responsible for."""
+    pendings = list(getattr(ctx, "pending_orders", None) or [])
+    if not pendings:
+        return ["(none)"]
+    lines = []
+    for p in pendings:
+        side = "LONG" if (p.get("direction") or 0) > 0 else "SHORT"
+        lines.append(f"#{p.get('ticket', '?')} {p.get('kind', '?').upper()} "
+                     f"{p.get('playbook', '?')} {side} "
+                     f"@ {float(p.get('level') or 0):,.1f} "
+                     f"({float(p.get('volume') or 0)} lots) "
+                     f"SL {float(p.get('sl') or 0):,.1f} "
+                     f"expires H1 bar {p.get('expiry_bar', '?')}")
+    return lines
+
+
+def _config_text(ctx: CommandContext) -> str:
+    """The safe live config only — never tokens, paths, credentials,
+    or live-trading permission."""
+    ctrl = _control(ctx)
+    if ctrl is None:
+        return ("live config unavailable (no live runner attached).\n"
+                "Safe keys: fixed_lots, max_layers, manipulation_filter, "
+                "pending_expiry_bars, playbook.<name>.")
+    cfg = ctrl.get_live_config()
+    lines = ["MT5 LIVE CONFIG (safe keys only):",
+             f"fixed_lots = "
+             f"{'auto (risk-% sizing)' if cfg.get('fixed_lots') is None else cfg.get('fixed_lots')}",
+             f"max_layers = {cfg.get('max_layers')}",
+             f"manipulation_filter = "
+             f"{'on' if cfg.get('manipulation_filter') else 'off'}",
+             f"pending_expiry_bars = {cfg.get('pending_expiry_bars')}",
+             f"paused = {'yes' if cfg.get('paused') else 'no'}",
+             "", "playbooks:"]
+    for name, enabled in (cfg.get("playbooks") or {}).items():
+        lines.append(f"  {name}: {'on' if enabled else 'off'}")
+    lines += ["", "Change with /set <key> <value> (confirm required).",
+              "Pause is not a /set key — use Pause / Resume."]
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ commands
+
+@mt5_command("/start", "show the persistent bottom menu")
+def _mt5_start(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return CommandResult(
+        text=("GoldenSwing MT5 engine — use the menu below, or /help "
+              "for the full command list.  Status / position / pending "
+              "messages carry their own action buttons."),
+        reply_markup=MENU_KEYBOARD)
+
+
+@mt5_command("/menu", "re-show the persistent bottom menu")
+def _mt5_menu(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return CommandResult(
+        text="MT5 menu — Status / Positions / Pendings / Playbooks / "
+             "Config / Trades / Harvest / Pause / Resume.",
+        reply_markup=MENU_KEYBOARD)
+
+
+@mt5_command("/playbooks", "per-playbook state: executing vs shadow, on/off, signal counts")
+def _mt5_playbooks(ctx: CommandContext, args: list[str]) -> CommandResult:
+    ctrl = _control(ctx)
+    enabled: dict[str, bool] = {}
+    counts: dict[str, int] = {}
+    if ctrl is not None:
+        enabled = (ctrl.get_live_config().get("playbooks") or {})
+        counts = (ctrl.blocked_stats().get("signal_counts") or {})
+    lines = ["MT5 PLAYBOOKS (executing = may order; shadow = evaluated + "
+             "logged, never ordered):", ""]
+    for name in EXECUTE_PLAYBOOK_NAMES:
+        on = enabled.get(name, True)
+        lines.append(f"  {name}: executing, "
+                     f"{'on' if on else 'off'}, "
+                     f"signals {counts.get(name, 0)}")
+    for name in SHADOW_PLAYBOOK_NAMES:
+        on = enabled.get(name, True)
+        lines.append(f"  {name}: shadow, "
+                     f"{'on' if on else 'off'}, "
+                     f"signals {counts.get(name, 0)}")
+    lines += ["", "Toggle with /set playbook.<name> on/off "
+                  "(confirm required)."]
+    return CommandResult(text="\n".join(lines),
+                         reply_markup=mt5_control_keyboard())
+
+
+@mt5_command("/help", "list the MT5 engine commands")
+def _mt5_help(ctx: CommandContext, args: list[str]) -> CommandResult:
+    lines = ["MT5 engine commands (this engine's own journal/state):"]
+    for name in sorted(MT5_COMMANDS):
+        desc, _ = MT5_COMMANDS[name]
+        lines.append(f"{name} — {desc}")
+    return CommandResult(text="\n".join(lines))
+
+
+@mt5_command("/status", "MT5 engine health: positions+layers, pendings, blocked-leg stats, today's P&L")
+def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
+    from ..execution.reporting import (iter_paper_trades, open_positions)
+    fs = ctx.feed_status or {}
+    feed_line = ("feed: OK (MT5 terminal connected)" if fs.get("ok")
+                 else f"feed: STALE — {fs.get('reason', 'no status yet')}")
+    if ctx.last_bar_time:
+        feed_line += f" (last bar {ctx.last_bar_time})"
+    if ctx.last_price:
+        feed_line += f" last price {ctx.last_price:,.1f}"
+
+    ctrl = _control(ctx)
+    cfg = ctrl.get_live_config() if ctrl is not None else None
+    if cfg is not None and cfg.get("paused"):
+        state_line = ("engine: PAUSED — new signals blocked, tick "
+                      "management (breakeven / trail / partial) continues")
     else:
-        if not journal_opens:
-            lines.append("(none)")
-        for o in journal_opens:
-            side = "LONG" if (o.get("direction") or 0) > 0 else "SHORT"
-            entry = float(o.get("entry") or 0)
-            stop = float(o.get("stop") or 0)
-            risk = abs(entry - stop)
-            r_now = "?"
-            if ctx.last_price and risk > 0:
-                r_now = (f"{(o.get('direction') or 0) * (ctx.last_price - entry) / risk:+.2f}R")
-            lines.append(f"#{o.get('ticket', '?')} {o.get('playbook', '?')} {side} "
-                         f"@ {entry:,.1f} sl {stop:,.1f} now ≈{r_now}")
-    opens = journal_opens
+        state_line = "engine: RUNNING"
+    lines = ["MT5 ENGINE STATUS", feed_line, state_line, ""]
+    if cfg is not None:
+        lines.append(
+            f"config: fixed_lots="
+            f"{'auto' if cfg.get('fixed_lots') is None else cfg.get('fixed_lots')} "
+            f"max_layers={cfg.get('max_layers')} "
+            f"manipulation_filter="
+            f"{'on' if cfg.get('manipulation_filter') else 'off'} "
+            f"pending_expiry={cfg.get('pending_expiry_bars')} bars")
+        lines.append("")
+    # Live positions from the terminal (MT5 = source of truth) win
+    # over journal opens: they include restart-adopted positions that
+    # have no signal record.  Journal opens are the fallback.
+    lines.append("open MT5 positions:")
+    lines += _position_lines(ctx)
+    lines.append("")
+    lines.append("pending orders:")
+    lines += _pending_lines(ctx)
 
     trades = iter_paper_trades(ctx.journal) if ctx.journal else []
     today = _today_utc()
@@ -119,24 +334,105 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
     lines += ["", f"today (UTC): {len(todays)} closed, "
                   f"{sum(t['r_net'] for t in todays):+.2f}R "
                   f"({sum(t['pnl_money'] for t in todays):+.2f})"]
+    opens = open_positions(ctx.journal) if ctx.journal else []
     if opens:
         last_open = max(opens, key=lambda r: r.get("ts") or "")
         lines.append(f"last signal: {last_open.get('playbook', '?')} "
                      f"{last_open.get('ts', '?')}")
     else:
         lines.append("last signal: none journaled yet")
-    return CommandResult(text="\n".join(lines))
+
+    # Why no trades: blocked-leg stats + per-playbook signal counts.
+    if ctrl is not None:
+        stats = ctrl.blocked_stats()
+        lines.append("")
+        lines.append("why no trades — blocked legs:")
+        legs = stats.get("legs") or {}
+        if not legs and not stats.get("manipulation_blocked"):
+            lines.append("  (nothing blocked yet)")
+        for leg, count in sorted(legs.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  {leg}: {count}")
+        if stats.get("manipulation_blocked"):
+            lines.append(f"  manipulation_filter: "
+                         f"{stats['manipulation_blocked']}")
+        lines.append(f"  last blocked: {stats.get('last') or '(none)'}")
+        counts = stats.get("signal_counts") or {}
+        lines.append("")
+        lines.append("per-playbook signals (passed gate+score):")
+        if not counts:
+            lines.append("  (none yet)")
+        for name in sorted(counts):
+            lines.append(f"  {name}: {counts[name]}")
+    return CommandResult(text="\n".join(lines),
+                         reply_markup=mt5_control_keyboard())
 
 
-@mt5_command("/trim", "close the top (most recent) added layer early; base rides")
+@mt5_command("/position", "open MT5 positions with layers")
+def _mt5_position(ctx: CommandContext, args: list[str]) -> CommandResult:
+    lines = ["MT5 OPEN POSITIONS:"]
+    lines += _position_lines(ctx)
+    return CommandResult(text="\n".join(lines),
+                         reply_markup=mt5_control_keyboard())
+
+
+@mt5_command("/pending", "resting MT5 pending LIMIT / STOP orders")
+def _mt5_pending(ctx: CommandContext, args: list[str]) -> CommandResult:
+    lines = ["MT5 PENDING ORDERS:"]
+    lines += _pending_lines(ctx)
+    return CommandResult(text="\n".join(lines),
+                         reply_markup=mt5_control_keyboard())
+
+
+@mt5_command("/pause", "pause new signals (management continues) — confirm required")
+def _mt5_pause(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return _confirm_result(ctx, "pause", "⏸ Pause engine")
+
+
+@mt5_command("/resume", "resume new signals — confirm required")
+def _mt5_resume(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return _confirm_result(ctx, "resume", "▶ Resume engine")
+
+
+@mt5_command("/cancel_pending", "cancel ALL resting pending orders — confirm required")
+def _mt5_cancel_pending(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return _confirm_result(ctx, "cancel_pending",
+                           "❌ Cancel ALL pending orders")
+
+
+@mt5_command("/trim", "close the top (most recent) added layer early; base rides — confirm required")
 def _mt5_trim(ctx: CommandContext, args: list[str]) -> CommandResult:
-    cb = getattr(ctx, "trim_callback", None)
-    if cb is None:
-        return CommandResult(text="trim unavailable (no live runner)")
-    try:
-        return CommandResult(text=str(cb()))
-    except Exception as exc:
-        return CommandResult(text=f"trim FAILED: {exc}")
+    return _confirm_result(ctx, "trim", "✂️ Trim top layer")
+
+
+@mt5_command("/config", "show the live MT5 config (safe keys only)")
+def _mt5_config(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return CommandResult(text=_config_text(ctx),
+                         reply_markup=mt5_control_keyboard())
+
+
+@mt5_command("/set", "change a safe live config key: /set <key> <value> — confirm required")
+def _mt5_set(ctx: CommandContext, args: list[str]) -> CommandResult:
+    if len(args) < 2:
+        return CommandResult(
+            text="usage: /set <key> <value>\n"
+                 "safe keys: fixed_lots (0.01–1.0 | auto), max_layers (0–3), "
+                 "manipulation_filter (on/off), pending_expiry_bars (1–24), "
+                 "playbook.<name> (on/off).  Pause is not a /set key.")
+    if len(args) > 2:
+        return CommandResult(text="/set takes exactly one key and one value.")
+    key, raw = args[0], args[1]
+    change, error = parse_set(key, raw)
+    if error is not None:
+        return CommandResult(text=f"/set rejected: {error}")
+    ctrl = _control(ctx)
+    if ctrl is None:
+        return CommandResult(
+            text="/set unavailable (no live runner attached)")
+    token = ctrl.request_confirm("set", change)
+    return CommandResult(
+        text=f"Apply {describe_change(change)}? "
+             f"Tap Confirm to apply, Cancel to abort.",
+        reply_markup=mt5_confirm_keyboard(token))
 
 
 @mt5_command("/trades", "last N MT5 trades with R multiples (default 5)")

@@ -52,13 +52,14 @@ on peers.
 from __future__ import annotations
 
 import os
+import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
 
-from ..alerts.commands import CommandContext
+from ..alerts.commands import CommandContext, is_owner_callback
 from ..backtest.data import REPO_ROOT
 from ..charts.engine import render_mt5_signal
 from ..confluence import ConfluenceEngine
@@ -72,13 +73,18 @@ from ..live.manipulation import chase_blocked
 from ..live.volume import volume_features
 from ..reader.session_timeframes import compose as _compose_session
 from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
-                         QMM5Playbook, SweepReversalPlaybook,
-                         TrendlineRetestPlaybook)
+                         InversionPlaybook, JudasSwingPlaybook,
+                         KillzoneOpenPlaybook, OrderBlockPlaybook,
+                         QMM5Playbook, RetracementTrapPlaybook,
+                         SweepReversalPlaybook, TrendlineRetestPlaybook,
+                         TurtleSoupPlaybook, VReversalPlaybook)
 from ..playbooks.base import EngineContext
 from .executor import OrderRequest, PendingOrder
 from .learning import TradeJournal
 from .mt5 import MT5Executor, select_order_type
-from .mt5_commands import mt5_router
+from .mt5_commands import (mt5_confirm_keyboard, mt5_control_keyboard,
+                           mt5_router, parse_mt5_callback)
+from .mt5_config import LiveConfigStore
 from .risk import RiskConfig, RiskGuards, size_position
 from .tick_manager import TickAction, TickManager
 from ..feed.mt5 import TRADE_MODE_REAL, MT5Feed, TickPump
@@ -94,7 +100,8 @@ class MT5RunnerConfig:
     magic: int = 260101
     execute_playbooks: tuple = ("sweep_reversal", "fvg_midline",
                                 "trendline_retest", "fvg_limit",
-                                "inversion", "killzone_open")
+                                "inversion", "killzone_open",
+                                "judas_swing")
     min_score: float = 60.0
     signal_gap_bars: int = 0
     journal_path: Path = DATA_DIR / "mt5_journal.jsonl"
@@ -130,6 +137,11 @@ class MT5RunnerConfig:
     layer_min_profit_r: float = 0.5
     layer_max_total_risk_mult: float = 2.0
     layer_max_layers: int = 3
+    # Live Telegram control (see mt5_config.py — persisted in
+    # data/mt5_config.json, changeable via /set + Confirm):
+    manipulation_filter: bool = True   # liquidity-test entry filter
+    disabled_playbooks: tuple = ()      # playbook names switched off
+    paused: bool = False                # pause new signals, not management
 
     @classmethod
     def from_env(cls, **overrides) -> "MT5RunnerConfig":
@@ -232,16 +244,86 @@ class MT5Runner:
         self._tg_synced = False
         self._last_poll = 0.0
         self._command_router = None
+        # Blocked-leg stats (why no trades — surfaced by /status):
+        # cheap in-memory counters + journal notes on every block.
+        # A restart resets the counters; the journal keeps the notes.
+        self._blocked_leg_counts: dict[str, int] = {}
+        self._blocked_last: str = ""
+        self._blocked_total: int = 0
+        self._signal_counts: dict[str, int] = {}
+        self._manipulation_blocked: int = 0
+        # Pending Confirm taps: token -> {"action", "arg"}.
+        self._confirm_tokens: dict[str, dict] = {}
+        # Persisted live config (data/mt5_config.json): when the file
+        # exists it wins over the constructed defaults — /set changes
+        # survive a restart because the next process loads this file.
+        self._config_store = LiveConfigStore(
+            self.cfg.journal_path.parent / "mt5_config.json")
+        if self._config_store.path.exists():
+            self._config_store.apply_to(self.cfg)
 
     # ------------------------------------------------------------ wiring
     def _get_playbooks(self) -> list:
+        """Every playbook the engine knows: the 7 executing ones plus
+        the 5 shadow ones.  Instantiation alone never orders — the
+        ``auto = pb.name in execute_playbooks`` gate at the order step
+        decides, and shadow playbooks only ever get evaluated +
+        logged (see _run_signal_path).  A playbook missing from this
+        list can never fire, executing or shadow."""
         if self._playbooks is None:
             self._playbooks = [SweepReversalPlaybook(),
                                FVGMidlinePlaybook(),
                                TrendlineRetestPlaybook(),
                                FVGLimitPlaybook(),
+                               InversionPlaybook(),
+                               KillzoneOpenPlaybook(),
+                               JudasSwingPlaybook(),
+                               TurtleSoupPlaybook(),
+                               VReversalPlaybook(),
+                               RetracementTrapPlaybook(),
+                               OrderBlockPlaybook(),
                                QMM5Playbook()]
         return self._playbooks
+
+    # ------------------------------------------------- blocked-leg stats
+    def _record_blocked(self, reason: str, playbook: str | None = None
+                        ) -> None:
+        """Count one blocked verdict by leg (cheap counters only —
+        journal notes are written by the caller where they matter)."""
+        if reason.startswith("hierarchy:"):
+            parts = reason.split(":")
+            leg = parts[1] if len(parts) > 1 and parts[1] else "hierarchy"
+        elif "manipulation" in reason:
+            leg = "manipulation_filter"
+        elif reason.startswith("paused"):
+            leg = "paused"
+        elif "session_scope" in reason:
+            leg = "session"
+        elif "tripwire" in reason:
+            leg = "required_context"
+        elif "hunting ground" in reason:
+            leg = "hunting_ground"
+        elif reason.startswith("order:"):
+            leg = "order_selection"
+        elif reason.startswith("min_score"):
+            leg = "min_score"
+        elif reason.startswith("playbook_error"):
+            leg = "playbook_error"
+        else:
+            leg = "other"
+        self._blocked_leg_counts[leg] = \
+            self._blocked_leg_counts.get(leg, 0) + 1
+        self._blocked_total += 1
+        self._blocked_last = \
+            f"{playbook or '?'}: {reason}"[:200]
+
+    def blocked_stats(self) -> dict:
+        """Snapshot for /status: why no trades."""
+        return {"legs": dict(self._blocked_leg_counts),
+                "last": self._blocked_last,
+                "total": self._blocked_total,
+                "manipulation_blocked": self._manipulation_blocked,
+                "signal_counts": dict(self._signal_counts)}
 
     def _get_engine(self) -> ConfluenceEngine:
         if self._engine is None:
@@ -899,82 +981,135 @@ class MT5Runner:
         # flat -> new position, holding -> layer only.  There is no
         # early return here: the signal path must run while holding
         # so layers can be evaluated.
+        # Paused (Telegram Pause): evaluate nothing into orders — the
+        # confirmed entry is dropped, tick management of the held
+        # position continues elsewhere.  The block is counted so
+        # /status can answer "why no trades".
+        if self.cfg.paused:
+            self._record_blocked(
+                "paused: engine paused — confirmed entry dropped")
+            self.journal.log_note(
+                "mt5: signal path paused — confirmed entry dropped, "
+                "no order")
+            return
         ctx = EngineContext(df=h1, states=states, years=years,
                             instrument=self.cfg.symbol)
         engine = self._get_engine()
         for pb in self._get_playbooks():
-            if not pb.live:
-                continue
-            sigs = pb.live_signal(states, t, h1) or []
-            for sig in sigs:
-                if sig.score < self.cfg.min_score:
-                    continue
-                if sig.index - self._last_sig_bar.get(pb.name, -10 ** 9) \
-                        < self.cfg.signal_gap_bars:
-                    continue
-                ok, reason = engine.gate_live_signal(
-                    pb, sig, ctx, hierarchy_verdict=verdict)
-                if not ok:
-                    stats["gated"] += 1
-                    if reason.startswith("hierarchy:"):
-                        stats["hierarchy_blocked"] = stats.get(
-                            "hierarchy_blocked", 0) + 1
-                    self.journal.log_note(
-                        f"mt5: {pb.name} signal gated: {reason}")
-                    continue
-                conf, notes = engine.score_live_signal(
-                    pb, sig, ctx, hierarchy_verdict=verdict)
-                self._last_sig_bar[pb.name] = sig.index
-                stats["signals"] += 1
-                auto = pb.name in self.cfg.execute_playbooks
-                tag = "MT5" if auto else "SHADOW"
-                alert_id = f"MT5-{pb.name}-{sig.index}"
+            if pb.name in (self.cfg.disabled_playbooks or ()):
+                continue  # switched off via /set — not evaluated
+            try:
+                self._run_one_playbook(pb, sig_ctx=(ctx, engine),
+                                       h1=h1, t=t, verdict=verdict,
+                                       stats=stats)
+            except Exception as exc:
+                # A crashing playbook never kills the signal path
+                # (shadow playbooks in particular only ran behind
+                # the live-skip before this wiring fix).
+                self._record_blocked(
+                    f"playbook_error: {type(exc).__name__}: {exc}",
+                    pb.name)
                 self.journal.log_note(
-                    f"mt5 [{tag}] {pb.name} "
-                    f"{'+' if sig.direction > 0 else '-'}1 "
-                    f"score={sig.score:.0f} conf={conf:.0f} "
-                    f"entry~{sig.entry_ref:.1f} stop~{sig.invalidation:.1f} "
-                    f"factors={'+'.join(notes) if notes else '-'} "
-                    f"hierarchy: D1 {verdict['bias_d1']:+d} / H4 "
-                    f"{verdict['bias_h4']:+d} / {verdict['trigger']} / "
-                    f"{verdict['entry_clock']} amd:{verdict.get('amd_phase')} "
-                    f"qm:{verdict.get('qm', {}).get('status')} "
-                    f"vol:{(verdict.get('volume') or {}).get('volume_ratio')}")
-                # Chart: H4 zone + entry/stop/targets + verdict, saved
-                # next to the journal and attached to the alert.
-                png, _path = self._build_chart(
-                    sig, verdict, alert_id=alert_id, playbook=pb.name)
-                self._send_alert(
-                    f"MT5 [{tag}] {pb.name} "
-                    f"{'+' if sig.direction > 0 else '-'}1 "
-                    f"entry~{sig.entry_ref:.1f} stop~{sig.invalidation:.1f} "
-                    f"conf={conf:.0f}",
-                    chart_png=png)
-                if auto:
-                    # Manipulation / liquidity-test filter (entry
-                    # selection, NOT a veto): a signal chasing past
-                    # a level whose most recent test failed is
-                    # skipped — the engine waits for the retest /
-                    # real leg.  Retest entries and reversals pass.
-                    h1_closed = (self._stack.frames.get("H1")
-                                 if self._stack is not None else None)
-                    blocked, why = chase_blocked(
-                        h1_closed, int(sig.direction),
-                        float(sig.entry_ref), float(sig.atr))
-                    if blocked:
-                        stats["manipulation_blocked"] = stats.get(
-                            "manipulation_blocked", 0) + 1
-                        self.journal.log_note(
-                            f"mt5: {pb.name} signal manipulation-blocked: "
-                            f"{why}")
-                        continue
-                    if self.tick_manager.tickets():
-                        self._try_layer(pb, sig, stats, verdict=verdict,
-                                        entry_bar=t)
-                    else:
-                        self._place_live_order(pb, sig, stats,
-                                               verdict=verdict,
-                                               entry_bar=t)
+                    f"mt5: {pb.name} signal path failed: "
+                    f"{type(exc).__name__}: {exc}")
+
+    def _run_one_playbook(self, pb, *, sig_ctx, h1, t, verdict, stats
+                          ) -> None:
+        """One playbook through gate -> score -> (order | shadow log).
+
+        Shadow playbooks (not in ``execute_playbooks``) are
+        EVALUATED + LOGGED + COUNTED exactly like executing ones —
+        but they never reach chart/alert/order: the ``auto`` gate
+        below is the only thing that may order, and it is False for
+        them.  Instantiation never orders by itself.
+        """
+        ctx, engine = sig_ctx
+        # Positional, as before: playbook live_signal signatures name
+        # the frame parameter differently (df / h1).
+        sigs = pb.live_signal(ctx.states, t, h1) or []
+        for sig in sigs:
+            if sig.score < self.cfg.min_score:
+                self._record_blocked(
+                    f"min_score: score {sig.score:.0f} < "
+                    f"{self.cfg.min_score:.0f}", pb.name)
+                continue
+            if sig.index - self._last_sig_bar.get(pb.name, -10 ** 9) \
+                    < self.cfg.signal_gap_bars:
+                continue
+            ok, reason = engine.gate_live_signal(
+                pb, sig, ctx, hierarchy_verdict=verdict)
+            if not ok:
+                stats["gated"] += 1
+                if reason.startswith("hierarchy:"):
+                    stats["hierarchy_blocked"] = stats.get(
+                        "hierarchy_blocked", 0) + 1
+                self._record_blocked(reason, pb.name)
+                self.journal.log_note(
+                    f"mt5: {pb.name} signal gated: {reason}")
+                continue
+            conf, notes = engine.score_live_signal(
+                pb, sig, ctx, hierarchy_verdict=verdict)
+            self._last_sig_bar[pb.name] = sig.index
+            stats["signals"] += 1
+            self._signal_counts[pb.name] = \
+                self._signal_counts.get(pb.name, 0) + 1
+            auto = pb.name in self.cfg.execute_playbooks
+            tag = "MT5" if auto else "SHADOW"
+            alert_id = f"MT5-{pb.name}-{sig.index}"
+            self.journal.log_note(
+                f"mt5 [{tag}] {pb.name} "
+                f"{'+' if sig.direction > 0 else '-'}1 "
+                f"score={sig.score:.0f} conf={conf:.0f} "
+                f"entry~{sig.entry_ref:.1f} stop~{sig.invalidation:.1f} "
+                f"factors={'+'.join(notes) if notes else '-'} "
+                f"hierarchy: D1 {verdict['bias_d1']:+d} / H4 "
+                f"{verdict['bias_h4']:+d} / {verdict['trigger']} / "
+                f"{verdict['entry_clock']} amd:{verdict.get('amd_phase')} "
+                f"qm:{verdict.get('qm', {}).get('status')} "
+                f"vol:{(verdict.get('volume') or {}).get('volume_ratio')}")
+            if not auto:
+                # Shadow: evaluated + logged + counted — never
+                # charted, alerted, or ordered.
+                continue
+            # Chart: H4 zone + entry/stop/targets + verdict, saved
+            # next to the journal and attached to the alert.
+            png, _path = self._build_chart(
+                sig, verdict, alert_id=alert_id, playbook=pb.name)
+            self._send_alert(
+                f"MT5 [{tag}] {pb.name} "
+                f"{'+' if sig.direction > 0 else '-'}1 "
+                f"entry~{sig.entry_ref:.1f} stop~{sig.invalidation:.1f} "
+                f"conf={conf:.0f}",
+                chart_png=png)
+            # Manipulation / liquidity-test filter (entry
+            # selection, NOT a veto): a signal chasing past
+            # a level whose most recent test failed is
+            # skipped — the engine waits for the retest /
+            # real leg.  Retest entries and reversals pass.
+            # Off via /set manipulation_filter off.
+            if self.cfg.manipulation_filter:
+                h1_closed = (self._stack.frames.get("H1")
+                             if self._stack is not None else None)
+                blocked, why = chase_blocked(
+                    h1_closed, int(sig.direction),
+                    float(sig.entry_ref), float(sig.atr))
+                if blocked:
+                    stats["manipulation_blocked"] = stats.get(
+                        "manipulation_blocked", 0) + 1
+                    self._manipulation_blocked += 1
+                    self._record_blocked(
+                        f"manipulation: {why}", pb.name)
+                    self.journal.log_note(
+                        f"mt5: {pb.name} signal manipulation-blocked: "
+                        f"{why}")
+                    continue
+            if self.tick_manager.tickets():
+                self._try_layer(pb, sig, stats, verdict=verdict,
+                                entry_bar=t)
+            else:
+                self._place_live_order(pb, sig, stats,
+                                       verdict=verdict,
+                                       entry_bar=t)
 
     # ------------------------------------------------------------- layering
     # Scale-in onto ONE position: a confirming setup in the same
@@ -1154,6 +1289,135 @@ class MT5Runner:
         return (f"trimmed top layer ({action.volume} lots); "
                 f"{remaining} layer(s) remain")
 
+    # ------------------------------------------- telegram control surface
+    # Mutating actions (pause / resume / trim / cancel pending / every
+    # /set) run ONLY through request_confirm -> confirm_pending: the
+    # button / command stages a token, the owner taps Confirm, and
+    # only then does anything act.  Read-only commands never touch
+    # these.  Live-trading permission is NOT here and never will be:
+    # there is no key, command, or button for it.
+
+    def get_live_config(self) -> dict:
+        """Safe live config only (see mt5_config.snapshot_from)."""
+        return self._config_store.snapshot_from(self.cfg)
+
+    def _persist_live_config(self) -> None:
+        self._config_store.save(self.get_live_config())
+
+    def reload_live_config(self) -> None:
+        """Re-read data/mt5_config.json and apply (e.g. hand-edited)."""
+        self._config_store.apply_to(self.cfg)
+
+    def set_live_config(self, change: dict) -> tuple[bool, str]:
+        """Apply one parsed /set change (from mt5_config.parse_set):
+        validate already happened — this applies + persists +
+        journals.  Returns (ok, message)."""
+        field = change.get("field")
+        value = change.get("value")
+        if field == "fixed_lots":
+            self.cfg.fixed_lots = value
+        elif field == "max_layers":
+            self.cfg.layer_max_layers = int(value)
+        elif field == "manipulation_filter":
+            self.cfg.manipulation_filter = bool(value)
+        elif field == "pending_expiry_bars":
+            self.cfg.pending_expiry_bars = int(value)
+        elif field == "playbook":
+            name = change.get("name")
+            disabled = set(self.cfg.disabled_playbooks or ())
+            if value:
+                disabled.discard(name)
+            else:
+                disabled.add(name)
+            self.cfg.disabled_playbooks = tuple(sorted(disabled))
+        else:
+            return False, f"unknown config change {field!r} — not applied"
+        self._persist_live_config()
+        from .mt5_config import describe_change
+        label = describe_change(change)
+        self.journal.log_note(f"mt5 config: {label} (via Telegram)")
+        return True, f"applied: {label}"
+
+    def pause_engine(self) -> str:
+        if self.cfg.paused:
+            return "engine already paused"
+        self.cfg.paused = True
+        self._persist_live_config()
+        self.journal.log_note("mt5: engine PAUSED via Telegram "
+                              "(new signals blocked, management continues)")
+        return ("engine PAUSED — new signals blocked; tick management "
+                "(breakeven / trail / partial) continues")
+
+    def resume_engine(self) -> str:
+        if not self.cfg.paused:
+            return "engine already running"
+        self.cfg.paused = False
+        self._persist_live_config()
+        self.journal.log_note("mt5: engine RESUMED via Telegram")
+        return "engine RESUMED — new signals live again"
+
+    def cancel_all_pending(self) -> str:
+        tickets = list(self._pending_orders)
+        if not tickets:
+            return "no pending orders — nothing to cancel"
+        stats: dict = {}
+        done = 0
+        for ticket in tickets:
+            if self._cancel_pending(
+                    ticket, "telegram: cancel all pending", stats):
+                done += 1
+        return (f"cancelled {done}/{len(tickets)} pending order(s)"
+                + ("" if done == len(tickets)
+                   else " — retry /pending; a failed cancel retries "
+                        "next tick"))
+
+    def pending_orders_snapshot(self) -> list[dict]:
+        """Resting pendings for /status / /pending (no secrets)."""
+        out = []
+        for state in self._pending_orders.values():
+            out.append({"ticket": state.ticket, "kind": state.kind,
+                        "direction": state.direction,
+                        "level": state.level, "volume": state.volume,
+                        "sl": state.sl, "playbook": state.playbook,
+                        "expiry_bar": state.expiry_bar,
+                        "alert_id": state.alert_id})
+        return out
+
+    # ------------------------------------------------- confirm handshake
+    def request_confirm(self, action: str, arg=None) -> str:
+        """Stage a mutating action; returns the Confirm token."""
+        token = secrets.token_hex(4)
+        self._confirm_tokens[token] = {"action": action, "arg": arg}
+        return token
+
+    def confirm_pending(self, token: str) -> tuple[bool, str]:
+        """Execute a staged action (Confirm tap).  The token is
+        single-use: consumed whether the action succeeds or not."""
+        staged = self._confirm_tokens.pop(token, None)
+        if staged is None:
+            return False, ("confirmation expired — nothing acted. "
+                           "Send the command again.")
+        action, arg = staged["action"], staged.get("arg")
+        try:
+            if action == "pause":
+                return True, self.pause_engine()
+            if action == "resume":
+                return True, self.resume_engine()
+            if action == "trim":
+                return True, self.trim_top_layer()
+            if action == "cancel_pending":
+                return True, self.cancel_all_pending()
+            if action == "set":
+                return self.set_live_config(arg or {})
+            return False, f"unknown staged action {action!r} — not acted"
+        except Exception as exc:
+            return False, (f"{action} FAILED: {type(exc).__name__}: {exc}")
+
+    def cancel_confirm(self, token: str) -> str:
+        if self._confirm_tokens.pop(token, None) is None:
+            return "nothing to cancel (confirmation already expired)"
+        return "cancelled — nothing changed"
+
     # -------------------------------------------------------------- orders
     def _place_live_order(self, pb, sig, stats: dict,
                           verdict: dict | None = None,
@@ -1233,6 +1497,7 @@ class MT5Runner:
             alert_id=request.alert_id, magic=self.cfg.magic)
         if kind == "invalid":
             stats["invalidated"] = stats.get("invalidated", 0) + 1
+            self._record_blocked(f"order:invalid: {reason}", pb.name)
             self.journal.log_note(
                 f"mt5: order invalidated {pb.name}: {reason} — "
                 f"no order placed")
@@ -1690,8 +1955,20 @@ class MT5Runner:
         try:
             if self.executor is not None:
                 for p in self.executor.positions(self.cfg.symbol):
+                    ticket = getattr(p, "ticket", None)
+                    layers = []
+                    try:
+                        for ly in self.tick_manager.layers(ticket):
+                            layers.append({
+                                "entry": getattr(ly, "entry", 0),
+                                "volume": getattr(ly, "volume", 0),
+                                "sl": getattr(ly, "sl", 0),
+                                "playbook": getattr(ly, "playbook", ""),
+                            })
+                    except Exception:
+                        layers = []
                     live_positions.append({
-                        "ticket": getattr(p, "ticket", None),
+                        "ticket": ticket,
                         "symbol": getattr(p, "symbol", self.cfg.symbol),
                         "direction": getattr(p, "direction", 0),
                         "entry_price": getattr(p, "entry_price", 0),
@@ -1699,6 +1976,7 @@ class MT5Runner:
                         "volume": getattr(p, "volume", 0),
                         "alert_id": getattr(p, "alert_id", ""),
                         "playbook": "",
+                        "layers": layers,
                     })
         except Exception:
             live_positions = []
@@ -1720,6 +1998,8 @@ class MT5Runner:
             feed=self.feed,
             live_positions=live_positions,
             trim_callback=self.trim_top_layer,
+            mt5_control=self,
+            pending_orders=self.pending_orders_snapshot(),
         )
 
     def _reply_command(self, result) -> None:
@@ -1737,7 +2017,13 @@ class MT5Runner:
                                     f"({result.document})")
                 elif result.text is not None:
                     if hasattr(sender, "send_text"):
-                        sender.send_text(result.text, silent=True)
+                        try:
+                            sender.send_text(
+                                result.text, silent=True,
+                                reply_markup=result.reply_markup)
+                        except TypeError:
+                            # Legacy sender without reply_markup support.
+                            sender.send_text(result.text, silent=True)
                     else:
                         sender.send(result.text)
             except Exception as exc:
@@ -1818,6 +2104,11 @@ class MT5Runner:
         ctx = self._command_context()
         for upd in updates:
             self._tg_offset = int(upd["update_id"]) + 1
+            if upd.get("callback_query") is not None:
+                # Button taps share THIS poller (one getUpdates
+                # consumer only — never a second poller).
+                self._handle_callback_query(upd)
+                continue
             try:
                 result, _chat_id = router.dispatch(upd, ctx)
             except Exception as exc:
@@ -1830,3 +2121,100 @@ class MT5Runner:
             # Confirm the drained offset server-side.
             self._tg_api("getUpdates",
                          {"offset": self._tg_offset, "timeout": 0})
+
+    # -------------------------------------------------- callback_query
+    def _handle_callback_query(self, upd: dict) -> None:
+        """One button tap: owner-gated, answered, acted on.
+
+        Flow: a tap on Pause / Resume / Trim / Cancel pending only
+        STAGES a confirmation (a "confirm?" message with Confirm /
+        Cancel buttons) — the action runs only on the Confirm tap.
+        Refresh / Config re-render the message in place.  A tap from
+        anyone but the owner is refused and acts on nothing.
+        """
+        import json as _json
+
+        query = upd.get("callback_query") or {}
+        query_id = query.get("id", "")
+        router = self._get_command_router()
+
+        def _answer(text: str) -> None:
+            try:
+                self._tg_api("answerCallbackQuery",
+                             {"callback_query_id": query_id,
+                              "text": (text or "")[:200]})
+            except Exception:
+                pass
+
+        if not is_owner_callback(upd, router.owner_chat_id):
+            _answer("not authorized")
+            return
+        parsed = parse_mt5_callback(query.get("data", ""))
+        if parsed is None:
+            _answer("")  # not ours (e.g. a legacy alert button) — ignore
+            return
+        action, arg = parsed
+        msg = query.get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id") or query.get("from", {}).get("id")
+        message_id = msg.get("message_id")
+        try:
+            if action in ("pause", "resume", "trim", "cancel_pending"):
+                labels = {"pause": "⏸ Pause engine",
+                          "resume": "▶ Resume engine",
+                          "trim": "✂️ Trim top layer",
+                          "cancel_pending": "❌ Cancel ALL pending orders"}
+                token = self.request_confirm(action)
+                self._tg_api("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": f"{labels[action]} — tap Confirm to act, "
+                            f"Cancel to abort.",
+                    "reply_markup": _json.dumps(
+                        mt5_confirm_keyboard(token))})
+                _answer(f"Confirm to {action}…")
+                return
+            if action == "confirm":
+                ok, text = self.confirm_pending(arg or "")
+                if message_id is not None:
+                    self._tg_api("editMessageText", {
+                        "chat_id": chat_id, "message_id": message_id,
+                        "text": text,
+                        "reply_markup": _json.dumps(
+                            mt5_control_keyboard())})
+                _answer(text)
+                return
+            if action == "cancel":
+                text = self.cancel_confirm(arg or "")
+                if message_id is not None:
+                    self._tg_api("editMessageText", {
+                        "chat_id": chat_id, "message_id": message_id,
+                        "text": text})
+                _answer(text)
+                return
+            if action in ("refresh", "status"):
+                from .mt5_commands import _mt5_status
+                result = _mt5_status(self._command_context(), [])
+                if message_id is not None:
+                    self._tg_api("editMessageText", {
+                        "chat_id": chat_id, "message_id": message_id,
+                        "text": result.text or "",
+                        "reply_markup": _json.dumps(
+                            mt5_control_keyboard())})
+                _answer("refreshed")
+                return
+            if action == "config":
+                from .mt5_commands import _mt5_config
+                result = _mt5_config(self._command_context(), [])
+                if message_id is not None:
+                    self._tg_api("editMessageText", {
+                        "chat_id": chat_id, "message_id": message_id,
+                        "text": result.text or "",
+                        "reply_markup": _json.dumps(
+                            mt5_control_keyboard())})
+                _answer("config")
+                return
+            _answer("unknown button")
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: callback handling failed: {exc}")
+            _answer("button failed — try the command again")
