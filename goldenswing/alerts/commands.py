@@ -78,6 +78,7 @@ class CommandContext:
     reports_dir: Path | None = None
     feed: object = None                  # live feed (MT5 /ticks export)
     live_positions: list = field(default_factory=list)  # MT5 truth: open positions
+    trim_callback: object = None         # MT5 runner.trim_top_layer (bound)
 
 
 def _is_owner(update: dict, owner_chat_id: str | int | None) -> bool:

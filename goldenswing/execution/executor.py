@@ -21,7 +21,24 @@ class OrderRequest:
     """Everything needed to open one position.  Built by the risk
     pipeline (handler) from an Alert: direction/stop/targets come from
     the signal, ``volume`` from the lot sizer, ``risk_money`` is the
-    sizer's actual money-at-risk at that volume."""
+    sizer's actual money-at-risk at that volume.
+
+    ``order_kind`` selects HOW the broker is asked to enter (the
+    setup-dependent order selection — a real trader picks the order
+    type by the setup, never always-market):
+
+    - ``"market"`` (default): immediate DEAL at the current tick.
+    - ``"limit"``: pending BUY_LIMIT / SELL_LIMIT at ``order_price``
+      (price must come back to the level — the pullback entry).
+    - ``"stop"``: pending BUY_STOP / SELL_STOP at ``order_price``
+      (price must break through the level — the breakout entry).
+
+    For ``"limit"`` / ``"stop"``, ``order_price`` is the pending
+    price (the POI entry level from the verdict/playbook
+    ``entry_ref``, NOT the current tick); ``0.0`` falls back to
+    ``entry_ref``.  Paper executors ignore these fields (they
+    simulate an immediate fill) — only the MT5 executor acts on them.
+    """
 
     symbol: str
     direction: int                  # +1 buy | -1 sell
@@ -36,6 +53,8 @@ class OrderRequest:
     bar_index: int = 0              # signal bar (hold-time accounting)
     magic: int = 0
     comment: str = ""
+    order_kind: str = "market"      # "market" | "limit" | "stop"
+    order_price: float = 0.0        # pending price (limit/stop only)
 
 
 @dataclass
@@ -61,6 +80,30 @@ class Position:
     alert_id: str = ""
     open_time: object = None
     risk_money: float = 0.0         # money lost if the stop is hit
+
+
+@dataclass
+class PendingOrder:
+    """A pending (not yet filled) broker order — a LIMIT or STOP
+    placed by setup-dependent order selection, waiting for the
+    market to come to it (limit) or break through it (stop).
+
+    ``kind`` is ``"limit"`` | ``"stop"``; ``price`` is the pending
+    price (the POI entry level).  A pending order is NOT a position:
+    it has no entry price and no P&L until it fills, at which point
+    the broker turns it into a position carrying the same
+    ``alert_id`` (via the ``GS:<alert_id>`` comment)."""
+
+    ticket: int
+    symbol: str
+    kind: str                       # "limit" | "stop"
+    direction: int                  # +1 buy | -1 sell
+    price: float                    # pending price (the POI entry level)
+    volume: float
+    sl: float | None = None
+    tp: float | None = None
+    magic: int = 0
+    alert_id: str = ""
 
 
 @dataclass
@@ -108,6 +151,20 @@ class Executor(ABC):
     @abstractmethod
     def close_all(self, symbol: str | None = None) -> list[OrderResult]:
         ...
+
+    # --------------------------------------------------- pending orders
+    # Default: unsupported (paper executors simulate immediate fills and
+    # never hold pending orders).  The MT5 executor overrides both.
+    # Deliberately NOT abstract: forcing every paper executor to
+    # implement pending orders would touch the OANDA loops for no gain.
+    def pending_orders(self, symbol: str | None = None) -> list["PendingOrder"]:
+        """Pending (unfilled) broker orders with our filtering left to
+        the caller.  Empty for executors that never hold pendings."""
+        return []
+
+    def cancel_pending(self, ticket: int) -> OrderResult:
+        """Cancel one pending order by its broker ticket."""
+        return OrderResult(False, message="pending orders unsupported")
 
     # ------------------------------------------------------------- shared
     def open_risk(self, spec: SymbolSpec | None = None) -> tuple[float, int]:

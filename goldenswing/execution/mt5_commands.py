@@ -128,6 +128,17 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
     return CommandResult(text="\n".join(lines))
 
 
+@mt5_command("/trim", "close the top (most recent) added layer early; base rides")
+def _mt5_trim(ctx: CommandContext, args: list[str]) -> CommandResult:
+    cb = getattr(ctx, "trim_callback", None)
+    if cb is None:
+        return CommandResult(text="trim unavailable (no live runner)")
+    try:
+        return CommandResult(text=str(cb()))
+    except Exception as exc:
+        return CommandResult(text=f"trim FAILED: {exc}")
+
+
 @mt5_command("/trades", "last N MT5 trades with R multiples (default 5)")
 def _mt5_trades(ctx: CommandContext, args: list[str]) -> CommandResult:
     from ..execution.reporting import iter_paper_trades

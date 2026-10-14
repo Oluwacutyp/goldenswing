@@ -523,3 +523,173 @@ def zones_for_direction(zone_bars: pd.DataFrame, direction: int, *,
     if direction < 0:
         return zones.get("resistance")
     return None
+
+
+# ------------------------------------------------------- live evaluation clock
+# The closed-bar hierarchy above (evaluate_hierarchy) is the shared
+# implementation behind the backtest and the legacy paper loop.  The
+# MT5 engine must NOT wait for an H1 bar to close before acting: a
+# real trader acts when the level breaks.  These helpers implement
+# the SAME legs with a LIVE clock — trigger on tick-cross, entry on
+# entry-TF closes, TF closes only refresh levels — reusing the same
+# primitives (evaluate_bias, zones_by_side, find_swings, atr14,
+# detect_bos_msch_choch) and the same gate formulas as _evaluate.
+# Levels come from CLOSED bars only; the forming bar never confirms
+# its own swing and never feeds a level.  The live verdict the runner
+# builds from these helpers has the same shape as evaluate_hierarchy's
+# output, so confluence.gate_live_signal needs no special case.
+
+
+def live_setup(stack: TimeframeStack | dict, *,
+               swing_n: int = 3) -> dict | None:
+    """Trigger levels from CLOSED bars only (refreshed on TF closes).
+
+    Returns None when legs 1-2 (D1 bias / H4 agreement) fail or no
+    H4 POI / H1 trigger levels exist — the setup is not armed.
+    Otherwise returns the levels the tick clock checks every tick:
+    ``bias_d1`` / ``bias_h4`` / ``direction``, ``zone`` (the H4 POI
+    band for the bias direction), H1 reference/minor swing levels,
+    ``atr_h1``, ``buf`` (the breakout buffer), and the H4 swing price
+    lists used for the target.  The stack frames must hold CLOSED
+    bars only (the live invariant); the forming bar is never here.
+    """
+    if isinstance(stack, dict):
+        stack = TimeframeStack.from_frames(stack)
+    d1 = stack.frames.get("D1")
+    h4 = stack.frames.get("H4")
+    h1 = stack.frames.get("H1")
+    need = 2 * swing_n + 5
+    if d1 is None or len(d1) < need or h4 is None or len(h4) < need \
+            or h1 is None or len(h1) < need:
+        return None
+    bias_d1 = evaluate_bias(d1, swing_n=swing_n)
+    if bias_d1 == 0:
+        return None
+    bias_h4 = evaluate_bias(h4, swing_n=swing_n)
+    if bias_h4 != bias_d1:
+        return None
+    zones = zones_by_side(h4, swing_n=swing_n)
+    zone = zones.get("support") if bias_d1 > 0 \
+        else zones.get("resistance")
+    if zone is None:
+        return None
+    trig_highs, trig_lows = find_swings(
+        h1["high"].to_numpy(), h1["low"].to_numpy(), swing_n)
+    if not trig_highs or not trig_lows:
+        return None
+    atr_h1 = atr14(h1)
+    if atr_h1 <= 0:
+        return None
+    h4_highs, h4_lows = find_swings(
+        h4["high"].to_numpy(), h4["low"].to_numpy(), swing_n)
+    return {
+        "bias_d1": int(bias_d1), "bias_h4": int(bias_h4),
+        "direction": int(bias_d1), "zone": zone,
+        "ref_high": float(trig_highs[-1][1]),
+        "minor_high": float(trig_highs[-2][1])
+        if len(trig_highs) >= 2 else None,
+        "ref_low": float(trig_lows[-1][1]),
+        "minor_low": float(trig_lows[-2][1])
+        if len(trig_lows) >= 2 else None,
+        "atr_h1": float(atr_h1),
+        "buf": float(SWING.breakout_atr * atr_h1),
+        "h4_highs": [float(p) for _, p in h4_highs],
+        "h4_lows": [float(p) for _, p in h4_lows],
+        "swing_n": int(swing_n),
+    }
+
+
+def check_live_trigger(setup: dict, *, open_: float, high: float,
+                       low: float, close: float,
+                       closed_h1: pd.DataFrame) -> dict | None:
+    """Check one live (forming) H1 bar against the setup levels.
+
+    Same gates as ``_evaluate``'s legs 3-4, with the forming bar in
+    the trigger-bar seat: the live price must sit AT the H4 POI band,
+    and :func:`detect_bos_msch_choch` (same function, same config,
+    same displacement gate) must fire on the forming bar against
+    swing levels taken from CLOSED bars only.  Returns None when
+    nothing fires, else ``{trigger, direction, entry, stop, target,
+    risk, level, zone}`` where ``level`` is the crossed level the
+    runner watches for a reversal (price back across it = the break
+    failed).
+    """
+    zone = setup["zone"]
+    if not (zone["bottom"] <= close <= zone["top"]):
+        return None
+    tail = closed_h1.tail(30)[["open", "high", "low", "close"]]
+    forming = pd.DataFrame(
+        [{"open": float(open_), "high": float(high),
+          "low": float(low), "close": float(close)}],
+        index=[closed_h1.index[-1] + pd.Timedelta(minutes=60)])
+    frame = pd.concat([tail, forming])
+    bias = int(setup["direction"])
+    event = detect_bos_msch_choch(
+        frame, setup["ref_high"], setup["ref_low"], setup["atr_h1"],
+        trend=bias, minor_high=setup["minor_high"],
+        minor_low=setup["minor_low"], config=SWING)
+    if event is None:
+        return None
+    direction = 1 if event.endswith("bull") else -1
+    if direction != bias:
+        return None
+    buf = setup["buf"]
+    if direction > 0:
+        stop = setup["ref_low"] - buf
+        if not stop < close:
+            return None
+        level = setup["ref_high"] if event.startswith("MSCH") else max(
+            setup["ref_high"],
+            setup["minor_high"] if setup["minor_high"] is not None
+            else setup["ref_high"])
+        cands = [p for p in setup["h4_highs"] if p > close]
+    else:
+        stop = setup["ref_high"] + buf
+        if not stop > close:
+            return None
+        level = setup["ref_low"] if event.startswith("MSCH") else min(
+            setup["ref_low"],
+            setup["minor_low"] if setup["minor_low"] is not None
+            else setup["ref_low"])
+        cands = [p for p in setup["h4_lows"] if p < close]
+    risk = abs(close - stop)
+    target = close + direction * 2.0 * risk
+    if cands:
+        nearest = min(cands, key=lambda p: abs(p - close))
+        if abs(nearest - close) >= 2.0 * risk:
+            target = nearest
+    return {"trigger": event, "direction": direction,
+            "entry": float(close), "stop": float(stop),
+            "target": float(target), "risk": float(risk),
+            "level": float(level), "zone": zone}
+
+
+def check_live_entry(entry_frame: pd.DataFrame, bias: int, swing_n: int,
+                     *, since, entry_clock: str) -> int | None:
+    """Entry-TF confirmation on CLOSED entry bars composing the forming
+    H1 bar (index >= ``since``).
+
+    Mirrors the closed-bar leg 5 exactly: the FULL entry frame is
+    passed to :func:`_entry_event_window` (the event at bar ``j``
+    needs swing history from bars strictly before ``j``), with
+    ``window`` = the number of composing bars closed so far, capped
+    at ``60 // TF_MINUTES[entry_clock]`` (4 for M15, 2 for M30).
+    Returns the most recent event's direction (either sign — the
+    caller compares it to the bias) or None when no composing bar
+    fires.  A closed entry bar is the unit here, never a tick.
+    """
+    if entry_frame is None or len(entry_frame) == 0:
+        return None
+    entry_window = max(1, int(60 // TF_MINUTES[entry_clock]))
+    n_composing = int((entry_frame.index >= pd.Timestamp(since)).sum())
+    window = min(n_composing, entry_window)
+    if window <= 0:
+        return None
+    direction, _idx = _entry_event_window(
+        entry_frame, bias, swing_n, window)
+    return direction
+
+
+def qm_annotation(qm_touch: dict | None, bias: int, asof) -> dict:
+    """QM M5 leg annotation (public wrapper over :func:`_qm_leg`)."""
+    return _qm_leg(qm_touch, bias, asof)

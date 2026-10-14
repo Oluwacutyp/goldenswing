@@ -81,6 +81,11 @@ Command polling is ON by default — the MT5 engine IS the engine.
 are answered from the MT5 journal/state (`data/mt5_*`), never the
 OANDA loop's files.
 
+`/trim` closes the top (most recent) added layer early while the base
+layer rides — the manual version of "close some".  With only the base
+layer it replies "nothing to trim".  It is the one mutating command:
+it executes a broker partial close.
+
 ```powershell
 .\\.venv\\Scripts\\python.exe scripts\\run_mt5.py   # polling ON (default)
 ```

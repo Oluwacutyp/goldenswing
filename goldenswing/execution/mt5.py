@@ -24,13 +24,80 @@ rejects the request — the standard deviation/filling handling.
 from __future__ import annotations
 
 from .executor import (AccountState, Executor, OrderRequest, OrderResult,
-                        Position)
+                        PendingOrder, Position)
 from .risk import SymbolSpec
 
 #: retcodes that mean "the order went through"
 _DONE = (10009, 10008)          # TRADE_RETCODE_DONE / DONE_PARTIAL->PLACED
 _FILLING_FOK_BIT = 1            # SYMBOL_FILLING_FOK
 _FILLING_IOC_BIT = 2            # SYMBOL_FILLING_IOC
+
+#: "At the level" tolerance for order selection, as a fraction of ATR:
+#: price within this of the entry level counts as AT the level.
+_AT_LEVEL_ATR = 0.25
+
+
+def select_order_type(*, direction: int, price: float,
+                      entry_ref: float,
+                      zone: dict | None = None,
+                      atr: float = 0.0) -> tuple[str, float, str]:
+    """Setup-dependent order selection — the real-trader entry rule.
+
+    A real trader picks the order type by where price is vs the
+    level when the signal fires, never always-market:
+
+    - price AT the entry level (within ``_AT_LEVEL_ATR`` x ATR) with
+      the trigger confirmed -> ``"market"`` at the current price
+      (waiting would mean missing it);
+    - entry level BEHIND price (long: below; short: above) ->
+      ``"limit"`` at ``entry_ref`` (pullback setup: price must come
+      back to the POI — the market comes to the order);
+    - entry level AHEAD of price (long: above; short: below) ->
+      ``"stop"`` at ``entry_ref`` (breakout setup: price must break
+      through the level to enter);
+    - price beyond the POI band on the ADVERSE side (long: below the
+      zone bottom; short: above the zone top) -> ``"invalid"`` (the
+      zone failed — the setup's premise is gone, no order).
+
+    ``entry_ref`` is the playbook's POI entry level (FVG edge, QM
+    level, trendline), NOT the current tick.  Returns
+    ``(kind, level, reason)``; ``level`` is the pending price for
+    limit/stop, the current price for market, ``0.0`` for invalid.
+    A missing/zero ``entry_ref`` falls back to market (legacy).
+    """
+    if entry_ref <= 0:
+        return "market", float(price), "no entry_ref: market at price"
+    tol = _AT_LEVEL_ATR * float(atr) if atr and atr > 0 else 0.0
+    if zone is not None:
+        bottom = float(zone.get("bottom", 0.0))
+        top = float(zone.get("top", 0.0))
+        if direction > 0 and price < bottom - tol:
+            return ("invalid", 0.0,
+                    f"zone failed: price {price:.2f} below POI "
+                    f"bottom {bottom:.2f} (long)")
+        if direction < 0 and price > top + tol:
+            return ("invalid", 0.0,
+                    f"zone failed: price {price:.2f} above POI "
+                    f"top {top:.2f} (short)")
+    if abs(float(price) - float(entry_ref)) <= tol:
+        return ("market", float(price),
+                f"at level: price {price:.2f} within {tol:.2f} of "
+                f"entry {entry_ref:.2f}, trigger confirmed")
+    if direction > 0:
+        if entry_ref < price - tol:
+            return ("limit", float(entry_ref),
+                    f"pullback: entry {entry_ref:.2f} below price "
+                    f"{price:.2f} — limit at POI")
+        return ("stop", float(entry_ref),
+                f"breakout: entry {entry_ref:.2f} above price "
+                f"{price:.2f} — stop beyond level")
+    if entry_ref > price + tol:
+        return ("limit", float(entry_ref),
+                f"pullback: entry {entry_ref:.2f} above price "
+                f"{price:.2f} — limit at POI")
+    return ("stop", float(entry_ref),
+            f"breakout: entry {entry_ref:.2f} below price "
+            f"{price:.2f} — stop beyond level")
 
 
 class MT5Unavailable(RuntimeError):
@@ -217,6 +284,22 @@ class MT5Executor(Executor):
         return last or OrderResult(False, message="no filling mode attempted")
 
     def place_order(self, request: OrderRequest) -> OrderResult:
+        """Open one position — dispatching on ``request.order_kind``.
+
+        ``"market"``: immediate DEAL at the current tick (the legacy
+        path).  ``"limit"`` / ``"stop"``: pending BUY_LIMIT /
+        SELL_LIMIT / BUY_STOP / SELL_STOP at ``order_price``
+        (``entry_ref`` when ``order_price`` is 0), GTC, SL/TP
+        attached.  A wrong-sided pending price (a BUY_LIMIT above the
+        ask, a BUY_STOP below it, ...) is refused before it reaches
+        the broker — the broker would reject it anyway, and a
+        refusal here is a clean error, not a broker rejection.
+        """
+        kind = getattr(request, "order_kind", "market") or "market"
+        if kind in ("limit", "stop"):
+            return self._place_pending(request, kind)
+        if kind != "market":
+            return OrderResult(False, message=f"unknown order_kind {kind!r}")
         mt5 = self._lib()
         symbol = request.symbol
         if not mt5.symbol_select(symbol, True):
@@ -242,6 +325,145 @@ class MT5Executor(Executor):
             "type_time": mt5.ORDER_TIME_GTC,
         }
         return self._send_with_fillings(base)
+
+    def _place_pending(self, request: OrderRequest,
+                       kind: str) -> OrderResult:
+        """Pending LIMIT / STOP at the POI entry level.
+
+        Single ``order_send`` (no filling-mode retries — filling modes
+        do not apply to pending orders).  Success is retcode PLACED
+        (10008): the broker holds the order; the position appears
+        only when the market reaches the level.
+        """
+        mt5 = self._lib()
+        symbol = request.symbol
+        if not mt5.symbol_select(symbol, True):
+            return OrderResult(False, message=f"symbol_select({symbol}) failed")
+        price = float(request.order_price) if request.order_price \
+            else float(request.entry_ref)
+        if price <= 0:
+            return OrderResult(False, message="pending order needs a price")
+        # Wrong-sided pending prices are refused, not sent: a BUY_LIMIT
+        # must sit BELOW the ask, a BUY_STOP ABOVE it (mirrored for
+        # sells).  The selection logic guarantees the side; this is
+        # the backstop against a broker rejection.
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is not None:
+            ask, bid = float(tick.ask), float(tick.bid)
+            if request.direction == 1 and kind == "limit" \
+                    and price >= ask:
+                return OrderResult(
+                    False, message=f"BUY_LIMIT price {price:.2f} not below "
+                                   f"ask {ask:.2f}")
+            if request.direction == 1 and kind == "stop" \
+                    and price <= ask:
+                return OrderResult(
+                    False, message=f"BUY_STOP price {price:.2f} not above "
+                                   f"ask {ask:.2f}")
+            if request.direction == -1 and kind == "limit" \
+                    and price <= bid:
+                return OrderResult(
+                    False, message=f"SELL_LIMIT price {price:.2f} not above "
+                                   f"bid {bid:.2f}")
+            if request.direction == -1 and kind == "stop" \
+                    and price >= bid:
+                return OrderResult(
+                    False, message=f"SELL_STOP price {price:.2f} not below "
+                                   f"bid {bid:.2f}")
+        order_type = {
+            (1, "limit"): mt5.ORDER_TYPE_BUY_LIMIT,
+            (-1, "limit"): mt5.ORDER_TYPE_SELL_LIMIT,
+            (1, "stop"): mt5.ORDER_TYPE_BUY_STOP,
+            (-1, "stop"): mt5.ORDER_TYPE_SELL_STOP,
+        }[(1 if request.direction > 0 else -1, kind)]
+        comment = (f"GS:{request.alert_id}" if request.alert_id
+                   else "GS")[:31]
+        base = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "volume": float(request.volume),
+            "type": order_type,
+            "price": price,
+            "sl": float(request.stop_loss),
+            "tp": float(request.take_profit) if request.take_profit else 0.0,
+            "magic": int(request.magic or self.magic),
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+        }
+        res = mt5.order_send(base)
+        if res is None:
+            return OrderResult(False, message=f"order_send returned None: "
+                                              f"{mt5.last_error()}")
+        if int(res.retcode) in _DONE:
+            return OrderResult(
+                True, ticket=int(getattr(res, "order", 0) or 0),
+                price=price, volume=float(request.volume),
+                message=str(getattr(res, "comment", "") or "placed"),
+                retcode=int(res.retcode))
+        return OrderResult(
+            False, price=price,
+            message=f"retcode {res.retcode}: "
+                    f"{getattr(res, 'comment', '')}",
+            retcode=int(res.retcode))
+
+    def pending_orders(self, symbol: str | None = None) -> list[PendingOrder]:
+        """Pending (unfilled) broker orders — ``orders_get`` mapped to
+        :class:`PendingOrder`.  Market DEALs never appear here (they
+        become positions on fill)."""
+        mt5 = self._lib()
+        raw = mt5.orders_get(symbol=symbol) if symbol \
+            else mt5.orders_get()
+        if raw is None:
+            raise MT5Unavailable(f"orders_get failed: {mt5.last_error()}")
+        out: list[PendingOrder] = []
+        for o in raw:
+            t = int(o.type)
+            if t == int(mt5.ORDER_TYPE_BUY_LIMIT):
+                kind, direction = "limit", 1
+            elif t == int(mt5.ORDER_TYPE_SELL_LIMIT):
+                kind, direction = "limit", -1
+            elif t == int(mt5.ORDER_TYPE_BUY_STOP):
+                kind, direction = "stop", 1
+            elif t == int(mt5.ORDER_TYPE_SELL_STOP):
+                kind, direction = "stop", -1
+            elif t == int(mt5.ORDER_TYPE_BUY):
+                kind, direction = "market", 1
+            elif t == int(mt5.ORDER_TYPE_SELL):
+                kind, direction = "market", -1
+            else:
+                continue  # unknown order type: never invent a kind
+            comment = str(getattr(o, "comment", "") or "")
+            alert_id = comment[3:] if comment.startswith("GS:") else ""
+            out.append(PendingOrder(
+                ticket=int(o.ticket), symbol=str(o.symbol), kind=kind,
+                direction=direction, price=float(o.price_open),
+                volume=float(o.volume_current),
+                sl=float(o.sl) if o.sl else None,
+                tp=float(o.tp) if o.tp else None,
+                magic=int(getattr(o, "magic", 0)), alert_id=alert_id))
+        return out
+
+    def cancel_pending(self, ticket: int) -> OrderResult:
+        """Cancel one pending order (TRADE_ACTION_REMOVE).  A ticket
+        that is already gone (filled / cancelled) reports failure —
+        the caller reconciles against ``orders_get`` + positions to
+        tell a fill from an external cancel."""
+        mt5 = self._lib()
+        res = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE,
+                              "order": int(ticket)})
+        if res is None:
+            return OrderResult(False, message=f"order_send returned None: "
+                                              f"{mt5.last_error()}")
+        if int(res.retcode) in _DONE:
+            return OrderResult(True, ticket=int(ticket),
+                               message=str(getattr(res, "comment", "")
+                                           or "removed"),
+                               retcode=int(res.retcode))
+        return OrderResult(
+            False, ticket=int(ticket),
+            message=f"remove failed: retcode {res.retcode}: "
+                    f"{getattr(res, 'comment', '')}",
+            retcode=int(res.retcode))
 
     def modify_sl(self, ticket: int, sl: float,
                   tp: float | None = None) -> OrderResult:

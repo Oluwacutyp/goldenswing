@@ -84,6 +84,9 @@ class FakeMT5:
         self._script_base = int(time.time()) + server_offset_seconds
         self.sent: list[dict] = []
         self.positions_store: list[SimpleNamespace] = []
+        # Pending (unfilled) broker orders, keyed by ticket — the
+        # orders_get surface the pending-order lifecycle tests use.
+        self.orders_store: list[SimpleNamespace] = []
         self._ticket = 5000
         self.shutdown_called = False
 
@@ -181,6 +184,33 @@ class FakeMT5:
                and (ticket is None or p.ticket == ticket)]
         return out
 
+    def orders_get(self, symbol=None, ticket=None):
+        return [o for o in self.orders_store
+                if (symbol is None or o.symbol == symbol)
+                and (ticket is None or o.ticket == ticket)]
+
+    def fill_pending(self, ticket, price):
+        """Simulate the broker filling a pending order: the order
+        leaves orders_get and a position with the same comment
+        (GS:<alert_id>) appears — exactly what the runner's
+        reconcile uses to recognise a fill.  Returns True on fill."""
+        for o in list(self.orders_store):
+            if o.ticket == ticket:
+                self.orders_store.remove(o)
+                # A filled pending becomes a real position: the
+                # position type is BUY/SELL, never the order type.
+                pos_type = self.POSITION_TYPE_BUY \
+                    if o.type in (self.ORDER_TYPE_BUY_LIMIT,
+                                  self.ORDER_TYPE_BUY_STOP) \
+                    else self.POSITION_TYPE_SELL
+                self.positions_store.append(SimpleNamespace(
+                    ticket=o.ticket, symbol=o.symbol, type=pos_type,
+                    volume=o.volume_current, price_open=price,
+                    sl=o.sl, tp=o.tp, magic=o.magic,
+                    comment=o.comment, time=0))
+                return True
+        return False
+
     def order_send(self, request):
         self.sent.append(dict(request))
         action = request.get("action")
@@ -217,5 +247,27 @@ class FakeMT5:
                                    order=self._ticket, deal=self._ticket,
                                    price=request.get("price", 0.0),
                                    volume=request.get("volume", 0.0))
+        if action == self.TRADE_ACTION_PENDING:
+            self._ticket += 1
+            self.orders_store.append(SimpleNamespace(
+                ticket=self._ticket, symbol=request["symbol"],
+                type=request["type"], volume_current=request["volume"],
+                price_open=request["price"], sl=request.get("sl", 0.0),
+                tp=request.get("tp", 0.0), magic=request.get("magic", 0),
+                comment=request.get("comment", ""), time=0))
+            return SimpleNamespace(retcode=10008, comment="placed",
+                                   order=self._ticket, deal=0,
+                                   price=request.get("price", 0.0),
+                                   volume=request.get("volume", 0.0))
+        if action == self.TRADE_ACTION_REMOVE:
+            for o in list(self.orders_store):
+                if o.ticket == request["order"]:
+                    self.orders_store.remove(o)
+                    return SimpleNamespace(retcode=10009, comment="removed",
+                                           order=o.ticket, deal=0,
+                                           price=0.0, volume=0.0)
+            return SimpleNamespace(retcode=10006, comment="order not found",
+                                   order=0, deal=0, price=0.0,
+                                   volume=0.0)
         return SimpleNamespace(retcode=10009, comment="done",
                                order=0, deal=0, price=0.0, volume=0.0)

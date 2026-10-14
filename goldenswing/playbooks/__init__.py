@@ -14,9 +14,14 @@ another is a new experiment, not a refactor.
 from .base import Candidate, EngineContext, Playbook
 from .fvg_limit import FVGLimitPlaybook
 from .fvg_midline import FVGMidlinePlaybook
+from .inversion import InversionPlaybook
+from .killzone_open import KillzoneOpenPlaybook
+from .order_block import OrderBlockPlaybook
 from .qm_m5 import QMM5Playbook
+from .retracement_trap import RetracementTrapPlaybook
 from .sweep_reversal import SweepReversalPlaybook
 from .trendline_retest import TrendlineRetestPlaybook
+from .v_reversal import VReversalPlaybook
 
 __all__ = [
     "Candidate",
@@ -27,4 +32,9 @@ __all__ = [
     "FVGLimitPlaybook",
     "TrendlineRetestPlaybook",
     "QMM5Playbook",
+    "VReversalPlaybook",
+    "RetracementTrapPlaybook",
+    "InversionPlaybook",
+    "OrderBlockPlaybook",
+    "KillzoneOpenPlaybook",
 ]
