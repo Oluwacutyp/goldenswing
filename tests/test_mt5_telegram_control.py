@@ -101,7 +101,10 @@ def _runner(tmp_path, *, executor=None, **cfg_kw):
         **cfg_kw)
     runner = MT5Runner(cfg, executor=executor or FakeExecutor())
     runner.feed = SimpleNamespace(
-        account_state=lambda: {"equity": 10000.0},
+        account_state=lambda: {"equity": 10000.0, "balance": 10000.0,
+                               "free_margin": 10000.0},
+        order_margin=lambda *, volume, price, direction:
+            float(volume) * 100.0 * float(price) / 500.0,
         poll_status=lambda: {"ok": True})
     return runner
 

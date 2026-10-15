@@ -311,6 +311,25 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
     else:
         state_line = "engine: RUNNING"
     lines = ["MT5 ENGINE STATUS", feed_line, state_line, ""]
+    if ctrl is not None:
+        # MacroTrend alignment (D1/W1/MN1): sizing + Golden Swing
+        # confirmation state.  Guarded — old runners lack it.
+        alignment = getattr(ctrl, "alignment_line", None)
+        if callable(alignment):
+            lines.append(alignment())
+            lines.append("")
+        # DXY correlation: confluence context, never a gate.
+        # Guarded — old runners lack it.
+        dxy = getattr(ctrl, "dxy_line", None)
+        if callable(dxy):
+            lines.append(dxy())
+            lines.append("")
+        # Execution health: tick freshness / order latency /
+        # slippage.  Guarded — old runners lack it.
+        health = getattr(ctrl, "health_line", None)
+        if callable(health):
+            lines.append(health())
+            lines.append("")
     if cfg is not None:
         lines.append(
             f"config: fixed_lots="

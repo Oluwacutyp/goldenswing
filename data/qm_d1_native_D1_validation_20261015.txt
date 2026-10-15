@@ -1,0 +1,50 @@
+promotion rule: PF >= 1.1 AND total R > 0 AND trades >= 30 (iron rule)
+qm_d1 stays SHADOW regardless — promotion is a separate owner decision.
+
+Daily QM (qm_d1) validation — NATIVE MT5 D1 (MT5_XAUUSD_D1_native_2000bars_20261015.csv)
+  native file: 727 bars 2023-06-26 -> 2026-10-14
+  contiguous segments: 3
+    seg 0: 5 bars 2023-06-26 -> 2023-06-30
+    seg 1: 718 bars 2024-03-31 -> 2026-07-17
+    seg 2: 4 bars 2026-10-11 -> 2026-10-14
+  SKIPPED fragment (5 bars 2023-06-26 -> 2023-06-30): too short for QM validation, never run across holes
+  SKIPPED fragment (4 bars 2026-10-11 -> 2026-10-14): too short for QM validation, never run across holes
+
+PRIMARY native D1 (last 2y of longest segment): daily bars=625 window: 2024-07-17 -> 2026-07-17 (2.00 years)
+  qm_d1: trades=4 win=50% total_R=+1.6 PF=1.79 avg_R=+0.40 maxDD=-1.0R first_half_R=+0.7 second_half_R=+0.8 -> FAIL iron rule (only 4 trades (need >= 30))
+  breakdowns (where it works / doesn't):
+  long: trades=3 win=67% total_R=+2.6 PF=3.59 avg_R=+0.86
+  short: trades=1 win=0% total_R=-1.0 PF=0.00 avg_R=-1.00
+  sweep_head: trades=1 win=100% total_R=+1.8 PF=inf avg_R=+1.84
+  no sweep_head: trades=3 win=33% total_R=-0.3 PF=0.87 avg_R=-0.09
+  displacement_break: trades=2 win=0% total_R=-2.0 PF=0.00 avg_R=-1.00
+  no displacement_break: trades=2 win=100% total_R=+3.6 PF=inf avg_R=+1.79
+  with 50-bar drift: trades=2 win=50% total_R=+0.7 PF=1.74 avg_R=+0.37
+  against 50-bar drift: trades=2 win=50% total_R=+0.8 PF=1.84 avg_R=+0.42
+  ATR >= median (expanded): trades=2 win=100% total_R=+3.6 PF=inf avg_R=+1.79
+  ATR < median (compressed): trades=2 win=0% total_R=-2.0 PF=0.00 avg_R=-1.00
+  exit stop: n=2 total_R=-2.0
+  exit target: n=1 total_R=+1.8
+  exit timeout: n=1 total_R=+1.7
+
+EXTENDED native D1 (longest contiguous segment): daily bars=718 window: 2024-03-31 -> 2026-07-17 (2.29 years)
+  qm_d1: trades=4 win=50% total_R=+1.6 PF=1.79 avg_R=+0.40 maxDD=-1.0R first_half_R=-1.0 second_half_R=+2.6 -> FAIL iron rule (only 4 trades (need >= 30))
+  breakdowns (where it works / doesn't):
+  long: trades=3 win=67% total_R=+2.6 PF=3.59 avg_R=+0.86
+  short: trades=1 win=0% total_R=-1.0 PF=0.00 avg_R=-1.00
+  sweep_head: trades=1 win=100% total_R=+1.8 PF=inf avg_R=+1.84
+  no sweep_head: trades=3 win=33% total_R=-0.3 PF=0.87 avg_R=-0.09
+  displacement_break: trades=2 win=0% total_R=-2.0 PF=0.00 avg_R=-1.00
+  no displacement_break: trades=2 win=100% total_R=+3.6 PF=inf avg_R=+1.79
+  with 50-bar drift: trades=2 win=50% total_R=+0.7 PF=1.74 avg_R=+0.37
+  against 50-bar drift: trades=2 win=50% total_R=+0.8 PF=1.84 avg_R=+0.42
+  ATR >= median (expanded): trades=2 win=100% total_R=+3.6 PF=inf avg_R=+1.79
+  ATR < median (compressed): trades=2 win=0% total_R=-2.0 PF=0.00 avg_R=-1.00
+  exit stop: n=2 total_R=-2.0
+  exit target: n=1 total_R=+1.8
+  exit timeout: n=1 total_R=+1.7
+
+REPLAY Oct 14 2026 setup (owner: QM ~4,133-4,140, drop to ~4,104)
+  Oct 14 D1 bar: O 4155.136 H 4170.448 L 4073.195 C 4111.850 (range $97.25)
+  Bars before Oct 14 in the same contiguous segment: 3
+  REPLAY BLOCKED: the QM formation history (up to 60 bars) lies inside a data hole before Oct 11.  The 4-bar Oct 11-14 fragment cannot support QM detection.  No claim is made for or against the owner's Oct 14 QM.

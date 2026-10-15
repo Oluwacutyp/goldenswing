@@ -36,21 +36,39 @@ def test_breakeven_fires_on_crossing_tick_not_next_poll():
     _open(mgr)
     # +0.8R: nothing.
     assert mgr.on_tick(101, 2010.0) == []
-    # +1.0R exactly: breakeven fires on THIS tick.
+    # +1.0R exactly: tier-1 partial (50%) AND the profit-lock
+    # (SL -> entry + 0.5R, tighter than breakeven) fire on THIS
+    # tick — the lock takes precedence over breakeven, the owner's
+    # rule (lock applies while breakeven has not moved yet).
     actions = mgr.on_tick(101, 2012.5)
-    assert len(actions) == 1
-    assert actions[0].kind == "modify_sl"
-    assert actions[0].reason == "breakeven"
-    assert actions[0].level == pytest.approx(2000.0)
-    mgr.apply(101, actions[0])
-    # Same price again: no repeat (breakeven is done).
+    assert [a.reason for a in actions] == ["partial_tier_1",
+                                           "profit_lock"]
+    assert actions[0].volume == pytest.approx(0.5)
+    assert actions[1].level == pytest.approx(2007.5)
+    for a in actions:
+        mgr.apply(101, a)
+    # Same price again: no repeat (tier 1 + profit-lock done).
+    assert mgr.on_tick(101, 2012.5) == []
+
+
+def test_breakeven_fires_when_profit_lock_disabled():
+    mgr = TickManager(tick=TickConfig(profit_lock_enabled=False))
+    _open(mgr)
+    assert mgr.on_tick(101, 2010.0) == []
+    actions = mgr.on_tick(101, 2012.5)
+    assert [a.reason for a in actions] == ["partial_tier_1", "breakeven"]
+    assert actions[1].level == pytest.approx(2000.0)
+    for a in actions:
+        mgr.apply(101, a)
     assert mgr.on_tick(101, 2012.5) == []
 
 
 def test_trailing_follows_breakeven_on_later_ticks():
-    mgr = TickManager()
+    # Tiers disabled: isolate the SL-move chain.
+    mgr = TickManager(tick=TickConfig(partial_tiers=()))
     _open(mgr)
     be = mgr.on_tick(101, 2012.5)[0]
+    assert be.reason == "profit_lock"
     mgr.apply(101, be)
     # +2.0R: trail level = 2000 + (2.0 - 1.0) * 12.5 = 2012.50.
     actions = mgr.on_tick(101, 2025.0)
@@ -63,11 +81,13 @@ def test_trailing_follows_breakeven_on_later_ticks():
 
 
 def test_partial_fires_on_crossing_tick_and_halves_volume():
-    mgr = TickManager()
+    # Tiers disabled: the legacy single pool partial.
+    mgr = TickManager(tick=TickConfig(partial_tiers=()))
     _open(mgr)
-    # Breakeven fires first on the way up (+2.32R at 2029).
+    # At +2.32R the R-trail (2016.5) is tighter than the profit-lock
+    # (2007.5) — tightest wins.
     be = mgr.on_tick(101, 2029.0)
-    assert [a.reason for a in be] == ["breakeven"]
+    assert [a.reason for a in be] == ["trail"]
     mgr.apply(101, be[0])
     actions = mgr.on_tick(101, 2030.0)
     kinds = [a.kind for a in actions]
@@ -96,9 +116,10 @@ def test_failed_modify_is_retried_next_tick():
     mgr = TickManager()
     _open(mgr)
     actions = mgr.on_tick(101, 2012.5)
-    assert len(actions) == 1  # decided, NOT applied (executor failed)
+    assert len(actions) == 2  # decided, NOT applied (executor failed)
     actions2 = mgr.on_tick(101, 2013.0)
-    assert len(actions2) == 1 and actions2[0].reason == "breakeven"
+    assert [a.reason for a in actions2] == ["partial_tier_1",
+                                            "profit_lock"]
 
 
 def test_short_direction_mirror():
@@ -106,11 +127,13 @@ def test_short_direction_mirror():
     req = _request(-1, targets=(1970.0,))
     mgr.open(ticket=202, request=req, fill_price=2000.0, entry_bar=6)
     assert mgr.on_tick(202, 1990.0) == []  # -0.8R
-    actions = mgr.on_tick(202, 1987.5)  # -1.0R
-    assert len(actions) == 1 and actions[0].reason == "breakeven"
-    assert actions[0].level == pytest.approx(2000.0)
-    mgr.apply(202, actions[0])
-    actions = mgr.on_tick(202, 1970.0)  # -2.4R: partial + trail
+    actions = mgr.on_tick(202, 1987.5)  # -1.0R: tier-1 + profit-lock
+    assert [a.reason for a in actions] == ["partial_tier_1",
+                                           "profit_lock"]
+    assert actions[1].level == pytest.approx(1992.5)
+    for a in actions:
+        mgr.apply(202, a)
+    actions = mgr.on_tick(202, 1970.0)  # -2.4R: tier-1 partial + trail
     assert "partial" in [a.kind for a in actions]
     assert any(a.reason == "trail" for a in actions)
 
@@ -130,7 +153,9 @@ def test_adopted_position_gets_breakeven_and_trail_but_no_partial():
     mgr = TickManager()
     mgr.adopt(ticket=303, symbol="XAUUSD", direction=1, volume=1.0,
               entry_price=2000.0, sl=1987.5)
-    assert mgr.on_tick(303, 2012.5)[0].reason == "breakeven"
+    # Profit-lock wins over breakeven at +1.0R (ATR unknown, so the
+    # lock is the 0.5R leg only: 2000 + 0.5 * 12.5 = 2006.25).
+    assert mgr.on_tick(303, 2012.5)[0].reason == "profit_lock"
     # No partial even far past any pool — no target book.
     assert not [a for a in mgr.on_tick(303, 2100.0)
                 if a.kind == "partial"]

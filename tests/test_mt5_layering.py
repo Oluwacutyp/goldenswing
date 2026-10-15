@@ -86,7 +86,11 @@ def _runner(tmp_path, **cfg_kw):
         kill_switch_path=tmp_path / "mt5_KILL",
         fixed_lots=0.01,
         **cfg_kw)
-    feed = SimpleNamespace(account_state=lambda: {"equity": 10000.0})
+    feed = SimpleNamespace(
+        account_state=lambda: {"equity": 10000.0, "balance": 10000.0,
+                               "free_margin": 10000.0},
+        order_margin=lambda *, volume, price, direction:
+            float(volume) * 100.0 * float(price) / 500.0)
     return MT5Runner(cfg, feed=feed, executor=NettingFakeExecutor())
 
 
@@ -306,7 +310,8 @@ def _signal_path_runner(tmp_path, h1):
 
 def _stub_engine():
     class Stub:
-        def gate_live_signal(self, pb, sig, ctx, hierarchy_verdict=None):
+        def gate_live_signal(self, pb, sig, ctx, hierarchy_verdict=None,
+                             spread_px=None):
             return True, ""
 
         def score_live_signal(self, pb, sig, ctx, hierarchy_verdict=None):

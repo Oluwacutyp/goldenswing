@@ -55,6 +55,7 @@ class OrderRequest:
     comment: str = ""
     order_kind: str = "market"      # "market" | "limit" | "stop"
     order_price: float = 0.0        # pending price (limit/stop only)
+    is_scalp: bool = False          # scalp holding cap applies
 
 
 @dataclass

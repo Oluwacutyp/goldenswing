@@ -59,12 +59,22 @@ def test_warm_start_all_closed_bars_only():
     feed = _feed()
     feed.connect()
     frames = feed.warm_start_all()
-    assert set(frames) == {"D1", "H4", "H1", "M15", "M30", "M5"}
+    # Stack TFs + macro TFs (W1/MN1 feed alignment + strategies;
+    # they are NOT hierarchy legs).
+    assert set(frames) == {"D1", "H4", "H1", "M15", "M30", "M5",
+                           "W1", "MN1"}
     now = pd.Timestamp.now(tz="UTC")
     tf_minutes = {"D1": 1440, "H4": 240, "H1": 60, "M15": 15,
-                  "M30": 30, "M5": 5}
+                  "M30": 30, "M5": 5, "W1": 10080}
     for tf, frame in frames.items():
         assert len(frame) > 0
+        if tf == "MN1":
+            # Calendar-exact: the last MN1 bar opened strictly
+            # before this month (a 43200min duration check would
+            # fail for February bars).
+            last = frame.index[-1]
+            assert (last.year, last.month) < (now.year, now.month)
+            continue
         # Last bar's close must be <= now (forming bar dropped).
         last_close = frame.index[-1] + pd.Timedelta(
             minutes=tf_minutes[tf])

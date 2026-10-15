@@ -232,7 +232,12 @@ def test_executor_pending_orders_and_cancel():
 # ---------------------------------------------------------------- runner
 class FakeFeed:
     def account_state(self):
-        return {"equity": 10000.0, "balance": 10000.0}
+        return {"equity": 10000.0, "balance": 10000.0,
+                "free_margin": 10000.0}
+
+    def order_margin(self, *, volume, price, direction):
+        # Healthy account: margin is small vs free margin.
+        return float(volume) * 100.0 * float(price) / 500.0
 
 
 class FakeExecutor:
@@ -423,7 +428,10 @@ def test_no_second_pending_while_one_active(tmp_path):
     stats: dict = {}
     _place(runner, _sig(), _verdict(), stats, price=2030.0)
     assert len(runner._pending_orders) == 1
-    _place(runner, _sig(index=30), _verdict(), stats, price=2030.0)
+    # Different levels -> a different fingerprint (dedup must NOT be
+    # what refuses this); the one-position rule refuses it.
+    _place(runner, _sig(index=30, entry_ref=2006.0, invalidation=1991.0),
+           _verdict(), stats, price=2030.0)
     assert len(runner._pending_orders) == 1  # one-position rule
     assert "already holding/pending" in _journal(tmp_path)
 

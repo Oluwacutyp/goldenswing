@@ -283,7 +283,8 @@ def forecast_bonuses(signal_index: int, direction: int, table,
 
 
 def cost_gate_ok(signal, entry_price: float, cfg: ConfluenceConfig,
-                 playbook: str | None = None) -> tuple[bool, str]:
+                 playbook: str | None = None,
+                 spread_px: float | None = None) -> tuple[bool, str]:
     """Broker-cost entry filter — pine-faithful port of the GOD-CE cost
     gate (``godce/engine.py``, from GOD-CE-SLIM.pine §entries), lifted
     from the engine's fixed TP1 to any candidate's own targets.
@@ -309,7 +310,13 @@ def cost_gate_ok(signal, entry_price: float, cfg: ConfluenceConfig,
 
     ``playbook`` is only the fallback disambiguator; when omitted the
     fvg_midline sleeve is detected from ``signal.kind`` (``"choch_fvg"``
-    in the kind).  The gate NEVER raises: missing/non-finite entry
+    in the kind).  ``spread_px`` (live tick spread, price units)
+    overrides the ``cost_bps`` estimate: the spread IS the one-way
+    cost on a zero-commission account, and the two legs already
+    double it for the round trip.  A missing / non-positive spread
+    falls back to ``cost_bps``.
+
+    The gate NEVER raises: missing/non-finite entry
     price, missing invalidation, or ``risk <= 0`` all fail closed with
     a named reason.
     """
@@ -333,6 +340,15 @@ def cost_gate_ok(signal, entry_price: float, cfg: ConfluenceConfig,
         return False, f"no-direction: direction={d!r} is not +1/-1"
 
     cost_px = entry * cfg.cost_bps / 10000.0
+    cost_src = f"cost_bps={cfg.cost_bps:g}"
+    if spread_px is not None:
+        try:
+            spread_px = float(spread_px)
+        except (TypeError, ValueError):
+            spread_px = float("nan")
+        if math.isfinite(spread_px) and spread_px > 0:
+            cost_px = spread_px
+            cost_src = f"live-spread={spread_px:.2f}"
     risk = abs(entry - inv)
     if risk <= 0:
         return False, "risk<=0: entry sits exactly on the invalidation"
@@ -342,7 +358,7 @@ def cost_gate_ok(signal, entry_price: float, cfg: ConfluenceConfig,
     if risk < 2.0 * cost_px:
         return False, (
             f"risk-too-small: risk {risk:.2f} < 2×cost "
-            f"{2.0 * cost_px:.2f} (cost_bps={cfg.cost_bps:g})")
+            f"{2.0 * cost_px:.2f} ({cost_src})")
 
     # Planned TP1 in R, from the signal's own liquidity pools ahead.
     targets = getattr(signal, "targets", None) or []
@@ -420,7 +436,8 @@ class ConfluenceEngine:
     # --------------------------------------------------- live signals
     def gate_live_signal(self, pb: Playbook, signal,
                          ctx: EngineContext,
-                         hierarchy_verdict: dict | None = None
+                         hierarchy_verdict: dict | None = None,
+                         spread_px: float | None = None
                          ) -> tuple[bool, str]:
         """The context gates for a live (un-simulated) signal — the
         same gates the batch path applies, in the same order, plus
@@ -434,7 +451,12 @@ class ConfluenceEngine:
            the gate is skipped, not faked.
         1. session scope (first-class; never fires outside it),
         2. the playbook's required-context tripwire,
-        3. the measured hunting-ground exclusions.
+        3. the measured hunting-ground exclusions,
+        4. the broker-cost gate (``cost_gate_ok``): the planned
+           stop must clear twice the cost and TP1 net of cost must
+           clear the floor.  ``spread_px`` (live tick spread) is
+           the cost when available; without it the ``cost_bps``
+           estimate is used (paper loop).
         """
         if hierarchy_verdict is not None:
             from .live.hierarchy import verdict_permits
@@ -452,6 +474,11 @@ class ConfluenceEngine:
             pb, signal, ctx)
         if not ok:
             return False, reason
+        ok, reason = cost_gate_ok(
+            signal, getattr(signal, "entry_ref", None),
+            self.cfg, playbook=pb.name, spread_px=spread_px)
+        if not ok:
+            return False, f"cost_gate: {reason}"
         return True, ""
 
     def score_live_signal(self, pb: Playbook, signal,
@@ -482,6 +509,13 @@ class ConfluenceEngine:
             if vb != 0.0:
                 bonus += vb
                 notes.append(f"{vb:+g} volume confirmation ({vnote})")
+            # DXY correlation (Ghost Sentinel bands, bounded ±0.5):
+            # regime health, never a gate.  None = DXY unavailable.
+            from .live.dxy import dxy_bonus
+            db, dnote = dxy_bonus(hierarchy_verdict.get("dxy_corr"))
+            if db != 0.0:
+                bonus += db
+                notes.append(f"{db:+g} DXY correlation ({dnote})")
         return signal.score + bonus + mb + tb + fb, notes + mnotes + tnotes + fnotes
 
     @staticmethod

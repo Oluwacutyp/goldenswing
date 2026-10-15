@@ -51,10 +51,13 @@ on peers.
 """
 from __future__ import annotations
 
+import json
 import os
+import math
 import secrets
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -63,15 +66,25 @@ from ..alerts.commands import CommandContext, is_owner_callback
 from ..backtest.data import REPO_ROOT
 from ..charts.engine import render_mt5_signal
 from ..confluence import ConfluenceEngine
+from ..entry.validator import confirm_at_poi
 from ..features.engine import read_and_featurize
 from ..feed.tick_log import TickLogger
+from ..live.dxy import DXYTracker
+from ..live.health import HealthMonitor
+from ..live.urgency import urgency_score
+from ..live.volume_profile import volume_profile
 from ..live.hierarchy import (LEG_ORDER, TimeframeStack, TF_MINUTES,
                               check_live_entry, check_live_trigger,
                               evaluate_hierarchy, live_setup,
                               qm_annotation)
+from ..live.macrotrend import (MacroTrendResult, compute_macrotrend)
 from ..live.manipulation import chase_blocked
+from ..live.news import NewsCalendar
+from ..live.reasoning import build_reasoning, build_study
+from ..live.regime import classify_regime
 from ..live.volume import volume_features
-from ..reader.session_timeframes import compose as _compose_session
+from ..reader.session_timeframes import (
+    compose as _compose_session, session_of)
 from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
                          InversionPlaybook, JudasSwingPlaybook,
                          KillzoneOpenPlaybook, OrderBlockPlaybook,
@@ -79,17 +92,73 @@ from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
                          SweepReversalPlaybook, TrendlineRetestPlaybook,
                          TurtleSoupPlaybook, VReversalPlaybook)
 from ..playbooks.base import EngineContext
+from .entry_gates import (
+    DEFAULT_SESSION_MULTIPLIERS, EntryGate, EntryGateConfig,
+    is_friday_close, session_multiplier, signal_fingerprint)
 from .executor import OrderRequest, PendingOrder
 from .learning import TradeJournal
-from .mt5 import MT5Executor, select_order_type
+from .mt5 import MT5Executor, build_ladder, select_order_type
+from .signal_log import log_signal
 from .mt5_commands import (mt5_confirm_keyboard, mt5_control_keyboard,
                            mt5_router, parse_mt5_callback)
 from .mt5_config import LiveConfigStore
 from .risk import RiskConfig, RiskGuards, size_position
-from .tick_manager import TickAction, TickManager
+from .tick_manager import (DEFAULT_TIME_EXIT_BARS, TickAction, TickConfig,
+                          TickManager)
 from ..feed.mt5 import TRADE_MODE_REAL, MT5Feed, TickPump
 
 DATA_DIR = REPO_ROOT / "data"
+
+
+def _session_multipliers_from_env() -> dict:
+    """GS_SESSION_MULTIPLIERS is a JSON object {session: mult}; bad
+    JSON or a non-object fails closed to the defaults (never a
+    half-applied map)."""
+    raw = os.environ.get("GS_SESSION_MULTIPLIERS", "")
+    if not raw:
+        return dict(DEFAULT_SESSION_MULTIPLIERS)
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return dict(DEFAULT_SESSION_MULTIPLIERS)
+        out = dict(DEFAULT_SESSION_MULTIPLIERS)
+        for key, value in parsed.items():
+            out[str(key)] = float(value)
+        return out
+    except (ValueError, TypeError):
+        return dict(DEFAULT_SESSION_MULTIPLIERS)
+
+
+def _time_exit_bars_from_env() -> dict | None:
+    """GS_TIME_EXIT_BARS is a JSON object {structure: bars}; bad JSON
+    or a non-object fails closed to the engine-derived default map
+    (DEFAULT_TIME_EXIT_BARS).  A valid env JSON replaces the whole
+    map."""
+    raw = os.environ.get("GS_TIME_EXIT_BARS", "")
+    if not raw:
+        return dict(DEFAULT_TIME_EXIT_BARS)
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return dict(DEFAULT_TIME_EXIT_BARS)
+        return {str(key): int(value) for key, value in parsed.items()}
+    except (ValueError, TypeError):
+        return dict(DEFAULT_TIME_EXIT_BARS)
+
+
+def _tick_now_utc(last_tick: dict | None) -> datetime | None:
+    """The tick's own timestamp as an aware UTC datetime (the engine's
+    clock is the tick clock).  None when the tick carries no usable
+    time — callers fall back to the wall clock."""
+    try:
+        ts = pd.Timestamp((last_tick or {}).get("time"))
+        if ts is None or pd.isna(ts):
+            return None
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert("UTC").to_pydatetime()
+    except Exception:
+        return None
 
 
 @dataclass
@@ -142,6 +211,98 @@ class MT5RunnerConfig:
     manipulation_filter: bool = True   # liquidity-test entry filter
     disabled_playbooks: tuple = ()      # playbook names switched off
     paused: bool = False                # pause new signals, not management
+    # Margin checks (owner's-bot floor): every order must clear the
+    # broker-computed margin + a buffer, and a Golden Swing base
+    # order / any layer must leave the post-order free margin at or
+    # above the shield (free/equity).  Config-file / env only —
+    # deliberately NOT /set-editable.
+    margin_buffer_pct: float = 5.0
+    margin_shield_pct: float = 40.0
+    # Alignment is a SIZING + CONFIRMATION layer, never a hierarchy
+    # gate leg.  Sizing: Golden Swing (D1/W1/MN1 agree) multiplies
+    # base-order size by 1.5; D1/W1 conflict multiplies by 0.5.
+    # Confirmation: a Golden Swing base order WAITS for the owner's
+    # Confirm tap (REJECT cancels; timeout fires or cancels per
+    # golden_swing_confirm_timeout_action).  Layers are NOT gated
+    # (they scale via the layer risk budget).  Config-file / env
+    # only — deliberately NOT /set-editable.
+    golden_swing_sizing_enabled: bool = True
+    golden_swing_confirm_enabled: bool = True
+    golden_swing_confirm_timeout_sec: float = 300.0
+    # Timeout action for an unanswered Golden Swing confirm:
+    # "fire" places the staged order (unattended trading continues),
+    # "cancel" drops it.  Default "fire": a missed tap must not
+    # silently kill the engine's trading while the owner sleeps.
+    golden_swing_confirm_timeout_action: str = "fire"
+    # News pause + news-adaptive sizing (owner's-bot floor): no NEW
+    # entries inside a high-impact window; size blends down in the
+    # 90-min post-news cooldown.  Management is never paused.
+    # Config-file / env only — deliberately NOT /set-editable.
+    news_pause_enabled: bool = True
+    # Entry gates (owner's-bot floor): per-day / per-hour trade caps,
+    # cooldown after a close, fingerprint dedup.  In-memory per
+    # process run (a restart resets them — see entry_gates.py).
+    # Config-file / env only — deliberately NOT /set-editable.
+    entry_gates_enabled: bool = True
+    max_daily_trades: int = 0   # 0 = unlimited (owner's default)
+    max_hourly_trades: int = 0  # 0 = unlimited (owner's default)
+    loss_cooldown_sec: float = 300.0  # owner's 300s
+    win_cooldown_sec: float = 0.0
+    fingerprint_ttl_sec: float = 3600.0
+    # Session sizing + Friday close (owner's-bot floor): base-order
+    # size multiplied by the session multiplier (DST-aware sessions);
+    # no new base entries Friday at/after friday_close_hour UTC.
+    # friday_close_action: "hold" (positions ride the weekend, the
+    # broker SL guards them) or "close" (all positions + pendings
+    # closed at the Friday hour).  Config-file / env only.
+    session_multipliers: dict = field(
+        default_factory=lambda: dict(DEFAULT_SESSION_MULTIPLIERS))
+    friday_close_hour: int = 20  # owner's friday_close_hour
+    friday_close_action: str = "hold"
+    # Scalp holding cap (owner's-bot floor): positions whose playbook
+    # is in scalp_playbooks close after scalp_cap_minutes of
+    # wall-clock hold.  Default empty — DELIBERATELY, from a
+    # playbook-by-playbook audit: every live playbook is H1-evaluated
+    # with 1.5R structural targets and 48–72-bar horizons (intraday /
+    # swing, not scalps — a 15-min cap would cut them before their
+    # structure can resolve).  qm_m5 is the only M5-frame playbook
+    # but it is shadow-only and never opens a position, so tagging it
+    # would be inert config implying a behavior that cannot happen.
+    # No live playbook qualifies as a scalp.  Config-file / env only.
+    scalp_playbooks: tuple = ()
+    scalp_cap_minutes: float = 15.0  # owner's scalping_max_holding
+    # DXY correlation (owner's-bot floor): the XAUUSD vs DXYm
+    # correlation is confluence context (Ghost Sentinel bands,
+    # bounded ±0.5) — never a gate leg.  A dead DXY feed degrades
+    # to unavailable, never fails the gold path.  Config-file /
+    # env only — deliberately NOT /set-editable.
+    dxy_enabled: bool = True
+    dxy_symbol: str = "DXYm"  # owner's bot correlation_symbol
+    # Pending-order score decay (owner's-bot PendingOrderTracker):    # on each H1 close the originating playbook is re-evaluated; a
+    # pending whose setup no longer emits a same-direction signal at
+    # this level scoring at/above the decay floor accrues a decay
+    # bar, and at score_decay_bars it is cancelled.  Floor None =
+    # min_score (the floor that would have blocked it at birth).
+    # Config-file / env only — deliberately NOT /set-editable.
+    score_decay_enabled: bool = True
+    score_decay_floor: float | None = None
+    score_decay_bars: int = 2
+    # Multi-zone limit ladder (owner's-bot floor): a LIMIT order's
+    # size staggers across rungs from the playbook level to the
+    # adverse zone edge; only rung 0 is placed, the next rung
+    # advances on expiry.  Default OFF: it changes fill behavior
+    # (smaller first rung), so it is opt-in.  Config-file / env
+    # only — deliberately NOT /set-editable.
+    ladder_enabled: bool = False
+    ladder_rungs: int = 3
+    ladder_split: tuple = (0.5, 0.3, 0.2)
+    # structure.  Default DEFAULT_TIME_EXIT_BARS (engine-derived:
+    # 72-bar swing horizon for clean_trend/unclear, shorter for
+    # faster-resolving structures — see tick_manager).  Env JSON
+    # (GS_TIME_EXIT_BARS) replaces the whole map.  Config-file /
+    # env only.
+    time_exit_bars: dict | None = field(
+        default_factory=lambda: dict(DEFAULT_TIME_EXIT_BARS))
 
     @classmethod
     def from_env(cls, **overrides) -> "MT5RunnerConfig":
@@ -156,10 +317,73 @@ class MT5RunnerConfig:
                 os.environ.get("GS_MT5_POLL_INTERVAL", "30.0")),
             pending_expiry_bars=int(
                 os.environ.get("GS_MT5_PENDING_EXPIRY_BARS", "4")),
+            golden_swing_sizing_enabled=os.environ.get(
+                "GS_GOLDEN_SWING_SIZING", "1") != "0",
+            golden_swing_confirm_enabled=os.environ.get(
+                "GS_GOLDEN_SWING_CONFIRM", "1") != "0",
+            golden_swing_confirm_timeout_sec=float(os.environ.get(
+                "GS_GOLDEN_SWING_CONFIRM_TIMEOUT_SEC", "300")),
+            golden_swing_confirm_timeout_action=os.environ.get(
+                "GS_GOLDEN_SWING_CONFIRM_TIMEOUT_ACTION", "fire"),
+            news_pause_enabled=os.environ.get(
+                "GS_NEWS_PAUSE", "1") != "0",
+            entry_gates_enabled=os.environ.get(
+                "GS_ENTRY_GATES", "1") != "0",
+            max_daily_trades=int(os.environ.get(
+                "GS_MAX_DAILY_TRADES", "0")),
+            max_hourly_trades=int(os.environ.get(
+                "GS_MAX_HOURLY_TRADES", "0")),
+            loss_cooldown_sec=float(os.environ.get(
+                "GS_LOSS_COOLDOWN_SEC", "300")),
+            win_cooldown_sec=float(os.environ.get(
+                "GS_WIN_COOLDOWN_SEC", "0")),
+            fingerprint_ttl_sec=float(os.environ.get(
+                "GS_FINGERPRINT_TTL_SEC", "3600")),
+            session_multipliers=_session_multipliers_from_env(),
+            friday_close_hour=int(os.environ.get(
+                "GS_FRIDAY_CLOSE_HOUR", "20")),
+            friday_close_action=os.environ.get(
+                "GS_FRIDAY_CLOSE_ACTION", "hold"),
+            scalp_playbooks=tuple(
+                p.strip() for p in os.environ.get(
+                    "GS_SCALP_PLAYBOOKS", "").split(",") if p.strip()),
+            scalp_cap_minutes=float(os.environ.get(
+                "GS_SCALP_CAP_MINUTES", "15")),
+            time_exit_bars=_time_exit_bars_from_env(),
+            margin_buffer_pct=float(os.environ.get(
+                "GS_MT5_MARGIN_BUFFER_PCT", "5.0")),
+            margin_shield_pct=float(os.environ.get(
+                "GS_MT5_MARGIN_SHIELD_PCT", "40.0")),
+            dxy_enabled=os.environ.get("GS_DXY_ENABLED", "1") != "0",
+            dxy_symbol=os.environ.get("GS_DXY_SYMBOL", "DXYm"),
+            score_decay_enabled=os.environ.get(
+                "GS_SCORE_DECAY_ENABLED", "1") != "0",
+            score_decay_floor=(
+                float(os.environ["GS_SCORE_DECAY_FLOOR"])
+                if os.environ.get("GS_SCORE_DECAY_FLOOR") else None),
+            score_decay_bars=int(os.environ.get(
+                "GS_SCORE_DECAY_BARS", "2")),
+            ladder_enabled=os.environ.get(
+                "GS_LADDER_ENABLED", "0") != "0",
+            ladder_rungs=int(os.environ.get("GS_LADDER_RUNGS", "3")),
+            ladder_split=tuple(
+                float(x) for x in os.environ.get(
+                    "GS_LADDER_SPLIT", "0.5,0.3,0.2").split(",")
+                if x.strip()),
         )
         for key, value in overrides.items():
             setattr(cfg, key, value)
         return cfg
+
+    def __post_init__(self) -> None:
+        # A bad timeout action (hand-edited config) must not
+        # silently change order behavior: coerce to "fire".
+        if self.golden_swing_confirm_timeout_action not in ("fire",
+                                                             "cancel"):
+            self.golden_swing_confirm_timeout_action = "fire"
+        # Same for the Friday-close action: unknown -> "hold".
+        if self.friday_close_action not in ("hold", "close"):
+            self.friday_close_action = "hold"
 
 
 @dataclass
@@ -192,6 +416,19 @@ class PendingOrderState:
     sig: object = None              # playbook signal (fill chart/alert)
     verdict: dict | None = None     # hierarchy verdict (fill chart)
     is_layer: bool = False          # pending fills onto the held position
+    # Score-decay (owner's-bot PendingOrderTracker): the signal score
+    # at placement + consecutive H1 closes on which a re-evaluation
+    # found no same-direction signal at this level scoring at/above
+    # the decay floor.  At score_decay_bars the pending is cancelled
+    # (the setup died while the order rested — a real trader does
+    # not leave a limit at a dead setup).
+    placed_score: float = 0.0
+    decay_bars: int = 0
+    # Limit ladder: remaining rungs (levels + lots) after the live
+    # rung.  On expiry the next rung advances; on fill the rest are
+    # discarded (further entries go through layers, not the ladder).
+    ladder_levels: list = field(default_factory=list)
+    ladder_lots: list = field(default_factory=list)
 
 
 class MT5Runner:
@@ -201,15 +438,42 @@ class MT5Runner:
                  feed: MT5Feed | None = None,
                  executor: MT5Executor | None = None,
                  senders: list | None = None,
-                 tick_manager: TickManager | None = None) -> None:
+                 tick_manager: TickManager | None = None,
+                 news_calendar: NewsCalendar | None = None,
+                 entry_gate: EntryGate | None = None) -> None:
         self.cfg = config or MT5RunnerConfig()
         self.feed = feed
         self.executor = executor
         self.senders = senders or []
         self.journal = TradeJournal(self.cfg.journal_path)
-        self.guards = RiskGuards(self.cfg.risk_state_path, RiskConfig(),
-                                 kill_switch_path=self.cfg.kill_switch_path)
-        self.tick_manager = tick_manager or TickManager()
+        # RiskGuards ENFORCED on the live path (previously constructed
+        # but never consulted here).  max_total_risk_pct=0 disables
+        # the money-at-stops exposure cap — on the Exness MT5 loop
+        # margin + equity stop-out are the real constraint, not R
+        # (same documented reason the paper loop sets it to 0 in
+        # risk.py).  The margin check in _place_live_order is the
+        # binding pre-trade constraint; the guards supply the
+        # daily/weekly/drawdown/consecutive-loss halts, the max
+        # position cap and the unstopped-position refusal.
+        self.guards = RiskGuards(
+            self.cfg.risk_state_path,
+            RiskConfig(max_total_risk_pct=0.0),
+            kill_switch_path=self.cfg.kill_switch_path)
+        self.tick_manager = tick_manager or TickManager(
+            tick=TickConfig(
+                scalp_cap_minutes=float(self.cfg.scalp_cap_minutes),
+                time_exit_bars=self.cfg.time_exit_bars))
+        # News calendar: the engine's single news source (fetch on
+        # the entry path only — never per tick, never blocking).
+        self.news = news_calendar or NewsCalendar(
+            cache_path=DATA_DIR / "news_cache.json")
+        # Entry gates: caps / cooldowns / dedup for new base entries.
+        self.entry_gate = entry_gate or EntryGate(EntryGateConfig(
+            max_daily_trades=int(self.cfg.max_daily_trades),
+            max_hourly_trades=int(self.cfg.max_hourly_trades),
+            loss_cooldown_sec=float(self.cfg.loss_cooldown_sec),
+            win_cooldown_sec=float(self.cfg.win_cooldown_sec),
+            fingerprint_ttl_sec=float(self.cfg.fingerprint_ttl_sec)))
         self._playbooks: list | None = None
         self._engine: ConfluenceEngine | None = None
         self._stack: TimeframeStack | None = None
@@ -236,6 +500,8 @@ class MT5Runner:
         self._last_tick: dict | None = None
         # UTC date of the last tick seen (rollover recap clock).
         self._last_tick_date = None
+        # UTC date the Friday-close action last fired (once per day).
+        self._friday_close_done_date = None
         self._stopped = False
         # Startup ping: exactly one Telegram "engine started" message
         # per process start (see _send_startup_ping).  Guarded so a
@@ -263,6 +529,29 @@ class MT5Runner:
         self._manipulation_blocked: int = 0
         # Pending Confirm taps: token -> {"action", "arg"}.
         self._confirm_tokens: dict[str, dict] = {}
+        # MacroTrend alignment (D1/W1/MN1): recomputed at warm start
+        # and whenever a D1/W1/MN1 bar closes.  Sizing + Golden
+        # Swing confirmation read this — never a hierarchy leg.
+        self._alignment: MacroTrendResult = MacroTrendResult()
+        # DXY correlation (owner's-bot floor): refreshed on H1
+        # closes; confluence context only, never a gate.  A dead
+        # DXY feed degrades to unavailable — the gold path never
+        # depends on it.
+        self._dxy = DXYTracker(
+            self.feed, symbol=self.cfg.dxy_symbol,
+            enabled=self.cfg.dxy_enabled)
+        self._dxy_last_available: bool | None = None
+        # Execution health (tick freshness / order latency /
+        # slippage): observed, never gating.  Breach journaling is
+        # new-breach-only (a stuck breach gets one note).
+        self._health = HealthMonitor()
+        self._health_last_breaches: set[str] = set()
+        # Staged Golden Swing orders awaiting a Confirm tap:
+        # order key -> {playbook, sig, verdict, entry_bar}.  The
+        # token in _confirm_tokens (action "place_order") is the
+        # single-use handshake; this dict is the payload.  Both are
+        # popped together on confirm / reject / timeout.
+        self._order_confirms: dict[str, dict] = {}
         # Persisted live config (data/mt5_config.json): when the file
         # exists it wins over the constructed defaults — /set changes
         # survive a restart because the next process loads this file.
@@ -326,6 +615,16 @@ class MT5Runner:
             leg = "min_score"
         elif reason.startswith("playbook_error"):
             leg = "playbook_error"
+        elif reason.startswith("risk_guard"):
+            leg = "risk_guard"
+        elif reason.startswith("margin_shield"):
+            leg = "margin_shield"
+        elif reason.startswith("margin"):
+            leg = "margin"
+        elif reason.startswith("market_closed"):
+            leg = "market_closed"
+        elif reason.startswith("cost_gate"):
+            leg = "cost_gate"
         else:
             leg = "other"
         self._blocked_leg_counts[leg] = \
@@ -398,6 +697,9 @@ class MT5Runner:
         # close is NOT the signal clock anymore — this setup is what
         # the tick clock checks every tick (see _evaluate_live_tick).
         self._live_setup = live_setup(self._stack)
+        # MacroTrend alignment from the warm-start frames (D1/W1/MN1
+        # closed bars).  Sizing + Golden Swing confirmation read this.
+        self._refresh_alignment()
         self.feed = feed
         self.executor = executor
         self.journal.log_note(
@@ -405,7 +707,8 @@ class MT5Runner:
             f"(symbol={self.cfg.symbol}) "
             f"({', '.join(f'{tf}:{len(self._stack.frames.get(tf, []))}' for tf in self._stack.frames)}) "
             f"account login={acct.get('login')} equity={acct.get('equity')} "
-            f"trade_mode={acct.get('trade_mode')}"
+            f"trade_mode={acct.get('trade_mode')} "
+            f"macro: {self._alignment.describe()}"
             + (f" connect: {feed_msg}" if feed_msg != "MT5 connected" else ""))
 
         # Fast-forward playbook streaming state over history; past
@@ -470,9 +773,14 @@ class MT5Runner:
             stats["ticks"] += 1
             self._tick_count += 1
             self._last_tick = tick
+            self._health.note_tick(tick.get("time"))
             # Day rollover -> the honest recap for the day/week that
             # just ended (wins AND losses).  Never breaks the loop.
             self._maybe_send_rollover_recap(tick)
+            # Friday close (action "close" only): existing positions
+            # + pendings are closed at the Friday hour, once per day.
+            # Default action "hold" is a no-op here.
+            self._maybe_friday_close(tick, stats)
             # Tick CSV: exactly as seen, never breaks the loop.
             if self._tick_logger is not None:
                 try:
@@ -493,7 +801,11 @@ class MT5Runner:
             # Live evaluation clock: trigger on tick-cross, entry on
             # entry-TF closes.  H1 closes never gate evaluation.
             self._evaluate_live_tick(tick, stats)
-            self._poll_telegram_commands()
+            # Golden Swing confirm timeouts are wall-clock: sweep
+            # every tick (a tap processed after timeout is late —
+            # the token is already gone, "confirmation expired").
+            self._sweep_order_confirms(stats)
+            self._poll_telegram_commands(stats)
         return _handle
 
     def _manage_tick(self, price: float, stats: dict) -> None:
@@ -523,6 +835,11 @@ class MT5Runner:
                                 f"MT5 BREAKEVEN {pb} ticket {ticket}: "
                                 f"SL -> entry {action.level:.2f} — "
                                 f"risk off, trade is now free")
+                        elif action.reason == "profit_lock":
+                            self._send_alert(
+                                f"MT5 PROFIT LOCK {pb} ticket {ticket}: "
+                                f"SL -> {action.level:.2f} — profit "
+                                f"locked in, trade cannot lose")
                     else:
                         self.journal.log_note(
                             f"mt5 tick: ticket {ticket} SL move FAILED "
@@ -571,6 +888,39 @@ class MT5Runner:
                                                stats)
                     else:
                         self._record_close(ticket, price, "stop", stats)
+                elif action.kind == "panic":
+                    # Panic-candle emergency close: adverse excursion
+                    # past 3x ATR with severity > 1.5 — close the
+                    # whole position NOW at market (the broker SL is
+                    # too far to help).
+                    still = self.executor.positions()
+                    if any(p.ticket == ticket for p in still):
+                        res = self.executor.close_position(ticket)
+                        if res.ok:
+                            self._record_close(ticket, price, "panic",
+                                               stats)
+                            self._send_alert(
+                                f"MT5 PANIC CLOSE {pb} ticket {ticket}: "
+                                f"adverse excursion past panic "
+                                f"threshold — closed @ {price:.2f}")
+                    else:
+                        self._record_close(ticket, price, "panic", stats)
+                elif action.kind == "scalp_cap":
+                    # Scalp holding cap: wall-clock hold past the cap
+                    # — close the whole position NOW.
+                    still = self.executor.positions()
+                    if any(p.ticket == ticket for p in still):
+                        res = self.executor.close_position(ticket)
+                        if res.ok:
+                            self._record_close(ticket, price,
+                                               "scalp_cap", stats)
+                            self._send_alert(
+                                f"MT5 SCALP CAP {pb} ticket {ticket}: "
+                                f"held past the scalp cap — closed "
+                                f"@ {price:.2f}")
+                    else:
+                        self._record_close(ticket, price, "scalp_cap",
+                                           stats)
 
     def _reconcile(self, price: float, stats: dict) -> None:
         """MT5 positions_get is the truth: drop broker-closed, adopt ours."""
@@ -711,8 +1061,15 @@ class MT5Runner:
         pnl_money = 0.0
         try:
             spec = self.executor.symbol_spec(self.cfg.symbol)
-            pnl_money = d * spec.money_for_move(
-                abs(price - pos.entry_price), pos.volume)
+            # money_for_move abs()es the distance, so sign it by
+            # hand: a long below entry (or a short above) is a LOSS.
+            # Booking the unsigned value would count every losing
+            # long as a win — in the journal, the recaps, and the
+            # RiskGuards outcome feed.
+            pnl_money = spec.money_for_move(
+                price - pos.entry_price, pos.volume)
+            if d * (price - pos.entry_price) < 0:
+                pnl_money = -pnl_money
         except Exception:
             pass
         # Classify BEFORE remove(): the classifier reads the live
@@ -734,8 +1091,65 @@ class MT5Runner:
             f"{pos.volume} lots entry {pos.entry_price:.2f} -> exit "
             f"{price:.2f} — {display} {pnl_r:+.2f}R "
             f"(ticket {ticket})")
+        # Feed the closed trade's outcome to RiskGuards: the
+        # daily/weekly/drawdown/consecutive-loss halts only work if
+        # outcomes are booked.  Never breaks the close path.
+        # (Partial closes are not separately booked — the full
+        # close books the remainder volume's P&L, matching the
+        # journal's close record.)
+        try:
+            balance = float(self.feed.account_state().get("balance", 0.0))
+            if balance > 0:
+                self.guards.record_outcome(float(pnl_money), balance)
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: risk outcome not booked for ticket {ticket}: "
+                f"{exc}")
+        # Feed the close to the entry gates: the loss/win cooldown
+        # starts at the close.  Never breaks the close path.
+        try:
+            self.entry_gate.record_close(time.time(), pnl_r > 0)
+        except Exception:
+            pass
         self.tick_manager.remove(ticket)
         stats["reconciled_closed"] += 1
+
+    def _maybe_friday_close(self, tick: dict, stats: dict) -> None:
+        """Friday-close action "close": at/after the Friday hour, close
+        every open position + cancel every pending order, once per
+        UTC date.  Action "hold" (default) never reaches here.
+        Never breaks the tick loop."""
+        if self.cfg.friday_close_action != "close":
+            return
+        try:
+            now = _tick_now_utc(tick)
+            if now is None:
+                return
+            day = now.date()
+            if day == self._friday_close_done_date:
+                return
+            if not is_friday_close(now, self.cfg.friday_close_hour):
+                return
+            self._friday_close_done_date = day
+            price = float(tick.get("mid") or 0.0)
+            for ticket in list(self.tick_manager.tickets()):
+                try:
+                    res = self.executor.close_position(ticket)
+                    if res.ok:
+                        self._record_close(ticket, price,
+                                           "friday_close", stats)
+                except Exception as exc:
+                    self.journal.log_note(
+                        f"mt5 friday close: ticket {ticket} failed: "
+                        f"{exc}")
+            for ticket in list(self._pending_orders):
+                self._cancel_pending(ticket, "friday_close", stats)
+            self.journal.log_note(
+                "mt5 friday close: positions + pendings closed for "
+                "the weekend")
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5 friday close failed (loop continues): {exc}")
 
     def _maybe_send_rollover_recap(self, tick: dict) -> None:
         """UTC day rollover -> Telegram recap(s) for what just ended.
@@ -838,6 +1252,16 @@ class MT5Runner:
                     self._stack.frames.get("D1"), stats)
             if tf == "H1":
                 h1_accepted += accepted
+        # MacroTrend alignment refreshes ONLY on D1/W1/MN1 closes
+        # (EMA200 bias moves only when a macro bar closes).  It never
+        # refreshes hierarchy legs — alignment is sizing +
+        # confirmation, never a gate leg.
+        if any(tf in ("D1", "W1", "MN1") for tf in appended):
+            self._refresh_alignment()
+        # DXY correlation refreshes on H1 closes (its window is H1
+        # bars).  Confluence context only — never a hierarchy leg.
+        if "H1" in appended:
+            self._refresh_dxy()
         if any(tf in ("D1", "H4", "H1") for tf in appended):
             self._live_setup = live_setup(self._stack)
         # Phase 3: the pending entry confirms on entry-TF closes
@@ -855,6 +1279,62 @@ class MT5Runner:
         if any(tf in ("D1", "H4") for tf in appended):
             self._check_pending_bias(stats)
 
+    # ------------------------------------------- MacroTrend alignment
+    def _refresh_alignment(self) -> None:
+        """Recompute D1/W1/MN1 alignment from the stack's closed bars.
+
+        Journals only when the alignment label changes (a macro-bar
+        close that flips bias) or at warm start — not on every tick.
+        Alignment is sizing + confirmation only; it never touches
+        hierarchy legs.
+        """
+        if self._stack is None:
+            return
+        new = compute_macrotrend(self._stack.frames)
+        old = self._alignment
+        self._alignment = new
+        if new.alignment_label != old.alignment_label \
+                or new.conflict != old.conflict:
+            self.journal.log_note(
+                f"mt5: macro alignment -> {new.describe()}")
+
+    def _journal_new_breaches(self) -> None:
+        """Journal health breaches that were not breaching before —
+        a stuck breach gets one note, not one per order."""
+        current = self._health.breaches()
+        new = current - self._health_last_breaches
+        self._health_last_breaches = current
+        for key in sorted(new):
+            self.journal.log_note(
+                f"mt5: health breach: {key} — {self._health.describe()}")
+
+    def health_line(self) -> str:
+        """One-line execution health for /status (see mt5_commands)."""
+        return self._health.describe()
+
+    def _refresh_dxy(self) -> None:
+        """Recompute XAUUSD/DXY correlation from the stack's H1 bars.
+
+        Journals only when availability flips (a DXY outage is
+        worth one note, not one per H1 close).  The correlation is
+        confluence context — it never touches hierarchy legs.
+        """
+        if self._stack is None:
+            return
+        state = self._dxy.refresh(self._stack.frames.get("H1"))
+        if self._dxy_last_available is None \
+                or state.available != self._dxy_last_available:
+            self.journal.log_note(f"mt5: DXY -> {state.describe()}")
+        self._dxy_last_available = state.available
+
+    def dxy_line(self) -> str:
+        """One-line DXY state for /status (see mt5_commands)."""
+        return self._dxy.state.describe()
+
+    def alignment_line(self) -> str:
+        """One-line alignment for /status (see mt5_commands)."""
+        return f"macro alignment: {self._alignment.describe()}"
+
     # ------------------------------------------- live evaluation clock
     # The H1 close is NOT the signal clock.  The trigger fires when
     # the tick crosses the trigger level; the entry leg evaluates on
@@ -862,6 +1342,86 @@ class MT5Runner:
     # hierarchy legs and gate formulas are unchanged (see
     # live/hierarchy.py::live_setup / check_live_trigger /
     # check_live_entry) — only the EVALUATION CLOCK changed.
+
+    def _check_pending_score_decay(self, stats: dict) -> None:
+        """Score-decay cancellation (owner's-bot PendingOrderTracker):
+        on each H1 close, re-evaluate the originating playbook; a
+        pending whose setup no longer emits a same-direction signal
+        at this level scoring at/above the decay floor accrues a
+        decay bar, and at ``score_decay_bars`` it is cancelled.
+
+        A re-evaluation crash never cancels: the pending is left
+        alone and the failure is journalled (fail-open — decay is
+        an optimisation, not a safety rule; invalidation/expiry/
+        bias-flip still guard a truly dead setup).
+        """
+        if not self.cfg.score_decay_enabled \
+                or not self._pending_orders \
+                or self._stack is None:
+            return
+        h1 = self._stack.frames.get("H1")
+        if h1 is None or len(h1) == 0:
+            return
+        floor = self.cfg.score_decay_floor \
+            if self.cfg.score_decay_floor is not None \
+            else self.cfg.min_score
+        try:
+            states = read_and_featurize(h1, None)
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: score-decay check skipped (featurize failed): "
+                f"{exc}")
+            return
+        t = len(h1) - 1
+        playbooks = {pb.name: pb for pb in self._get_playbooks()}
+        for ticket, state in list(self._pending_orders.items()):
+            try:
+                pb = playbooks.get(state.playbook)
+                if pb is None:
+                    # Playbook unknown: the setup cannot be
+                    # re-confirmed — count it as decayed.
+                    current = None
+                else:
+                    current = None
+                    for sig in pb.live_signal(states, t, h1) or []:
+                        if int(sig.direction) != state.direction:
+                            continue
+                        atr = float(getattr(sig, "atr", 0.0) or 0.0)
+                        tol = 0.5 * atr if atr > 0 else 0.0
+                        if abs(float(sig.entry_ref) - state.level) \
+                                <= max(tol, 1e-9):
+                            current = float(sig.score)
+                            break
+                if current is not None and current >= floor:
+                    if state.decay_bars:
+                        self.journal.log_note(
+                            f"mt5: pending ticket {ticket} score "
+                            f"recovered ({current:.0f} >= floor "
+                            f"{floor:.0f}) — decay reset")
+                    state.decay_bars = 0
+                    continue
+                state.decay_bars += 1
+                if state.decay_bars >= self.cfg.score_decay_bars:
+                    self._cancel_pending(
+                        ticket,
+                        f"score_decay: setup re-scored "
+                        f"{current if current is not None else 'gone'} "
+                        f"vs floor {floor:.0f} for "
+                        f"{state.decay_bars} H1 closes "
+                        f"(placed score {state.placed_score:.0f})",
+                        stats)
+                else:
+                    self.journal.log_note(
+                        f"mt5: pending ticket {ticket} decay "
+                        f"{state.decay_bars}/"
+                        f"{self.cfg.score_decay_bars} "
+                        f"(re-score "
+                        f"{current if current is not None else 'gone'} "
+                        f"vs floor {floor:.0f})")
+            except Exception as exc:
+                self.journal.log_note(
+                    f"mt5: score-decay check failed for ticket "
+                    f"{ticket} (pending left alone): {exc}")
 
     def _on_h1_close(self, tick: dict, stats: dict) -> None:
         """An H1 close: time stop + pending expiry + forming reset.
@@ -871,10 +1431,19 @@ class MT5Runner:
         """
         h1 = self._stack.frames["H1"]
         last_bar_index = len(h1) - 1
+        # Regime-dependent time exit: bedrock regime of the H1 frame
+        # sets each position's horizon (classification failure falls
+        # back to the fixed horizon — never breaks the close).
+        regime_structure = None
+        try:
+            regime_structure = classify_regime(h1).structure
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: regime classify failed, fixed horizon: {exc}")
         # Time stop for tracked positions (bar-defined rule).
         for ticket in list(self.tick_manager.tickets()):
             for action in self.tick_manager.on_bar_close(
-                    ticket, last_bar_index):
+                    ticket, last_bar_index, regime_structure):
                 res = self.executor.close_position(ticket, action.volume)
                 if res.ok:
                     self._record_close(
@@ -884,12 +1453,37 @@ class MT5Runner:
         # Pending-order expiry: unfilled past expiry_bar dies — the
         # setup went stale (a real trader does not leave a limit
         # resting at a dead zone).
+        # Score decay runs BEFORE expiry: a setup that died on
+        # re-evaluation is cancelled as score_decay (more
+        # informative than expired), and decay at 2 bars fires
+        # before the 4-bar expiry anyway.
+        self._check_pending_score_decay(stats)
         for ticket, state in list(self._pending_orders.items()):
             if last_bar_index >= state.expiry_bar:
-                self._cancel_pending(
-                    ticket,
-                    f"expired: no fill after "
-                    f"{self.cfg.pending_expiry_bars} H1 bars", stats)
+                if state.ladder_levels and state.ladder_lots:
+                    # Ladder: this rung expired — cancel it and
+                    # advance the next rung (one live pending at a
+                    # time).  Score decay already ran first: a dead
+                    # setup is cancelled as score_decay, never
+                    # advanced.  A failed cancel keeps the rung
+                    # (do not place a second pending).
+                    next_level = state.ladder_levels.pop(0)
+                    next_lots = state.ladder_lots.pop(0)
+                    if self._cancel_pending(
+                            ticket,
+                            f"expired: no fill after "
+                            f"{self.cfg.pending_expiry_bars} H1 bars "
+                            f"— ladder advancing to {next_level:.2f}",
+                            stats):
+                        self._place_ladder_rung(
+                            state, next_level, next_lots,
+                            last_bar_index, stats)
+                else:
+                    self._cancel_pending(
+                        ticket,
+                        f"expired: no fill after "
+                        f"{self.cfg.pending_expiry_bars} H1 bars",
+                        stats)
         # A pending trigger belongs to the H1 bar that just closed:
         # without entry confirmation it is invalidated by
         # non-confirmation — logged, never erased.
@@ -1038,6 +1632,11 @@ class MT5Runner:
         # confirmed entry in the same direction becomes a layer
         # (_run_signal_path branches), never a second position.
         entry_frame = self._stack.frames.get(pend["entry_clock"])
+        # Shadow-only candle-shape confirmation at the POI
+        # (rejection / engulfing on the entry-TF bars composing the
+        # forming H1 bar).  Annotated on the pending, NEVER a gate:
+        # the live decision below comes from check_live_entry alone.
+        self._annotate_candle_confirm(pend, entry_frame)
         event = check_live_entry(entry_frame, pend["direction"],
                                  swing_n=3, since=pend["h1_open"],
                                  entry_clock=pend["entry_clock"])
@@ -1045,6 +1644,45 @@ class MT5Runner:
             return  # no entry event yet, or against-bias: not confirmed
         self._pending = None
         self._run_live_signal(pend, tick, stats)
+
+    def _annotate_candle_confirm(self, pend: dict,
+                                 entry_frame) -> None:
+        """Shadow-only POI confirmation (full shape family) at the POI.
+
+        Computes :func:`confirm_at_poi` on the entry-TF bars
+        composing the forming H1 bar (index >= ``h1_open``) against
+        the pending's zone band, and stores it as
+        ``pend["candle_confirm"]``.  The first confirmed annotation
+        is journal-logged once.  Best-effort by design: any failure
+        here (missing zone, odd restored pending) skips silently —
+        shadow telemetry must never break the entry leg.
+        """
+        try:
+            zone = pend.get("zone")
+            h1_open = pend.get("h1_open")
+            if zone is None or h1_open is None:
+                return
+            if entry_frame is None or len(entry_frame) == 0:
+                return
+            composing = entry_frame[entry_frame.index >= h1_open]
+            ann = confirm_at_poi(composing, pend["direction"],
+                                 zone["bottom"], zone["top"],
+                                 context=entry_frame)
+            pend["candle_confirm"] = {
+                "confirmed": bool(ann.confirmed),
+                "shape": ann.shape,
+                "shapes": list(ann.shapes),
+                "detail": ann.detail,
+            }
+            if ann.confirmed and not pend.get("candle_confirm_logged"):
+                pend["candle_confirm_logged"] = True
+                self.journal.log_note(
+                    f"mt5: candle confirmation "
+                    f"{','.join(ann.shapes)} at POI "
+                    f"({ann.detail}) — shadow only, entry still "
+                    f"needs the structural event")
+        except Exception:
+            return
 
     def _run_live_signal(self, pend: dict, tick: dict,
                          stats: dict) -> None:
@@ -1128,7 +1766,25 @@ class MT5Runner:
                                 pend["h1_open"]),
             "veto_enabled": False, "asof": pend["h1_open"].isoformat(),
             "volume": volume_features(h1_closed),
+            # DXY correlation: confluence context, never a gate.
+            "dxy_corr": (self._dxy.state.corr
+                         if self._dxy.state.available else None),
+            # Signal-time urgency (dispatch context, never a gate).
+            "urgency": self._urgency_for(
+                mid, tick.get("time"), pend["zone"], h1_closed),
         }
+
+    def _urgency_for(self, price, timestamp, zone, frame) -> float | None:
+        """Signal-time urgency for a verdict (record + reasoning).
+        Never raises — None on any failure (verdict annotation must
+        not break the verdict).  Placement-time urgency is computed
+        separately in _place_live_order (dispatch reading)."""
+        try:
+            return urgency_score(
+                float(price), session=session_of(timestamp)[0],
+                zone=zone, frame=frame)
+        except Exception:
+            return None
 
     def _run_signal_path(self, h1: pd.DataFrame, t: int,
                          states, years: float, verdict: dict,
@@ -1159,6 +1815,17 @@ class MT5Runner:
             self.journal.log_note(
                 "mt5: signal path paused — confirmed entry dropped, "
                 "no order")
+            return
+        # Market-closed guard (signal processing): the tick pump
+        # delivers nothing while the market is closed, so this is
+        # defence-in-depth — it blocks the path if a tick ever
+        # arrives while the symbol is disabled / close-only.
+        open_ok, open_reason = self._market_open()
+        if not open_ok:
+            self._record_blocked(f"market_closed: {open_reason}")
+            self.journal.log_note(
+                "mt5: signal path market-closed — confirmed entry "
+                f"dropped, no order ({open_reason})")
             return
         ctx = EngineContext(df=h1, states=states, years=years,
                             instrument=self.cfg.symbol)
@@ -1196,16 +1863,29 @@ class MT5Runner:
         # the frame parameter differently (df / h1).
         sigs = pb.live_signal(ctx.states, t, h1) or []
         for sig in sigs:
+            alert_id = f"MT5-{pb.name}-{sig.index}"
             if sig.score < self.cfg.min_score:
                 self._record_blocked(
                     f"min_score: score {sig.score:.0f} < "
                     f"{self.cfg.min_score:.0f}", pb.name)
+                log_signal(
+                    self.journal, signal_id=alert_id, playbook=pb.name,
+                    direction=int(sig.direction), score=float(sig.score),
+                    decision="below_floor",
+                    reason=f"min_score: score {sig.score:.0f} < "
+                           f"{self.cfg.min_score:.0f}",
+                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    entry=float(sig.entry_ref),
+                    stop=float(sig.invalidation),
+                    targets=[float(x) for x in (sig.targets or [])],
+                    factors=list(getattr(sig, "factors", []) or []))
                 continue
             if sig.index - self._last_sig_bar.get(pb.name, -10 ** 9) \
                     < self.cfg.signal_gap_bars:
                 continue
             ok, reason = engine.gate_live_signal(
-                pb, sig, ctx, hierarchy_verdict=verdict)
+                pb, sig, ctx, hierarchy_verdict=verdict,
+                spread_px=(self._last_tick or {}).get("spread"))
             if not ok:
                 stats["gated"] += 1
                 if reason.startswith("hierarchy:"):
@@ -1214,6 +1894,21 @@ class MT5Runner:
                 self._record_blocked(reason, pb.name)
                 self.journal.log_note(
                     f"mt5: {pb.name} signal gated: {reason}")
+                log_signal(
+                    self.journal, signal_id=alert_id, playbook=pb.name,
+                    direction=int(sig.direction), score=float(sig.score),
+                    decision="gated", reason=reason,
+                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    entry=float(sig.entry_ref),
+                    stop=float(sig.invalidation),
+                    targets=[float(x) for x in (sig.targets or [])],
+                    factors=list(getattr(sig, "factors", []) or []),
+                    hierarchy={
+                        "bias_d1": (verdict or {}).get("bias_d1"),
+                        "bias_h4": (verdict or {}).get("bias_h4"),
+                        "trigger": (verdict or {}).get("trigger"),
+                        "entry_clock": (verdict or {}).get("entry_clock"),
+                    })
                 continue
             conf, notes = engine.score_live_signal(
                 pb, sig, ctx, hierarchy_verdict=verdict)
@@ -1223,7 +1918,20 @@ class MT5Runner:
                 self._signal_counts.get(pb.name, 0) + 1
             auto = pb.name in self.cfg.execute_playbooks
             tag = "MT5" if auto else "SHADOW"
-            alert_id = f"MT5-{pb.name}-{sig.index}"
+            # Dynamic reasoning + study package (accepted signals
+            # only): the why + the key levels/data behind it — on
+            # the signal record and in the Telegram alert (with the
+            # chart PNG, the visual half of the study).
+            reasoning = study = None
+            if auto:
+                reasoning = build_reasoning(
+                    pb.name, sig, verdict,
+                    alignment_label=getattr(
+                        self._alignment, "alignment_label", None))
+                study = build_study(
+                    pb.name, sig, verdict,
+                    alignment_label=getattr(
+                        self._alignment, "alignment_label", None))
             self.journal.log_note(
                 f"mt5 [{tag}] {pb.name} "
                 f"{'+' if sig.direction > 0 else '-'}1 "
@@ -1235,6 +1943,26 @@ class MT5Runner:
                 f"{verdict['entry_clock']} amd:{verdict.get('amd_phase')} "
                 f"qm:{verdict.get('qm', {}).get('status')} "
                 f"vol:{(verdict.get('volume') or {}).get('volume_ratio')}")
+            log_signal(
+                self.journal, signal_id=alert_id, playbook=pb.name,
+                direction=int(sig.direction), score=float(sig.score),
+                decision="accepted" if auto else "shadow",
+                confluence=float(conf),
+                bar_ts=h1.index[t] if t < len(h1) else None,
+                entry=float(sig.entry_ref),
+                stop=float(sig.invalidation),
+                targets=[float(x) for x in (sig.targets or [])],
+                factors=list(notes),
+                dxy_corr=(verdict or {}).get("dxy_corr"),
+                urgency=(verdict or {}).get("urgency"),
+                reasoning=reasoning,
+                study=study,
+                hierarchy={
+                    "bias_d1": (verdict or {}).get("bias_d1"),
+                    "bias_h4": (verdict or {}).get("bias_h4"),
+                    "trigger": (verdict or {}).get("trigger"),
+                    "entry_clock": (verdict or {}).get("entry_clock"),
+                })
             if not auto:
                 # Shadow: evaluated + logged + counted — never
                 # charted, alerted, or ordered.
@@ -1247,7 +1975,8 @@ class MT5Runner:
                 f"MT5 [{tag}] {pb.name} "
                 f"{'+' if sig.direction > 0 else '-'}1 "
                 f"entry~{sig.entry_ref:.1f} stop~{sig.invalidation:.1f} "
-                f"conf={conf:.0f}",
+                f"conf={conf:.0f}"
+                + (f"\n\n{reasoning}" if reasoning else ""),
                 chart_png=png)
             # Manipulation / liquidity-test filter (entry
             # selection, NOT a veto): a signal chasing past
@@ -1270,10 +1999,31 @@ class MT5Runner:
                     self.journal.log_note(
                         f"mt5: {pb.name} signal manipulation-blocked: "
                         f"{why}")
+                    log_signal(
+                        self.journal, signal_id=alert_id,
+                        playbook=pb.name,
+                        direction=int(sig.direction),
+                        score=float(sig.score),
+                        decision="manipulation_blocked", reason=why,
+                        confluence=float(conf),
+                        bar_ts=h1.index[t] if t < len(h1) else None,
+                        entry=float(sig.entry_ref),
+                        stop=float(sig.invalidation),
+                        targets=[float(x) for x in (sig.targets or [])],
+                        factors=list(notes))
                     continue
             if self.tick_manager.tickets():
                 self._try_layer(pb, sig, stats, verdict=verdict,
                                 entry_bar=t)
+            elif self.cfg.golden_swing_confirm_enabled \
+                    and self._alignment.golden_swing:
+                # Golden Swing base order: the order WAITS for the
+                # owner's Confirm tap (REJECT cancels; timeout
+                # fires/cancels per config).  Nothing is placed
+                # here.  Layers never come here — a held position
+                # routes to _try_layer above.
+                self._stage_order_confirm(pb, sig, stats,
+                                          verdict=verdict, entry_bar=t)
             else:
                 self._place_live_order(pb, sig, stats,
                                        verdict=verdict,
@@ -1548,17 +2298,23 @@ class MT5Runner:
                         "level": state.level, "volume": state.volume,
                         "sl": state.sl, "playbook": state.playbook,
                         "expiry_bar": state.expiry_bar,
-                        "alert_id": state.alert_id})
+                        "alert_id": state.alert_id,
+                        "ladder_remaining": len(state.ladder_levels)})
         return out
 
     # ------------------------------------------------- confirm handshake
     def request_confirm(self, action: str, arg=None) -> str:
         """Stage a mutating action; returns the Confirm token."""
         token = secrets.token_hex(4)
-        self._confirm_tokens[token] = {"action": action, "arg": arg}
+        # created_at (monotonic) lets the order-confirm sweep expire
+        # place_order tokens; control tokens never expire.
+        self._confirm_tokens[token] = {
+            "action": action, "arg": arg,
+            "created_at": time.monotonic()}
         return token
 
-    def confirm_pending(self, token: str) -> tuple[bool, str]:
+    def confirm_pending(self, token: str,
+                        stats: dict | None = None) -> tuple[bool, str]:
         """Execute a staged action (Confirm tap).  The token is
         single-use: consumed whether the action succeeds or not."""
         staged = self._confirm_tokens.pop(token, None)
@@ -1577,14 +2333,288 @@ class MT5Runner:
                 return True, self.cancel_all_pending()
             if action == "set":
                 return self.set_live_config(arg or {})
+            if action == "place_order":
+                return self._execute_order_confirm(
+                    arg or "", stats if stats is not None else {})
             return False, f"unknown staged action {action!r} — not acted"
         except Exception as exc:
             return False, (f"{action} FAILED: {type(exc).__name__}: {exc}")
 
     def cancel_confirm(self, token: str) -> str:
-        if self._confirm_tokens.pop(token, None) is None:
+        staged = self._confirm_tokens.pop(token, None)
+        if staged is None:
             return "nothing to cancel (confirmation already expired)"
+        if staged.get("action") == "place_order":
+            # A rejected Golden Swing order dies here: drop the
+            # payload so it can never fire later.  Nothing was
+            # placed — the order waited for the tap.
+            self._order_confirms.pop(staged.get("arg") or "", None)
+            self.journal.log_note(
+                "mt5: Golden Swing order REJECTED — no order placed")
+            return "rejected — no order placed"
         return "cancelled — nothing changed"
+
+    def _apply_alignment_multiplier(self, lots: float, spec,
+                                    pb_name: str) -> float:
+        """MacroTrend size multiplier on a base-order size.
+
+        Golden Swing -> 1.5x, D1/W1 conflict -> 0.5x, else 1.0x
+        (no-op).  Re-steps DOWN to the broker volume step (never
+        rounds up), floors at the broker minimum, caps at the
+        maximum.  No-op when sizing is disabled or the multiplier
+        is 1.0 — the common path is untouched.
+        """
+    def _apply_size_multiplier(self, lots: float, spec,
+                               mult: float, note: str) -> float:
+        """Multiply a base-order size, re-stepping DOWN to the broker
+        volume step (never rounds up), floored at the broker minimum,
+        capped at the maximum.  No-op at 1.0x."""
+        if mult == 1.0:
+            return lots
+        step = spec.volume_step if spec.volume_step > 0 \
+            else spec.volume_min
+        scaled = math.floor(lots * mult / step + 1e-9) * step
+        scaled = round(min(max(scaled, spec.volume_min),
+                           spec.volume_max), 10)
+        self.journal.log_note(
+            f"mt5: sizing {note}: {lots:.2f} lots x {mult:g} -> "
+            f"{scaled:.2f} lots")
+        return scaled
+
+    def _apply_alignment_multiplier(self, lots: float, spec,
+                                    pb_name: str) -> float:
+        """MacroTrend size multiplier on a base-order size.
+
+        Golden Swing -> 1.5x, D1/W1 conflict -> 0.5x, else 1.0x
+        (no-op).  No-op when sizing is disabled or the multiplier
+        is 1.0 — the common path is untouched.
+        """
+        if not self.cfg.golden_swing_sizing_enabled:
+            return lots
+        mult = float(self._alignment.size_multiplier)
+        if mult == 1.0:
+            return lots
+        return self._apply_size_multiplier(
+            lots, spec, mult,
+            f"alignment {pb_name} ({self._alignment.alignment_label})")
+
+    # ------------------------------------------- Golden Swing confirm
+    # A Golden Swing base order WAITS for the owner's Confirm tap.
+    # Unlike the owner's bot (order fired first, tap changed
+    # nothing), nothing is placed until Confirm, timeout, or
+    # Reject.  The existing confirm handshake carries it:
+    # request_confirm token + mt5_confirm_keyboard + the same
+    # callback parsing; only the staged action is new.
+    def _stage_order_confirm(self, pb, sig, stats: dict,
+                             verdict: dict | None,
+                             entry_bar: int | None) -> None:
+        """Stage a Golden Swing base order: Telegram Confirm/Reject
+        buttons, order held.  Layers never come here (they route
+        through _try_layer at fire time)."""
+        key = secrets.token_hex(4)
+        self._order_confirms[key] = {
+            "pb": pb, "sig": sig, "verdict": verdict,
+            "entry_bar": entry_bar}
+        token = self.request_confirm("place_order", key)
+        timeout = self.cfg.golden_swing_confirm_timeout_sec
+        action = self.cfg.golden_swing_confirm_timeout_action
+        self.journal.log_note(
+            f"mt5: Golden Swing {pb.name} "
+            f"{'+' if sig.direction > 0 else '-'}1 staged — awaiting "
+            f"Confirm tap (timeout {timeout:.0f}s, then {action})")
+        self._send_alert(
+            f"🎯 GOLDEN SWING {pb.name} "
+            f"{'+' if sig.direction > 0 else '-'}1\n"
+            f"entry~{sig.entry_ref:.1f} stop~{sig.invalidation:.1f} "
+            f"score={sig.score:.0f} size x{self._alignment.size_multiplier:g}\n"
+            f"Tap Confirm to place, Reject to cancel. "
+            f"Timeout {timeout:.0f}s → {action}."
+            + (f"\n\n{build_reasoning(pb.name, sig, verdict, alignment_label=getattr(self._alignment, 'alignment_label', None))}"),
+            reply_markup=mt5_confirm_keyboard(token))
+
+    def _execute_order_confirm(self, key: str,
+                               stats: dict) -> tuple[bool, str]:
+        """Place a staged Golden Swing order (Confirm tap or
+        timeout-fire).  Fire-time revalidation: paused engine
+        refuses; a gone/flipped setup refuses; a held position
+        routes to _try_layer (one-position rule) instead of a
+        second position.  Placement itself re-checks price vs
+        entry (select_order_type) so a stale setup cannot fill
+        at a dead level."""
+        payload = self._order_confirms.pop(key, None)
+        if payload is None:
+            return False, ("confirmation expired — nothing acted. "
+                           "Send the command again.")
+        pb, sig = payload["pb"], payload["sig"]
+        if self.cfg.paused:
+            self.journal.log_note(
+                f"mt5: Golden Swing {pb.name} confirm refused — "
+                "engine paused, no order placed")
+            return False, "engine paused — order not placed"
+        setup = self._live_setup
+        if setup is None or int(setup["direction"]) != int(sig.direction):
+            self.journal.log_note(
+                f"mt5: Golden Swing {pb.name} confirm refused — "
+                "setup gone/flipped, no order placed")
+            return False, "setup gone — order not placed"
+        if self.tick_manager.tickets():
+            held = self.tick_manager.tickets()
+            if len(held) != 1:
+                return False, "position state unclear — order not placed"
+            pos = self.tick_manager.position(held[0])
+            if pos is not None and int(pos.direction) != int(sig.direction):
+                self.journal.log_note(
+                    f"mt5: Golden Swing {pb.name} confirm refused — "
+                    "opposite position held, no order placed")
+                return False, "opposite position held — order not placed"
+            self._try_layer(pb, sig, stats,
+                            verdict=payload.get("verdict"),
+                            entry_bar=payload.get("entry_bar"))
+            return True, "confirmed — evaluated as layer; see journal"
+        self._place_live_order(pb, sig, stats,
+                               verdict=payload.get("verdict"),
+                               entry_bar=payload.get("entry_bar"))
+        return True, "confirmed — order placed"
+
+    def _sweep_order_confirms(self, stats: dict) -> None:
+        """Expire unanswered Golden Swing confirms: timeout -> fire
+        (place, revalidated) or cancel (drop), per config.  Runs
+        every tick from _on_tick — the timeout is wall-clock, not
+        bar-clock, so it must not wait for a bar close."""
+        timeout = float(self.cfg.golden_swing_confirm_timeout_sec)
+        action = self.cfg.golden_swing_confirm_timeout_action
+        now = time.monotonic()
+        for token, staged in list(self._confirm_tokens.items()):
+            if staged.get("action") != "place_order":
+                continue
+            created = staged.get("created_at", now)
+            if now - created < timeout:
+                continue
+            self._confirm_tokens.pop(token, None)
+            key = staged.get("arg") or ""
+            if action == "cancel":
+                self._order_confirms.pop(key, None)
+                self.journal.log_note(
+                    "mt5: Golden Swing order confirm timed out — "
+                    "cancelled per config, no order placed")
+                self._send_alert(
+                    "Golden Swing order timed out — cancelled "
+                    "(no Confirm tap).")
+            else:  # "fire" (also the fallback for a bad config value)
+                ok, text = self._execute_order_confirm(key, stats)
+                self.journal.log_note(
+                    "mt5: Golden Swing order confirm timed out — "
+                    f"auto-fire: {text}")
+
+    # ------------------------------------------------- safety wiring
+    # RiskGuards, margin + shield, market-closed: the live path
+    # enforces all of them at order time.  A refusal is journalled
+    # + counted by leg (see _record_blocked) — never silent.
+    def _market_open(self) -> tuple[bool, str]:
+        """Broker accepting new orders?  Feeds without market_open()
+        are legacy — treated as open (the real MT5Feed implements
+        it, and a missing method must not change order behaviour
+        for a feed that never claimed the check)."""
+        fn = getattr(self.feed, "market_open", None)
+        if fn is None:
+            return True, ""
+        try:
+            return fn()
+        except Exception as exc:
+            return False, f"market_open check failed: {exc}"
+
+    def _check_risk_guards(self, pb, sig, lots: float, stop0: float,
+                           acct: dict) -> bool:
+        """RiskGuards on the live path: may this order open?"""
+        try:
+            spec = self.executor.symbol_spec(self.cfg.symbol)
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: order refused {pb.name}: risk guard check "
+                f"failed, no symbol spec ({exc})")
+            return False
+        open_risk = 0.0
+        unstopped = 0
+        for ticket in self.tick_manager.tickets():
+            pos = self.tick_manager.position(ticket)
+            if pos is None:
+                continue
+            # risk_price <= 0 = no measurable stop (e.g. adopted
+            # without an SL): exposure unknowable, counts unstopped.
+            if pos.risk_price <= 0:
+                unstopped += 1
+            else:
+                open_risk += spec.money_for_move(
+                    abs(pos.entry_price - pos.risk_price), pos.volume)
+        new_risk = spec.money_for_move(
+            abs(float(sig.entry_ref) - stop0), lots)
+        decision = self.guards.check_new_trade(
+            balance=float(acct.get("balance", 0.0)),
+            open_risk_money=open_risk, new_risk_money=new_risk,
+            open_count=len(self.tick_manager.tickets()),
+            unstopped_positions=unstopped)
+        if decision.allowed:
+            return True
+        self._record_blocked(f"risk_guard: {decision.reason}", pb.name)
+        self.journal.log_note(
+            f"mt5: order refused {pb.name}: risk guard — "
+            f"{decision.reason}")
+        return False
+
+    def _check_margin(self, pb, sig, lots: float, is_layer: bool,
+                      acct: dict) -> bool:
+        """Margin + swing margin shield before any order placement.
+
+        Margin: the broker-computed requirement (order_calc_margin)
+        plus the configured buffer must fit inside free margin —
+        the owner's-bot formula (lots × contract × price / leverage,
+        +5%) with the terminal's own number instead of a hand-rolled
+        one.  Shield: a Golden Swing base order or any layer must
+        leave the POST-order free margin at or above the shield
+        fraction of equity (owner's bot: 40%), so a layer can never
+        push the account into margin-call territory.  A margin
+        number the terminal cannot compute refuses the order —
+        never a guess.
+        """
+        free = float(acct.get("free_margin", 0.0))
+        equity = float(acct.get("equity", 0.0))
+        try:
+            margin_req = self.feed.order_margin(
+                volume=float(lots), price=float(sig.entry_ref),
+                direction=int(sig.direction))
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: order refused {pb.name}: margin check failed "
+                f"({exc}) — no order without a margin number")
+            return False
+        if margin_req is None:
+            self.journal.log_note(
+                f"mt5: order refused {pb.name}: terminal could not "
+                "compute margin — no order without a margin number")
+            return False
+        buffered = margin_req * (1.0 + self.cfg.margin_buffer_pct / 100.0)
+        if buffered > free:
+            self._record_blocked(
+                f"margin: required {buffered:.2f} (buffered) > free "
+                f"{free:.2f}", pb.name)
+            self.journal.log_note(
+                f"mt5: order refused {pb.name}: margin — required "
+                f"{buffered:.2f} (buffered) > free margin {free:.2f}")
+            return False
+        if is_layer or self._alignment.golden_swing:
+            post_free = free - margin_req
+            shield = self.cfg.margin_shield_pct / 100.0
+            if equity <= 0 or post_free / equity < shield:
+                self._record_blocked(
+                    f"margin_shield: post-order free {post_free:.2f} "
+                    f"/ equity {equity:.2f} < "
+                    f"{self.cfg.margin_shield_pct:g}%", pb.name)
+                self.journal.log_note(
+                    f"mt5: order refused {pb.name}: margin shield — "
+                    f"post-order free {post_free:.2f} / equity "
+                    f"{equity:.2f} < {self.cfg.margin_shield_pct:g}%")
+                return False
+        return True
 
     # -------------------------------------------------------------- orders
     def _place_live_order(self, pb, sig, stats: dict,
@@ -1612,6 +2642,60 @@ class MT5Runner:
         one; ``layer_lots`` is the pre-capped layer size from
         ``_try_layer``.
         """
+        # Market-closed guard (order placement): never place while
+        # the broker is not accepting new orders — covers
+        # confirm-fired orders and layers, not just the signal path.
+        open_ok, open_reason = self._market_open()
+        if not open_ok:
+            self.journal.log_note(
+                f"mt5: order refused {pb.name}: market closed "
+                f"({open_reason})")
+            return
+        # News pause (base orders only): no NEW entries inside a
+        # high-impact window.  Layers are management of a held
+        # position, never paused.  Confirm-fired orders re-check
+        # here (the wait may have crossed into a window).
+        news_mult = 1.0
+        if not is_layer and self.cfg.news_pause_enabled:
+            state = self.news.execution_state()
+            if state.paused:
+                stats["gate_news"] = stats.get("gate_news", 0) + 1
+                self.journal.log_note(
+                    f"mt5: order refused {pb.name}: news pause "
+                    f"({state.regime} {state.event_title})")
+                return
+            news_mult = state.size_mult
+        # Entry gates (base orders only): caps / cooldown /
+        # fingerprint dedup.  Layers are management of a held
+        # position, never gated.  The fingerprint is recorded only
+        # on a successful placement (below).
+        fingerprint = ""
+        if not is_layer and self.cfg.entry_gates_enabled:
+            fingerprint = signal_fingerprint(
+                pb.name, int(sig.direction), float(sig.entry_ref),
+                float(sig.invalidation))
+            ok, gate_reason = self.entry_gate.check_new_entry(
+                time.time(), fingerprint)
+            if not ok:
+                stats[f"gate_{gate_reason}"] = stats.get(
+                    f"gate_{gate_reason}", 0) + 1
+                self.journal.log_note(
+                    f"mt5: order refused {pb.name}: entry gate "
+                    f"{gate_reason}")
+                return
+        # Friday close (base orders only): no NEW swing entries late
+        # Friday.  Layers are management, never blocked.  The clock
+        # is the tick clock, falling back to the wall clock.
+        now_utc = _tick_now_utc(self._last_tick) \
+            or datetime.now(timezone.utc)
+        if not is_layer and is_friday_close(
+                now_utc, self.cfg.friday_close_hour):
+            stats["gate_friday"] = stats.get("gate_friday", 0) + 1
+            self.journal.log_note(
+                f"mt5: order refused {pb.name}: friday close "
+                f"(no new entries Fri >= "
+                f"{self.cfg.friday_close_hour}:00 UTC)")
+            return
         executor = self.executor
         spec = executor.symbol_spec(self.cfg.symbol)
         acct = self.feed.account_state()
@@ -1634,14 +2718,83 @@ class MT5Runner:
                 self.journal.log_note(
                     f"mt5: sizing refused {pb.name}: {sizing.reason}")
                 return
+            # MacroTrend alignment sizing (base orders only): Golden
+            # Swing 1.5x, D1/W1 conflict 0.5x.  fixed_lots is an
+            # explicit override and is never multiplied; layers are
+            # NOT multiplied here — they scale via the layer risk
+            # budget, which derives from the (multiplied) base risk.
+            lots = self._apply_alignment_multiplier(lots, spec, pb.name)
+            # News-adaptive sizing: shrink entries in the post-news
+            # cooldown blend (1.0 far from news).  Same no-multiply
+            # rules as alignment (risk-% base orders only).
+            lots = self._apply_size_multiplier(
+                lots, spec, news_mult, f"news {pb.name}")
+            # Session sizing: the session multiplier for the tick
+            # clock (killzone sessions are the overlap bucket,
+            # off-session is reduced).  Same no-multiply rules.
+            lots = self._apply_size_multiplier(
+                lots, spec,
+                session_multiplier(now_utc, self.cfg.session_multipliers),
+                f"session {pb.name}")
+        # Safety gates (order time, never silent): RiskGuards, then
+        # margin + swing margin shield.  Both must pass — a refusal
+        # is journalled + counted by leg.
+        if not self._check_risk_guards(pb, sig, lots, stop0, acct):
+            return
+        if not self._check_margin(pb, sig, lots, is_layer, acct):
+            return
         # Selection: where is price vs the entry level NOW?
         price = float((self._last_tick or {}).get("mid")
                       or (verdict or {}).get("entry")
                       or sig.entry_ref)
+        # Placement-time urgency + volume profile (dispatch
+        # context): urgency from the live tick (session + ATR
+        # velocity + zone distance), profile from the H1 closed
+        # bars.  Signal-time urgency (verdict annotation, for the
+        # record + reasoning) is computed in the verdict builders;
+        # this is the dispatch-time reading, which may differ if
+        # the tick moved since the verdict.
+        _urgency = None
+        _profile = None
+        try:
+            _h1 = self._stack.frames.get("H1") \
+                if self._stack is not None else None
+            _session = session_of(now_utc)[0]
+            _urgency = urgency_score(
+                price, session=_session,
+                zone=(verdict or {}).get("zone"), frame=_h1)
+            _profile = volume_profile(_h1)
+        except Exception:
+            _urgency, _profile = None, None
         kind, level, reason = select_order_type(
             direction=int(sig.direction), price=price,
             entry_ref=float(sig.entry_ref),
-            zone=(verdict or {}).get("zone"), atr=float(sig.atr))
+            zone=(verdict or {}).get("zone"), atr=float(sig.atr),
+            urgency=_urgency, profile=_profile)
+        # Limit ladder (opt-in): stagger the LIMIT across rungs
+        # from the playbook level to the adverse zone edge.  Rung 0
+        # is placed now (replaces the single-pending level + lots);
+        # the rest advance on expiry.  Layers never ladder (they
+        # scale through the layer risk budget).
+        _ladder_levels: list = []
+        _ladder_lots: list = []
+        if kind == "limit" and self.cfg.ladder_enabled \
+                and not is_layer:
+            _rungs = build_ladder(
+                direction=int(sig.direction),
+                entry_ref=float(sig.entry_ref),
+                zone=(verdict or {}).get("zone"), lots=lots,
+                rungs=self.cfg.ladder_rungs,
+                split=self.cfg.ladder_split)
+            if _rungs:
+                level = float(_rungs[0][0])
+                lots = float(_rungs[0][1])
+                _ladder_levels = [float(r[0]) for r in _rungs[1:]]
+                _ladder_lots = [float(r[1]) for r in _rungs[1:]]
+                self.journal.log_note(
+                    f"mt5: ladder {pb.name}: rung 0 {level:.2f} "
+                    f"({lots:.2f} lots), "
+                    f"{len(_ladder_levels)} rungs remaining")
         request = OrderRequest(
             symbol=self.cfg.symbol, direction=int(sig.direction),
             volume=lots, stop_loss=float(stop0),
@@ -1662,29 +2815,55 @@ class MT5Runner:
             entry_ref=float(sig.entry_ref),
             targets=[float(x) for x in (sig.targets or [])],
             atr=float(sig.atr), bar_index=int(sig.index),
-            alert_id=request.alert_id, magic=self.cfg.magic)
+            alert_id=request.alert_id, magic=self.cfg.magic,
+            is_scalp=pb.name in self.cfg.scalp_playbooks)
         if kind == "invalid":
             stats["invalidated"] = stats.get("invalidated", 0) + 1
             self._record_blocked(f"order:invalid: {reason}", pb.name)
             self.journal.log_note(
                 f"mt5: order invalidated {pb.name}: {reason} — "
                 f"no order placed")
+            log_signal(
+                self.journal, signal_id=request.alert_id,
+                playbook=pb.name, direction=int(sig.direction),
+                score=float(sig.score), decision="invalidated",
+                reason=reason,
+                entry=float(sig.entry_ref),
+                stop=float(sig.invalidation),
+                targets=[float(x) for x in (sig.targets or [])],
+                factors=list(getattr(sig, "factors", []) or []),
+                dxy_corr=(verdict or {}).get("dxy_corr"),
+                urgency=(verdict or {}).get("urgency"))
             return
         if kind != "market":
-            self._place_pending_order(
+            placed = self._place_pending_order(
                 pb, sig, verdict, kind, level, request, track_request,
-                stats, entry_bar, is_layer=is_layer)
+                stats, entry_bar, is_layer=is_layer,
+                ladder_levels=_ladder_levels,
+                ladder_lots=_ladder_lots)
+            if placed and fingerprint:
+                self.entry_gate.record_open(time.time(), fingerprint)
             return
+        _t0 = time.monotonic()
         res = executor.place_order(request)
+        self._health.note_order(time.monotonic() - _t0)
+        self._journal_new_breaches()
         if not res.ok:
             self.journal.log_note(
                 f"mt5: order FAILED {pb.name}: {res.message}")
             return
         fill = res.price or sig.entry_ref
+        # Slippage: adverse fill vs the tick mid the order aimed at
+        # (long filled above the aim, short below it), in ATR units.
+        self._health.note_fill(
+            int(sig.direction) * (float(fill) - float(price)),
+            float(sig.atr))
         if is_layer:
             self._record_layer_fill(pb.name, sig, fill=fill, lots=lots,
                                     stop0=stop0, stats=stats)
             return
+        if fingerprint:
+            self.entry_gate.record_open(time.time(), fingerprint)
         h1 = self._stack.frames["H1"]
         self.tick_manager.open(ticket=int(res.ticket),
                                request=track_request, fill_price=fill,
@@ -1740,7 +2919,10 @@ class MT5Runner:
                              playbook: str, zone: dict | None,
                              invalidation: float, placed_bar: int,
                              sig, verdict, track_request,
-                             is_layer: bool = False) -> PendingOrderState:
+                             is_layer: bool = False,
+                             ladder_levels: list | None = None,
+                             ladder_lots: list | None = None
+                             ) -> PendingOrderState:
         """Register a broker pending order in engine tracking."""
         state = PendingOrderState(
             ticket=int(order.ticket), kind=str(order.kind),
@@ -1754,17 +2936,62 @@ class MT5Runner:
             placed_bar=int(placed_bar),
             expiry_bar=int(placed_bar) + self.cfg.pending_expiry_bars,
             track_request=track_request, sig=sig, verdict=verdict,
-            is_layer=bool(is_layer))
+            is_layer=bool(is_layer),
+            placed_score=float(getattr(sig, "score", 0.0) or 0.0),
+            ladder_levels=list(ladder_levels or []),
+            ladder_lots=list(ladder_lots or []))
         self._pending_orders[state.ticket] = state
         return state
+
+    def _place_ladder_rung(self, state: PendingOrderState,
+                           level: float, lots: float,
+                           entry_bar: int, stats: dict) -> bool:
+        """Advance a ladder: place the next rung after the previous
+        one expired.  Rebuilds the request from the state's own
+        fields (same direction / SL / TP / alert_id); the sig and
+        verdict ride along so fill handling and reasoning see the
+        originating setup.  Returns False when the playbook is gone
+        or the broker refuses — the ladder dies, no retry."""
+        sig = getattr(state, "sig", None)
+        if sig is None:
+            return False
+        playbooks = {pb.name: pb for pb in self._get_playbooks()}
+        pb = playbooks.get(state.playbook)
+        if pb is None:
+            self.journal.log_note(
+                f"mt5: ladder rung NOT placed: playbook "
+                f"{state.playbook} unknown")
+            return False
+        request = OrderRequest(
+            symbol=self.cfg.symbol, direction=int(state.direction),
+            volume=float(lots), order_kind="limit",
+            order_price=float(level), stop_loss=float(state.sl),
+            take_profit=float(state.tp) if state.tp is not None
+            else None, magic=self.cfg.magic,
+            alert_id=state.alert_id)
+        track_request = OrderRequest(
+            symbol=self.cfg.symbol, direction=int(state.direction),
+            volume=float(lots), order_kind="limit",
+            order_price=float(level), stop_loss=float(state.sl),
+            take_profit=float(state.tp) if state.tp is not None
+            else None, magic=self.cfg.magic,
+            alert_id=state.alert_id)
+        return self._place_pending_order(
+            pb, sig, state.verdict, "limit", float(level), request,
+            track_request, stats, entry_bar, is_layer=state.is_layer,
+            ladder_levels=list(state.ladder_levels),
+            ladder_lots=list(state.ladder_lots))
 
     def _place_pending_order(self, pb, sig, verdict, kind: str,
                              level: float, request: OrderRequest,
                              track_request: OrderRequest,
                              stats: dict,
                              entry_bar: int | None,
-                             is_layer: bool = False) -> None:
-        """Place a pending LIMIT / STOP and start tracking it."""
+                             is_layer: bool = False,
+                             ladder_levels: list | None = None,
+                             ladder_lots: list | None = None) -> bool:
+        """Place a pending LIMIT / STOP and start tracking it.
+        Returns True when the broker accepted the order."""
         # One-position rule: a pending order COUNTS — never a second
         # pending while one pending is active, and never a base
         # pending while a position is active.  A pending LAYER is the
@@ -1774,12 +3001,15 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: pending {kind} NOT placed {pb.name}: already "
                 f"holding/pending")
-            return
+            return False
+        _t0 = time.monotonic()
         res = self.executor.place_order(request)
+        self._health.note_order(time.monotonic() - _t0)
+        self._journal_new_breaches()
         if not res.ok:
             self.journal.log_note(
                 f"mt5: pending {kind} FAILED {pb.name}: {res.message}")
-            return
+            return False
         placed_bar = entry_bar if entry_bar is not None \
             else self._current_h1_bar()
         order = PendingOrder(
@@ -1793,7 +3023,8 @@ class MT5Runner:
             order, playbook=pb.name, zone=(verdict or {}).get("zone"),
             invalidation=float(sig.invalidation),
             placed_bar=placed_bar, sig=sig, verdict=verdict,
-            track_request=track_request, is_layer=is_layer)
+            track_request=track_request, is_layer=is_layer,
+            ladder_levels=ladder_levels, ladder_lots=ladder_lots)
         stats["pending"] = stats.get("pending", 0) + 1
         self.journal.log_note(
             f"mt5 pending: {kind.upper()} {pb.name} "
@@ -1813,6 +3044,7 @@ class MT5Runner:
             f"{request.volume} lots @ {level:.2f} "
             f"SL {request.stop_loss:.2f} (ticket {res.ticket})",
             chart_png=png)
+        return True
 
     def _check_pending_orders(self, price: float, stats: dict) -> None:
         """Tick-level pending invalidation: price beyond the adverse
@@ -1889,6 +3121,16 @@ class MT5Runner:
         back to opening a fresh base position.
         """
         self._pending_orders.pop(state.ticket, None)
+        # Slippage: adverse fill vs the pending level (long filled
+        # above it, short below it), in ATR units.  Adopted pendings
+        # (restart) have no signal — no ATR, no sample.
+        _sig = getattr(state, "sig", None)
+        if _sig is not None:
+            self._health.note_fill(
+                int(state.direction)
+                * (float(pos.entry_price) - float(state.level)),
+                float(getattr(_sig, "atr", 0.0) or 0.0))
+            self._journal_new_breaches()
         if state.is_layer and self.tick_manager.tickets():
             self._record_layer_fill(
                 state.playbook or "pending", state.sig,
@@ -2013,6 +3255,15 @@ class MT5Runner:
             # the causal H1 slice, so the forming bar never counts.
             sliced = h1[h1.index <= h1.index[t]]
             verdict["volume"] = volume_features(sliced)
+            # DXY correlation: confluence context, never a gate.
+            # None = DXY unavailable (scorer treats it as 0.0).
+            verdict["dxy_corr"] = (
+                self._dxy.state.corr
+                if self._dxy.state.available else None)
+            # Signal-time urgency (dispatch context, never a gate).
+            verdict["urgency"] = self._urgency_for(
+                h1["close"].iloc[t], h1.index[t],
+                verdict.get("zone"), sliced)
             return verdict
         except Exception as exc:
             self.journal.log_note(
@@ -2185,13 +3436,16 @@ class MT5Runner:
             self.journal.log_note(f"mt5: startup ping failed: {exc}")
 
     def _send_alert(self, text: str, *,
-                    chart_png: bytes | None = None) -> None:
+                    chart_png: bytes | None = None,
+                    reply_markup: dict | None = None) -> None:
         """Send a text alert, with the chart photo when one is attached.
 
         Sender contract (in preference order): ``send_photo(png,
         caption)`` (TelegramSender), ``send_text(text)``, legacy
         ``send(text)`` duck-type.  A sender failure is journaled,
-        never raised into the tick loop.
+        never raised into the tick loop.  ``reply_markup`` (inline
+        keyboard) is passed through when the sender supports it —
+        used by the Golden Swing Confirm request.
         """
         for sender in self.senders:
             try:
@@ -2201,7 +3455,12 @@ class MT5Runner:
                         self.journal.log_note(
                             f"mt5: alert photo send failed: {res.detail}")
                 elif hasattr(sender, "send_text"):
-                    res = sender.send_text(text)
+                    try:
+                        res = sender.send_text(
+                            text, reply_markup=reply_markup)
+                    except TypeError:
+                        # Legacy sender without reply_markup support.
+                        res = sender.send_text(text)
                     if not getattr(res, "delivered", False):
                         self.journal.log_note(
                             f"mt5: alert send failed: {res.detail}")
@@ -2336,7 +3595,7 @@ class MT5Runner:
         except Exception:
             return {}
 
-    def _poll_telegram_commands(self) -> None:
+    def _poll_telegram_commands(self, stats: dict | None = None) -> None:
         """Poll getUpdates and answer owner commands (MT5 registry).
 
         ON by default: this engine OWNS getUpdates.  The OANDA loop's
@@ -2344,6 +3603,9 @@ class MT5Runner:
         consumer only.  First poll only syncs the offset (drains the
         backlog without answering stale commands); later polls answer.
         A poll failure is silent — the tick loop never stops for it.
+        ``stats`` (this tick's counters) is threaded to Confirm taps
+        so a deferred Golden Swing order's execution counts on the
+        tick that confirmed it.
         """
         if not self.cfg.poll_commands:
             return
@@ -2376,7 +3638,7 @@ class MT5Runner:
             if upd.get("callback_query") is not None:
                 # Button taps share THIS poller (one getUpdates
                 # consumer only — never a second poller).
-                self._handle_callback_query(upd)
+                self._handle_callback_query(upd, stats)
                 continue
             try:
                 result, _chat_id = router.dispatch(upd, ctx)
@@ -2392,7 +3654,8 @@ class MT5Runner:
                          {"offset": self._tg_offset, "timeout": 0})
 
     # -------------------------------------------------- callback_query
-    def _handle_callback_query(self, upd: dict) -> None:
+    def _handle_callback_query(self, upd: dict,
+                               stats: dict | None = None) -> None:
         """One button tap: owner-gated, answered, acted on.
 
         Flow: a tap on Pause / Resume / Trim / Cancel pending only
@@ -2443,7 +3706,8 @@ class MT5Runner:
                 _answer(f"Confirm to {action}…")
                 return
             if action == "confirm":
-                ok, text = self.confirm_pending(arg or "")
+                ok, text = self.confirm_pending(
+                    arg or "", stats if stats is not None else {})
                 if message_id is not None:
                     self._tg_api("editMessageText", {
                         "chat_id": chat_id, "message_id": message_id,

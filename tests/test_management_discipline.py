@@ -154,11 +154,30 @@ def test_close_safety_net_stop_is_sl_hit(tmp_path):
 
 
 # ------------------------------------------------- tick-management follow-ups
-def test_breakeven_move_sends_follow_up(tmp_path):
+def test_profit_lock_move_sends_follow_up(tmp_path):
     sender = FakeSender()
     runner = _runner(tmp_path, sender)
     _open_long(runner)
-    runner._manage_tick(2023.0, {"tick_actions": 0})  # +1.03R: breakeven triggers
+    runner._manage_tick(2023.0, {"tick_actions": 0})  # +1.03R: profit-lock
+    assert any("MT5 PROFIT LOCK" in t and "profit locked" in t
+               for t in sender.texts)
+
+
+def test_breakeven_move_sends_follow_up(tmp_path):
+    from goldenswing.execution.tick_manager import (
+        TickConfig, TickManager)
+    sender = FakeSender()
+    cfg = MT5RunnerConfig(
+        journal_path=tmp_path / "mt5_journal.jsonl",
+        risk_state_path=tmp_path / "mt5_risk.json",
+        kill_switch_path=tmp_path / "mt5_KILL")
+    runner = MT5Runner(
+        cfg, executor=FakeExecutor(),
+        tick_manager=TickManager(
+            tick=TickConfig(profit_lock_enabled=False)))
+    runner.senders = [sender]
+    _open_long(runner)
+    runner._manage_tick(2023.0, {"tick_actions": 0})  # +1.03R: breakeven
     assert any("MT5 BREAKEVEN" in t and "risk off" in t
                for t in sender.texts)
 
@@ -170,6 +189,107 @@ def test_partial_bank_sends_follow_up(tmp_path):
     runner._manage_tick(2040.0, {"tick_actions": 0})  # partial pool + breakeven
     assert any("MT5 PARTIAL" in t and "banked" in t
                for t in sender.texts)
+
+
+def test_panic_close_records_panic_and_alerts(tmp_path):
+    # Wide stop so panic (not the stop) fires: long @ 2005,
+    # invalidation 1930 -> stop0 1927.5, risk 77.5, ATR 10.
+    # Panic needs adverse > 45 -> price < 1960.
+    class OpenExecutor(FakeExecutor):
+        def positions(self, symbol=None):
+            return [SimpleNamespace(ticket=7)]
+
+    cfg = MT5RunnerConfig(
+        journal_path=tmp_path / "mt5_journal.jsonl",
+        risk_state_path=tmp_path / "mt5_risk.json",
+        kill_switch_path=tmp_path / "mt5_KILL")
+    sender = FakeSender()
+    runner = MT5Runner(cfg, executor=OpenExecutor())
+    runner.senders = [sender]
+    req = OrderRequest(symbol="XAUUSD", direction=1, volume=0.01,
+                       stop_loss=1930.0, entry_ref=2005.0,
+                       targets=[2100.0], atr=10.0,
+                       alert_id="MT5-fvg_limit-42", bar_index=10,
+                       magic=260101)
+    runner.tick_manager.open(ticket=7, request=req, fill_price=2005.0,
+                             entry_bar=10, broker_sl=1927.5)
+    runner._manage_tick(1959.0, {"tick_actions": 0,
+                                  "reconciled_closed": 0})
+    assert any("MT5 PANIC CLOSE" in t for t in sender.texts)
+    assert any("MT5 CLOSE" in t and "panic" in t for t in sender.texts)
+    assert runner.tick_manager.position(7) is None
+
+
+def test_scalp_cap_close_records_scalp_cap_and_alerts(tmp_path):
+    import time as _time
+    from goldenswing.execution.tick_manager import TickManager
+
+    class OpenExecutor(FakeExecutor):
+        def positions(self, symbol=None):
+            return [SimpleNamespace(ticket=7)]
+
+    cfg = MT5RunnerConfig(
+        journal_path=tmp_path / "mt5_journal.jsonl",
+        risk_state_path=tmp_path / "mt5_risk.json",
+        kill_switch_path=tmp_path / "mt5_KILL")
+    sender = FakeSender()
+    runner = MT5Runner(cfg, executor=OpenExecutor(),
+                       tick_manager=TickManager())
+    runner.senders = [sender]
+    req = OrderRequest(symbol="XAUUSD", direction=1, volume=0.01,
+                       stop_loss=1990.0, entry_ref=2005.0,
+                       targets=[2040.0], atr=10.0,
+                       alert_id="MT5-fvg_limit-42", bar_index=10,
+                       magic=260101, is_scalp=True)
+    runner.tick_manager.open(ticket=7, request=req, fill_price=2005.0,
+                             entry_bar=10, broker_sl=1987.5,
+                             now=_time.time() - 16 * 60)
+    runner._manage_tick(2005.0, {"tick_actions": 0,
+                                  "reconciled_closed": 0})
+    assert any("MT5 SCALP CAP" in t for t in sender.texts)
+    assert any("MT5 CLOSE" in t and "scalp_cap" in t
+               for t in sender.texts)
+    assert runner.tick_manager.position(7) is None
+
+
+def test_h1_close_passes_regime_to_time_exit(tmp_path):
+    import numpy as np
+    from goldenswing.execution.tick_manager import (
+        TickConfig, TickManager)
+    from goldenswing.live.regime import classify_regime
+
+    # 100 steadily rising H1 bars -> bedrock classifies a structure.
+    idx = pd.date_range("2026-01-01", periods=100, freq="h", tz="UTC")
+    closes = np.linspace(2000.0, 2100.0, 100)
+    h1 = pd.DataFrame({
+        "open": closes - 0.5, "high": closes + 1.0,
+        "low": closes - 1.0, "close": closes,
+        "volume": np.ones(100)}, index=idx)
+    structure = classify_regime(h1).structure
+    assert structure  # the wiring test keys the map on it
+
+    cfg = MT5RunnerConfig(
+        journal_path=tmp_path / "mt5_journal.jsonl",
+        risk_state_path=tmp_path / "mt5_risk.json",
+        kill_switch_path=tmp_path / "mt5_KILL")
+    runner = MT5Runner(
+        cfg, executor=FakeExecutor(),
+        tick_manager=TickManager(
+            tick=TickConfig(time_exit_bars={structure: 8})))
+    runner._stack = SimpleNamespace(frames={"H1": h1})
+    runner._last_tick = {"mid": 2050.0}
+    last_bar = len(h1) - 1
+    req = OrderRequest(symbol="XAUUSD", direction=1, volume=0.01,
+                       stop_loss=1990.0, entry_ref=2005.0,
+                       targets=[2040.0], atr=10.0,
+                       alert_id="MT5-fvg_limit-42",
+                       bar_index=last_bar - 8, magic=260101)
+    runner.tick_manager.open(ticket=7, request=req, fill_price=2005.0,
+                             entry_bar=last_bar - 8, broker_sl=1987.5)
+    runner._on_h1_close({"mid": 2050.0, "time": idx[-1]},
+                        {"reconciled_closed": 0})
+    # 8 bars at the classified structure's horizon -> timeout close.
+    assert runner.tick_manager.position(7) is None
 
 
 def test_layer_stop_sends_follow_up(tmp_path):

@@ -48,6 +48,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from ..entry.validator import confirm_at_poi
 from ..live.hierarchy import (STACK_TFS, TF_MINUTES, TimeframeStack,
                               evaluate_hierarchy)
 from ..live.volume import volume_features
@@ -304,6 +305,31 @@ def run_hierarchy_backtest(frames: dict[str, pd.DataFrame], *,
         target = pool if (pool - fill) * d >= 2.0 * risk \
             else fill + d * 2.0 * risk
 
+        # Shadow-only candle-shape confirmation at the POI, on the
+        # entry-TF bars composing the signal H1 bar (the bars live
+        # would have seen before the next-open entry).  Annotation
+        # only: the trade book is unchanged — WITHOUT = all trades,
+        # WITH = the candle_confirmed subset, compared by the caller.
+        candle_confirmed, candle_shape, candle_shapes = False, "none", []
+        clock = verdict.get("entry_clock")
+        if clock in stack_frames:
+            eframe = stack_frames[clock]
+            if stamps.get(clock, "open") == "close":
+                composing = eframe[(eframe.index > asof)
+                                   & (eframe.index <= h1_close)]
+            else:
+                composing = eframe[(eframe.index >= asof)
+                                   & (eframe.index < h1_close)]
+            # Causal context: entry-TF bars up to the signal H1
+            # close only — structure shapes must not see the future.
+            ctx = eframe[eframe.index <= h1_close]
+            ann = confirm_at_poi(composing, d,
+                                 band["bottom"], band["top"],
+                                 context=ctx)
+            candle_confirmed = bool(ann.confirmed)
+            candle_shape = ann.shape
+            candle_shapes = list(ann.shapes)
+
         last = min(i + time_stop_bars, n - 1)
         exit_price, exit_idx, reason = float(closes[last]), last, "timeout"
         for k in range(i + 1, last + 1):
@@ -346,6 +372,9 @@ def run_hierarchy_backtest(frames: dict[str, pd.DataFrame], *,
             "hold_bars": int(exit_idx - i),
             "zone_level": float(band["level"]),
             "trigger": verdict.get("trigger"),
+            "candle_confirmed": candle_confirmed,
+            "candle_shape": candle_shape,
+            "candle_shapes": candle_shapes,
         })
         # Resume at the exit bar: one position at a time, never overlap.
         i = exit_idx
@@ -361,6 +390,7 @@ def run_hierarchy_backtest(frames: dict[str, pd.DataFrame], *,
                             risk_money),
     }
     qm_confirmed = [t for t in trades if t["qm_status"] == "qm_confirmed"]
+    candle_confirmed = [t for t in trades if t["candle_confirmed"]]
     return {
         "hierarchy": "D1 bias -> H4 zones -> H1 trigger -> entry clock",
         "swing_n": swing_n, "start_balance": float(start_balance),
@@ -382,6 +412,8 @@ def run_hierarchy_backtest(frames: dict[str, pd.DataFrame], *,
         "by_direction": by_direction,
         "qm_confirmed": _summarize(qm_confirmed, risk_money),
         "qm_confirmed_trades": len(qm_confirmed),
+        "candle_confirmed": _summarize(candle_confirmed, risk_money),
+        "candle_confirmed_trades": len(candle_confirmed),
     }
 
 

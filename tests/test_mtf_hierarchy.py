@@ -442,16 +442,23 @@ def test_multi_oanda_feed_interface(monkeypatch):
             return {"prices": [{"bids": [{"price": "102.00"}],
                                 "asks": [{"price": "102.10"}],
                                 "time": "2026-01-01T03:00:00Z"}]}
-        # candles: granularity-specific base so TFs are distinguishable
+        # candles: granularity-specific base so TFs are distinguishable.
+        # Keys are OANDA tokens: the D1 feed requests "D" (OANDA's
+        # CandlestickGranularity enum has no "D1").
         gran = params.get("granularity", "H1")
-        base = {"D1": 100.0, "H4": 101.0, "H1": 102.0, "M15": 103.0,
+        requested.append(gran)
+        base = {"D": 100.0, "H4": 101.0, "H1": 102.0, "M15": 103.0,
                 "M30": 104.0, "M5": 105.0}[gran]
         return {"candles": _candles(base)}
 
+    requested: list = []
     monkeypatch.setattr(oanda_mod, "_get", _fake_get)
     feed = MultiOandaFeed()
     all_frames = feed.warm_start_all()
     assert set(all_frames) == {"D1", "H4", "H1", "M15", "M30", "M5"}
+    # The D1 feed must request OANDA's "D" token, never the invalid "D1".
+    assert "D" in requested
+    assert "D1" not in requested
     for tf, df in all_frames.items():
         assert len(df) == 3, tf
     # Legacy single-TF interface still serves H1.

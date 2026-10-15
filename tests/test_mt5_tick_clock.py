@@ -469,7 +469,10 @@ def test_runner_full_live_path_places_order(tmp_path):
                    "triggers": 0, "invalidated": 0}
     # _place_live_order reads the account for sizing.
     runner.feed = SimpleNamespace(
-        account_state=lambda: {"equity": 10000.0})
+        account_state=lambda: {"equity": 10000.0, "balance": 10000.0,
+                               "free_margin": 10000.0},
+        order_margin=lambda *, volume, price, direction:
+            float(volume) * 100.0 * float(price) / 500.0)
 
     sig = SimpleNamespace(
         score=80.0, direction=1, index=len(runner._stack.frames["H1"]),

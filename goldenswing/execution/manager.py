@@ -60,6 +60,23 @@ class TrackedPosition:
     trail_level: float | None = None
     wicked_inv: bool = False
     closed: bool = False
+    #: ATR at entry (0.0 = unknown, e.g. adopted positions) — the
+    #: Chandelier / profit-lock ATR legs need it.
+    atr: float = 0.0
+    #: Never partial this position (adopted: no target book, the
+    #: setup is unknown).  Distinct from ``partial_done`` ("a partial
+    #: was taken"), which tiered partials also set.
+    no_partial: bool = False
+    #: Tiered partials fired so far (TickManager only).
+    tiers_done: int = 0
+    #: Worst adverse excursion in R (panic-candle accounting).
+    worst_r: float = 0.0
+    #: Scalp position (holding cap applies).
+    is_scalp: bool = False
+    #: Wall-clock open time (epoch seconds) for the scalp cap.
+    opened_at: float | None = None
+    #: Min-lot profit-lock applied (one-shot).
+    profit_lock_done: bool = False
 
     @property
     def active_stop(self) -> float:
@@ -105,7 +122,7 @@ class ExitStepper:
             entry_bar=entry_bar, invalidation=request.stop_loss,
             stop0=stop0, risk_price=risk,
             targets=tuple(request.targets or ()),
-            partial_price=partial_price)
+            partial_price=partial_price, atr=float(request.atr))
 
     def step(self, pos: TrackedPosition, bar: dict,
              bar_index: int) -> list[ExitEvent]:

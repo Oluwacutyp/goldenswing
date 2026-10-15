@@ -58,6 +58,11 @@ class FakeMT5:
     POSITION_TYPE_SELL = 1
     TRADE_RETCODE_DONE = 10009
     TRADE_RETCODE_PLACED = 10008
+    # Symbol trade modes (SYMBOL_TRADE_MODE_*): FULL (4) is the only
+    # mode in which the broker accepts new orders.
+    SYMBOL_TRADE_MODE_DISABLED = 0
+    SYMBOL_TRADE_MODE_CLOSEONLY = 3
+    SYMBOL_TRADE_MODE_FULL = 4
 
     _TF_BY_CONST = {v: k for k, v in [
         ("M1", 1), ("M5", 5), ("M15", 15), ("M30", 30),
@@ -67,12 +72,18 @@ class FakeMT5:
     def __init__(self, *, server_offset_seconds: int = 0,
                  base_price: float = 2000.0,
                  trade_mode: int = 0,
+                 symbol_trade_mode: int = 4,
+                 leverage: int = 500,
                  real_volume_on: bool = False,
                  tick_script: list | None = None,
                  symbols: list | None = None):
         self.server_offset_seconds = server_offset_seconds
         self.base_price = base_price
         self.trade_mode = trade_mode
+        # Symbol trade mode (SYMBOL_TRADE_MODE_*): separate from the
+        # ACCOUNT trade_mode above (0=demo, 2=real).  Default FULL.
+        self.symbol_trade_mode = symbol_trade_mode
+        self.leverage = leverage
         self.real_volume_on = real_volume_on
         self.tick_script = list(tick_script) if tick_script else []
         # Broker symbol universe: symbol_select only succeeds for a
@@ -113,7 +124,7 @@ class FakeMT5:
         return SimpleNamespace(
             trade_tick_value=1.0, trade_tick_size=0.01, volume_min=0.01,
             volume_max=50.0, volume_step=0.01, digits=2, point=0.01,
-            filling_mode=3)
+            filling_mode=3, trade_mode=self.symbol_trade_mode)
 
     # ---------------------------------------------------------------- ticks
     def _tick_now(self):
@@ -176,7 +187,13 @@ class FakeMT5:
         return SimpleNamespace(balance=10000.0, equity=10000.0,
                                margin=0.0, margin_free=10000.0,
                                currency="USD", login=123456,
-                               leverage=500, trade_mode=self.trade_mode)
+                               leverage=self.leverage,
+                               trade_mode=self.trade_mode)
+
+    def order_calc_margin(self, order_type, symbol, volume, price):
+        """Broker margin: lots × contract (100 oz) × price / leverage
+        — the owner's-bot formula, with the fake's leverage."""
+        return float(volume) * 100.0 * float(price) / max(1, self.leverage)
 
     def positions_get(self, symbol=None, ticket=None):
         out = [p for p in self.positions_store

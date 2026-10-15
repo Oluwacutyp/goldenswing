@@ -43,6 +43,29 @@ import pandas as pd
 API_HOST = "api-fxpractice.oanda.com"
 INSTRUMENT = "XAU_USD"
 
+#: Internal TF names -> OANDA CandlestickGranularity tokens. OANDA's
+#: enum (https://developer.oanda.com/rest-live-v20/instrument-df/) is
+#: S5 S10 S15 S30 M1 M2 M4 M5 M10 M15 M30 H1 H2 H3 H4 H6 H8 H12 D W M
+#: — there is NO "D1", "W1", or "MN1". Passing "D1" verbatim made
+#: OANDA reject every D1 request, so the D1 feed never succeeded once
+#: while M5-H4 (valid tokens) worked through identical code. The
+#: mapping applies ONLY at the OANDA request boundary: internal names
+#: (STACK_TFS, MT5 TIMEFRAME_ constants) are untouched.
+OANDA_GRANULARITY: dict[str, str] = {
+    "D1": "D",    # daily
+    "W1": "W",    # weekly
+    "MN1": "M",   # monthly
+}
+
+
+def to_oanda_granularity(tf: str) -> str:
+    """Translate an internal TF name to OANDA's granularity token.
+
+    Tokens already in OANDA's enum pass through unchanged; only the
+    internal D1/W1/MN1 spellings need translation.
+    """
+    return OANDA_GRANULARITY.get(tf, tf)
+
 
 @dataclass
 class OandaFeedConfig:
@@ -162,7 +185,8 @@ def fetch_oanda(instrument: str = INSTRUMENT, granularity: str = "H1",
     """
     payload = _get(
         f"/v3/instruments/{instrument}/candles",
-        {"granularity": granularity, "count": count, "price": price},
+        {"granularity": to_oanda_granularity(granularity),
+         "count": count, "price": price},
     )
     return normalize_oanda_candles(payload, complete_only=complete_only)
 
@@ -351,7 +375,15 @@ class OandaFeed:
     def poll_status(self) -> dict:
         now = time.time()
         if self._last_poll_ok is None:
-            return {"ok": False, "reason": "no successful poll yet"}
+            # Never hide the failure: before the first success the
+            # real error is the ONLY diagnostic, so surface it always.
+            # (Previously this returned a bare "no successful poll yet"
+            # and swallowed _last_error, making the D1 failure
+            # undiagnosable for its whole lifetime.)
+            reason = "no successful poll yet"
+            if self._last_error:
+                reason += f" (last error: {self._last_error})"
+            return {"ok": False, "reason": reason}
         idle = (now - self._last_poll_ok) / 60.0
         if idle > self.cfg.stale_poll_minutes:
             return {"ok": False,

@@ -50,6 +50,7 @@ Design (two-phase, execution-safe):
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from ..backtest.harness import ExitConfig
@@ -64,6 +65,86 @@ class TickConfig:
     #: Breakeven SL = entry + direction * breakeven_offset_r * risk.
     #: 0.0 = exactly entry (pure breakeven).
     breakeven_offset_r: float = 0.0
+    #: Tiered partials — (trigger_R, fraction_of_orig_volume) per tier,
+    #: fired in order as the excursion crosses each trigger.  Default
+    #: is the owner's 50/25/25 split (50% at 1R, 25% at 2R, 25% at
+    #: 3R, remainder rides).  When non-empty AND the position is at
+    #: least ``tier_min_volume`` lots, tiers OWN partials and the
+    #: single pool partial is skipped (two partial mechanisms would
+    #: double-bank).  Empty tuple = legacy single pool partial.
+    partial_tiers: tuple[tuple[float, float], ...] = (
+        (1.0, 0.50), (2.0, 0.25), (3.0, 0.25))
+    #: Tier logic applies only at/above this size (owner's gate:
+    #: 0.03 lots — below it, one plain partial).
+    tier_min_volume: float = 0.03
+    #: Min-lot profit-lock (owner's rule): once the excursion hits
+    #: ``profit_lock_trigger_r`` OR ``profit_lock_progress`` of the
+    #: way to the first target, move the SL to entry + the lock
+    #: distance in favour — ``max(fraction_of_risk * risk,
+    #: atr_mult * ATR)``.  One-shot, only ever tightens.
+    profit_lock_enabled: bool = True
+    profit_lock_trigger_r: float = 1.0
+    profit_lock_progress: float = 0.50
+    profit_lock_fraction_of_risk: float = 0.50
+    profit_lock_atr_mult: float = 0.75
+    #: Chandelier trailing (owner's TrailingStopEngine): once the
+    #: excursion reaches ``chandelier_activation_r``, the stop is the
+    #: best price since entry minus ``chandelier_atr_mult`` x ATR
+    #: (long; mirrored for short), ratcheting only.  Needs ATR —
+    #: adopted positions (ATR unknown) never get it.
+    chandelier_enabled: bool = True
+    chandelier_atr_mult: float = 3.0
+    chandelier_activation_r: float = 1.5
+    #: Panic-candle emergency close (owner's PanicCandleProtector):
+    #: when the adverse excursion since entry exceeds
+    #: ``panic_mult`` x ATR with severity
+    #: adverse / (panic_mult * ATR) > ``panic_severity``, close the
+    #: whole position NOW.  Tick-resolution version of the owner's
+    #: current-candle rule: same trigger level, trips on the
+    #: crossing tick instead of at the candle close.  Needs ATR.
+    panic_enabled: bool = True
+    panic_mult: float = 3.0
+    panic_severity: float = 1.5
+    #: Scalp holding cap (owner's scalping_max_holding_minutes): a
+    #: position flagged ``is_scalp`` closes after this many minutes
+    #: of wall-clock hold, on the tick that crosses the cap.
+    scalp_cap_minutes: float = 15.0
+    #: Regime-dependent time exit: max holding H1 bars per bedrock
+    #: structure.  None = the fixed ExitConfig.horizon for every
+    #: structure.  The runner default is DEFAULT_TIME_EXIT_BARS
+    #: (engine-derived values, see below).
+    time_exit_bars: dict[str, int] | None = None
+#: Default regime-dependent time-exit map (H1 bars from the signal
+#: bar), set deliberately from THIS engine's own evidence — NOT the
+#: owner's old-bot 8–20 values, whose bar unit is unverified (copying
+#: them onto H1 bars would silently cut swing holds from 72h to
+#: 8–20h).  Anchors:
+#:
+#: - The fixed horizon is 72 H1 bars (~3 days): Phase-2's own swing
+#:   horizon ("gives the 3-day swing room to breathe").
+#: - ``clean_trend`` gets the full 72: a trend needs room; a trend
+#:   that hasn't hit stop/target in 3 days is stale.
+#: - ``range`` 48 (2 days): a range trade should reach the opposite
+#:   edge, or the range read is stale.
+#: - ``compression`` 36 (1.5 days): compression resolves by breakout
+#:   or fails fast; longer is dead money.
+#: - ``breakout`` / ``reversal`` 24 (1 day): breakouts either follow
+#:   through immediately or fail; reversals are counter-trend and
+#:   the lowest-confidence label (0.45) — both get a short leash.
+#: - ``choppy`` 12 (~half a day): choppy has no core fit (wicky +
+#:   doji hunting); ~Phase-1's ~11-bar scalp-out scale.
+#: - ``unclear`` 72: classification failed — same as the fixed
+#:   horizon, explicit rather than a silent fallback.
+#: Keys are exactly the structures ``classify_regime`` produces.
+DEFAULT_TIME_EXIT_BARS: dict[str, int] = {
+    "clean_trend": 72,
+    "range": 48,
+    "compression": 36,
+    "breakout": 24,
+    "reversal": 24,
+    "choppy": 12,
+    "unclear": 72,
+}
 
 
 @dataclass
@@ -80,12 +161,15 @@ class Layer:
 @dataclass(frozen=True)
 class TickAction:
     kind: str          # "modify_sl" | "partial" | "stop_hit" | "timeout" |
-                       # "layer_stop" | "trim"
+                       # "layer_stop" | "trim" | "panic" | "scalp_cap"
     level: float | None = None   # SL level (modify_sl) / trigger (others)
     volume: float = 0.0          # lots to close (partial / stop / timeout /
-                                 # layer_stop / trim)
+                                 # layer_stop / trim / panic / scalp_cap)
     reason: str = ""             # "breakeven" | "trail" | "partial" |
-                                 # "stop" | "timeout" | "layer_stop" | "trim"
+                                 # "stop" | "timeout" | "layer_stop" |
+                                 # "trim" | "panic" | "scalp_cap" |
+                                 # "partial_tier_N" | "profit_lock" |
+                                 # "chandelier"
 
 
 @dataclass
@@ -132,17 +216,22 @@ class TickManager:
 
     def open(self, *, ticket: int, request: OrderRequest,
              fill_price: float, entry_bar: int,
-             broker_sl: float | None = None) -> TrackedPosition:
+             broker_sl: float | None = None,
+             now: float | None = None) -> TrackedPosition:
         """Start tracking a live position (after the order filled).
 
         ``request.stop_loss`` is the raw structural invalidation;
         the stepper derives the buffered stop0 from it.
         ``broker_sl`` is the SL actually placed on the broker
         (``planned_stop``); when omitted it defaults to stop0.
+        ``now`` is the wall-clock open time (epoch seconds) for the
+        scalp cap — defaults to ``time.time()``.
         """
         pos = self._stepper.open(ticket=ticket, request=request,
                                  fill_price=fill_price,
                                  entry_bar=entry_bar)
+        pos.is_scalp = bool(getattr(request, "is_scalp", False))
+        pos.opened_at = float(now) if now is not None else time.time()
         self._states[ticket] = _TickState(
             pos=pos, broker_sl=(float(broker_sl) if broker_sl is not None
                                 else pos.stop0),
@@ -171,7 +260,8 @@ class TickManager:
             invalidation=float(sl) if sl is not None else entry_price,
             stop0=float(sl) if sl is not None else entry_price,
             risk_price=abs(entry_price - sl) if sl is not None else 0.0,
-            alert_id=alert_id, partial_price=None, partial_done=True)
+            alert_id=alert_id, partial_price=None, partial_done=True,
+            no_partial=True)
         self._states[ticket] = _TickState(
             pos=pos, broker_sl=float(sl) if sl is not None else None,
             layers=[Layer(entry=float(entry_price), volume=float(volume),
@@ -230,14 +320,15 @@ class TickManager:
                           reason="trim")
 
     # ------------------------------------------------------------ per tick
-    def on_tick(self, ticket: int, price: float) -> list[TickAction]:
+    def on_tick(self, ticket: int, price: float,
+                now: float | None = None) -> list[TickAction]:
         """Actions this tick demands (decide; caller executes + applies).
 
         Order mirrors the stepper's conservative ordering: stops
         first, then the partial, then SL-tightening moves.  At most
-        one SL move is emitted per tick (breakeven wins over trail
-        when both trigger on the same tick — same level family,
-        tightest wins via ``apply`` ordering below).
+        one SL move is emitted per tick — it is the TIGHTEST
+        candidate (breakeven / profit-lock / R-trail / Chandelier)
+        that improves on the current stop.
         """
         st = self._states.get(ticket)
         if st is None:
@@ -260,6 +351,30 @@ class TickManager:
             return [TickAction("stop_hit", level=stop, volume=pos.volume,
                                 reason="stop")]
 
+        # 1a. Panic: adverse excursion since entry past the panic
+        #     threshold — close the whole position NOW, before any
+        #     partial or layer stop.  A crossed stop above already
+        #     returned, so panic never mislabels a stop hit.
+        pos.worst_r = max(pos.worst_r,
+                          -d * (price - pos.entry_price) / pos.risk_price)
+        tcfg = self.tick_cfg
+        if tcfg.panic_enabled and pos.atr > 0:
+            adverse = pos.worst_r * pos.risk_price
+            severity = adverse / (tcfg.panic_mult * pos.atr)
+            if severity > tcfg.panic_severity:
+                return [TickAction("panic", level=price,
+                                   volume=pos.volume, reason="panic")]
+
+        # 1b. Scalp holding cap: wall-clock hold past the cap closes
+        #     the whole position.  Panic (above) wins on a tie —
+        #     an emergency close outranks a time exit.
+        if pos.is_scalp and pos.opened_at is not None:
+            now_ts = float(now) if now is not None else time.time()
+            if now_ts - pos.opened_at >= tcfg.scalp_cap_minutes * 60.0:
+                return [TickAction("scalp_cap", level=price,
+                                   volume=pos.volume,
+                                   reason="scalp_cap")]
+
         actions: list[TickAction] = []
         # 1b. Added-layer stops (engine-side): an added layer whose
         # own SL is crossed closes alone — the base layer rides.
@@ -273,8 +388,33 @@ class TickManager:
                     reason="layer_stop"))
         if actions:
             return actions
-        # 2. Partial bank at the first liquidity pool.
-        if not pos.partial_done and pos.partial_price is not None:
+
+        # 3. Best excursion from THIS tick (not the next bar) —
+        #    evaluated BEFORE partials/SL moves so a tier, the
+        #    profit-lock, and the Chandelier all see this tick's
+        #    excursion (a gap tick must not leave them a tick late).
+        pos.best_r = max(pos.best_r,
+                         d * (price - pos.entry_price) / pos.risk_price)
+
+        # 2. Partial bank: tiered partials own partials when
+        #    configured and the position is big enough; otherwise
+        #    the legacy single pool partial.
+        tiers = self.tick_cfg.partial_tiers
+        if tiers and not pos.no_partial \
+                and pos.orig_volume >= self.tick_cfg.tier_min_volume:
+            if pos.tiers_done < len(tiers):
+                trig_r, frac = tiers[pos.tiers_done]
+                if pos.best_r >= trig_r:
+                    vol = min(frac * pos.orig_volume, pos.volume)
+                    if vol > 0:
+                        actions.append(TickAction(
+                            "partial",
+                            level=pos.entry_price + d * trig_r
+                            * pos.risk_price,
+                            volume=vol,
+                            reason=f"partial_tier_{pos.tiers_done + 1}"))
+        elif not pos.no_partial and not pos.partial_done \
+                and pos.partial_price is not None:
             crossed = price >= pos.partial_price if d == 1 \
                 else price <= pos.partial_price
             if crossed:
@@ -282,29 +422,52 @@ class TickManager:
                 actions.append(TickAction("partial", level=pos.partial_price,
                                           volume=vol, reason="partial"))
 
-        # 3. Best excursion from THIS tick (not the next bar).
-        pos.best_r = max(pos.best_r,
-                         d * (price - pos.entry_price) / pos.risk_price)
-
-        # 4. Breakeven: SL -> entry (+ offset) on the crossing tick.
-        sl_action: TickAction | None = None
+        # 4/5. SL-tightening candidates — at most ONE SL move per
+        #    tick, and it is the TIGHTEST candidate that improves on
+        #    the current stop.  Breakeven, profit-lock, the R-trail,
+        #    and the Chandelier are all "move the SL tighter" — the
+        #    tightest wins; a one-shot whose action is not applied
+        #    stays pending (its level stays a candidate next tick).
+        #    A candidate that would LOOSEN the stop never fires.
+        candidates: list[tuple[float, str]] = []
+        if not pos.profit_lock_done and tcfg.profit_lock_enabled:
+            tp = pos.targets[0] if pos.targets else None
+            target_dist = abs(tp - pos.entry_price) if tp is not None \
+                else 2.0 * pos.risk_price
+            progress = abs(price - pos.entry_price) / target_dist \
+                if target_dist > 0 else 0.0
+            if pos.best_r >= tcfg.profit_lock_trigger_r \
+                    or progress >= tcfg.profit_lock_progress:
+                lock_dist = max(
+                    tcfg.profit_lock_fraction_of_risk * pos.risk_price,
+                    tcfg.profit_lock_atr_mult * pos.atr
+                    if pos.atr > 0 else 0.0)
+                candidates.append((
+                    pos.entry_price + d * lock_dist, "profit_lock"))
         if not st.breakeven_done \
-                and pos.best_r >= self.tick_cfg.breakeven_trigger_r:
-            level = pos.entry_price + d * self.tick_cfg.breakeven_offset_r \
-                * pos.risk_price
-            if (d == 1 and level > stop) or (d == -1 and level < stop):
-                sl_action = TickAction("modify_sl", level=level,
-                                       reason="breakeven")
-        # 5. Trailing: evaluated independently when breakeven did not
-        #    already move the SL this tick (one SL move per tick).
-        if sl_action is None and pos.best_r >= ex.trail_trigger_r:
-            level = pos.entry_price + d * (
-                pos.best_r - ex.trail_dist_r) * pos.risk_price
-            if (d == 1 and level > stop) or (d == -1 and level < stop):
-                sl_action = TickAction("modify_sl", level=level,
-                                       reason="trail")
-        if sl_action is not None:
-            actions.append(sl_action)
+                and pos.best_r >= tcfg.breakeven_trigger_r:
+            candidates.append((
+                pos.entry_price + d * tcfg.breakeven_offset_r
+                * pos.risk_price, "breakeven"))
+        if pos.best_r >= ex.trail_trigger_r:
+            candidates.append((
+                pos.entry_price + d * (
+                    pos.best_r - ex.trail_dist_r) * pos.risk_price,
+                "trail"))
+        if tcfg.chandelier_enabled and pos.atr > 0 \
+                and pos.best_r >= tcfg.chandelier_activation_r:
+            best_price = pos.entry_price + d * pos.best_r * pos.risk_price
+            candidates.append((
+                best_price - d * tcfg.chandelier_atr_mult * pos.atr,
+                "chandelier"))
+        tighter = [(lvl, rsn) for lvl, rsn in candidates
+                   if (d == 1 and lvl > stop)
+                   or (d == -1 and lvl < stop)]
+        if tighter:
+            level, reason = max(tighter, key=lambda c: c[0]) \
+                if d == 1 else min(tighter, key=lambda c: c[0])
+            actions.append(TickAction("modify_sl", level=level,
+                                      reason=reason))
         return actions
 
     def apply(self, ticket: int, action: TickAction) -> None:
@@ -317,6 +480,8 @@ class TickManager:
             st.broker_sl = float(action.level)
             if action.reason == "breakeven":
                 st.breakeven_done = True
+            if action.reason == "profit_lock":
+                pos.profit_lock_done = True
             # Keep the stepper's trail level in sync so active_stop
             # never disagrees with the broker SL on the next tick.
             if pos.trail_level is None or \
@@ -324,6 +489,8 @@ class TickManager:
                     (pos.direction == -1 and action.level < pos.trail_level):
                 pos.trail_level = float(action.level)
         elif action.kind == "partial":
+            if action.reason.startswith("partial_tier_"):
+                pos.tiers_done += 1
             pos.partial_done = True
             pos.volume = max(0.0, pos.volume - action.volume)
             if pos.volume <= 0:
@@ -348,16 +515,21 @@ class TickManager:
             pos.volume = max(0.0, pos.volume - action.volume)
             if pos.volume <= 0:
                 pos.closed = True
-        elif action.kind in ("stop_hit", "timeout"):
+        elif action.kind in ("stop_hit", "timeout", "panic", "scalp_cap"):
             pos.closed = True
 
     # ----------------------------------------------------------- bar close
-    def on_bar_close(self, ticket: int, bar_index: int) -> list[TickAction]:
+    def on_bar_close(self, ticket: int, bar_index: int,
+                     regime_structure: str | None = None,
+                     ) -> list[TickAction]:
         """Time stop, evaluated on H1 bar closes (inherently bar-based).
 
         Everything price-based is tick-based (:meth:`on_tick`); the
         horizon time stop is the one rule that is defined in bars, so
         it fires here, on the bar close — never from a poll timer.
+        ``regime_structure`` is the bedrock structure at the close;
+        when the configured ``time_exit_bars`` map has an entry for
+        it, that horizon replaces the fixed one.
         """
         st = self._states.get(ticket)
         if st is None:
@@ -365,7 +537,11 @@ class TickManager:
         pos = st.pos
         if pos.closed:
             return []
-        if bar_index - pos.signal_bar >= self.exits.horizon:
+        horizon = self.exits.horizon
+        time_map = self.tick_cfg.time_exit_bars
+        if time_map and regime_structure is not None:
+            horizon = int(time_map.get(regime_structure, horizon))
+        if bar_index - pos.signal_bar >= horizon:
             return [TickAction("timeout", level=None, volume=pos.volume,
                                reason="timeout")]
         return []

@@ -46,10 +46,17 @@ TRADE_MODE_DEMO = 0
 TRADE_MODE_CONTEST = 1
 TRADE_MODE_REAL = 2
 
+#: MT5 symbol trade mode (SYMBOL_TRADE_MODE_*): FULL (4) is the only
+#: mode in which the broker accepts NEW orders.  DISABLED (0) is the
+#: weekend / market-closed state; CLOSEONLY (3) accepts closes only.
+SYMBOL_TRADE_MODE_FULL = 4
+
 #: Warm-start bar counts per timeframe (matches the OANDA feed's).
+#: W1 500 (~9.6y) and MN1 300 (25y) both clear the 200 bars the
+#: EMA200 alignment needs, with margin for the broker's history.
 _WARM_BARS: dict[str, int] = {
     "D1": 2000, "H4": 2000, "H1": 2000, "M15": 2000, "M30": 2000,
-    "M5": 2000,
+    "M5": 2000, "W1": 500, "MN1": 300,
 }
 
 
@@ -67,6 +74,11 @@ class MT5FeedConfig:
     #: for the built-in default.
     symbol_explicit: bool = False
     granularities: tuple[str, ...] = STACK_TFS
+    #: Macro timeframes (W1/MN1) fetched alongside the stack for
+    #: alignment (MacroTrend) and strategy use.  Deliberately NOT
+    #: part of STACK_TFS: the hierarchy leg set must not gain W1/MN1
+    #: legs, and backtests built on STACK_TFS stay untouched.
+    macro_tfs: tuple[str, ...] = ("W1", "MN1")
     #: Credentials: None means attach to the already-logged-in terminal
     #: (the normal EC2 case — the owner logs the terminal in by hand).
     #: When set, they come from env (GS_MT5_LOGIN / GS_MT5_PASSWORD /
@@ -298,6 +310,32 @@ class MT5Feed:
         return df[["open", "high", "low", "close", "volume",
                    "real_volume", "spread"]]
 
+    def bars_for(self, symbol: str, tf: str, count: int) -> pd.DataFrame:
+        """Latest ``count`` bars for an arbitrary symbol (e.g. DXY)
+        — same contract as :meth:`bars` (forming bar included).
+
+        The symbol is selected first (best-effort): a symbol the
+        terminal has never selected cannot be fetched.  A failed
+        select raises MT5Unavailable with a clear message instead
+        of returning a frame for the wrong symbol.
+        """
+        mt5 = self._lib()
+        if not mt5.symbol_select(symbol, True):
+            raise MT5Unavailable(
+                f"symbol_select({symbol}) failed — the broker does not "
+                "carry that symbol (check GS_DXY_SYMBOL)")
+        last_err: object = None
+        for attempt in range(1, self.cfg.max_fetch_retries + 1):
+            rates = mt5.copy_rates_from_pos(
+                symbol, self._tf_const(tf), 0, int(count))
+            if rates is not None and len(rates) > 0:
+                return self._frame(rates)
+            last_err = mt5.last_error()
+            if attempt < self.cfg.max_fetch_retries:
+                time.sleep(0.5 * (2 ** (attempt - 1)))
+        raise MT5Unavailable(
+            f"copy_rates_from_pos({symbol} {tf}) failed: {last_err}")
+
     def bars(self, tf: str, count: int) -> pd.DataFrame:
         """Latest ``count`` closed+forming bars for ``tf`` (UTC index).
 
@@ -305,18 +343,7 @@ class MT5Feed:
         Callers trade on closed bars only — the last row is the
         still-forming bar, exactly like the OANDA feed's contract.
         """
-        mt5 = self._lib()
-        last_err: object = None
-        for attempt in range(1, self.cfg.max_fetch_retries + 1):
-            rates = mt5.copy_rates_from_pos(
-                self.cfg.symbol, self._tf_const(tf), 0, int(count))
-            if rates is not None and len(rates) > 0:
-                return self._frame(rates)
-            last_err = mt5.last_error()
-            if attempt < self.cfg.max_fetch_retries:
-                time.sleep(0.5 * (2 ** (attempt - 1)))
-        raise MT5Unavailable(
-            f"copy_rates_from_pos({self.cfg.symbol} {tf}) failed: {last_err}")
+        return self.bars_for(self.cfg.symbol, tf, count)
 
     def warm_start_all(self) -> dict[str, pd.DataFrame]:
         """Full CLOSED history per TF (forming bar dropped).
@@ -330,8 +357,9 @@ class MT5Feed:
         included) when you need it.
         """
         now = datetime.now(timezone.utc)
+        tfs = tuple(self.cfg.granularities) + tuple(self.cfg.macro_tfs)
         return {tf: self._closed_only(self.bars(tf, self.cfg.warm_bars.get(tf, 2000)), tf, now)
-                for tf in self.cfg.granularities}
+                for tf in tfs}
 
     def fetch_new_all(self, since_by_tf: dict | None = None
                       ) -> dict[str, pd.DataFrame]:
@@ -339,7 +367,8 @@ class MT5Feed:
         since_by_tf = since_by_tf or {}
         now = datetime.now(timezone.utc)
         out: dict[str, pd.DataFrame] = {}
-        for tf in self.cfg.granularities:
+        tfs = tuple(self.cfg.granularities) + tuple(self.cfg.macro_tfs)
+        for tf in tfs:
             frame = self.bars(tf, 500)
             since = since_by_tf.get(tf)
             if since is not None:
@@ -350,10 +379,31 @@ class MT5Feed:
     @staticmethod
     def _closed_only(frame: pd.DataFrame, tf: str,
                      now: datetime) -> pd.DataFrame:
-        """Drop the still-forming bar: open + TF minutes must be <= now."""
+        """Drop the still-forming bar: open + TF minutes must be <= now.
+
+        W1/MN1 use calendar floors, not duration arithmetic: a
+        monthly bar is closed iff its open month is strictly before
+        the current month (a fixed 43200min would release a 31-day
+        month's bar a day early); a weekly bar iff its open Monday
+        is strictly before this week's Monday.
+        """
         if frame is None or len(frame) == 0:
             return frame
-        cutoff = pd.Timestamp(now) - pd.Timedelta(minutes=TF_MINUTES[tf])
+        now_ts = pd.Timestamp(now)
+        if tf == "W1":
+            # pandas floor() rejects "W-MON" (non-fixed frequency):
+            # Monday 00:00 UTC of the current week, by weekday math.
+            monday = now_ts.normalize() - pd.Timedelta(
+                days=now_ts.weekday())
+            return frame[frame.index < monday]
+        if tf == "MN1":
+            # floor("MS") is also rejected (non-fixed frequency):
+            # first of the current month, 00:00 UTC.
+            month_start = now_ts.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0,
+                nanosecond=0)
+            return frame[frame.index < month_start]
+        cutoff = now_ts - pd.Timedelta(minutes=TF_MINUTES[tf])
         return frame[frame.index <= cutoff]
 
     def poll_status(self) -> dict:
@@ -405,6 +455,58 @@ class MT5Feed:
         return df
 
     # ------------------------------------------------- account / positions
+    def market_open(self) -> tuple[bool, str]:
+        """Is the broker accepting NEW orders on this symbol?
+
+        MT5-native: ``symbol_info.trade_mode`` must be FULL.  The
+        tick pump delivers nothing while the market is closed, so
+        this is defence-in-depth — it blocks signal processing and
+        order placement if a tick ever arrives while the symbol is
+        disabled / close-only, and it fails CLOSED (never open) when
+        the terminal cannot answer.
+        """
+        mt5 = self._lib()
+        try:
+            info = mt5.symbol_info(self.cfg.symbol)
+        except Exception as exc:
+            return False, f"symbol_info failed: {exc}"
+        if info is None:
+            return False, ("symbol_info returned None (market closed "
+                            "or symbol unavailable)")
+        mode = getattr(info, "trade_mode", None)
+        if mode is None:
+            return False, "symbol_info has no trade_mode — refusing"
+        if int(mode) == SYMBOL_TRADE_MODE_FULL:
+            return True, ""
+        return False, (f"symbol trade_mode={int(mode)} (not FULL — "
+                        "market closed or close-only)")
+
+    def order_margin(self, *, volume: float, price: float,
+                     direction: int) -> float | None:
+        """Broker-computed margin for a new order (``order_calc_margin``).
+
+        The terminal's own number — contract size, leverage and
+        margin rates as the broker configured them — never a
+        hand-rolled formula that can drift from the broker.  None
+        when the terminal cannot compute it (caller refuses the
+        order rather than guessing).
+        """
+        mt5 = self._lib()
+        try:
+            order_type = mt5.ORDER_TYPE_BUY if direction > 0 \
+                else mt5.ORDER_TYPE_SELL
+            margin = mt5.order_calc_margin(order_type, self.cfg.symbol,
+                                           float(volume), float(price))
+        except Exception:
+            return None
+        if margin is None:
+            return None
+        try:
+            margin = float(margin)
+        except (TypeError, ValueError):
+            return None
+        return margin if margin >= 0 else None
+
     def account_state(self) -> dict:
         """Account state, straight from the terminal — MT5 is the
         source of truth for balance / equity / margin / trade mode."""
@@ -455,6 +557,9 @@ class MT5Feed:
         MT5 bars align to UTC boundaries: an H1 bar opens on the hour
         and closes on the next hour, so the latest closed H1 close is
         ``tick_time`` floored to the hour.  D1 floors to midnight UTC.
+        W1 floors to this week's Monday (the close of last week's
+        bar); MN1 floors to the first of this month (the close of
+        last month's bar).  Same UTC-boundary convention as D1.
         The runner compares this against its per-TF last-processed
         close to detect new closed bars — from tick time, never from
         a poll timer.
@@ -462,6 +567,15 @@ class MT5Feed:
         ts = pd.Timestamp(tick_time)
         if tf == "D1":
             return ts.floor("D")
+        if tf == "W1":
+            # Monday 00:00 UTC of this week (floor("W-MON") is
+            # rejected: non-fixed frequency).
+            return ts.normalize() - pd.Timedelta(days=ts.weekday())
+        if tf == "MN1":
+            # First of this month, 00:00 UTC (floor("MS") rejected:
+            # non-fixed frequency).
+            return ts.replace(day=1, hour=0, minute=0, second=0,
+                              microsecond=0, nanosecond=0)
         minutes = TF_MINUTES[tf]
         return ts.floor(f"{int(minutes)}min")
 

@@ -28,9 +28,19 @@ Adding any of that is a new experiment, not a refactor.
 
 Live path note: the paper executor fills at next bar's open, not at the
 limit edge — the loop convention (same as fvg_midline). The batch path
-grades edge fills. The parity test proves the SIGNAL sets are identical
-between paths; the fill-price gap between edge and next-open is measured
-by the live book, not assumed away.
+grades edge fills. The SIGNAL sets are identical between paths for
+penetrating first touches; the one deliberate divergence is
+graze-then-penetrate (batch: no trade; live: emits on the penetrating
+touch, because the live path cannot know at the touch bar whether a
+later bar will penetrate). The fill-price gap between edge and
+next-open is measured by the live book, not assumed away.
+
+Live causality note: the live path uses the causal fill check
+(penetration + levels, bars at/before the touch bar only) — never the
+batch forward walk, which needs future bars and always failed at the
+live edge. A grazed first touch does NOT consume the zone on the live
+path: the zone stays live until a penetrating touch (the batch path
+keeps first-touch-only grading, as validated).
 """
 from __future__ import annotations
 
@@ -101,15 +111,16 @@ def _first_touch_events(high: np.ndarray, low: np.ndarray) -> list:
     return events
 
 
-def _simulate(zone: FVGZone, touch_idx: int,
-              o: np.ndarray, h: np.ndarray, l: np.ndarray,
-              c: np.ndarray) -> tuple | None:
-    """The validated trade machine.  Returns
-    (entry, stop, target, r_multiple, exit_index, exit_reason) or None
-    when the touch bar fails the penetration requirement (missed fill)
-    or the trade is unresolved after MAX_HOLD_BARS (dropped, as in the
-    validation script)."""
-    n = len(c)
+def _fill(zone: FVGZone, touch_idx: int,
+         h: np.ndarray, l: np.ndarray, c: np.ndarray
+         ) -> tuple | None:
+    """Causal fill check at the touch bar: penetration + levels.
+
+    Uses ONLY bars at/before ``touch_idx`` (ATR window ends at the
+    touch bar), so it is valid at the live edge where no future bars
+    exist. Returns (entry, stop, target, risk) or None when the touch
+    bar fails the penetration requirement (graze) or risk is invalid.
+    """
     a = _atr(h, l, c, touch_idx)
     if a <= 0:
         return None
@@ -133,6 +144,29 @@ def _simulate(zone: FVGZone, touch_idx: int,
     if risk <= 0:
         return None
     target = entry + TARGET_R * risk * d
+    return entry, stop, target, risk
+
+
+def _simulate(zone: FVGZone, touch_idx: int,
+              o: np.ndarray, h: np.ndarray, l: np.ndarray,
+              c: np.ndarray) -> tuple | None:
+    """The validated trade machine.  Returns
+    (entry, stop, target, r_multiple, exit_index, exit_reason) or None
+    when the touch bar fails the penetration requirement (missed fill)
+    or the trade is unresolved after MAX_HOLD_BARS (dropped, as in the
+    validation script).
+
+    Batch-only: the forward walk grades the trade with future bars,
+    so this must NOT run at the live edge — the live path uses
+    :func:`_fill` (causal) instead. The fill portion is shared so the
+    two paths can never drift apart.
+    """
+    n = len(c)
+    fill = _fill(zone, touch_idx, h, l, c)
+    if fill is None:
+        return None
+    entry, stop, target, risk = fill
+    d = zone.direction
 
     # --- walk forward: invalidation first, then stop/target stop-first ---
     r, exit_idx, reason = None, None, None
@@ -276,13 +310,19 @@ class FVGLimitPlaybook(Playbook):
                 touched = h[t] >= z.bottom and l[t] <= z.top
             if not touched:
                 continue
+            # Causal fill check: only bars at/before t. A graze
+            # (touch without penetration) does NOT consume the zone —
+            # it stays live for a later penetrating touch. Consuming on
+            # a failed sim was the live-edge bug: at the live edge the
+            # old forward-walk sim always failed, so every zone died
+            # on first touch without ever emitting.
+            fill = _fill(z, t, h, l, c)
+            if fill is None:
+                continue  # graze: zone stays unconsumed, re-emittable
             self._consumed.add(z.formed_idx)
             if not collect:
                 continue
-            sim = _simulate(z, t, o, h, l, c)
-            if sim is None:
-                continue  # graze: queue never cleared, zone consumed
-            entry, stop, target, r, exit_idx, reason = sim
+            entry, stop, target, _risk = fill
             d = z.direction
             sig = GoldenSignal(
                 index=t, timestamp=None, direction=d,
@@ -296,8 +336,6 @@ class FVGLimitPlaybook(Playbook):
                 "touch_index": t, "edge": entry, "stop": stop,
                 "zone_top": z.top, "zone_bottom": z.bottom,
                 "zone_formed_idx": z.formed_idx, "direction": d,
-                "r_net_batch": r, "exit_reason_batch": reason,
-                "exit_index_batch": exit_idx,
             }
             out.append(sig)
         return out

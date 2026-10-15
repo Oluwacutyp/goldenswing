@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from ..feed.oanda import _get, normalize_oanda_candles
+from ..feed.oanda import _get, normalize_oanda_candles, to_oanda_granularity
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "data"
@@ -46,7 +46,8 @@ def fetch_oanda_range(instrument: str = INSTRUMENT,
         # combine with `count`, and a bare from/to range errors when
         # it spans more than 5000 candles — so walk with count and
         # stop at `end` ourselves.
-        params: dict = {"granularity": granularity, "price": "M",
+        params: dict = {"granularity": to_oanda_granularity(granularity),
+                        "price": "M",
                         "count": MAX_PER_REQUEST}
         if cursor:
             params["from"] = cursor

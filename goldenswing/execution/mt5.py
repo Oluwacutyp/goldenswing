@@ -40,7 +40,9 @@ _AT_LEVEL_ATR = 0.25
 def select_order_type(*, direction: int, price: float,
                       entry_ref: float,
                       zone: dict | None = None,
-                      atr: float = 0.0) -> tuple[str, float, str]:
+                      atr: float = 0.0,
+                      urgency: float | None = None,
+                      profile: dict | None = None) -> tuple[str, float, str]:
     """Setup-dependent order selection — the real-trader entry rule.
 
     A real trader picks the order type by where price is vs the
@@ -63,6 +65,19 @@ def select_order_type(*, direction: int, price: float,
     - price beyond the POI band on the ADVERSE side (long: below the
       zone bottom; short: above the zone top) -> ``"invalid"`` (the
       zone failed — the setup's premise is gone, no order).
+
+    Urgency / volume-profile dispatch (the old bot's dispatcher,
+    adapted): when ``urgency`` and ``profile`` are supplied and the
+    price-vs-level logic says MARKET, a thick level (price near the
+    POC or a high-volume node) with urgency < 70 downgrades to
+    LIMIT at ``entry_ref`` — pay the level, not the market, where
+    liquidity is thick.  Deliberate non-application: urgency NEVER
+    converts a limit into a market at a worse-than-POI price — the
+    old bot's urgency>80 -> MARKET exists because the old bot had
+    no no-chase rule; this engine does, and urgency does not
+    override it.  ``urgency``/``profile`` default to None (no
+    dispatch change — every existing caller behaves exactly as
+    before).
 
     ``entry_ref`` is the playbook's POI entry level (FVG edge, QM
     level, trendline), NOT the current tick.  Returns
@@ -92,6 +107,24 @@ def select_order_type(*, direction: int, price: float,
         at_or_better = (direction > 0 and price <= entry_ref) or \
             (direction < 0 and price >= entry_ref)
         if at_or_better:
+            # Urgency / volume-profile dispatch: a thick level
+            # (near POC / high-volume node) with moderate urgency
+            # downgrades MARKET to LIMIT at the POI — pay the level,
+            # not the market, where liquidity is thick.  Urgency
+            # never upgrades a limit to a market (no-chase).
+            if urgency is not None and urgency < 70.0 \
+                    and profile is not None \
+                    and profile.get("poc") is not None:
+                tol_px = 0.25 * float(atr) if atr and atr > 0 else 0.0
+                from ..live.volume_profile import near_level
+
+                nodes = list(profile.get("high_vol_nodes") or [])
+                if near_level(price, [profile["poc"]] + nodes,
+                              tolerance=tol_px):
+                    return ("limit", float(entry_ref),
+                            f"thick level: price {price:.2f} near POC / "
+                            f"high-volume node, urgency {urgency:.0f} "
+                            f"< 70 — resting limit at POI, not market")
             return ("market", float(price),
                     f"at level: price {price:.2f} within {tol:.2f} of "
                     f"entry {entry_ref:.2f}, trigger confirmed")
@@ -113,6 +146,65 @@ def select_order_type(*, direction: int, price: float,
     return ("stop", float(entry_ref),
             f"breakout: entry {entry_ref:.2f} below price "
             f"{price:.2f} — stop beyond level")
+
+
+def build_ladder(*, direction: int, entry_ref: float,
+                 zone: dict | None, lots: float, rungs: int = 3,
+                 split: tuple[float, ...] = (0.5, 0.3, 0.2)
+                 ) -> list[tuple[float, float]]:
+    """Multi-zone limit ladder: stagger a LIMIT order's size across
+    rungs from the playbook level down to the adverse zone edge.
+
+    For a long pullback limit the market comes DOWN into the zone:
+    rung 0 is the marked level (best fill odds), deeper rungs are
+    better prices if the pullback runs further.  Shorts mirror.
+    Rungs interpolate linearly from ``entry_ref`` to the adverse
+    edge (zone bottom for longs, zone top for shorts), clamped
+    inside the zone — a rung past the edge would sit past the
+    invalidation and be cancelled on sight.  Duplicate levels
+    collapse: fewer than 2 distinct rungs -> no ladder (single
+    pending, as today).  ``split`` weights are normalised; when it
+    has fewer entries than rungs, the tail splits evenly.
+
+    Returns ``[(level, lots), ...]`` (levels distinct, lots sum to
+    the input ``lots``), or ``[]`` when no ladder applies (no zone,
+    degenerate zone, or a single rung).  The ladder is SEQUENTIAL:
+    only rung 0 is placed; on expiry the next rung is placed (see
+    the runner); on fill the remaining rungs are discarded (further
+    entries go through the layer mechanism, not the ladder).
+    """
+    if zone is None or rungs < 2 or lots <= 0 or entry_ref <= 0:
+        return []
+    try:
+        bottom = float(zone.get("bottom", 0.0))
+        top = float(zone.get("top", 0.0))
+    except (TypeError, ValueError):
+        return []
+    if top <= bottom:
+        return []
+    edge = bottom if direction > 0 else top
+    lo, hi = min(entry_ref, edge), max(entry_ref, edge)
+    # Clamp the interpolation inside the zone band.
+    lo = max(lo, bottom)
+    hi = min(hi, top)
+    if hi - lo <= 1e-9:
+        return []
+    levels: list[float] = []
+    for i in range(rungs):
+        lvl = entry_ref + (edge - entry_ref) * (i / (rungs - 1))
+        lvl = min(max(lvl, bottom), top)
+        if not levels or abs(lvl - levels[-1]) > 1e-9:
+            levels.append(float(lvl))
+    if len(levels) < 2:
+        return []
+    weights = list(split[:len(levels)])
+    while len(weights) < len(levels):
+        weights.append(1.0)
+    total = sum(weights)
+    if total <= 0:
+        return []
+    return [(lvl, lots * w / total)
+            for lvl, w in zip(levels, weights)]
 
 
 class MT5Unavailable(RuntimeError):

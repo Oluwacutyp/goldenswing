@@ -90,7 +90,7 @@ def test_full_run_pumps_ticks(tmp_path):
     assert stats["ticks"] == 2
 
 
-def test_manage_tick_breakeven_via_runner(tmp_path):
+def test_manage_tick_profit_lock_via_runner(tmp_path):
     runner = _runner(tmp_path, executor=FakeExecutor())
     from goldenswing.execution.executor import OrderRequest
     req = OrderRequest(symbol="XAUUSD", direction=1, volume=1.0,
@@ -100,8 +100,10 @@ def test_manage_tick_breakeven_via_runner(tmp_path):
                              entry_bar=6)
     stats: dict = {"tick_actions": 0}
     runner._manage_tick(2012.5, stats)
-    assert runner.executor.modifies == [(101, pytest.approx(2000.0))]
-    assert stats["tick_actions"] == 1
+    # +1.0R: the profit-lock (2007.5) wins over breakeven (2000.0),
+    # and the tier-1 partial fires too — two actions this tick.
+    assert runner.executor.modifies == [(101, pytest.approx(2007.5))]
+    assert stats["tick_actions"] == 2
 
 
 def test_place_live_order_uses_buffered_stop_and_tracks(tmp_path):

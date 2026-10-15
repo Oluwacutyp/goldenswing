@@ -11,6 +11,17 @@ Primary window (like the other playbooks): H1 2024-10 -> 2026-10
 (~4y, ~1000 daily bars) — reported alongside, because a D1
 pattern is rare and the 2y sample is thin.
 
+NATIVE D1 MODE (--csv PATH): validate on a native MT5 D1 export
+instead of resampled bars (see data/MT5_XAUUSD_D1_native_*.NOTES.md).
+Native exports can be FRAGMENTED (MT5 history holes): pattern
+detection must never run across a hole, so native mode splits the
+frame into contiguous segments (a gap > 3 days breaks a segment)
+and validates the LONGEST segment only — EXTENDED = the whole
+longest segment, PRIMARY = its last 2 years.  Short fragments are
+reported as skipped, never validated.  --replay-oct14 additionally
+attempts the owner's Oct 14 2026 setup replay on the native file
+and reports exactly what the playbook finds (or why it is blocked).
+
 Backtests map WHERE a setup works, never binary kill/adopt: the
 script reports the iron-rule verdict (PF >= 1.10 AND total R > 0 AND
 >= 30 trades) AND breakdowns by direction, tags (sweep_head /
@@ -20,10 +31,11 @@ vs one that fights it), ATR regime (touch-bar ATR vs its median),
 and first/second half.  qm_d1 stays SHADOW regardless: promotion is
 a separate owner decision.
 
-Usage:  python3 scripts/validate_qm_d1.py
+Usage:  python3 scripts/validate_qm_d1.py [--csv PATH] [--replay-oct14]
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -81,7 +93,10 @@ def _breakdown(label: str, cands) -> None:
 
 
 def validate(label: str, h1: pd.DataFrame) -> dict:
-    d1 = to_daily(h1)
+    return report(label, to_daily(h1))
+
+
+def report(label: str, d1: pd.DataFrame) -> dict:
     years = (d1.index[-1] - d1.index[0]).total_seconds() / 86400 / 365.25
     ctx = EngineContext(df=d1, states=[], years=years,
                         instrument="XAUUSD")
@@ -150,13 +165,110 @@ def validate(label: str, h1: pd.DataFrame) -> dict:
     return s
 
 
+def load_native_d1(path: Path) -> pd.DataFrame:
+    """Native MT5 D1 export: time,open,high,low,close,volume,..."""
+    df = pd.read_csv(path, parse_dates=["time"])
+    df = df.set_index("time").sort_index()
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    return df[["open", "high", "low", "close", "volume"]]
+
+
+def contiguous_segments(d1: pd.DataFrame,
+                        max_gap_days: int = 3) -> list[pd.DataFrame]:
+    """Split a D1 frame at holes.  A gap > ``max_gap_days`` between
+    consecutive bars breaks a segment — pattern detection must never
+    run across a hole (a 60-bar lookback spanning a 275-day hole is
+    meaningless).  Normal weekend gaps are 1-3 days and stay inside
+    a segment."""
+    gaps = d1.index.to_series().diff().dt.total_seconds() / 86400
+    breaks = gaps > max_gap_days
+    groups = breaks.cumsum()
+    return [g for _, g in d1.groupby(groups)]
+
+
+def replay_oct14(d1: pd.DataFrame) -> None:
+    """Replay the owner's Oct 14 2026 setup on native D1.
+
+    The owner spotted a Daily QM at ~4,133-4,140 that held as
+    resistance and dropped to ~4,104.  This runs the playbook on
+    the native frame and reports exactly what it finds: pattern
+    found? POI in the 4133-4140 zone? limit triggered? filled?
+    A pattern needs up to 60 bars of formation history — if that
+    history is inside a data hole, the replay is BLOCKED and this
+    says so instead of claiming anything about the setup."""
+    print("REPLAY Oct 14 2026 setup (owner: QM ~4,133-4,140, drop to ~4,104)")
+    target = d1[d1.index.date == pd.Timestamp("2026-10-14").date()]
+    if len(target):
+        row = target.iloc[0]
+        print(f"  Oct 14 D1 bar: O {row['open']:.3f} H {row['high']:.3f} "
+              f"L {row['low']:.3f} C {row['close']:.3f} "
+              f"(range ${row['high'] - row['low']:.2f})")
+    else:
+        print("  Oct 14 bar ABSENT from the native file — replay impossible.")
+        return
+    # Formation history available before Oct 14 within its segment.
+    segs = contiguous_segments(d1)
+    seg = next((s for s in segs
+                if s.index[-1].date() == pd.Timestamp("2026-10-14").date()),
+               None)
+    if seg is None:
+        print("  Oct 14 bar is not in any contiguous segment — replay blocked.")
+        return
+    n_before = len(seg) - 1  # bars before Oct 14 in the same segment
+    print(f"  Bars before Oct 14 in the same contiguous segment: {n_before}")
+    if n_before < 60:
+        print("  REPLAY BLOCKED: the QM formation history (up to 60 bars) "
+              "lies inside a data hole before Oct 11.  The 4-bar "
+              "Oct 11-14 fragment cannot support QM detection.  "
+              "No claim is made for or against the owner's Oct 14 QM.")
+        return
+    ctx = EngineContext(df=seg, states=[], years=1.0, instrument="XAUUSD")
+    cands = QMD1Playbook().candidates(ctx)
+    print(f"  Playbook candidates on the Oct-14 segment: {len(cands)}")
+    for c in cands:
+        print(f"    dir={c.direction:+d} signal_idx={c.signal_index} "
+              f"tags={sorted(c.context.get('tags', []))} "
+              f"R={c.outcome.r_net:+.2f} exit={c.outcome.exit_reason}")
+
+
 def main() -> int:
-    print("Daily QM (qm_d1) validation — H1 resampled to D1")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", type=Path, default=None,
+                    help="native MT5 D1 CSV (skips H1 resampling)")
+    ap.add_argument("--replay-oct14", action="store_true",
+                    help="attempt the Oct 14 2026 setup replay")
+    args = ap.parse_args()
     print(f"promotion rule: PF >= {MIN_PF} AND total R > 0 AND "
           f"trades >= {MIN_TRADES} (iron rule)")
     print("qm_d1 stays SHADOW regardless — promotion is a separate "
           "owner decision.")
     print()
+    if args.csv is not None:
+        print(f"Daily QM (qm_d1) validation — NATIVE MT5 D1 ({args.csv.name})")
+        d1 = load_native_d1(args.csv)
+        print(f"  native file: {len(d1)} bars "
+              f"{d1.index[0].date()} -> {d1.index[-1].date()}")
+        segs = contiguous_segments(d1)
+        print(f"  contiguous segments: {len(segs)}")
+        for i, s in enumerate(segs):
+            print(f"    seg {i}: {len(s)} bars "
+                  f"{s.index[0].date()} -> {s.index[-1].date()}")
+        main_seg = max(segs, key=len)
+        skipped = [s for s in segs if s is not main_seg]
+        for s in skipped:
+            print(f"  SKIPPED fragment ({len(s)} bars "
+                  f"{s.index[0].date()} -> {s.index[-1].date()}): "
+                  "too short for QM validation, never run across holes")
+        print()
+        two_y_ago = main_seg.index[-1] - pd.Timedelta(days=730)
+        primary = main_seg[main_seg.index >= two_y_ago]
+        report("PRIMARY native D1 (last 2y of longest segment)", primary)
+        report("EXTENDED native D1 (longest contiguous segment)", main_seg)
+        if args.replay_oct14:
+            replay_oct14(d1)
+        return 0
+    print("Daily QM (qm_d1) validation — H1 resampled to D1")
     validate("PRIMARY 2024-10 -> 2026-10 (~2y)",
              load_h1([H1_PRIMARY]))
     validate("EXTENDED 2022-01 -> 2026-10 (~4y)",

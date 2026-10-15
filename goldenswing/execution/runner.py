@@ -938,6 +938,21 @@ class LiveRunner:
                 "feed_status": dict(self._feed_status),
                 "performance": perf}
 
+    def _log_below_floor(self, below_floor: list[tuple[str, float]],
+                         floor: float, bar_t, bar_ts, *,
+                         prefix: str) -> None:
+        """One compact below-floor record per bar, no matter how many
+        playbooks emitted below the floor on it.  Shared by the paper
+        loop and the live loop — a below-floor emission is a real
+        evaluation outcome in both, never silent in either."""
+        if not below_floor:
+            return
+        self.journal.log_note(
+            f"{prefix}: below score floor "
+            + ", ".join(f"{name} score={score:.0f}"
+                        for name, score in below_floor)
+            + f" (floor={floor:.0f}, bar={bar_t} {bar_ts})")
+
     def _paper_loop_bar(self, df, t: int, playbooks, engine, peers,
                         exec_set: set, score_floor: float,
                         signal_gap_bars: int, stats: dict,
@@ -974,10 +989,15 @@ class LiveRunner:
             and self.cfg.hierarchy_required
         if self.paper.positions():
             return  # one position at a time, like live
+        below_floor: list[tuple[str, float]] = []
         for pb in playbooks:
             sigs = pb.live_signal(states, t, df) or []
             for sig in sigs:
                 if sig.score < score_floor:
+                    # Never silent: a below-floor emission is a real
+                    # evaluation outcome. Collected and logged once
+                    # per bar below (aggregated, not per-signal spam).
+                    below_floor.append((pb.name, sig.score))
                     continue
                 if sig.index - last_sig_bar.get(pb.name, -10 ** 9) \
                         < signal_gap_bars:
@@ -1038,6 +1058,8 @@ class LiveRunner:
                        f"qm:{verdict.get('qm', {}).get('status')}"
                        if verdict is not None else
                        " hierarchy: unavailable (legacy feed)"))
+        self._log_below_floor(below_floor, score_floor, t, df.index[t],
+                              prefix="paper loop")
 
     def _run_bars_legacy(self, df: pd.DataFrame | None = None, *,
                          max_bars: int | None = None,
@@ -1209,12 +1231,17 @@ class LiveRunner:
                 manager.on_bar(bar, closed)
 
                 if watchdog.entries_allowed:
+                    below_floor: list[tuple[str, float]] = []
                     for pb in self._get_playbooks():
                         if not pb.live:
                             continue
                         sigs = pb.live_signal(states, t, closed) or []
                         for sig in sigs:
                             if sig.score < self.cfg.min_score:
+                                # Never silent: same treatment the paper
+                                # loop got (bugs phase) — collected and
+                                # logged once per bar below.
+                                below_floor.append((pb.name, sig.score))
                                 continue
                             if sig.index - last_signal_bar \
                                     < self.cfg.min_gap_bars:
@@ -1238,6 +1265,9 @@ class LiveRunner:
                                 self.journal.log_note(
                                     f"live signal {pb.name} {sig.direction} "
                                     f"score={sig.score:.0f} conf={conf:.0f}")
+                    self._log_below_floor(
+                        below_floor, self.cfg.min_score, t,
+                        closed.index[t], prefix="live loop")
 
                 store.save_bars(closed)
                 store.save_meta({

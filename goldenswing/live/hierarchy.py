@@ -93,9 +93,15 @@ from .multitf import (SWING, TimeframeConfig, atr14, detect_bos_msch_choch,
 STACK_TFS: tuple[str, ...] = ("D1", "H4", "H1", "M15", "M30", "M5")
 
 #: Minutes per bar, for causal closed-bar slicing.
+#: MN1 is nominal 30 days (43200 min): a calendar month is 28-31
+#: days, so duration arithmetic is NOT exact for MN1 — the
+#: calendar-exact close logic lives in ``feed._closed_only``,
+#: ``feed.closed_bar_close``, and ``_causal_window`` below, which
+#: special-case MN1 by month.  This entry exists so the generic
+#: ``TF_MINUTES[tf]`` lookups (next-close estimates) do not KeyError.
 TF_MINUTES: dict[str, float] = {
     "M1": 1.0, "M5": 5.0, "M15": 15.0, "M30": 30.0, "H1": 60.0,
-    "H4": 240.0, "D1": 1440.0, "W1": 10080.0,
+    "H4": 240.0, "D1": 1440.0, "W1": 10080.0, "MN1": 43200.0,
 }
 
 #: Hard veto policy: OFF, unconditionally, in this module.
@@ -203,6 +209,16 @@ def _causal_window(frame: pd.DataFrame, tf: str,
             columns=["open", "high", "low", "close", "volume"])
     if stamp == "close":
         cutoff = h1_close
+    elif tf == "MN1":
+        # Calendar-exact: a monthly bar stamped at its open is closed
+        # iff its open month is strictly before h1_close's month.
+        # Duration arithmetic (open + 43200min) would release a
+        # 31-day month's bar a day early — never do that.  Year*12 +
+        # month integer comparison: tz-safe, no Period warning.
+        h1_month = h1_close.year * 12 + h1_close.month
+        return frame[
+            (frame.index.year * 12 + frame.index.month) < h1_month
+        ].tail(window)
     else:
         minutes = TF_MINUTES.get(tf)
         if minutes is None:
