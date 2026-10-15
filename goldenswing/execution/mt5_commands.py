@@ -486,6 +486,33 @@ def _mt5_report(ctx: CommandContext, args: list[str]) -> CommandResult:
         caption="MT5 engine report (fresh from the MT5 journal)")
 
 
+@mt5_command("/recap", "daily / weekly recap — every closed trade, "
+                        "wins AND losses, nothing hidden")
+def _mt5_recap(ctx: CommandContext, args: list[str]) -> CommandResult:
+    from ..execution.reporting import recap_for_period
+    period = (args[0].lower() if args else "daily")
+    if period not in ("daily", "weekly"):
+        return CommandResult(text="usage: /recap [daily|weekly]")
+    if ctx.journal is None:
+        return CommandResult(text="no journal attached.")
+    try:
+        text = recap_for_period(ctx.journal, period)
+    except Exception as exc:
+        return CommandResult(
+            text=f"recap build failed: {type(exc).__name__}: {exc}")
+    # Short recaps go out as text; a long week goes out as a file
+    # (Telegram truncates long messages — the file loses nothing).
+    if len(text) <= 3500 or not ctx.reports_dir:
+        return CommandResult(text=text)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = Path(ctx.reports_dir) / f"mt5-recap-{period}-{stamp}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return CommandResult(
+        document=path,
+        caption=f"MT5 {period} recap (every closed trade, wins and losses)")
+
+
 @mt5_command("/ticks", "export the last N days of MT5 tick history as CSV (default 1, max 7)")
 def _mt5_ticks(ctx: CommandContext, args: list[str]) -> CommandResult:
     try:

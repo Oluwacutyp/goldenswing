@@ -3,7 +3,10 @@
 A real trader picks the order type by where price is vs the entry
 level when the signal fires — never always-market:
 
-- price AT the entry level, trigger confirmed -> MARKET at the tick
+- price AT the entry level (at-or-better), trigger confirmed ->
+  MARKET at the tick
+- price past the entry level (a market fill would pay WORSE than
+  the POI) -> PENDING LIMIT at the POI, never chase
 - entry level BEHIND price (pullback) -> PENDING LIMIT at the POI
 - entry level AHEAD of price (breakout) -> PENDING STOP beyond it
 - price beyond the POI on the adverse side -> INVALID (zone failed)
@@ -42,10 +45,32 @@ def test_at_level_with_trigger_confirmed_is_market():
     assert level == pytest.approx(2005.0)
 
 
-def test_within_tolerance_of_level_is_market():
-    kind, _, _ = select_order_type(
+def test_within_tolerance_past_poi_is_limit_never_chase():
+    # Price ran $1 PAST the POI (long): a market fill would pay worse
+    # than the marked level — resting limit at the POI, never chase.
+    kind, level, reason = select_order_type(
         direction=1, price=2006.0, entry_ref=2005.0, zone=ZONE, atr=ATR)
+    assert kind == "limit"
+    assert level == pytest.approx(2005.0)
+    assert "never chase" in reason
+    # Mirror: short, price ran below the POI.
+    kind, level, _ = select_order_type(
+        direction=-1, price=2004.0, entry_ref=2005.0, zone=ZONE, atr=ATR)
+    assert kind == "limit"
+    assert level == pytest.approx(2005.0)
+
+
+def test_within_tolerance_better_than_poi_is_market():
+    # Price a touch BETTER than the POI (long below entry, short
+    # above it): market at the better fill — that is not chasing.
+    kind, level, _ = select_order_type(
+        direction=1, price=2004.0, entry_ref=2005.0, zone=ZONE, atr=ATR)
     assert kind == "market"
+    assert level == pytest.approx(2004.0)
+    kind, level, _ = select_order_type(
+        direction=-1, price=2006.0, entry_ref=2005.0, zone=ZONE, atr=ATR)
+    assert kind == "market"
+    assert level == pytest.approx(2006.0)
 
 
 def test_long_pullback_is_limit_at_entry_ref_not_tick():

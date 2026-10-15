@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .learning import TradeJournal
@@ -186,6 +186,139 @@ def render_report_markdown(stats: dict, measured_oos: list[dict] | None,
         "",
     ]
     return "\n".join(lines)
+
+
+# ------------------------------------------------------- daily/weekly recap
+# A recap is the disciplined caller's update: EVERY closed trade in
+# the window, wins AND losses, listed individually — never a
+# wins-only highlight reel.  The journal already records all trades;
+# the recap must not hide the losers.
+
+
+def _parse_ts(value) -> datetime | None:
+    """Journal ts (ISO) -> aware datetime; None when unparseable."""
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def recap_trades(journal: TradeJournal, *, since: datetime,
+                 until: datetime) -> list[dict]:
+    """Closed trades whose close timestamp falls in [since, until)."""
+    out = []
+    for t in iter_paper_trades(journal):
+        ts = _parse_ts(t.get("closed_ts"))
+        if ts is not None and since <= ts < until:
+            out.append(t)
+    return out
+
+
+def _pf_fmt(pf: float) -> str:
+    if pf == float("inf"):
+        return "∞"
+    return f"{pf:.2f}"
+
+
+def render_recap_markdown(trades: list[dict], *, title: str,
+                          window_label: str) -> str:
+    """Recap document: totals + per-playbook + EVERY trade.
+
+    Losses are listed with the wins, in the same table, with the
+    same detail — a recap that hides losers is a lie by omission.
+    """
+    lines = [
+        f"# GoldenSwing recap — {title}",
+        "",
+        f"Window (UTC): {window_label}",
+        "",
+    ]
+    stats = _stats(trades)
+    if stats["trades"] == 0:
+        lines.append("(no closed trades in this window)")
+        lines.append("")
+        return "\n".join(lines)
+    wins = sum(1 for t in trades if t["r_net"] > 0)
+    losses = stats["trades"] - wins
+    lines += [
+        f"Trades: {stats['trades']} · Wins: {wins} · "
+        f"Losses: {losses} · Win%: {stats['win_rate']:.0f} · "
+        f"Total: {stats['total_r']:+.2f}R · PF: "
+        f"{_pf_fmt(stats['pf'])} · PnL: {stats['total_pnl']:+.2f}",
+        "",
+        "## Per playbook",
+        "",
+        "| playbook | trades | win% | +R | avgR | PF |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    by_pb: dict[str, list[dict]] = defaultdict(list)
+    for t in trades:
+        by_pb[t["playbook"]].append(t)
+    for pb, rows in sorted(by_pb.items()):
+        s = _stats(rows)
+        lines.append(
+            f"| {pb} | {s['trades']} | {s['win_rate']:.0f} | "
+            f"{s['total_r']:+.2f} | {s['avg_r']:+.2f} | "
+            f"{_pf_fmt(s['pf'])} |")
+    lines += [
+        "",
+        "## All closed trades — wins AND losses, nothing hidden",
+        "",
+    ]
+    for t in trades:
+        side = "LONG" if t["direction"] > 0 else "SHORT"
+        mark = "✅" if t["r_net"] > 0 else "❌"
+        lines.append(
+            f"- {mark} {t['closed_ts'] or '?'} {t['playbook']} {side} "
+            f"{t['r_net']:+.2f}R ({t['reason']}) "
+            f"pnl {t['pnl_money']:+.2f}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_daily_recap(journal: TradeJournal, day) -> str:
+    """Recap for one UTC calendar day (``day``: a ``date``)."""
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    trades = recap_trades(journal, since=start, until=end)
+    return render_recap_markdown(
+        trades, title=f"daily — {day.isoformat()}",
+        window_label=f"{start.date().isoformat()} (UTC calendar day)")
+
+
+def build_weekly_recap(journal: TradeJournal, week_start) -> str:
+    """Recap for one Mon–Sun UTC week (``week_start``: Monday date)."""
+    start = datetime(week_start.year, week_start.month, week_start.day,
+                     tzinfo=timezone.utc)
+    end = start + timedelta(days=7)
+    trades = recap_trades(journal, since=start, until=end)
+    return render_recap_markdown(
+        trades, title=f"weekly — {start.date().isoformat()}",
+        window_label=f"{start.date().isoformat()} -> "
+                     f"{(end - timedelta(days=1)).date().isoformat()} "
+                     f"(UTC Mon–Sun week)")
+
+
+def recap_for_period(journal: TradeJournal, period: str) -> str:
+    """Recap for the trailing window: ``daily`` = last 24h,
+    ``weekly`` = last 7d (used by /recap)."""
+    now = datetime.now(timezone.utc)
+    if period == "weekly":
+        trades = recap_trades(journal, since=now - timedelta(days=7),
+                              until=now)
+        return render_recap_markdown(
+            trades, title="weekly — last 7 days",
+            window_label="trailing 7 days to now (UTC)")
+    trades = recap_trades(journal, since=now - timedelta(days=1),
+                          until=now)
+    return render_recap_markdown(
+        trades, title="daily — last 24 hours",
+        window_label="trailing 24 hours to now (UTC)")
 
 
 def build_report_file(journal: TradeJournal, *,

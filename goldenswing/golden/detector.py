@@ -120,6 +120,8 @@ def playbook_of(state: MarketState, kind: str) -> str:
         return "trendline_retest"
     if kind == "qm_m5":
         return "qm_m5"
+    if kind == "qm_d1":
+        return "qm_d1"
     ev = state.last_structure_event
     if ev is not None and ev.kind == "BOS" and ev.direction == state.bias \
             and state.structure_event_age is not None \

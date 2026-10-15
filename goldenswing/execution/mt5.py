@@ -47,8 +47,13 @@ def select_order_type(*, direction: int, price: float,
     level when the signal fires, never always-market:
 
     - price AT the entry level (within ``_AT_LEVEL_ATR`` x ATR) with
-      the trigger confirmed -> ``"market"`` at the current price
-      (waiting would mean missing it);
+      the trigger confirmed AND the fill at-or-better than the POI
+      (long: price <= entry; short: price >= entry) -> ``"market"``
+      at the current price (a better fill than POI is not chasing);
+    - price past the entry level on the WRONG side (the move already
+      ran past the POI — a market fill would pay WORSE than the
+      marked level) -> ``"limit"`` at ``entry_ref`` (resting limit
+      at the POI, never chase a move that already left the zone);
     - entry level BEHIND price (long: below; short: above) ->
       ``"limit"`` at ``entry_ref`` (pullback setup: price must come
       back to the POI — the market comes to the order);
@@ -80,9 +85,19 @@ def select_order_type(*, direction: int, price: float,
                     f"zone failed: price {price:.2f} above POI "
                     f"top {top:.2f} (short)")
     if abs(float(price) - float(entry_ref)) <= tol:
-        return ("market", float(price),
-                f"at level: price {price:.2f} within {tol:.2f} of "
-                f"entry {entry_ref:.2f}, trigger confirmed")
+        # At-or-better: market (a better fill than POI is not
+        # chasing).  Past POI on the wrong side: the move already
+        # left the zone — rest a LIMIT at the POI and wait for the
+        # pullback; never pay worse than the marked level.
+        at_or_better = (direction > 0 and price <= entry_ref) or \
+            (direction < 0 and price >= entry_ref)
+        if at_or_better:
+            return ("market", float(price),
+                    f"at level: price {price:.2f} within {tol:.2f} of "
+                    f"entry {entry_ref:.2f}, trigger confirmed")
+        return ("limit", float(entry_ref),
+                f"past POI: price {price:.2f} already past entry "
+                f"{entry_ref:.2f} — resting limit at POI, never chase")
     if direction > 0:
         if entry_ref < price - tol:
             return ("limit", float(entry_ref),

@@ -53,6 +53,15 @@ P&L.  Promotion to live needs forward paper observation on a real M5
 feed (the live paper loop is H1-only today, so QM has no live feed
 yet).  The base score is a documented placeholder like the other
 sleeves, NOT a measured score.
+
+PARAMETERIZATION: this module owns the ONE QM state machine
+(:class:`_QMEngine`) behind every QM timeframe.  Timeframe-specific
+behaviour lives in :class:`QMParams` — the M5 values below
+(:data:`M5_PARAMS`) and the D1 values in ``playbooks/qm_d1.py``
+(:data:`QM_D1_PARAMS <goldenswing.playbooks.qm_d1.D1_PARAMS>`) — and
+in the thin :class:`QMPlaybookBase` subclasses.  There is exactly one
+engine, one simulator, one gate; a new QM timeframe adds a params
+row, never a copied engine.
 """
 from __future__ import annotations
 
@@ -101,17 +110,48 @@ SLEEVE_BASE_SCORE = 60.0
 VALIDATED_INSTRUMENTS = ("XAUUSD", "GC=F")
 
 
+@dataclass(frozen=True)
+class QMParams:
+    """One QM timeframe's numbers.  The ATR-relative thresholds
+    (legs, failure margin, stop buffer, target floor, stop band,
+    displacement body) are scale-free — identical on every
+    timeframe.  Only the BAR-COUNT expiries are timeframe-specific,
+    and they are calendar-structural equivalents (see
+    ``playbooks/qm_d1.py`` for the D1 derivation), never blind
+    rescalings of the M5 counts."""
+
+    swing_n: int = SWING_N
+    atr_n: int = ATR_N
+    min_leg_atr: float = MIN_LEG_ATR
+    min_fail_atr: float = MIN_FAIL_ATR
+    stop_buffer_atr: float = STOP_BUFFER_ATR
+    min_target_r: float = MIN_TARGET_R
+    max_pattern_bars: int = MAX_PATTERN_BARS
+    max_retrace_bars: int = MAX_RETRACE_BARS
+    max_hold_bars: int = MAX_HOLD_BARS
+    displacement_body_atr: float = DISPLACEMENT_BODY_ATR
+    min_stop_atr: float = MIN_STOP_ATR
+    max_stop_atr: float = MAX_STOP_ATR
+    base_score: float = SLEEVE_BASE_SCORE
+    kind: str = "qm_m5"
+    name: str = "qm_m5"
+
+
+#: The M5 parameter row (the values above, as one frozen object).
+M5_PARAMS = QMParams()
+
+
 def _atr(high: np.ndarray, low: np.ndarray, close: np.ndarray,
-         i: int) -> float:
-    """14-bar mean true range at closed bar i (needs i >= 14)."""
-    if i < ATR_N:
+         i: int, n: int = ATR_N) -> float:
+    """n-bar mean true range at closed bar i (needs i >= n)."""
+    if i < n:
         return 0.0
     trs = [
         max(high[k] - low[k], abs(high[k] - close[k - 1]),
             abs(low[k] - close[k - 1]))
-        for k in range(i - ATR_N + 1, i + 1)
+        for k in range(i - n + 1, i + 1)
     ]
-    return float(sum(trs) / ATR_N)
+    return float(sum(trs) / n)
 
 
 @dataclass
@@ -192,7 +232,9 @@ class _Broken:
 class _Touch:
     """A completed QM setup: price touched the QM level after the
     neckline break.  The batch path simulates it; the live path emits
-    it as a signal."""
+    it as a signal.  The timeframe's params travel ON the touch so
+    the simulator and the signal builder can never drift from the
+    engine that found it."""
     direction: int
     touch_index: int
     qm_level: float
@@ -204,10 +246,13 @@ class _Touch:
     p2_index: int
     atr: float
     tags: list[str] = field(default_factory=list)
+    stop_buffer_atr: float = STOP_BUFFER_ATR
+    max_hold_bars: int = MAX_HOLD_BARS
+    min_target_r: float = MIN_TARGET_R
 
     @property
     def stop(self) -> float:
-        buf = STOP_BUFFER_ATR * self.atr
+        buf = self.stop_buffer_atr * self.atr
         return self.head - self.direction * buf
 
     @property
@@ -225,7 +270,7 @@ def _simulate(touch: _Touch, o: np.ndarray, h: np.ndarray,
               l: np.ndarray, c: np.ndarray) -> tuple | None:
     """The QM trade machine.  Returns (entry, stop, target, r,
     exit_index, exit_reason) or None when the trade is untradeable
-    (target pays < MIN_TARGET_R — checked again here so the batch path
+    (target pays < min_target_r — checked again here so the batch path
     can never drift from the live gate).
 
     Entry is the QM level (resting limit, fills on touch).  Walk
@@ -235,12 +280,12 @@ def _simulate(touch: _Touch, o: np.ndarray, h: np.ndarray,
     exits at the close, booked (not dropped).
     """
     n = len(c)
-    if touch.risk <= 0 or touch.target_r < MIN_TARGET_R:
+    if touch.risk <= 0 or touch.target_r < touch.min_target_r:
         return None
     entry, stop, target = touch.qm_level, touch.stop, touch.neckline
     d = touch.direction
     r, exit_idx, reason = None, None, None
-    last = min(touch.touch_index + MAX_HOLD_BARS, n - 1)
+    last = min(touch.touch_index + touch.max_hold_bars, n - 1)
     for k in range(touch.touch_index + 1, last + 1):
         if d == 1:
             if l[k] <= stop:
@@ -271,14 +316,14 @@ def _simulate(touch: _Touch, o: np.ndarray, h: np.ndarray,
 
 
 class _QMEngine:
-    """The single QM state machine behind BOTH paths.
-
-    Batch runs it over all bars with collect=True; live advances it
-    bar-by-bar with collect only on the latest bar.  One machine, no
-    drift, parity by construction.
+    """The single QM state machine behind BOTH paths and EVERY QM
+    timeframe (M5, D1, ...).  Batch runs it over all bars with
+    collect=True; live advances it bar-by-bar with collect only on
+    the latest bar.  One machine, no drift, parity by construction.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, params: QMParams = M5_PARAMS) -> None:
+        self.p = params
         self.pivots: list[_Pivot] = []
         self.pending: list[_Triple] = []    # formed, awaiting break
         self.broken: list[_Broken] = []     # broken, awaiting touch
@@ -303,7 +348,7 @@ class _QMEngine:
             for tr in list(self.pending):
                 if tr.p2.index == old_index:
                     tr.p2 = piv
-                    if not _triple_valid(tr, atr):
+                    if not _triple_valid(tr, atr, self.p):
                         self.pending.remove(tr)
             # A replacement can also complete a triple that was never
             # formed (the old pivot failed validation); the pending
@@ -334,28 +379,29 @@ class _QMEngine:
                     sweep = True  # head wicked below the prior swing low
         tr = _Triple(direction=direction, p0=a, p1=b, p2=c,
                      sweep_head=sweep)
-        if _triple_valid(tr, atr):
+        if _triple_valid(tr, atr, self.p):
             self.pending.append(tr)
 
     # ---------------------------------------------------------- one bar
     def process(self, o, h, l, c, t: int, collect: bool) -> list[_Touch]:
         """Advance the machine through closed bar ``t``.
 
-        Pivot at t-SWING_N confirms on this bar; breaks and touches
+        Pivot at t-swing_n confirms on this bar; breaks and touches
         are evaluated on this bar's close.  Touch events on past bars
         still advance state but are only returned when ``collect``.
         """
         out: list[_Touch] = []
-        atr = _atr(h, l, c, t)
-        # 1. confirm the pivot at t - SWING_N (strictly extreme over
-        #    [i-SWING_N, i+SWING_N] — ties are never pivots).  Pivot
+        p = self.p
+        atr = _atr(h, l, c, t, p.atr_n)
+        # 1. confirm the pivot at t - swing_n (strictly extreme over
+        #    [i-swing_n, i+swing_n] — ties are never pivots).  Pivot
         #    confirmation is price-only: it must NOT wait for the
-        #    14-bar ATR warmup (a pivot confirming on bar 13 would
+        #    ATR warmup (a pivot confirming on an early bar would
         #    otherwise be lost forever — only triple validation
         #    needs ATR, and it gates on atr <= 0 itself).
-        i = t - SWING_N
-        if i >= SWING_N:
-            lo_i, hi_i = i - SWING_N, i + SWING_N
+        i = t - p.swing_n
+        if i >= p.swing_n:
+            lo_i, hi_i = i - p.swing_n, i + p.swing_n
             if h[i] > max(h[k] for k in range(lo_i, hi_i + 1) if k != i):
                 self._add_pivot(_Pivot(index=i, price=float(h[i]), side=1),
                                 atr)
@@ -365,7 +411,7 @@ class _QMEngine:
         # 2. neckline breaks (stale formations expire first).
         kept: list[_Triple] = []
         for tr in self.pending:
-            if t - tr.p0.index > MAX_PATTERN_BARS:
+            if t - tr.p0.index > p.max_pattern_bars:
                 continue  # stale: never broke in time
             d = tr.direction
             broke = (c[t] < tr.neckline) if d == -1 \
@@ -374,7 +420,7 @@ class _QMEngine:
                 body_atr = (abs(c[t] - o[t]) / atr) if atr > 0 else 0.0
                 self.broken.append(_Broken(
                     triple=tr, break_index=t,
-                    displacement=body_atr >= DISPLACEMENT_BODY_ATR))
+                    displacement=body_atr >= p.displacement_body_atr))
             else:
                 kept.append(tr)
         self.pending = kept
@@ -388,7 +434,7 @@ class _QMEngine:
             if br.break_index >= t:
                 kept_b.append(br)
                 continue
-            if t - br.break_index > MAX_RETRACE_BARS:
+            if t - br.break_index > p.max_retrace_bars:
                 continue  # expired: never retraced to the QM level
             invalidated = (c[t] > tr.head) if d == -1 \
                 else (c[t] < tr.head)
@@ -406,11 +452,14 @@ class _QMEngine:
                 p1_index=tr.p1.index, p2_index=tr.p2.index, atr=atr,
                 tags=(["sweep_head"] if tr.sweep_head else [])
                 + (["displacement_break"] if br.displacement else []),
+                stop_buffer_atr=p.stop_buffer_atr,
+                max_hold_bars=p.max_hold_bars,
+                min_target_r=p.min_target_r,
             )
             # The live gate, applied here so batch and live can never
-            # diverge: a compressed pattern that cannot pay >= 1R is
+            # diverge: a compressed pattern that cannot pay >= min R is
             # dropped, not emitted.
-            if touch.risk > 0 and touch.target_r >= MIN_TARGET_R \
+            if touch.risk > 0 and touch.target_r >= p.min_target_r \
                     and collect:
                 out.append(touch)
             # One trade per pattern, gated or not.
@@ -418,7 +467,7 @@ class _QMEngine:
         return out
 
 
-def _triple_valid(tr: _Triple, atr: float) -> bool:
+def _triple_valid(tr: _Triple, atr: float, p: QMParams) -> bool:
     """Structural inequalities for one pivot triple, in ATR units."""
     if atr <= 0:
         return False
@@ -430,9 +479,9 @@ def _triple_valid(tr: _Triple, atr: float) -> bool:
         leg1 = tr.p1.price - tr.p0.price
         leg2 = tr.p1.price - tr.p2.price
         fail = tr.p2.price - tr.p0.price
-    return (leg1 >= MIN_LEG_ATR * atr
-            and leg2 >= MIN_LEG_ATR * atr
-            and fail >= MIN_FAIL_ATR * atr)
+    return (leg1 >= p.min_leg_atr * atr
+            and leg2 >= p.min_leg_atr * atr
+            and fail >= p.min_fail_atr * atr)
 
 
 def _arrays(df):
@@ -444,12 +493,12 @@ def _arrays(df):
     )
 
 
-def _to_signal(touch: _Touch, timestamp) -> GoldenSignal:
+def _to_signal(touch: _Touch, timestamp, p: QMParams) -> GoldenSignal:
     sig = GoldenSignal(
         index=touch.touch_index, timestamp=timestamp,
-        direction=touch.direction, score=SLEEVE_BASE_SCORE,
-        kind="qm_m5",
-        factors=["qm_m5"] + list(touch.tags),
+        direction=touch.direction, score=p.base_score,
+        kind=p.kind,
+        factors=[p.kind] + list(touch.tags),
         entry_zone=(touch.qm_level, touch.qm_level),
         entry_ref=touch.qm_level,
         invalidation=touch.stop,
@@ -467,39 +516,28 @@ def _to_signal(touch: _Touch, timestamp) -> GoldenSignal:
     return sig
 
 
-class QMM5Playbook(Playbook):
-    name = "qm_m5"
-    description = (
-        "Quasimodo reversal on M5: head -> neckline pullback -> failed "
-        "rally (QM level) -> close through the neckline -> limit at the "
-        "QM level, stop beyond the head, target the broken neckline"
-    )
-    live = False  # SHADOW: unvalidated — shadow book + journal only,
-    # never live P&L, until forward paper observation promotes it.
+class QMPlaybookBase(Playbook):
+    """One QM playbook for one timeframe.  Subclasses supply
+    :attr:`params` (the timeframe's numbers), :attr:`name`,
+    :attr:`description` and :attr:`context_description` — the engine,
+    simulator, gate, and streaming cursor are shared, never copied."""
+
+    params: QMParams = M5_PARAMS
+    live = False  # SHADOW: QM is unvalidated on every timeframe —
+    # shadow book + journal only, never live P&L, until validation
+    # promotes it (a separate owner decision per timeframe).
     live_threshold = 0.0  # every qualifying touch is graded
-    context_description = (
-        "UNVALIDATED (no backtest, no win rate, no context map yet). "
-        "M5 Quasimodo reversal: confirmed fractal pivots (swing_n=3), "
-        "both legs >= 0.5 ATR, failed rally short of the head by "
-        ">= 0.25 ATR, close through the neckline within 120 bars of "
-        "the head, first retracement touch of the QM level within 48 "
-        "bars, neckline target >= 1.0R. Session-agnostic UNTIL "
-        "measured — timezone/session mapping is a separate task and "
-        "must not be assumed here."
-    )
-    #: Session-agnostic until measured (timezone mapping is Task 2).
     session_scope = "any"
-    #: No measured context map yet — fires everywhere, no map bonuses.
     hunting_ground = HuntingGround(excluded=set(), bonuses={})
 
     def __init__(self) -> None:
-        self._engine = _QMEngine()
+        self._engine = _QMEngine(self.params)
         self._processed = -1  # last bar run through the machine
 
     # ------------------------------------------------------- batch path
     def candidates(self, ctx: EngineContext) -> list[Candidate]:
         o, h, l, c = _arrays(ctx.df)
-        engine = _QMEngine()
+        engine = _QMEngine(self.params)
         out: list[Candidate] = []
         for t in range(len(o)):
             for touch in engine.process(o, h, l, c, t, collect=True):
@@ -507,7 +545,8 @@ class QMM5Playbook(Playbook):
                 if sim is None:
                     continue
                 entry, stop, target, r, exit_idx, reason = sim
-                sig = _to_signal(touch, ctx.df.index[touch.touch_index])
+                sig = _to_signal(touch, ctx.df.index[touch.touch_index],
+                                 self.params)
                 outcome = Outcome(
                     signal=sig, entry_index=touch.touch_index,
                     exit_index=exit_idx, exit_reason=reason, r_net=r,
@@ -515,7 +554,7 @@ class QMM5Playbook(Playbook):
                 )
                 side = "long" if touch.direction == 1 else "short"
                 thesis = (
-                    f"qm_m5 {side} (touch bar {touch.touch_index}): "
+                    f"{self.name} {side} (touch bar {touch.touch_index}): "
                     f"head {touch.head:.1f} (bar {touch.p0_index}) -> "
                     f"neckline {touch.neckline:.1f} (bar "
                     f"{touch.p1_index}) -> failed rally to QM level "
@@ -529,7 +568,7 @@ class QMM5Playbook(Playbook):
                 )
                 out.append(Candidate(
                     playbook=self.name, outcome=outcome,
-                    base_score=SLEEVE_BASE_SCORE, thesis=thesis,
+                    base_score=self.params.base_score, thesis=thesis,
                     context=dict(sig.live_context)))
         return out
 
@@ -550,21 +589,22 @@ class QMM5Playbook(Playbook):
         if c["break_index"] >= c["touch_index"]:
             return False, "touch must come strictly after the break"
         atr = signal.atr
+        p = self.params
         if atr and atr > 0:
             stop_atr = abs(signal.entry_ref - signal.invalidation) / atr
-            if not (MIN_STOP_ATR <= stop_atr <= MAX_STOP_ATR):
+            if not (p.min_stop_atr <= stop_atr <= p.max_stop_atr):
                 return False, (
                     f"stop {stop_atr:.2f} ATR outside the validated "
-                    f"{MIN_STOP_ATR}–{MAX_STOP_ATR} band")
+                    f"{p.min_stop_atr}–{p.max_stop_atr} band")
             risk = (signal.entry_ref - signal.invalidation) \
                 * signal.direction
             if risk > 0 and signal.targets:
                 target_r = (signal.targets[0] - signal.entry_ref) \
                     * signal.direction / risk
-                if target_r < MIN_TARGET_R:
+                if target_r < p.min_target_r:
                     return False, (
                         f"neckline target {target_r:.2f}R below the "
-                        f"{MIN_TARGET_R}R qualification floor")
+                        f"{p.min_target_r}R qualification floor")
         return True, ""
 
     # ------------------------------------------------------- live path
@@ -588,7 +628,7 @@ class QMM5Playbook(Playbook):
         for t2 in range(self._processed + 1, t + 1):
             for touch in self._engine.process(o, h, l, c, t2,
                                               collect=(t2 == t)):
-                out.append(_to_signal(touch, df.index[t2]))
+                out.append(_to_signal(touch, df.index[t2], self.params))
         self._processed = t
         return out
 
@@ -605,10 +645,37 @@ class QMM5Playbook(Playbook):
         # FRESH engine, never keep stale streaming state.
         state = state or {}
         self._processed = int(state.get("processed", -1))
-        self._engine = _QMEngine()
+        self._engine = _QMEngine(self.params)
         self._engine.pivots = [_Pivot.from_dict(p)
                                 for p in state.get("pivots", [])]
         self._engine.pending = [_Triple.from_dict(tr)
                                 for tr in state.get("pending", [])]
         self._engine.broken = [_Broken.from_dict(br)
                                 for br in state.get("broken", [])]
+
+
+class QMM5Playbook(QMPlaybookBase):
+    params = M5_PARAMS
+    name = "qm_m5"
+    description = (
+        "Quasimodo reversal on M5: head -> neckline pullback -> failed "
+        "rally (QM level) -> close through the neckline -> limit at the "
+        "QM level, stop beyond the head, target the broken neckline"
+    )
+    live = False  # SHADOW: unvalidated — shadow book + journal only,
+    # never live P&L, until forward paper observation promotes it.
+    live_threshold = 0.0  # every qualifying touch is graded
+    context_description = (
+        "UNVALIDATED (no backtest, no win rate, no context map yet). "
+        "M5 Quasimodo reversal: confirmed fractal pivots (swing_n=3), "
+        "both legs >= 0.5 ATR, failed rally short of the head by "
+        ">= 0.25 ATR, close through the neckline within 120 bars of "
+        "the head, first retracement touch of the QM level within 48 "
+        "bars, neckline target >= 1.0R. Session-agnostic UNTIL "
+        "measured — timezone/session mapping is a separate task and "
+        "must not be assumed here."
+    )
+    #: Session-agnostic until measured (timezone mapping is Task 2).
+    session_scope = "any"
+    #: No measured context map yet — fires everywhere, no map bonuses.
+    hunting_ground = HuntingGround(excluded=set(), bonuses={})

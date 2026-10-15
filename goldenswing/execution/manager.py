@@ -51,6 +51,9 @@ class TrackedPosition:
     stop0: float                # buffered structural stop
     risk_price: float           # |entry - stop0|
     alert_id: str = ""
+    #: The signal's target levels (first = the TP the close
+    #: classifier measures against).  Adopted positions have none.
+    targets: tuple[float, ...] = ()
     partial_price: float | None = None
     partial_done: bool = False
     best_r: float = 0.0
@@ -100,7 +103,9 @@ class ExitStepper:
             volume=request.volume, orig_volume=request.volume,
             entry_price=fill_price, signal_bar=request.bar_index,
             entry_bar=entry_bar, invalidation=request.stop_loss,
-            stop0=stop0, risk_price=risk, partial_price=partial_price)
+            stop0=stop0, risk_price=risk,
+            targets=tuple(request.targets or ()),
+            partial_price=partial_price)
 
     def step(self, pos: TrackedPosition, bar: dict,
              bar_index: int) -> list[ExitEvent]:

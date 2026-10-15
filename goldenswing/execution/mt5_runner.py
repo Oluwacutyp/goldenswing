@@ -75,7 +75,7 @@ from ..reader.session_timeframes import compose as _compose_session
 from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
                          InversionPlaybook, JudasSwingPlaybook,
                          KillzoneOpenPlaybook, OrderBlockPlaybook,
-                         QMM5Playbook, RetracementTrapPlaybook,
+                         QMD1Playbook, QMM5Playbook, RetracementTrapPlaybook,
                          SweepReversalPlaybook, TrendlineRetestPlaybook,
                          TurtleSoupPlaybook, VReversalPlaybook)
 from ..playbooks.base import EngineContext
@@ -214,6 +214,9 @@ class MT5Runner:
         self._engine: ConfluenceEngine | None = None
         self._stack: TimeframeStack | None = None
         self._qm_touch: dict | None = None
+        # Daily QM shadow: last touch index already journal-logged
+        # (the D1 scan logs each touch once, never re-logs history).
+        self._qm_d1_last_logged: int = -1
         # Live evaluation clock (tick-cross trigger, entry-TF entry):
         # the forming H1 bar tracked from ticks, the cached trigger
         # levels from closed bars, and the pending (fired, still
@@ -231,6 +234,8 @@ class MT5Runner:
         self._last_sig_bar: dict[str, int] = {}
         self._tick_count = 0
         self._last_tick: dict | None = None
+        # UTC date of the last tick seen (rollover recap clock).
+        self._last_tick_date = None
         self._stopped = False
         # Startup ping: exactly one Telegram "engine started" message
         # per process start (see _send_startup_ping).  Guarded so a
@@ -268,12 +273,20 @@ class MT5Runner:
 
     # ------------------------------------------------------------ wiring
     def _get_playbooks(self) -> list:
-        """Every playbook the engine knows: the 7 executing ones plus
-        the 5 shadow ones.  Instantiation alone never orders — the
-        ``auto = pb.name in execute_playbooks`` gate at the order step
-        decides, and shadow playbooks only ever get evaluated +
-        logged (see _run_signal_path).  A playbook missing from this
-        list can never fire, executing or shadow."""
+        """Every playbook the H1-clocked signal path knows: the 7
+        executing ones plus the 5 shadow ones.  Instantiation alone
+        never orders — the ``auto = pb.name in execute_playbooks``
+        gate at the order step decides, and shadow playbooks only
+        ever get evaluated + logged (see _run_signal_path).  A
+        playbook missing from this list can never fire, executing
+        or shadow, ON THE H1 PATH.
+
+        ``qm_d1`` is deliberately NOT here: the H1 path drives
+        ``live_signal`` with H1 bars, and running D1 QM logic on H1
+        bars would emit H1 patterns mislabelled as Daily QM.  The
+        Daily QM shadow lives in :meth:`_scan_qm_d1`, which evaluates
+        it on the real D1 frame on every D1 close (see
+        :meth:`_refresh_bars`)."""
         if self._playbooks is None:
             self._playbooks = [SweepReversalPlaybook(),
                                FVGMidlinePlaybook(),
@@ -418,7 +431,12 @@ class MT5Runner:
                        "hierarchy_blocked": 0, "tick_actions": 0,
                        "reconciled_closed": 0, "triggers": 0,
                        "invalidated": 0, "pending": 0,
-                       "pending_filled": 0, "pending_cancelled": 0}
+                       "pending_filled": 0, "pending_cancelled": 0,
+                       "qm_d1_shadow": 0}
+        # Daily QM shadow: evaluate the D1 frame once at warm start
+        # (the latest touch, if any, is logged here; later touches
+        # are logged on their D1 close by _refresh_bars).
+        self._scan_qm_d1(self._stack.frames.get("D1"), stats)
         pump = TickPump(feed, interval=self.cfg.tick_interval)
         try:
             pump.run(self._on_tick(stats), max_ticks=max_ticks)
@@ -452,6 +470,9 @@ class MT5Runner:
             stats["ticks"] += 1
             self._tick_count += 1
             self._last_tick = tick
+            # Day rollover -> the honest recap for the day/week that
+            # just ended (wins AND losses).  Never breaks the loop.
+            self._maybe_send_rollover_recap(tick)
             # Tick CSV: exactly as seen, never breaks the loop.
             if self._tick_logger is not None:
                 try:
@@ -476,10 +497,20 @@ class MT5Runner:
         return _handle
 
     def _manage_tick(self, price: float, stats: dict) -> None:
-        """TickManager actions for every tracked position, executed now."""
+        """TickManager actions for every tracked position, executed now.
+
+        Every executed management action that changes the position
+        gets a Telegram follow-up (breakeven / partial / layer stop)
+        — the disciplined caller's update — on top of the journal
+        note.  Trail SL moves stay journal-only: they fire on
+        nearly every favourable tick and would spam the channel.
+        """
         for ticket in list(self.tick_manager.tickets()):
             for action in self.tick_manager.on_tick(ticket, price):
                 stats["tick_actions"] += 1
+                pos = self.tick_manager.position(ticket)
+                pb = self._playbook_from_alert_id(
+                    pos.alert_id if pos is not None else "")
                 if action.kind == "modify_sl":
                     res = self.executor.modify_sl(ticket, action.level)
                     if res.ok:
@@ -487,6 +518,11 @@ class MT5Runner:
                         self.journal.log_note(
                             f"mt5 tick: ticket {ticket} SL -> "
                             f"{action.level:.2f} ({action.reason})")
+                        if action.reason == "breakeven":
+                            self._send_alert(
+                                f"MT5 BREAKEVEN {pb} ticket {ticket}: "
+                                f"SL -> entry {action.level:.2f} — "
+                                f"risk off, trade is now free")
                     else:
                         self.journal.log_note(
                             f"mt5 tick: ticket {ticket} SL move FAILED "
@@ -498,6 +534,10 @@ class MT5Runner:
                         self.journal.log_note(
                             f"mt5 tick: ticket {ticket} partial close "
                             f"{action.volume} lots at {price:.2f}")
+                        self._send_alert(
+                            f"MT5 PARTIAL {pb} ticket {ticket}: banked "
+                            f"{action.volume} lots @ {price:.2f} "
+                            f"(remainder rides)")
                     else:
                         self.journal.log_note(
                             f"mt5 tick: ticket {ticket} partial FAILED: "
@@ -512,6 +552,10 @@ class MT5Runner:
                             f"mt5 tick: ticket {ticket} layer stop "
                             f"{action.volume} lots at {price:.2f} "
                             f"(layer SL {action.level:.2f})")
+                        self._send_alert(
+                            f"MT5 LAYER STOP {pb} ticket {ticket}: "
+                            f"closed {action.volume} lots @ {price:.2f} "
+                            f"(layer SL {action.level:.2f}, base rides)")
                     else:
                         self.journal.log_note(
                             f"mt5 tick: ticket {ticket} layer stop FAILED: "
@@ -601,6 +645,61 @@ class MT5Runner:
                     f"mt5 reconcile: adopted pending {order.kind} "
                     f"ticket {ticket} @ {order.price:.2f}")
 
+    @staticmethod
+    def _playbook_from_alert_id(alert_id: str) -> str:
+        """Playbook out of ``MT5-<playbook>-<index>`` (``?`` when the
+        alert id does not follow the shape — follow-up text only,
+        never a gate)."""
+        if alert_id.startswith("MT5-") and "-" in alert_id[4:]:
+            return alert_id[4:].rsplit("-", 1)[0] or "?"
+        return "?"
+
+    def _classify_close(self, pos, price: float, reason: str) -> str:
+        """What the close MEANS, for the journal note + Telegram
+        follow-up (the structured journal ``reason`` keeps the raw
+        rule reason — ``stop`` / ``broker_closed`` / ``timeout`` —
+        so downstream joins never change).
+
+        - ``timeout`` stays ``timeout`` (the rule that fired), even
+          when the exit is in profit.
+        - The safety-net ``stop`` is an SL hit; when the stop that
+          got hit is the TRAIL level or the BREAKEVEN level, it says
+          so (a breakeven stop is risk-off, not a loss).
+        - ``broker_closed`` is the broker's TP or SL (or a manual
+          close): classify by price against the signal's first
+          target and the effective broker stop.  Between the two,
+          it is an unexplained broker close — reported as such,
+          never dressed up as a TP.
+        """
+        d = pos.direction
+        if reason == "timeout":
+            return "timeout"
+        if reason == "stop":
+            return self._stop_label(pos)
+        if reason == "broker_closed":
+            targets = list(getattr(pos, "targets", None) or [])
+            if targets:
+                tp = targets[0]
+                if (d == 1 and price >= tp) or \
+                        (d == -1 and price <= tp):
+                    return "TP hit"
+            eff = self.tick_manager.effective_stop(pos.ticket)
+            if eff is not None and ((d == 1 and price <= eff) or
+                                    (d == -1 and price >= eff)):
+                return self._stop_label(pos)
+            return "broker_closed"
+        return reason
+
+    def _stop_label(self, pos) -> str:
+        """Which stop got hit: breakeven (risk-off), trail, or the
+        structural stop."""
+        if abs((self.tick_manager.effective_stop(pos.ticket) or 0.0)
+               - pos.entry_price) < 1e-9 and pos.risk_price > 0:
+            return "SL hit (breakeven)"
+        if pos.stop_is_trail:
+            return "SL hit (trail)"
+        return "SL hit"
+
     def _record_close(self, ticket: int, price: float, reason: str,
                       stats: dict) -> None:
         pos = self.tick_manager.position(ticket)
@@ -616,15 +715,72 @@ class MT5Runner:
                 abs(price - pos.entry_price), pos.volume)
         except Exception:
             pass
+        # Classify BEFORE remove(): the classifier reads the live
+        # effective stop from the TickManager.
+        display = self._classify_close(pos, price, reason)
         self.journal.log_close(
             alert_id=pos.alert_id, ticket=ticket, exit_price=price,
             reason=reason, pnl_money=float(pnl_money), r_net=float(pnl_r),
             hold_bars=0, partial_taken=pos.partial_done)
         self.journal.log_note(
-            f"mt5 close: ticket {ticket} {reason} at {price:.2f} "
+            f"mt5 close: ticket {ticket} {display} at {price:.2f} "
             f"({pnl_r:+.2f}R)")
+        # Telegram follow-up — the disciplined caller's update: every
+        # close is reported, wins AND losses, with the R and the
+        # reason (a loss is never silently journalled).
+        pb = self._playbook_from_alert_id(pos.alert_id)
+        self._send_alert(
+            f"MT5 CLOSE {pb} {'+' if d > 0 else '-'}1 "
+            f"{pos.volume} lots entry {pos.entry_price:.2f} -> exit "
+            f"{price:.2f} — {display} {pnl_r:+.2f}R "
+            f"(ticket {ticket})")
         self.tick_manager.remove(ticket)
         stats["reconciled_closed"] += 1
+
+    def _maybe_send_rollover_recap(self, tick: dict) -> None:
+        """UTC day rollover -> Telegram recap(s) for what just ended.
+
+        On the first tick of a new UTC day: the DAILY recap for the
+        day that just ended.  When the new day is a Monday, the
+        WEEKLY recap for the Mon–Sun week that just ended too.
+        Both report wins AND losses (see reporting.py) — the recap
+        never hides losers.  No senders configured -> nothing sent
+        (and no journal read).  Never raises into the tick loop; a
+        recap failure is one journal note.
+        """
+        if not self.senders:
+            # Still advance the clock: a sender-less run must not
+            # "roll over" the same day twice if senders appear later.
+            try:
+                ts = pd.Timestamp(tick["time"])
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                self._last_tick_date = ts.tz_convert("UTC").date()
+            except Exception:
+                pass
+            return
+        try:
+            ts = pd.Timestamp(tick["time"])
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            day = ts.tz_convert("UTC").date()
+        except Exception:
+            return
+        prev = self._last_tick_date
+        self._last_tick_date = day
+        if prev is None or prev == day:
+            return  # first tick, or same day: no rollover
+        try:
+            from .reporting import (build_daily_recap,
+                                    build_weekly_recap)
+            from datetime import timedelta as _td
+            self._send_alert(build_daily_recap(self.journal, prev))
+            if day.weekday() == 0:  # Monday: the week just ended
+                self._send_alert(build_weekly_recap(
+                    self.journal, prev - _td(days=6)))
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: rollover recap failed: {exc}")
 
     # --------------------------------------------------------------- bars
     def _refresh_bars(self, tick: dict, stats: dict) -> None:
@@ -677,6 +833,9 @@ class MT5Runner:
             if tf == "M5":
                 self._qm_touch = self._advance_qm(
                     self._stack.frames.get("M5"))
+            if tf == "D1":
+                self._scan_qm_d1(
+                    self._stack.frames.get("D1"), stats)
             if tf == "H1":
                 h1_accepted += accepted
         if any(tf in ("D1", "H4", "H1") for tf in appended):
@@ -1885,6 +2044,66 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: QM M5 scan failed (annotation only): {exc}")
             return None
+
+    def _scan_qm_d1(self, d1_df, stats: dict | None = None) -> list[dict]:
+        """Daily QM SHADOW scan on the D1 frame: evaluated + logged,
+        never ordered, never charted, never alerted.
+
+        Runs on the real D1 frame at warm start and on every D1
+        close (see :meth:`_refresh_bars`) — NOT through the
+        H1-clocked signal path, which would run D1 logic on H1 bars.
+        Each touch is journal-logged exactly once (tracked by
+        ``_qm_d1_last_logged``); the scan itself is the shadow book
+        for this playbook.  Switched off via
+        ``/set playbook.qm_d1 off`` like any other shadow playbook.
+        Failures return [] (annotation missing, never a crash).
+        """
+        if "qm_d1" in (self.cfg.disabled_playbooks or ()):
+            return []
+        try:
+            if d1_df is None or len(d1_df) < 30:
+                return []
+            pb = QMD1Playbook()
+            ctx = EngineContext(df=d1_df, states=[], years=0.0,
+                                instrument=self.cfg.symbol)
+            out: list[dict] = []
+            for cand in pb.candidates(ctx):
+                if cand.signal_index <= self._qm_d1_last_logged:
+                    continue  # already logged on an earlier scan
+                sig = cand.outcome.signal
+                lc = dict(getattr(sig, "live_context", None) or {})
+                touch = {"direction": int(cand.direction),
+                         "touch_ts": d1_df.index[cand.signal_index],
+                         "touch_index": int(cand.signal_index),
+                         "qm_level": lc.get("qm_level"),
+                         "head": lc.get("head"),
+                         "neckline": lc.get("neckline"),
+                         "tags": lc.get("tags", []),
+                         "r_net": float(cand.outcome.r_net),
+                         "exit_reason": cand.outcome.exit_reason}
+                out.append(touch)
+                self.journal.log_note(
+                    f"mt5 [SHADOW] qm_d1 "
+                    f"{'+' if touch['direction'] > 0 else '-'}1 "
+                    f"touch {touch['touch_ts'].date()} "
+                    f"QM {touch['qm_level']:.1f} head "
+                    f"{touch['head']:.1f} neckline "
+                    f"{touch['neckline']:.1f} "
+                    f"-> {touch['r_net']:+.2f}R "
+                    f"({touch['exit_reason']})"
+                    + (f" tags:{','.join(touch['tags'])}"
+                       if touch["tags"] else ""))
+            if out:
+                self._qm_d1_last_logged = max(
+                    t["touch_index"] for t in out)
+                if stats is not None:
+                    stats["qm_d1_shadow"] = stats.get(
+                        "qm_d1_shadow", 0) + len(out)
+            return out
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: QM D1 shadow scan failed (never ordered): {exc}")
+            return []
 
     # ------------------------------------------------- alerts + charts
     def _build_chart(self, sig, verdict: dict | None, *,

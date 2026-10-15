@@ -229,9 +229,11 @@ class SessionMapping:
     @property
     def entry_clock(self) -> str:
         """The clock that may fire: the session trigger, unless the
-        playbook owns its own clock (QM M5 keeps M5)."""
+        playbook owns its own clock (QM M5 keeps M5, QM D1 keeps D1)."""
         if self.playbook == "qm_m5":
             return "M5"
+        if self.playbook == "qm_d1":
+            return "D1"
         return self.trigger_tf
 
     @property
@@ -283,6 +285,8 @@ def mapping_for(ts, *, amd_phase: str | None = None,
             tags.append("manipulation_in_killzone")
     if playbook == "qm_m5":
         tags.append("qm_m5 keeps M5 clock; session is annotation only")
+    elif playbook == "qm_d1":
+        tags.append("qm_d1 keeps D1 clock; session is annotation only")
     elif playbook is not None:
         tags.append(f"playbook:{playbook}")
     return SessionMapping(

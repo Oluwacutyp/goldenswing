@@ -18,6 +18,7 @@ from .inversion import InversionPlaybook
 from .judas_swing import JudasSwingPlaybook
 from .killzone_open import KillzoneOpenPlaybook
 from .order_block import OrderBlockPlaybook
+from .qm_d1 import QMD1Playbook
 from .qm_m5 import QMM5Playbook
 from .retracement_trap import RetracementTrapPlaybook
 from .sweep_reversal import SweepReversalPlaybook
@@ -34,6 +35,7 @@ __all__ = [
     "FVGMidlinePlaybook",
     "FVGLimitPlaybook",
     "TrendlineRetestPlaybook",
+    "QMD1Playbook",
     "QMM5Playbook",
     "VReversalPlaybook",
     "RetracementTrapPlaybook",
