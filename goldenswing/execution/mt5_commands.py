@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..feed.tick_log import export_tick_history
+from ..feed.mt5 import MT5Feed
 from ..alerts.commands import (CommandContext, CommandResult,
                               CommandRouter, build_zip_bundle)
 from .mt5_config import (EXECUTE_PLAYBOOK_NAMES, SHADOW_PLAYBOOK_NAMES,
@@ -538,6 +539,55 @@ def _mt5_ticks(ctx: CommandContext, args: list[str]) -> CommandResult:
         document=path,
         caption=f"MT5 tick history, last {days} day(s): {rows} ticks "
                 f"(exactly as seen — no resampling)")
+
+
+#: /d1 defaults — mirror the feed's warm-start bar count for D1.
+D1_DEFAULT_BARS = 2000
+D1_MAX_BARS = 5000
+D1_COLUMNS = ["time", "open", "high", "low", "close", "volume",
+              "real_volume", "spread"]
+
+
+@mt5_command("/d1", "export D1 bars as CSV from the live MT5 feed (default 2000, max 5000)")
+def _mt5_d1(ctx: CommandContext, args: list[str]) -> CommandResult:
+    try:
+        bars_n = int(args[0]) if args else D1_DEFAULT_BARS
+    except (ValueError, IndexError):
+        return CommandResult(text="usage: /d1 [bars]  (1–5000, default 2000)")
+    if bars_n <= 0:
+        return CommandResult(text="usage: /d1 [bars]  (1–5000, default 2000)")
+    bars_n = min(bars_n, D1_MAX_BARS)
+    if ctx.feed is None or not hasattr(ctx.feed, "bars"):
+        return CommandResult(
+            text="D1 export needs the live MT5 feed "
+                 "(not available in this context).")
+    out_dir = Path(ctx.reports_dir) if ctx.reports_dir else Path.cwd()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out_path = out_dir / f"mt5-d1-{bars_n}bars-{stamp}.csv"
+    try:
+        # Real MT5 D1 bars via copy_rates_from_pos(TIMEFRAME_D1) —
+        # never resampled, never faked. Closed bars only: the
+        # still-forming daily bar is incomplete and would corrupt
+        # validation — the engine trades closed bars.
+        frame = ctx.feed.bars("D1", bars_n)
+        frame = MT5Feed._closed_only(frame, "D1",
+                                     datetime.now(timezone.utc))
+        out = frame.reset_index(names="time")
+        out = out[D1_COLUMNS]
+        out.to_csv(out_path, index=False)
+    except Exception as exc:
+        return CommandResult(
+            text=f"D1 export failed: {type(exc).__name__}: {exc}")
+    if len(out):
+        span = f"{str(out['time'].iloc[0])[:10]} → " \
+               f"{str(out['time'].iloc[-1])[:10]}"
+    else:
+        span = "no closed bars"
+    return CommandResult(
+        document=out_path,
+        caption=f"MT5 D1 bars: {len(out)} closed bars, {span} "
+                f"(real MT5 bars — no resampling)")
 
 
 # ------------------------------------------------------------------ /harvest

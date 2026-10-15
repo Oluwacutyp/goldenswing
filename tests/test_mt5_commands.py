@@ -400,3 +400,78 @@ def test_runner_alert_sends_photo_when_chart_present(tmp_path):
     assert sender.photos[0][1] == "hello"
     runner._send_alert("text only")
     assert sender.texts == ["text only"]
+
+
+# ------------------------------------------------------------ /d1 export
+def _d1_ctx(tmp_path, feed):
+    return CommandContext(reports_dir=tmp_path / "reports", feed=feed)
+
+
+def _d1_fn():
+    return MT5_COMMANDS["/d1"][1]
+
+
+def test_d1_registered_in_mt5_commands():
+    assert "/d1" in MT5_COMMANDS
+    assert MT5_COMMANDS["/d1"][0]  # description shown in help
+
+
+def test_d1_export_writes_csv_with_d1_bars(tmp_path):
+    feed = MT5Feed(MT5FeedConfig(), mt5_module=FakeMT5())
+    ctx = _d1_ctx(tmp_path, feed)
+    res = _d1_fn()(ctx, ["10"])
+    assert res.document is not None
+    path = Path(res.document)
+    assert path.exists()
+    assert "10bars" in path.name
+    df = pd.read_csv(path)
+    assert list(df.columns) == ["time", "open", "high", "low", "close",
+                                "volume", "real_volume", "spread"]
+    assert 1 <= len(df) <= 10
+    # Daily spacing: consecutive bars exactly one day apart.
+    ts = pd.to_datetime(df["time"], utc=True)
+    assert (ts.diff().dropna() == pd.Timedelta(days=1)).all()
+    assert "closed bars" in (res.caption or "")
+    assert "no resampling" in (res.caption or "")
+
+
+def test_d1_export_default_is_multiyear(tmp_path):
+    feed = MT5Feed(MT5FeedConfig(), mt5_module=FakeMT5())
+    ctx = _d1_ctx(tmp_path, feed)
+    res = _d1_fn()(ctx, [])
+    assert "2000bars" in Path(res.document).name
+    assert len(pd.read_csv(res.document)) > 1000  # default covers years
+
+
+def test_d1_export_caps_and_rejects_bad_input(tmp_path):
+    feed = MT5Feed(MT5FeedConfig(), mt5_module=FakeMT5())
+    ctx = _d1_ctx(tmp_path, feed)
+    fn = _d1_fn()
+    res = fn(ctx, ["99999"])
+    assert "5000bars" in Path(res.document).name
+    assert len(pd.read_csv(res.document)) <= 5000
+    for bad in (["abc"], ["0"], ["-5"], ["1.5"]):
+        res = fn(ctx, bad)
+        assert "usage" in (res.text or "")
+        assert res.document is None
+
+
+def test_d1_export_no_feed_is_clean_error(tmp_path):
+    ctx = _d1_ctx(tmp_path, feed=None)
+    res = _d1_fn()(ctx, ["10"])
+    assert res.document is None
+    assert "live MT5 feed" in (res.text or "")
+
+
+def test_d1_export_feed_failure_is_clean_error(tmp_path):
+    from goldenswing.feed.mt5 import MT5Unavailable
+
+    class BoomFeed:
+        def bars(self, tf, count):
+            raise MT5Unavailable("terminal not connected")
+
+    ctx = _d1_ctx(tmp_path, feed=BoomFeed())
+    res = _d1_fn()(ctx, ["10"])
+    assert res.document is None
+    assert "D1 export failed" in (res.text or "")
+    assert "MT5Unavailable" in (res.text or "")
