@@ -82,6 +82,8 @@ class CommandContext:
     trim_callback: object = None         # MT5 runner.trim_top_layer (bound)
     mt5_control: object = None           # MT5 runner (pause/config/confirm)
     pending_orders: list = field(default_factory=list)  # MT5 pendings
+    reconciler: object = None            # engine Reconciler | None (/reconcile)
+    deterministic: object = None        # DeterministicRuntime | None (/health)
 
 
 def _is_owner(update: dict, owner_chat_id: str | int | None) -> bool:
@@ -563,6 +565,196 @@ def build_harvest_bundle(ctx: CommandContext, scope: str = "all") -> tuple[Path,
         files=chosen, data_dir=data_dir, manifest_base=manifest_base,
         results_md_fn=lambda m: _harvest_results_md(ctx, scope, m),
         slim_files=journal_only)
+
+
+# ------------------------------------------------------------------ engine /
+# backtest export commands (deterministic engine + Telegram wiring).
+#
+# /backtest      — build a backtest report from the attached journal
+#                  and send it as a FILE + concise summary caption.
+#                  The file is the contract: the owner drops it back
+#                  to Muse for review.  The caption carries trades /
+#                  win% / R / PF / MaxDD / period.  Never silent: no
+#                  journal means an explicit text reply, not nothing.
+# /backtest_send — same file + caption, with the explicit instruction
+#                  to drop the file back to Muse.  (Alias of /backtest
+#                  with the drop-back instruction in the caption.)
+# /journal       — journal head / record count / last record.
+# /snapshot      — deterministic-engine snapshot manifest (N / N_prev)
+#                  when an engine dir exists, else an honest "none yet".
+# /reconcile     — reconciliation status from the journal (open vs
+#                  closed); the live Reconciler is reported when the
+#                  runner attaches one on ctx (ctx.reconciler).
+# /health        — feed + journal + open positions in one reply.
+
+def _backtest_rows_from_journal(ctx: CommandContext) -> list[dict]:
+    """Trade rows for the backtest exporter, from the paper journal."""
+    from goldenswing.execution.reporting import iter_paper_trades
+    if ctx.journal is None:
+        return []
+    rows: list[dict] = []
+    for t in iter_paper_trades(ctx.journal):
+        rows.append({
+            "playbook": t.get("playbook", "?"),
+            "direction": t.get("direction", 0),
+            "r_net": t.get("r_net", 0.0),
+            "pnl": t.get("pnl_money", 0.0),
+            "reason": t.get("reason", ""),
+        })
+    return rows
+
+
+def _d1_coverage(ctx: CommandContext) -> tuple[int | None, bool]:
+    """(d1_bars, d1_stale) from feed_status when available.
+
+    The paper loop reports hierarchy-blocked D1 staleness via
+    feed_status; when it says the D1 feed is stale the backtest
+    summary must say so too — never claim clean on stale D1 data.
+    """
+    fs = ctx.feed_status or {}
+    if not fs:
+        return None, False
+    stale = not bool(fs.get("ok", True))
+    return None, stale
+
+
+def build_backtest_result(ctx: CommandContext, *,
+                          drop_back: bool = False) -> CommandResult:
+    """Shared /backtest + /backtest_send implementation (both loops)."""
+    from goldenswing.engine.backtest_export import (
+        format_summary, write_report)
+    if ctx.journal is None:
+        return CommandResult(
+            text="no journal attached — nothing to export. "
+                 "Run the paper loop or a backtest first.")
+    rows = _backtest_rows_from_journal(ctx)
+    if not rows:
+        return CommandResult(
+            text="no closed trades in the journal yet — "
+                 "nothing to export. Run the paper loop first.")
+    d1_bars, d1_stale = _d1_coverage(ctx)
+    out_dir = Path(ctx.reports_dir) if ctx.reports_dir else \
+        Path.cwd() / "data" / "reports"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path, _summary = write_report(
+        rows, out_dir / f"backtest-{stamp}.md",
+        period="paper journal", d1_bars=d1_bars, d1_stale=d1_stale)
+    summary = format_summary(_summary)
+    caption = summary
+    if drop_back:
+        caption += "\nDrop this file back to Muse for review."
+    # Caption limit is 1024 chars in the sender; keep it concise.
+    if len(caption) > 1000:
+        caption = caption[:997] + "…"
+    return CommandResult(document=path, caption=caption)
+
+
+@command("/backtest", "build + send backtest report file + summary")
+def _backtest(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return build_backtest_result(ctx, drop_back=False)
+
+
+@command("/backtest_send", "send backtest results file to drop back to Muse")
+def _backtest_send(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return build_backtest_result(ctx, drop_back=True)
+
+
+@command("/journal", "journal head / record count / last record")
+def _journal(ctx: CommandContext, args: list[str]) -> CommandResult:
+    if ctx.journal is None:
+        return CommandResult(text="no journal attached.")
+    try:
+        records = ctx.journal.records()
+    except Exception:
+        records = []
+    lines = [f"journal: {ctx.journal_path or '(unknown path)'}",
+             f"records: {len(records)}"]
+    if records:
+        last = records[-1]
+        lines.append(
+            f"last: seq={last.get('seq', '?')} "
+            f"type={last.get('type', '?')} ts={last.get('ts', '?')}")
+    return CommandResult(text="\n".join(lines))
+
+
+@command("/snapshot", "deterministic-engine snapshot manifest (N / N_prev)")
+def _snapshot(ctx: CommandContext, args: list[str]) -> CommandResult:
+    # Engine dir: alongside the journal (data/engine/) when present.
+    base = Path(ctx.journal_path).parent / "engine" \
+        if ctx.journal_path else Path.cwd() / "data" / "engine"
+    manifest_path = base / "manifest.json"
+    if not manifest_path.exists():
+        return CommandResult(
+            text="no deterministic-engine snapshots yet — "
+                 "the engine has not written a snapshot manifest. "
+                 "Paper journal snapshots are separate (see /db).")
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        return CommandResult(
+            text=f"snapshot manifest unreadable: {exc}")
+    snaps = manifest.get("snapshots", [])
+    if not snaps:
+        return CommandResult(text="snapshot manifest is empty.")
+    lines = ["snapshots (newest first):"]
+    for s in snaps:
+        lines.append(
+            f"N={s.get('watermark')} root={str(s.get('snapshot_root'))[:12]}… "
+            f"chain={str(s.get('chain_n'))[:12]}…")
+    return CommandResult(text="\n".join(lines))
+
+
+@command("/reconcile", "reconciliation status: unresolved / open vs closed")
+def _reconcile(ctx: CommandContext, args: list[str]) -> CommandResult:
+    reconciler = getattr(ctx, "reconciler", None)
+    if reconciler is not None:
+        unresolved = reconciler.unresolved()
+        return CommandResult(
+            text=f"reconciler phase: {reconciler.phase}\n"
+                 f"unresolved: {len(unresolved)}\n"
+                 f"reconciliation_complete: "
+                 f"{reconciler.reconciliation_complete}\n"
+                 f"holding queue: {len(reconciler.holding)}")
+    if ctx.journal is None:
+        return CommandResult(text="no journal attached.")
+    from goldenswing.execution.reporting import open_positions
+    try:
+        opens = open_positions(ctx.journal)
+    except Exception:
+        opens = []
+    return CommandResult(
+        text="no live reconciler attached to this loop.\n"
+             f"journal open positions (unclosed): {len(opens)}\n"
+             "Run the deterministic engine for live "
+             "UNCONFIRMED/UNKNOWN reconciliation status.")
+
+
+@command("/health", "feed + journal + open positions health")
+def _health(ctx: CommandContext, args: list[str]) -> CommandResult:
+    fs = ctx.feed_status or {}
+    feed_line = ("feed: OK" if fs.get("ok")
+                 else f"feed: STALE — {fs.get('reason', 'no status yet')}")
+    lines = ["HEALTH", feed_line]
+    if getattr(ctx, "deterministic", None) is not None:
+        try:
+            det = ctx.deterministic.status()
+            lines.append(
+                f"deterministic: {det.get('phase')} head={det.get('head')} "
+                f"commit={det.get('commit_index')} "
+                f"unresolved={det.get('unresolved')}")
+        except Exception:
+            pass
+    if ctx.journal is not None:
+        try:
+            lines.append(f"journal records: {len(ctx.journal.records())}")
+        except Exception:
+            pass
+    if ctx.paper is not None:
+        try:
+            lines.append(f"open paper positions: {len(ctx.paper.positions())}")
+        except Exception:
+            pass
+    return CommandResult(text="\n".join(lines))
 
 
 @command("/harvest", "harvest database + journal + state + results as one ZIP")
