@@ -84,6 +84,11 @@ def _runner(tmp_path, **cfg_kw):
         journal_path=tmp_path / "mt5_journal.jsonl",
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
+        # News pause OFF: the order path's news check reads the
+        # REAL wall-clock calendar — these tests must not fail on
+        # a real news day (e.g. PPI).  The pause itself is covered
+        # by test_news_calendar.py.
+        news_pause_enabled=False,
         fixed_lots=0.01,
         **cfg_kw)
     feed = SimpleNamespace(

@@ -117,7 +117,12 @@ def test_runner_records_latency_and_slippage_on_fill(tmp_path):
         journal_path=tmp_path / "mt5_journal.jsonl",
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
-        execute_playbooks=("fvg_midline",))
+        execute_playbooks=("fvg_midline",),
+        # News pause OFF: the order path's news check reads the
+        # REAL wall-clock calendar — this test must not fail on
+        # a real news day (e.g. PPI).  The pause itself is covered
+        # by test_news_calendar.py.
+        news_pause_enabled=False)
     feed = MT5Feed(MT5FeedConfig(), mt5_module=FakeMT5())
     feed.connect()
     runner = MT5Runner(cfg, feed=feed, executor=_Exec())

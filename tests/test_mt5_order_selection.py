@@ -12,12 +12,15 @@ level when the signal fires — never always-market:
 - price beyond the POI on the adverse side -> INVALID (zone failed)
 
 Pending orders are tracked until they fill, cancel, or expire:
-invalidation (zone break / invalidation cross) cancels on the tick,
-expiry (N H1 bars without fill) cancels on the H1 close, a bias flip
-cancels, engine stop cancels.  A fill becomes a TickManager
-position exactly like a market fill; reconciliation picks up a
-fill the engine missed (never double-counted); a pending COUNTS
-toward the one-position rule.
+invalidation (Close Rule: an entry-TF bar CLOSE beyond the
+invalidation level) cancels on the bar close, expiry (N H1 bars
+without fill) cancels on the H1 close, a bias flip cancels,
+engine stop cancels.  A fill becomes a TickManager position
+exactly like a market fill; reconciliation picks up a fill the
+engine missed (never double-counted); a pending COUNTS toward
+the one-position rule.  On fill the placement-time SL/TP attach
+unchanged (no recompute); a partial fill opens with the partial
+volume and leaves the remainder pending.
 """
 import pandas as pd
 import pytest
@@ -29,7 +32,7 @@ from goldenswing.execution.mt5 import (MT5Executor, select_order_type)
 from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
 from goldenswing.execution.risk import gold_spec
 from goldenswing.golden.detector import GoldenSignal
-from goldenswing.live.hierarchy import TimeframeStack
+from goldenswing.live.hierarchy import TF_MINUTES, TimeframeStack
 from mt5_fakes import FakeMT5
 
 ZONE = {"bottom": 2000.0, "top": 2010.0, "kind": "support",
@@ -295,15 +298,30 @@ class FakeExecutor:
                 return OrderResult(True, ticket=ticket)
         return OrderResult(False, message="order not found")
 
-    def fill_pending(self, ticket, price):
+    def fill_pending(self, ticket, price, volume=None):
         """Broker fill: pending leaves, a position with the same
-        alert_id appears."""
+        alert_id appears.  ``volume`` None (default) fills the
+        whole remaining pending; a smaller volume is a PARTIAL
+        fill — the remainder stays pending (reduced volume) and
+        the position grows (netting: same ticket)."""
         for p in list(self._pendings):
             if p.ticket == ticket:
-                self._pendings.remove(p)
+                fill_vol = p.volume if volume is None \
+                    else min(float(volume), p.volume)
+                if fill_vol < p.volume:
+                    p.volume -= fill_vol  # remainder stays pending
+                else:
+                    self._pendings.remove(p)
+                for pos in self._positions:
+                    if pos.ticket == ticket:
+                        # Netting: the remainder fill grows the
+                        # existing position (same ticket).
+                        pos.volume += fill_vol
+                        pos.entry_price = price
+                        return True
                 self._positions.append(Position(
                     ticket=p.ticket, symbol=p.symbol,
-                    direction=p.direction, volume=p.volume,
+                    direction=p.direction, volume=fill_vol,
                     entry_price=price, sl=p.sl, tp=p.tp,
                     magic=p.magic, alert_id=p.alert_id))
                 return True
@@ -335,6 +353,11 @@ def _runner(tmp_path, **cfg_kw):
         journal_path=tmp_path / "mt5_journal.jsonl",
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
+        # News pause OFF: the order path's news check reads the
+        # REAL wall-clock calendar — these tests must not fail on
+        # a real news day (e.g. PPI).  The pause itself is covered
+        # by test_news_calendar.py.
+        news_pause_enabled=False,
         fixed_lots=0.01, **cfg_kw)
     runner = MT5Runner(cfg, feed=FakeFeed(), executor=FakeExecutor())
     runner._stack = TimeframeStack.from_frames(_frames())
@@ -436,17 +459,171 @@ def test_no_second_pending_while_one_active(tmp_path):
     assert "already holding/pending" in _journal(tmp_path)
 
 
-def test_pending_cancelled_on_zone_break(tmp_path):
+def _tick(when, mid):
+    return {"time": pd.Timestamp(when, tz="UTC").to_pydatetime(),
+            "mid": mid, "bid": mid, "ask": mid + 0.30,
+            "tick_volume": 1, "real_volume": 0, "spread": 30}
+
+
+def _one_bar(when, open_, high, low, close):
+    return pd.DataFrame(
+        {"open": [open_], "high": [high], "low": [low],
+         "close": [close], "volume": [100], "real_volume": [0],
+         "spread": [30]},
+        index=pd.DatetimeIndex([when], tz="UTC"))
+
+
+def _bar_feed(m15_bar):
+    """Feed delivering one M15 bar (and nothing else)."""
+    class BarFeed:
+        def account_state(self):
+            return {"equity": 10000.0, "balance": 10000.0,
+                    "free_margin": 10000.0}
+
+        def order_margin(self, *, volume, price, direction):
+            return float(volume) * 100.0 * float(price) / 500.0
+
+        def fetch_new_all(self, cursors):
+            empty = pd.DataFrame(
+                columns=["open", "high", "low", "close", "volume",
+                         "real_volume", "spread"])
+            return {"M15": m15_bar, "H1": empty, "M30": empty,
+                    "M5": empty, "H4": empty, "D1": empty}
+    return BarFeed()
+
+
+def _set_cursors(runner):
+    """_last_processed so _refresh_bars sees the frames as caught
+    up (the order_selection _runner does not set it)."""
+    for tf, frame in runner._stack.frames.items():
+        runner._last_processed[tf] = (
+            frame.index[-1] + pd.Timedelta(minutes=TF_MINUTES[tf]))
+
+
+def test_pending_cancelled_on_close_beyond_invalidation(tmp_path):
+    # Close Rule (owner, 2026-10-15): a resting pending is
+    # cancelled when an entry-TF bar CLOSES beyond its
+    # invalidation — not on a tick through it (the old tick-level
+    # check is gone: a tick is a wick).
     runner = _runner(tmp_path)
     stats: dict = {}
     _place(runner, _sig(), _verdict(), stats, price=2030.0)
     ticket = next(iter(runner._pending_orders))
-    # Price drops through the POI bottom: the zone failed.
-    runner._check_pending_orders(1995.0, stats)
+    _set_cursors(runner)
+    # M15 bar closes at 1985.0, below the invalidation (1990.0).
+    bar = _one_bar("2026-10-15 05:15", 2000.0, 2001.0, 1980.0, 1985.0)
+    runner.feed = _bar_feed(bar)
+    runner._refresh_bars(_tick("2026-10-15 05:30", 1985.0), stats)
     assert runner._pending_orders == {}
     assert runner.executor.pending_orders() == []
     assert stats["pending_cancelled"] == 1
     assert "invalidated" in _journal(tmp_path)
+
+
+def test_pending_not_cancelled_on_wick(tmp_path):
+    # Close Rule: a wick beyond the invalidation does NOT cancel
+    # — only a close beyond does.  The bar sweeps to 1980 (below
+    # the 1990 invalidation) but closes back at 2000.0, inside.
+    runner = _runner(tmp_path)
+    stats: dict = {}
+    _place(runner, _sig(), _verdict(), stats, price=2030.0)
+    ticket = next(iter(runner._pending_orders))
+    _set_cursors(runner)
+    bar = _one_bar("2026-10-15 05:15", 2000.0, 2001.0, 1980.0, 2000.0)
+    runner.feed = _bar_feed(bar)
+    runner._refresh_bars(_tick("2026-10-15 05:30", 2000.0), stats)
+    assert len(runner._pending_orders) == 1
+    assert len(runner.executor.pending_orders()) == 1
+    assert stats.get("pending_cancelled", 0) == 0
+    assert "invalidated" not in _journal(tmp_path)
+
+
+def test_pending_fill_attaches_placement_sl_tp_no_recompute(tmp_path):
+    # Fill transition: the placement-time SL/TP attach unchanged.
+    # SL = invalidation + buffer (1990 - 0.25*10 = 1987.5), TP =
+    # the signal's first target (2040).  The fill is at a BETTER
+    # price than the entry (LIMIT 2005 filled at 2000) — the SL/TP
+    # levels do NOT move to the fill price (no recompute: the
+    # pre-computed R holds, the fill is at-or-better).
+    runner = _runner(tmp_path)
+    stats: dict = {}
+    _place(runner, _sig(), _verdict(), stats, price=2030.0)
+    ticket = next(iter(runner._pending_orders))
+    assert runner.executor.fill_pending(ticket, 2000.0)
+    runner._reconcile(2000.0, stats)
+    assert runner._pending_orders == {}
+    assert stats["pending_filled"] == 1 and stats["executed"] == 1
+    pos = runner.tick_manager.position(ticket)
+    assert pos is not None
+    assert pos.entry_price == pytest.approx(2000.0)
+    assert pos.stop0 == pytest.approx(1987.5)  # placement-time SL
+    assert pos.invalidation == pytest.approx(1990.0)
+    assert pos.targets == (2040.0,)  # placement-time TP
+    assert runner.tick_manager.effective_stop(ticket) == pytest.approx(
+        1987.5)
+
+
+def test_pending_fill_starts_clocks_at_fill(tmp_path):
+    # Management clocks start AT THE FILL: time-exit bars from the
+    # fill bar (not the placement signal bar), holding cap from
+    # the fill time.  The pending was placed on bar 29; the fill
+    # happens on the forming bar (30).
+    runner = _runner(tmp_path)
+    stats: dict = {}
+    _place(runner, _sig(), _verdict(), stats, price=2030.0)
+    ticket = next(iter(runner._pending_orders))
+    assert runner._pending_orders[ticket].placed_bar == 29
+    assert runner.executor.fill_pending(ticket, 2005.0)
+    runner._reconcile(2005.0, stats)
+    pos = runner.tick_manager.position(ticket)
+    assert pos.signal_bar == 30  # fill bar, not placement bar 29
+    assert pos.entry_bar == 30
+    assert pos.opened_at > 0  # holding cap starts at fill time
+
+
+def test_partial_fill_leaves_remainder_pending(tmp_path):
+    # Partial fill: state -> ACTIVE with the PARTIAL volume; the
+    # unfilled remainder stays pending — not a full fill, not a
+    # failure.
+    runner = _runner(tmp_path)
+    stats: dict = {}
+    _place(runner, _sig(), _verdict(), stats, price=2030.0)
+    ticket = next(iter(runner._pending_orders))
+    assert runner.executor.fill_pending(ticket, 2005.0, volume=0.005)
+    runner._reconcile(2005.0, stats)
+    assert stats["executed"] == 1  # ACTIVE with partial volume
+    assert stats["pending_filled"] == 1
+    assert stats["pending_partial"] == 1
+    pos = runner.tick_manager.position(ticket)
+    assert pos is not None
+    assert pos.volume == pytest.approx(0.005)
+    assert pos.stop0 == pytest.approx(1987.5)  # placement SL
+    assert pos.targets == (2040.0,)  # placement TP
+    # Remainder stays pending (reduced volume).
+    assert len(runner._pending_orders) == 1
+    state = runner._pending_orders[ticket]
+    assert state.volume == pytest.approx(0.005)
+    assert "PARTIAL" in _journal(tmp_path)
+
+
+def test_remainder_fill_completes_position(tmp_path):
+    # The remainder of a partial fill lands on the held position
+    # as an added leg (same setup, same alert_id) — never a
+    # second position.
+    runner = _runner(tmp_path)
+    stats: dict = {}
+    _place(runner, _sig(), _verdict(), stats, price=2030.0)
+    ticket = next(iter(runner._pending_orders))
+    assert runner.executor.fill_pending(ticket, 2005.0, volume=0.005)
+    runner._reconcile(2005.0, stats)
+    assert runner.executor.fill_pending(ticket, 2005.0)  # remainder
+    runner._reconcile(2005.0, stats)
+    assert runner._pending_orders == {}
+    assert runner.tick_manager.tickets() == [ticket]  # one position
+    pos = runner.tick_manager.position(ticket)
+    assert pos.volume == pytest.approx(0.01)  # full order volume
+    assert len(runner.tick_manager.layers(ticket)) == 2  # base + leg
+    assert "remainder filled" in _journal(tmp_path)
 
 
 def test_pending_cancelled_on_expiry(tmp_path):
