@@ -162,3 +162,99 @@ def test_fetch_filenames_carry_symbol(tmp_path):
     assert mf._cache_covers(tmp_path, "XAUUSDm", start, end) is True
     # Same bars do NOT satisfy a different symbol's cache.
     assert mf._cache_covers(tmp_path, "XAUUSD", start, end) is False
+
+"""Per-chunk tick log + naive retry + stale 1-day cache rejection.
+
+Owner evidence (2026-10-16): the backtest ran on ~74,579 ticks
+(~1 day) with no visibility into WHY the 3y tick request came
+back with one day. The fetch must log per-chunk rows so a
+depth-limited broker (only the last chunk has rows) is
+distinguishable from a fetch failure (all chunks empty).
+"""
+
+
+def _empty_ticks():
+    return np.zeros(0, dtype=[("time", "i8"), ("bid", "f8"),
+                              ("ask", "f8"), ("last", "f8"),
+                              ("volume", "f8"), ("flags", "i8")])
+
+
+class _RecentOnlyTicks(_FakeMT5):
+    """Broker/terminal returns ticks only for the recent chunk."""
+
+    def copy_ticks_range(self, symbol, start, end, flags):
+        self.calls["ticks"] += 1
+        _ts = pd.Timestamp(start)
+        if _ts.tzinfo is None:
+            _ts = _ts.tz_localize("UTC")
+        else:
+            _ts = _ts.tz_convert("UTC")
+        if _ts < pd.Timestamp("2026-01-07", tz="UTC"):
+            return _empty_ticks()
+        return super().copy_ticks_range(symbol, start, end, flags)
+
+
+def test_fetch_records_per_chunk_tick_log(tmp_path):
+    start = pd.Timestamp("2026-01-01", tz="UTC")
+    end = pd.Timestamp("2026-01-10", tz="UTC")
+    fake = _RecentOnlyTicks()
+    manifest = mf.fetch_mt5_native("XAUUSDm", start, end, tmp_path,
+                                   mt5_module=fake, tick_chunk_days=3)
+    chunks = manifest["tick_chunks"]
+    assert len(chunks) == 3  # 01-04, 04-07, 07-10
+    assert chunks[0]["rows"] == 0
+    assert chunks[1]["rows"] == 0
+    assert chunks[2]["rows"] > 0
+    assert manifest["tick_fetch"]["chunks_requested"] == 3
+    assert manifest["tick_fetch"]["chunks_with_data"] == 1
+    # Tick window starts where the broker actually had ticks.
+    assert manifest["tick_window"]["start"].startswith("2026-01-07")
+
+
+class _TzAwareEmptyTicks(_FakeMT5):
+    """Terminal build that returns nothing for tz-aware datetimes."""
+
+    def copy_ticks_range(self, symbol, start, end, flags):
+        self.calls["ticks"] += 1
+        if getattr(start, "tzinfo", None) is not None:
+            return _empty_ticks()
+        return super().copy_ticks_range(symbol, start, end, flags)
+
+
+def test_copy_ticks_naive_retry(tmp_path):
+    fake = _TzAwareEmptyTicks()
+    start = pd.Timestamp("2026-01-01", tz="UTC")
+    end = pd.Timestamp("2026-01-02", tz="UTC")
+    ticks, mode = mf._copy_ticks_range(fake, "XAUUSDm",
+                                      start.to_pydatetime(),
+                                      end.to_pydatetime())
+    assert mode == "naive_server_time"
+    assert ticks is not None and len(ticks) > 0
+
+
+def test_ensure_does_not_reuse_one_day_stale_ticks(tmp_path):
+    # Owner's exact trap: a 1-day ticks cache + TF files covering
+    # that 1 day. ensure() must NOT treat it as "covers tick
+    # window" for a 3y request — the overlap is 1 day < 30d, so
+    # it must re-fetch from the terminal.
+    tick_idx = pd.date_range("2026-10-15", "2026-10-16", freq="min",
+                             tz="UTC")
+    pd.DataFrame({"time": tick_idx, "bid": 4000.0, "ask": 4000.2,
+                  "last": 4000.1, "volume": 1.0,
+                  "flags": 0}).to_csv(
+        tmp_path / "MT5_XAUUSDm_ticks.csv", index=False)
+    for tf in mf.REQUIRED_TFS:
+        idx = pd.date_range("2026-10-15", "2026-10-16", freq="h",
+                            tz="UTC")
+        pd.DataFrame({"time": idx, "open": 4000.0, "high": 4001.0,
+                      "low": 3999.0, "close": 4000.5,
+                      "tick_volume": 10, "spread": 20,
+                      "real_volume": 0}).to_csv(
+            tmp_path / f"MT5_XAUUSDm_{tf}_native.csv", index=False)
+    start = pd.Timestamp("2023-10-17", tz="UTC")
+    end = pd.Timestamp("2026-10-16", tz="UTC")
+    fake = _FakeMT5()
+    result = mf.ensure_mt5_native("XAUUSDm", start, end, tmp_path,
+                                  mt5_module=fake)
+    assert result["source"] == "mt5_terminal_live_fetch"
+    assert fake.calls["ticks"] > 0

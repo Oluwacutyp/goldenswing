@@ -260,6 +260,94 @@ def write_data_report(report: dict, out: Path) -> dict:
     return {"json": str(json_path), "md": str(md_path)}
 
 
+MIN_TICK_WINDOW_DAYS = 30
+"""A full-engine tick backtest needs a real tick window.
+
+Owner evidence (2026-10-16): the terminal returned only ~74k
+ticks — about ONE day (M1 1394 rows, MN1 1 row, D1 3 rows) — and
+the harness silently ran on it. A 1-day run must never be
+reported as a 3-year / 10-month backtest. Below this threshold
+the run BLOCKS unless --allow-short-tick-window is passed, in
+which case the run is loudly labelled SHORT and the report is
+tagged short_tick_window=True.
+"""
+
+
+def _print_frames(provenance: dict) -> None:
+    """Print per-TF frame provenance.
+
+    ``provenance`` mixes TF entries (dicts with rows/source) with
+    run-level entries: ``window`` (dict), ``tick_window`` (dict),
+    ``tick_coverage`` (STR), ``resampling`` (str),
+    ``built_from_ticks`` (list). The 2026-10-16 crash was
+    ``meta.get`` on the ``tick_coverage`` STRING. Only dict
+    entries with a ``rows`` key are TF rows — everything else is
+    skipped, never assumed to be a dict.
+    """
+    print("Frames (native, no resampling):")
+    for tf, meta in provenance.items():
+        if not isinstance(meta, dict) or "rows" not in meta:
+            continue
+        tag = " [built from MT5 ticks]" \
+            if meta.get("built_from_ticks") else ""
+        print(f"  {tf:4} {meta['rows']:>6} rows  {meta['source']}{tag}")
+    if provenance.get("built_from_ticks"):
+        print(f"  Built from ticks: "
+              f"{', '.join(provenance['built_from_ticks'])}")
+    print(f"  {provenance['resampling']}")
+
+
+def _check_tick_window(provenance: dict, manifest: dict,
+                       allow_short: bool) -> str | None:
+    """Honest gate on the tick window. Returns an error string to
+    BLOCK with, or None to proceed.
+
+    The broker keeps bars back to 2023 but ticks only for a
+    limited recent window. If the terminal returned only a few
+    days of ticks (owner: ~1 day, 74,579 ticks), running the full
+    engine on it and calling it a 3y backtest would be a lie.
+    Block, and show the per-chunk fetch log so the owner can see
+    WHICH chunks returned ticks (all-empty except the last chunk
+    = broker/terminal tick-depth limit, not a code bug). With
+    ``allow_short`` the run proceeds but is labelled SHORT.
+    No-ticks (native-only) runs skip this gate — they have no
+    tick window to judge.
+    """
+    tick_win = provenance.get("tick_window")
+    if not isinstance(tick_win, dict):
+        return None
+    try:
+        t_start = pd.Timestamp(tick_win["start"])
+        t_end = pd.Timestamp(tick_win["end"])
+    except Exception:
+        return None
+    days = (t_end - t_start).total_seconds() / 86400.0
+    if days >= MIN_TICK_WINDOW_DAYS:
+        return None
+    if allow_short:
+        return None
+    rows = tick_win.get("rows", "?")
+    chunks = manifest.get("tick_chunks") or []
+    chunk_lines = "\n".join(
+        f"    {c.get('chunk_start')}..{c.get('chunk_end')}: "
+        f"{c.get('rows', '?')} ticks ({c.get('mode', '?')})"
+        for c in chunks) or "    (no per-chunk log — cache hit)"
+    return (
+        f"BLOCKED — tick window is only {days:.1f} days "
+        f"({t_start}..{t_end}, {rows} ticks), below the "
+        f"{MIN_TICK_WINDOW_DAYS}-day minimum for a full-engine "
+        f"tick backtest. The terminal returned ticks only for "
+        f"that short window — the broker/terminal tick history "
+        f"is depth-limited, not a 3y tick store. Running the "
+        f"full engine on it and calling it a 3y backtest would "
+        f"be false.\n"
+        f"  Per-chunk tick fetch:\n{chunk_lines}\n"
+        f"  Re-run with --allow-short-tick-window for a loudly "
+        f"labelled SHORT run (report tagged short_tick_window), "
+        f"or run a bar-level backtest on the 3y bars instead."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--coverage", action="store_true",
@@ -271,6 +359,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--allow-m1-proxy", action="store_true",
                     help="smoke-run on labelled M1 tick approximation "
                          "when no real MT5 tick file exists")
+    ap.add_argument("--allow-short-tick-window", action="store_true",
+                    help="run even when the terminal returned <30 days "
+                         "of ticks, loudly labelled SHORT (report tagged "
+                         "short_tick_window). Default: block — a 1-day "
+                         "run must never be reported as a 3y backtest.")
     ap.add_argument("--symbol", type=str, default=DEFAULT_SYMBOL,
                     help="MT5 broker symbol to fetch data for "
                          "(default: XAUUSDm — the owner's Exness "
@@ -323,17 +416,24 @@ def main(argv: list[str] | None = None) -> int:
     except MissingNativeData as exc:
         print(f"BLOCKED — {exc}", file=sys.stderr)
         return 3
-    print("Frames (native, no resampling):")
-    for tf, meta in provenance.items():
-        if tf in ("window", "resampling", "built_from_ticks"):
-            continue
-        tag = " [built from MT5 ticks]" \
-            if meta.get("built_from_ticks") else ""
-        print(f"  {tf:4} {meta['rows']:>6} rows  {meta['source']}{tag}")
-    if provenance.get("built_from_ticks"):
-        print(f"  Built from ticks: "
-              f"{', '.join(provenance['built_from_ticks'])}")
-    print(f"  {provenance['resampling']}")
+    _print_frames(provenance)
+    short_window = _check_tick_window(
+        provenance, manifest, args.allow_short_tick_window)
+    if short_window is not None:
+        print(short_window, file=sys.stderr)
+        return 3
+    if (isinstance(provenance.get("tick_window"), dict)
+            and args.allow_short_tick_window):
+        _tw = provenance["tick_window"]
+        try:
+            _days = (pd.Timestamp(_tw["end"])
+                     - pd.Timestamp(_tw["start"])).total_seconds() / 86400.0
+        except Exception:
+            _days = None
+        if _days is not None and _days < MIN_TICK_WINDOW_DAYS:
+            print(f"WARNING: SHORT TICK WINDOW — { _days:.1f} days "
+                  f"({_tw['start']}..{_tw['end']}). Labelled SHORT run, "
+                  f"NOT a 3y backtest. Report tagged short_tick_window.")
 
     dxy = bfe._load_csv(bfe.DATA_DIR / "DOLLAR_H1_2y.csv")
     # FULL WINDOW: the whole tick window runs — no --days slice,
@@ -419,6 +519,20 @@ def main(argv: list[str] | None = None) -> int:
                         "full_run": True,
                         "playbooks": "all as-is (no picking, "
                                      "no disabling, no tuning)"}
+    # A short-window run that proceeded via --allow-short-tick-window
+    # is tagged, never reported as a full-window backtest.
+    _tw2 = provenance.get("tick_window")
+    if isinstance(_tw2, dict):
+        try:
+            _d2 = (pd.Timestamp(_tw2["end"])
+                   - pd.Timestamp(_tw2["start"])).total_seconds() / 86400.0
+        except Exception:
+            _d2 = None
+        report["short_tick_window"] = bool(
+            _d2 is not None and _d2 < MIN_TICK_WINDOW_DAYS
+            and args.allow_short_tick_window)
+    else:
+        report["short_tick_window"] = False
     # Report + JSON to data/ (timestamped) as well as out/results.json.
     report["report_files"] = write_data_report(report, out)
     bfe.print_report(report)
@@ -426,8 +540,15 @@ def main(argv: list[str] | None = None) -> int:
     # TELEGRAM EXPORT (owner addendum): real-tick full runs only.
     # M1-proxy smoke runs never send — their numbers are not a
     # tick backtest and must never land in the owner's Telegram
-    # as if they were.
-    if tick_provenance == "real_mt5_ticks" and not args.no_telegram:
+    # as if they were. Same for SHORT-tick-window runs: a 1-day
+    # summary must never arrive as if it were a full backtest.
+    if report.get("short_tick_window"):
+        print("Telegram: skipped (SHORT tick window — labelled run, "
+              "not a full backtest).")
+        report["telegram"] = {"sent": False,
+                              "error": "skipped: short tick window"}
+        report["report_files"] = write_data_report(report, out)
+    elif tick_provenance == "real_mt5_ticks" and not args.no_telegram:
         tg = send_telegram_summary(build_telegram_summary(report),
                                    chat_id=args.telegram_chat)
         report["telegram"] = tg
