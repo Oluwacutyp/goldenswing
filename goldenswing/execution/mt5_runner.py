@@ -57,6 +57,7 @@ import math
 import secrets
 import time
 from dataclasses import dataclass, field, replace
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -73,9 +74,13 @@ from ..live.health import HealthMonitor
 from ..live.urgency import urgency_score
 from ..live.volume_profile import volume_profile
 from ..live.hierarchy import (LEG_ORDER, TimeframeStack, TF_MINUTES,
-                              check_live_trigger, check_zone_touch,
-                              evaluate_hierarchy, live_setup,
-                              live_setup_reason, qm_annotation)
+                              check_live_trigger,
+                              check_zone_touch, evaluate_hierarchy,
+                              live_setup, live_setup_hold_state,
+                              live_setup_reason, log_feed_error,
+                              log_hold_state, qm_annotation,
+                              resolve_setup_for_touch)
+from ..live.range import RANGE_SIZE_MULT, RangeDef
 from ..live.macrotrend import (MacroTrendResult, compute_macrotrend)
 from ..live.manipulation import chase_blocked
 from ..live.news import NewsCalendar
@@ -87,7 +92,11 @@ from ..reader.session_timeframes import (
 from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
                          InversionPlaybook, JudasSwingPlaybook,
                          KillzoneOpenPlaybook, OrderBlockPlaybook,
-                         QMD1Playbook, QMM5Playbook, RetracementTrapPlaybook,
+                         QMD1Playbook, QMM5Playbook,
+                         RangeCompressionBreakoutPlaybook,
+                         RangeMeanReversionPlaybook, RangeQMPlaybook,
+                         RangeSweepReclaimPlaybook,
+                         RetracementTrapPlaybook,
                          SweepReversalPlaybook, TrendlineRetestPlaybook,
                          TurtleSoupPlaybook, VReversalPlaybook)
 from ..playbooks.base import EngineContext
@@ -113,6 +122,8 @@ DATA_DIR = REPO_ROOT / "data"
 # within this of the pending volume counts as full — float dust
 # must not manufacture a phantom partial fill.
 _VOL_EPS = 1e-9
+
+_log = logging.getLogger(__name__)
 
 
 def _session_multipliers_from_env() -> dict:
@@ -175,7 +186,10 @@ class MT5RunnerConfig:
     execute_playbooks: tuple = ("sweep_reversal", "fvg_midline",
                                 "trendline_retest", "fvg_limit",
                                 "inversion", "killzone_open",
-                                "judas_swing")
+                                "judas_swing",
+                                "range_sweep_reclaim", "range_qm",
+                                "range_mean_reversion",
+                                "range_compression_breakout")
     min_score: float = 60.0
     signal_gap_bars: int = 0
     journal_path: Path = DATA_DIR / "mt5_journal.jsonl"
@@ -528,6 +542,16 @@ class MT5Runner:
         # of showing "blocked legs: none" for a runner that is
         # merely waiting (2026-10-16 screenshot).
         self._live_setup_reason: str = "not evaluated yet"
+        # d1_flat HOLD state (D1BiasState) — the pending swings /
+        # bars-remaining / flip requirements behind a flat bias.
+        # A flat bias is a HOLD, never a feed error; this rides
+        # alongside _live_setup so /status can show it.
+        self._live_hold_state = None
+        # Last HOLD line logged — HOLD is logged only when its
+        # description changes (a new pending extreme, a bar
+        # confirming, a flip requirement changing), not on every
+        # TF-close refresh, or a flat week would spam the log.
+        self._last_hold_logged: str | None = None
         self._pending: dict | None = None
         # Fired-window guard (trigger redesign): the H1 bar open
         # time in which a trigger last fired.  The H1 bar IS the
@@ -630,8 +654,9 @@ class MT5Runner:
 
     # ------------------------------------------------------------ wiring
     def _get_playbooks(self) -> list:
-        """Every playbook the H1-clocked signal path knows: the 7
-        executing ones plus the 5 shadow ones.  Instantiation alone
+        """Every playbook the H1-clocked signal path knows: the 11
+        executing ones (7 trend + 4 range) plus the 5 shadow ones.
+        Instantiation alone
         never orders — the ``auto = pb.name in execute_playbooks``
         gate at the order step decides, and shadow playbooks only
         ever get evaluated + logged (see _run_signal_path).  A
@@ -656,7 +681,11 @@ class MT5Runner:
                                VReversalPlaybook(),
                                RetracementTrapPlaybook(),
                                OrderBlockPlaybook(),
-                               QMM5Playbook()]
+                               QMM5Playbook(),
+                               RangeSweepReclaimPlaybook(),
+                               RangeQMPlaybook(),
+                               RangeMeanReversionPlaybook(),
+                               RangeCompressionBreakoutPlaybook()]
         return self._playbooks
 
     # ------------------------------------------------- blocked-leg stats
@@ -746,6 +775,10 @@ class MT5Runner:
         executor = self.executor or MT5Executor()
         ok, msg = feed.connect()
         if not ok:
+            # Feed failure on the FEED_ERROR channel (ERROR), before
+            # raising — a connect failure is a feed problem, and it
+            # must never be mistaken for a flat-bias HOLD.
+            log_feed_error(_log, symbol=self.cfg.symbol, reason=msg)
             raise RuntimeError(f"MT5 runner: feed connect failed: {msg}")
         feed_msg = msg  # executor.connect() below reuses `msg`
         # The feed is the source of truth for the broker's gold symbol:
@@ -771,6 +804,10 @@ class MT5Runner:
             raise RuntimeError(f"MT5 runner: executor connect failed: {msg}")
 
         # Warm start: full closed history per TF -> forward-only stack.
+        # Feed health is reported on the FEED_ERROR channel (ERROR)
+        # when poll_status says not-ok — a stale / disconnected
+        # feed is a feed problem, distinct from a flat-bias HOLD.
+        self.report_feed_status(feed.poll_status())
         self._stack = TimeframeStack.from_frames(feed.warm_start_all())
         h1 = self._stack.frames.get("H1")
         if h1 is None or len(h1) == 0:
@@ -1509,9 +1546,37 @@ class MT5Runner:
         if self._stack is None:
             self._live_setup = None
             self._live_setup_reason = "no stack"
+            self._live_hold_state = None
             return
         self._live_setup = live_setup(self._stack)
         self._live_setup_reason = live_setup_reason(self._stack)
+        # HOLD state: computed on every refresh (cheap, closed bars
+        # only) so /status + logs always describe the CURRENT flat
+        # state, not a stale one.  Logged at INFO as HOLD when the
+        # reason is d1_flat — never ERROR, never FEED_ERROR.
+        self._live_hold_state = live_setup_hold_state(self._stack)
+        if self._live_setup_reason.startswith("d1_flat") \
+                and self._live_hold_state is not None:
+            line = self._live_hold_state.describe()
+            if line != self._last_hold_logged:
+                self._last_hold_logged = line
+                log_hold_state(_log, self._live_hold_state)
+
+    def report_feed_status(self, feed_status: dict | None) -> None:
+        """Log a feed failure on the SEPARATE FEED_ERROR channel.
+
+        Call with the ``feed.poll_status()`` dict.  ``ok=False`` logs
+        one ERROR ``FEED_ERROR`` line (terminal disconnected, symbol
+        unselected, fetch failed, stale bars).  ``ok=True`` logs
+        nothing — a healthy feed is not news, and a flat bias on a
+        healthy feed is a HOLD (see ``_refresh_live_setup``), never
+        a feed error.  The two channels are never conflated.
+        """
+        if not feed_status or feed_status.get("ok", True):
+            return
+        log_feed_error(
+            _log, symbol=self.cfg.symbol,
+            reason=str(feed_status.get("reason") or "feed not ok"))
 
     def setup_line(self) -> str:
         """One-line live-setup state for /status (see mt5_commands).
@@ -1523,7 +1588,51 @@ class MT5Runner:
         """
         setup = self._live_setup
         if setup is None:
+            # d1_flat with no defined range renders as HOLD with
+            # pending swings / bars-remaining / flip requirements /
+            # earliest flip — never as a feed error, never as a
+            # bare "none".
+            if self._live_setup_reason.startswith("d1_flat") \
+                    and self._live_hold_state is not None:
+                line = self._live_hold_state.describe()
+                last = self._last_tick or {}
+                mid = last.get("mid")
+                if mid:
+                    line += f" · last price {mid:.1f}"
+                return line
             return f"setup: none — {self._live_setup_reason}"
+        if setup.get("regime") == "range":
+            # RANGE regime: range band + touches + mid + nearest
+            # edge + distance to it — never "HOLD d1_flat".
+            rng = RangeDef.from_dict(setup["range"])
+            line = (f"setup: ARMED RANGE · range "
+                    f"{rng.low:.1f}–{rng.high:.1f} "
+                    f"(width {rng.width:.1f} = "
+                    f"{rng.width / rng.atr:.1f}x ATR, touches "
+                    f"H{rng.touches_high}/L{rng.touches_low}, "
+                    f"mid {rng.mid:.1f}"
+                    + (", compressed" if rng.compressed else "") + ")")
+            last = self._last_tick or {}
+            mid = last.get("mid")
+            if mid:
+                if mid < rng.low:
+                    line += (f" · last price {mid:.1f} "
+                             f"(${rng.low - mid:.1f} below range)")
+                elif mid > rng.high:
+                    line += (f" · last price {mid:.1f} "
+                             f"(${mid - rng.high:.1f} above range)")
+                else:
+                    d_low = abs(mid - rng.low)
+                    d_high = abs(mid - rng.high)
+                    if d_low <= d_high:
+                        line += (f" · last price {mid:.1f} "
+                                 f"(${d_low:.1f} from low edge — "
+                                 f"LONG side armed)")
+                    else:
+                        line += (f" · last price {mid:.1f} "
+                                 f"(${d_high:.1f} from high edge — "
+                                 f"SHORT side armed)")
+            return line
         zone = setup["zone"]
         direction = "LONG" if setup["direction"] > 0 else "SHORT"
         context = setup.get("h4_context", "")
@@ -1973,11 +2082,23 @@ class MT5Runner:
         setup = self._live_setup
         if setup is None:
             return  # legs 1-2 not armed
+        # RANGE regime: a range setup carries direction 0 and two
+        # edge bands.  A tick AT an edge resolves to that edge's
+        # per-edge setup (direction toward mid, zone = edge band)
+        # so the stale / invalidated / pending machinery below —
+        # which reads setup["direction"] / setup["zone"] — needs no
+        # range special case.  A tick touching NEITHER edge leaves
+        # the setup unresolved: only a compression breakout (below)
+        # can fire from there.
+        if setup.get("regime") == "range" \
+                and check_zone_touch(setup, mid=mid):
+            setup = resolve_setup_for_touch(setup, mid=mid)
         # Stale re-arm block (continued): if the block is still set,
         # price is still inside the dead zone.  Re-arm only on a
         # DIFFERENT zone (a different POI is a fresh setup) — the
-        # same zone re-arms only after exit + re-entry.
-        if self._stale_zone is not None:
+        # same zone re-arms only after exit + re-entry.  Skipped
+        # while a range setup is unresolved (no single zone yet).
+        if self._stale_zone is not None and setup.get("zone") is not None:
             _d, _b, _t = self._stale_zone
             if (_d, _b, _t) == (setup["direction"],
                                 setup["zone"]["bottom"],
@@ -1988,7 +2109,8 @@ class MT5Runner:
         # the Close Rule is TERMINATED — exit + re-entry does not
         # revive it.  Re-arm only on a DIFFERENT zone (a different
         # POI is a different setup).
-        if self._invalidated_zone is not None:
+        if self._invalidated_zone is not None \
+                and setup.get("zone") is not None:
             _d, _b, _t = self._invalidated_zone
             if (_d, _b, _t) == (setup["direction"],
                                 setup["zone"]["bottom"],
@@ -2001,6 +2123,26 @@ class MT5Runner:
         # bars (trigger storm).  The next H1 bar is a fresh window.
         if bar_open == self._fired_h1_bar:
             return
+        # RANGE BREAKOUT: a compressed range whose entry-clock bar
+        # just CLOSED beyond an edge fires outward — it never
+        # touches the edge band on the way out, so the touch-arm
+        # below cannot carry it, by construction.  The breakout
+        # bypasses the pending (a pending would die the moment
+        # price left the zone) and goes straight to the signal
+        # path with a resolved outward setup.
+        if setup.get("regime") == "range" \
+                and setup.get("zone") is None:
+            fired = self._range_breakout_fired(setup, tick, bar_open)
+            if fired is not None:
+                self._fired_h1_bar = bar_open
+                stats["triggers"] = stats.get("triggers", 0) + 1
+                self.journal.log_note(
+                    f"mt5: trigger fired range_breakout "
+                    f"{'+' if fired['direction'] > 0 else '-'}1 "
+                    f"@ {fired['entry']:.2f} (H1 bar {bar_open}) — "
+                    f"compressed range breakout")
+                self._run_live_signal(fired, tick, stats)
+                return
         # TRIGGER, REDESIGNED (2026-10-15): a tick AT the POI band
         # arms the pending; the confirmation family decides whether
         # it fires (see _evaluate_pending_entry).  The old

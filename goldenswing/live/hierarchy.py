@@ -95,6 +95,8 @@ from ..reader.session_timeframes import compose as _compose_session
 from .multitf import (SWING, TimeframeConfig, atr14, detect_bos_msch_choch,
                       evaluate as _mtf_evaluate, evaluate_bias, find_swings,
                       zones_by_side)
+from .range import (RANGE_SIZE_MULT, RangeDef, detect_range,
+                    range_setup, resolve_range_touch)
 
 #: The full timeframe stack, slowest -> fastest.
 STACK_TFS: tuple[str, ...] = ("D1", "H4", "H1", "M15", "M30", "M5")
@@ -254,6 +256,102 @@ def _structural_reason_to_leg(reason: str) -> str:
     return "h1_trigger"  # unknown structural reason: fail at the trigger
 
 
+def _range_verdict(verdict: dict, legs: dict,
+                   sliced: dict, range_def: RangeDef, *, asof,
+                   h1_close, swing_n: int, qm_touch,
+                   amd_phase) -> dict:
+    """Closed-bar verdict for RANGE regime (D1 flat + defined range).
+
+    Legs: ``d1_bias`` passes as ``range_regime`` (flat is expected,
+    not a failure); ``h4_zone`` passes (the range is defined);
+    ``h1_trigger`` passes iff the trigger H1 bar's range overlaps
+    a range-edge band (price AT the edge); ``entry`` passes iff an
+    entry-TF structure event confirms toward the range mid on the
+    bars composing the trigger H1 bar.  On pass: direction is the
+    toward-mid direction of the touched edge, stop sits beyond the
+    edge extreme + buffer, target is the range mid, ``size_mult``
+    is ``RANGE_SIZE_MULT`` (0.5x).  On edge-touch failure the
+    verdict is blocked at ``h1_trigger`` (``range_no_edge_touch``);
+    on confirmation failure it is blocked at ``entry``.
+    """
+    verdict["regime"] = "range"
+    verdict["range"] = range_def.to_dict()
+    verdict["size_mult"] = RANGE_SIZE_MULT
+    verdict["bias_h4"] = int(evaluate_bias(sliced["H4"],
+                                            swing_n=swing_n))
+    verdict["h4_context"] = "range"
+    legs["d1_bias"] = _leg(
+        True, "range_regime: D1 flat -> RANGE (trend legs N/A)")
+    legs["h4_agree"] = _leg(
+        True, "range: H4 supplies the range edges, not a vote")
+    legs["h4_zone"] = _leg(
+        True, f"range defined: {range_def.describe()}")
+    h1_frame = sliced["H1"]
+    trig_bar = h1_frame.iloc[-1]
+    edge = None
+    for cand in range_def.edges():
+        if trig_bar["low"] <= cand["top"] \
+                and trig_bar["high"] >= cand["bottom"]:
+            edge = cand
+            break
+    if edge is None:
+        legs["h1_trigger"] = _leg(
+            False, "range_no_edge_touch: trigger H1 bar touches "
+                   "neither range edge")
+        legs["entry"] = _leg(False, "not evaluated (no edge touch)")
+        return _finish(verdict, legs, qm_touch=qm_touch, bias=0)
+    legs["h1_trigger"] = _leg(
+        True, f"range edge touch: {edge['side']} edge "
+               f"{edge['level']:.1f}")
+    direction = int(edge["direction"])
+    verdict["direction"] = direction
+    verdict["zone"] = edge
+    verdict["trigger"] = "range_edge_touch"
+    session = _compose_session(asof, amd_phase=amd_phase)
+    verdict["session"] = session
+    entry_clock = session["entry_clock"]
+    verdict["entry_clock"] = entry_clock
+    entry_frame = sliced.get(entry_clock)
+    if entry_frame is None or len(entry_frame) < 2 * swing_n + 5:
+        legs["entry"] = _leg(
+            False, f"entry_tf_missing: no closed {entry_clock} bars")
+        return _finish(verdict, legs, qm_touch=qm_touch, bias=0)
+    entry_window = max(1, int(60 // TF_MINUTES[entry_clock]))
+    entry_event, _conf_idx = _entry_event_window(
+        entry_frame, direction, swing_n, entry_window)
+    if entry_event is None:
+        legs["entry"] = _leg(
+            False, f"entry_no_confirm: no {entry_clock} structure "
+                    f"event toward mid on the entry bars composing "
+                    f"the trigger H1 bar")
+        return _finish(verdict, legs, qm_touch=qm_touch, bias=0)
+    if entry_event != direction:
+        legs["entry"] = _leg(
+            False, f"entry_against_bias: {entry_clock} event "
+                    f"{entry_event:+d} vs range direction "
+                    f"{direction:+d}")
+        return _finish(verdict, legs, qm_touch=qm_touch, bias=0)
+    legs["entry"] = _leg(True, f"{entry_clock} event {entry_event:+d}")
+    verdict["qm"] = _qm_leg(qm_touch, direction, asof)
+    buf = float(0.5 * range_def.atr)
+    entry = float(trig_bar["close"])
+    if direction > 0:
+        stop = float(range_def.low - buf)
+    else:
+        stop = float(range_def.high + buf)
+    risk = abs(entry - stop)
+    if risk <= 0:
+        legs["entry"] = _leg(False, "entry_invalid: zero risk")
+        return _finish(verdict, legs, qm_touch=qm_touch, bias=0)
+    verdict["entry"] = entry
+    verdict["stop"] = stop
+    verdict["target"] = float(range_def.mid)
+    verdict["risk"] = float(risk)
+    verdict["allowed"] = True
+    verdict["blocked_leg"] = ""
+    return verdict
+
+
 def evaluate_hierarchy(stack: TimeframeStack | dict,
                        *, asof=None, amd_phase: str | None = None,
                        amd_via: str | None = None,
@@ -289,6 +387,11 @@ def evaluate_hierarchy(stack: TimeframeStack | dict,
     verdict: dict = {
         "allowed": False, "blocked_leg": "data", "legs": legs,
         "bias_d1": 0, "bias_h4": 0, "h4_context": "", "direction": 0,
+        # Regime: "trend" (D1 bias != 0), "range" (D1 flat + defined
+        # range), "hold" (D1 flat + no defined range).  "range"
+        # carries the RangeDef dict; "size_mult" is 0.5 for range
+        # trades, 1.0 otherwise (applied at order placement).
+        "regime": "trend", "range": None, "size_mult": 1.0,
         "zone": None, "trigger": None, "entry": None, "stop": None,
         "target": None, "risk": None, "session": None,
         "amd_phase": amd_phase or "unknown",
@@ -297,6 +400,10 @@ def evaluate_hierarchy(stack: TimeframeStack | dict,
                "recent": False, "status": "qm_absent"},
         "veto_enabled": HARD_VETO_ENABLED, "asof": None,
         "entry_clock": None,
+        # HOLD state when leg 1 (d1_bias) is flat: pending swings,
+        # bars-to-confirm, flip requirements, earliest flip.  None
+        # when the bias is nonzero — HOLD only describes flat.
+        "hold_state": None,
     }
 
     h1_frame = stack.frames.get("H1")
@@ -327,8 +434,27 @@ def evaluate_hierarchy(stack: TimeframeStack | dict,
     bias_d1 = evaluate_bias(sliced["D1"], swing_n=swing_n)
     verdict["bias_d1"] = int(bias_d1)
     if bias_d1 == 0:
-        legs["d1_bias"] = _leg(False, "d1_bias_flat")
-        return _finish(verdict, legs)
+        # D1 flat is RANGE regime, not a shutdown: look for a
+        # defined H4/D1 range.  Only when NO defined range exists
+        # does the engine HOLD (see _range_verdict / hold_state).
+        range_def = detect_range(sliced["D1"], sliced["H4"],
+                                 sliced["H1"], swing_n=swing_n)
+        if range_def is None:
+            verdict["regime"] = "hold"
+            legs["d1_bias"] = _leg(False, "d1_bias_flat")
+            # HOLD, not ERROR: the flat bias with no defined range
+            # is a legitimate waiting state (swing_n confirmation
+            # lag), so the verdict carries the hold state —
+            # pending swings, bars remaining, flip requirements —
+            # and backtest / paper loop can log HOLD instead of
+            # misdiagnosing a feed error.
+            verdict["hold_state"] = bias_hold_state(
+                sliced["D1"], swing_n=swing_n).to_dict()
+            return _finish(verdict, legs)
+        return _range_verdict(verdict, legs, sliced, range_def,
+                              asof=asof, h1_close=h1_close,
+                              swing_n=swing_n, qm_touch=qm_touch,
+                              amd_phase=amd_phase)
     legs["d1_bias"] = _leg(True, "")
 
     # --- leg 2: H4 context (recorded, never a vote).
@@ -605,6 +731,298 @@ def _h4_context(bias_d1: int, bias_h4: int) -> str:
     return "pullback"
 
 
+# ------------------------------------------------- d1_flat HOLD state
+# d1_flat is NOT a feed error and NOT a bug.  It is a legitimate HOLD
+# during choppy / transitioning regimes, caused by the swing_n
+# confirmation lag: a structural swing needs ``swing_n`` bars AFTER
+# it before :func:`multitf.find_swings` recognises it, so a D1 bias
+# flip is only recognised >= ``swing_n`` daily closes after the
+# extreme printed.  Price action alone cannot flip it.  The engine
+# must handle / log d1_flat as HOLD, never misdiagnose it as a feed
+# error.  Feed errors are a SEPARATE channel (:func:`log_feed_error`,
+# ``FEED_ERROR``, feed_status ok=False) and the two are never
+# conflated: a flat bias with a healthy feed is HOLD; a stale feed
+# with a nonzero bias is FEED_ERROR.
+#
+# CONTRACT (exact — see also ``live/multitf.py`` module docstring):
+# - ``evaluate_bias()`` = STRUCTURE direction: HH+HL -> +1, LH+LL ->
+#   -1, else 0, swing_n=3, 3-bar confirmation lag.  This is the ONLY
+#   bias that gates trades (leg 1, ``d1_bias``).
+# - ``macrotrend.compute_macrotrend()`` = SIZING ONLY: EMA200 per
+#   TF, Golden Swing / D1_W1 / D1_Only, conflict 0.5x.  Never gates.
+# - DXY = confluence nudge only (+0.5 / -0.5 / 0, unavailable -> 0).
+#   Never gates.
+
+
+@dataclass
+class D1BiasState:
+    """What a flat D1 structure bias is waiting on.
+
+    ``bias`` is the current :func:`multitf.evaluate_bias` value (0
+    when this state is meaningful).  ``pending_high`` / ``pending_low``
+    are the unconfirmed extremes in the last ``swing_n`` bars that
+    could become the next confirmed swings: each is
+    ``{price, bar_time, bars_remaining, bars_confirmed, eta}`` or None
+    when no candidate extreme is forming on that side.
+    ``bars_remaining`` counts the additional bars that must still
+    close before the candidate confirms (1..swing_n).
+    ``flip_needed`` is the human-readable requirement
+    (``need confirmed lower low for SHORT`` …).
+    ``earliest_flip`` is the earliest calendar date the bias could
+    flip (both legs of one direction confirming), or None when no
+    direction has both legs forming.  ``reason`` is ``flat_mixed``
+    (last two confirmed swings mixed) or
+    ``insufficient_confirmed_swings`` (< 2 confirmed swings per side).
+    """
+
+    bias: int = 0
+    swing_n: int = 3
+    confirmed_highs: list = field(default_factory=list)
+    confirmed_lows: list = field(default_factory=list)
+    pending_high: dict | None = None
+    pending_low: dict | None = None
+    flip_needed: str = ""
+    earliest_flip: str | None = None
+    reason: str = "flat_mixed"
+
+    def to_dict(self) -> dict:
+        return {
+            "bias": int(self.bias),
+            "swing_n": int(self.swing_n),
+            "confirmed_highs": [float(p) for p in self.confirmed_highs],
+            "confirmed_lows": [float(p) for p in self.confirmed_lows],
+            "pending_high": self.pending_high,
+            "pending_low": self.pending_low,
+            "flip_needed": self.flip_needed,
+            "earliest_flip": self.earliest_flip,
+            "reason": self.reason,
+        }
+
+    def describe(self) -> str:
+        """One line for /status, e.g. ``HOLD d1_flat - pending swing
+        low 4066.5 (2/3 bars confirmed), need LH+LL for SHORT,
+        earliest flip 2026-10-19``."""
+        if self.reason == "insufficient_confirmed_swings":
+            return (
+                "HOLD d1_flat — insufficient confirmed swings "
+                f"({len(self.confirmed_highs)} highs, "
+                f"{len(self.confirmed_lows)} lows) — need 2 confirmed "
+                "swings per side before any bias can form")
+        bits = ["HOLD d1_flat"]
+        pend: list[str] = []
+        for label, cand in (("high", self.pending_high),
+                            ("low", self.pending_low)):
+            if cand is None:
+                continue
+            pend.append(
+                f"pending swing {label} {cand['price']:.1f} "
+                f"({cand['bars_confirmed']}/{self.swing_n} bars confirmed)")
+        if pend:
+            bits.append(" — " + ", ".join(pend))
+        else:
+            bits.append(" — no pending swing extreme")
+        if self.flip_needed:
+            bits.append(f", {self.flip_needed}")
+        if self.earliest_flip:
+            bits.append(f", earliest flip {self.earliest_flip}")
+        return "".join(bits)
+
+
+def _pending_swings(high, low, n: int) -> tuple[tuple | None,
+                                                 tuple | None]:
+    """Unconfirmed swing candidates in the last ``n`` bars.
+
+    A candidate at index ``i`` must beat every bar in its left window
+    ``[i-n, i)`` (the same left check :func:`multitf.find_swings`
+    uses) AND every bar printed so far to its right (it has not been
+    invalidated yet).  At most one candidate per side can survive:
+    if ``i1 < i2`` both survived, ``high[i1] > high[i2]`` (right
+    check) and ``high[i2] > high[i1]`` (left check) would both have
+    to hold.  Returns ``(pending_high, pending_low)`` as
+    ``(index, price)`` pairs or None.  The last ``n`` bars can never
+    contain a CONFIRMED swing; these are the ones still forming.
+    """
+    h = [float(v) for v in high]
+    lo = [float(v) for v in low]
+    total = len(h)
+    pend_high: tuple | None = None
+    pend_low: tuple | None = None
+    for i in range(max(n, total - n), total):
+        left_h = h[max(0, i - n):i]
+        if left_h and h[i] > max(left_h) and (
+                i == total - 1 or h[i] > max(h[i + 1:])):
+            pend_high = (i, h[i])
+        left_l = lo[max(0, i - n):i]
+        if left_l and lo[i] < min(left_l) and (
+                i == total - 1 or lo[i] < min(lo[i + 1:])):
+            pend_low = (i, lo[i])
+    return pend_high, pend_low
+
+
+def bias_hold_state(d1_bars: pd.DataFrame, *,
+                    swing_n: int = 3) -> D1BiasState:
+    """Build the HOLD state for a D1 frame (flat bias or not).
+
+    Pure function over CLOSED bars: confirmed swings from
+    :func:`multitf.find_swings`, pending extremes from
+    :func:`_pending_swings`, flip requirements against the last
+    confirmed pair (SHORT needs a new confirmed pair with lower high
+    AND lower low; LONG needs higher high AND higher low).
+    """
+    if d1_bars is None or len(d1_bars) == 0:
+        return D1BiasState(
+            bias=0, swing_n=swing_n, reason="insufficient_confirmed_swings",
+            flip_needed="need D1 bars before any bias can form")
+    highs, lows = find_swings(
+        d1_bars["high"].to_numpy(), d1_bars["low"].to_numpy(), swing_n)
+    bias = evaluate_bias(d1_bars, swing_n=swing_n)
+    total = len(d1_bars)
+    # Median bar spacing for ETA arithmetic (D1 -> 1 day).
+    try:
+        diffs = d1_bars.index.to_series().diff().dropna()
+        step = diffs.median() if len(diffs) else pd.Timedelta(days=1)
+        if pd.isna(step) or step <= pd.Timedelta(0):
+            step = pd.Timedelta(days=1)
+    except Exception:
+        step = pd.Timedelta(days=1)
+
+    def _pending(cand: tuple | None) -> dict | None:
+        if cand is None:
+            return None
+        idx, price = cand
+        bars_remaining = int((idx + swing_n + 1) - total)
+        bars_remaining = max(1, min(swing_n, bars_remaining))
+        try:
+            eta = (pd.Timestamp(d1_bars.index[idx])
+                   + (swing_n + 1) * step)
+            eta_s: str | None = eta.date().isoformat()
+        except Exception:
+            eta_s = None
+        return {"price": float(price),
+                "bar_time": pd.Timestamp(
+                    d1_bars.index[idx]).isoformat(),
+                "bars_remaining": bars_remaining,
+                "bars_confirmed": int(swing_n - bars_remaining),
+                "eta": eta_s}
+
+    pend_high = _pending(_pending_swings(
+        d1_bars["high"].to_numpy(), d1_bars["low"].to_numpy(),
+        swing_n)[0])
+    pend_low = _pending(_pending_swings(
+        d1_bars["high"].to_numpy(), d1_bars["low"].to_numpy(),
+        swing_n)[1])
+
+    if len(highs) < 2 or len(lows) < 2:
+        return D1BiasState(
+            bias=int(bias), swing_n=swing_n,
+            confirmed_highs=[float(p) for _, p in highs],
+            confirmed_lows=[float(p) for _, p in lows],
+            pending_high=pend_high, pending_low=pend_low,
+            flip_needed="need 2 confirmed swings per side",
+            earliest_flip=None,
+            reason="insufficient_confirmed_swings")
+
+    last_high = float(highs[-1][1])
+    last_low = float(lows[-1][1])
+
+    # Leg status per direction: "forming" (pending candidate in the
+    # right direction), "against" (pending candidate the wrong way —
+    # it must confirm/fail before a new candidate can form), or
+    # "missing" (no candidate extreme printed yet).
+    def _leg(pending: dict | None, needed: float,
+             want_lower: bool) -> str:
+        if pending is None:
+            return "missing"
+        if want_lower:
+            return "forming" if pending["price"] < needed else "against"
+        return "forming" if pending["price"] > needed else "against"
+
+    short_high = _leg(pend_high, last_high, True)
+    short_low = _leg(pend_low, last_low, True)
+    long_high = _leg(pend_high, last_high, False)
+    long_low = _leg(pend_low, last_low, False)
+
+    def _earliest(leg_h: str, leg_l: str) -> str | None:
+        if leg_h != "forming" or leg_l != "forming":
+            return None
+        etas = [e for e in (pend_high["eta"] if pend_high else None,
+                            pend_low["eta"] if pend_low else None)
+                if e]
+        return max(etas) if etas else None
+
+    eta_short = _earliest(short_high, short_low)
+    eta_long = _earliest(long_high, long_low)
+    cands = [e for e in (eta_short, eta_long) if e]
+    earliest = min(cands) if cands else None
+
+    if short_high == "forming" and short_low == "forming":
+        flip = ("need LH+LL for SHORT — flip when pending swings confirm")
+    elif long_high == "forming" and long_low == "forming":
+        flip = ("need HH+HL for LONG — flip when pending swings confirm")
+    else:
+        missing: list[str] = []
+        if short_low != "forming":
+            missing.append("confirmed lower low for SHORT")
+        if short_high != "forming":
+            missing.append("confirmed lower high for SHORT")
+        if long_low != "forming":
+            missing.append("confirmed higher low for LONG")
+        if long_high != "forming":
+            missing.append("confirmed higher high for LONG")
+        flip = "need " + " + ".join(missing)
+    return D1BiasState(
+        bias=int(bias), swing_n=swing_n,
+        confirmed_highs=[float(p) for _, p in highs],
+        confirmed_lows=[float(p) for _, p in lows],
+        pending_high=pend_high, pending_low=pend_low,
+        flip_needed=flip, earliest_flip=earliest,
+        reason="flat_mixed")
+
+
+def live_setup_hold_state(stack: TimeframeStack | dict, *,
+                          swing_n: int = 3) -> D1BiasState | None:
+    """HOLD state for a stack's D1 frame, or None when no D1 bars."""
+    if isinstance(stack, dict):
+        stack = TimeframeStack.from_frames(stack)
+    d1 = stack.frames.get("D1")
+    if d1 is None or len(d1) == 0:
+        return None
+    return bias_hold_state(d1, swing_n=swing_n)
+
+
+def log_hold_state(logger, hold_state: D1BiasState | dict) -> None:
+    """Log a d1_flat HOLD at INFO — never ERROR/WARNING, never
+    ``FEED_ERROR``.  A flat bias with a healthy feed is a HOLD, not
+    a feed problem; the two channels must never be conflated."""
+    if isinstance(hold_state, dict):
+        state = D1BiasState(
+            bias=int(hold_state.get("bias", 0)),
+            swing_n=int(hold_state.get("swing_n", 3)),
+            confirmed_highs=list(
+                hold_state.get("confirmed_highs", [])),
+            confirmed_lows=list(hold_state.get("confirmed_lows", [])),
+            pending_high=hold_state.get("pending_high"),
+            pending_low=hold_state.get("pending_low"),
+            flip_needed=str(hold_state.get("flip_needed", "")),
+            earliest_flip=hold_state.get("earliest_flip"),
+            reason=str(hold_state.get("reason", "flat_mixed")))
+    else:
+        state = hold_state
+    logger.info("HOLD %s", state.describe())
+
+
+def log_feed_error(logger, *, symbol: str, reason: str,
+                   last_bar_age: str | None = None) -> None:
+    """Log a feed failure at ERROR as ``FEED_ERROR`` — the separate
+    channel from HOLD.  Call only when the feed itself failed
+    (``feed_status`` ok=False: terminal disconnected, symbol
+    unselected, fetch failed, stale bars past the staleness bound),
+    never for a flat bias on a healthy feed."""
+    extra = f" last_bar_age={last_bar_age}" if last_bar_age else ""
+    logger.error("FEED_ERROR symbol=%s reason=%s%s",
+                 symbol, reason, extra)
+
+
 def _live_setup_impl(stack: TimeframeStack | dict, *,
                      swing_n: int = 3) -> tuple[dict | None, str]:
     """``live_setup`` + the reason it is / is not armed.
@@ -627,7 +1045,31 @@ def _live_setup_impl(stack: TimeframeStack | dict, *,
         return None, "insufficient_bars"
     bias_d1 = evaluate_bias(d1, swing_n=swing_n)
     if bias_d1 == 0:
-        return None, "d1_flat: D1 bias is flat — no direction, no setup"
+        # D1 flat is RANGE regime, not a shutdown: arm the range
+        # setup when a defined H4/D1 range exists.  Only when NO
+        # defined range exists is there no setup (HOLD, reason
+        # names the missing range).  The reason keeps the
+        # ``d1_flat`` prefix so /status + journal readers that key
+        # on it keep working; the HOLD / RANGE distinction is the
+        # ``regime`` field on the returned setup.
+        range_def = detect_range(d1, h4, h1, swing_n=swing_n)
+        if range_def is None:
+            return None, (
+                "d1_flat: D1 bias is flat — no defined range "
+                "(HOLD: no range to trade)")
+        bias_h4 = evaluate_bias(h4, swing_n=swing_n)
+        atr_h1 = atr14(h1)
+        buf = float(SWING.breakout_atr * atr_h1) if atr_h1 > 0 else 0.0
+        trig_highs, trig_lows = find_swings(
+            h1["high"].to_numpy(), h1["low"].to_numpy(), swing_n)
+        h4_highs, h4_lows = find_swings(
+            h4["high"].to_numpy(), h4["low"].to_numpy(), swing_n)
+        return range_setup(range_def, bias_h4=int(bias_h4),
+                           h4_context="range",
+                           atr_h1=float(atr_h1), buf=buf,
+                           h4_highs=[float(p) for _, p in h4_highs],
+                           h4_lows=[float(p) for _, p in h4_lows],
+                           swing_n=swing_n), "armed_range"
     bias_h4 = evaluate_bias(h4, swing_n=swing_n)
     # NO H4-agreement requirement here — that was the 2026-10-16
     # zero-signal root cause.  Requiring H4 bias == D1 bias is
@@ -695,8 +1137,12 @@ def live_setup(stack: TimeframeStack | dict, *,
                swing_n: int = 3) -> dict | None:
     """Trigger levels from CLOSED bars only (refreshed on TF closes).
 
-    Returns None when D1 bias is flat or no H4 POI / H1 swing
-    levels exist — the setup is not armed.  H4 bias agreement is
+    Returns None when there is no setup: D1 flat with NO defined
+    range, or no H4 POI / H1 swing levels exist.  D1 flat WITH a
+    defined range returns a RANGE setup (``regime == "range"``,
+    ``direction == 0``, both edge bands in ``edges``) — the tick
+    clock resolves the touched edge via
+    :func:`resolve_setup_for_touch`.  H4 bias agreement is
     deliberately NOT required: H4 supplies the POI zone, D1
     supplies the direction (see ``_live_setup_impl``).  Otherwise
     returns the levels the tick clock checks every tick:
@@ -721,14 +1167,47 @@ def live_setup_reason(stack: TimeframeStack | dict, *,
 
 
 def check_zone_touch(setup: dict, *, mid: float) -> bool:
-    """Arm condition: the live price sits AT the H4 POI band.
+    """Arm condition: the live price sits AT the POI band.
 
-    This is the trigger's first half: a touch, not a breakout.  A
-    touch arms the pending; the confirmation family decides
-    whether it fires (see :func:`check_live_trigger`).
+    Trend: the price sits AT the H4 POI band.  Range: the price
+    sits AT either range-edge band.  This is the trigger's first
+    half: a touch, not a breakout.  A touch arms the pending; the
+    confirmation family decides whether it fires (see
+    :func:`check_live_trigger`).
     """
+    if setup.get("regime") == "range":
+        for edge in setup.get("edges", []):
+            if edge["bottom"] <= mid <= edge["top"]:
+                return True
+        return False
     zone = setup["zone"]
     return zone["bottom"] <= mid <= zone["top"]
+
+
+def resolve_setup_for_touch(setup: dict, *, mid: float) -> dict:
+    """Per-edge setup for a touched price (tick-clock arming).
+
+    Trend setups pass through unchanged.  Range setups carry
+    ``direction == 0`` and two edge bands; the touched edge
+    resolves to a shallow copy with that edge's direction/zone,
+    so the pending / trigger / verdict machinery downstream —
+    which all read ``setup["direction"]`` / ``setup["zone"]`` —
+    needs no range special case.  Raises ``ValueError`` when a
+    range setup is resolved at a price touching neither edge
+    (callers check :func:`check_zone_touch` first).
+    """
+    if setup.get("regime") != "range":
+        return setup
+    range_def = RangeDef.from_dict(setup["range"])
+    edge = resolve_range_touch(range_def, mid)
+    if edge is None:
+        raise ValueError("range setup resolved at a price "
+                         "touching neither edge")
+    out = dict(setup)
+    out["direction"] = int(edge["direction"])
+    out["zone"] = edge
+    out["trigger_edge"] = edge["side"]
+    return out
 
 
 def check_live_trigger(setup: dict, *, entry_frame: pd.DataFrame,

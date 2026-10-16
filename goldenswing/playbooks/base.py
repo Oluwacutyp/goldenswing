@@ -99,6 +99,13 @@ class Playbook(abc.ABC):
     #: True -> candidates may enter the live P&L book.
     #: False -> shadow/paper only: scored, logged, never in live P&L.
     live: bool = False
+    #: Regime this playbook may fire in: "trend" (D1 bias != 0),
+    #: "range" (D1 flat + defined range), or "both".  Enforced by
+    #: ``confluence.ConfluenceEngine.gate_live_signal`` — a range
+    #: playbook can never fire in a TREND verdict and a trend
+    #: playbook can never fire in a RANGE verdict.  Default
+    #: "trend": every pre-existing playbook is a trend playbook.
+    regime_scope: str = "trend"
     #: minimum base_score for live-book membership (anchor: 60.0).
     live_threshold: float = 60.0
     #: Where this playbook is genuinely good, in the words of its

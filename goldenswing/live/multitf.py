@@ -80,6 +80,29 @@ Every function reads CLOSED bars only.  ``find_swings`` returns only
 confirmed swings (a swing at index ``i`` needs ``n`` bars after it).
 ``evaluate`` computes trigger-TF swings from ``bars[:-1]`` so the
 trigger bar can never confirm its own reference swing.
+
+CONTRACT — THREE SEPARATE CONCERNS, NEVER CONFUSED
+--------------------------------------------------
+1. ``evaluate_bias()`` = STRUCTURE direction, the ONLY bias that
+   gates trades (hierarchy leg 1, ``d1_bias``): +1 iff the last two
+   confirmed swings show higher high AND higher low; -1 iff lower
+   high AND lower low; else 0 (flat/mixed — no trade).  A swing at
+   index ``i`` needs ``swing_n`` bars AFTER it (default 3), so a D1
+   bias flip is only recognised >= 3 daily closes after the extreme
+   printed.  Price action alone cannot flip it.  ``d1_flat`` is a
+   legitimate HOLD during choppy / transitioning regimes, NOT a feed
+   error, NOT a bug — see ``live/hierarchy.py::D1BiasState`` /
+   ``bias_hold_state`` for the pending-swing / bars-remaining /
+   flip-requirement tracking, and ``log_hold_state`` (INFO, HOLD)
+   vs ``log_feed_error`` (ERROR, FEED_ERROR).
+2. ``live/macrotrend.py::compute_macrotrend()`` = SIZING ONLY:
+   EMA200 bias per TF (D1/W1/MN1), Golden Swing (all equal nonzero)
+   1.5x, D1_W1 1.25x, D1_Only 1.0x, D1/W1 conflict 0.5x.  It
+   never gates, never blocks, never touches hierarchy legs.
+3. DXY (``live/dxy.py``) = CONFLUENCE NUDGE ONLY: correlation <
+   -0.8 -> +0.5, > -0.2 -> -0.5, else 0; unavailable -> 0.  It
+   never gates.  A missing DXY feed degrades to 0, it is not a
+   trade blocker and not a bias.
 """
 from __future__ import annotations
 

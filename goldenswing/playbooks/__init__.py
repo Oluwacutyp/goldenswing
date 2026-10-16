@@ -21,6 +21,13 @@ from .killzone_open import KillzoneOpenPlaybook
 from .order_block import OrderBlockPlaybook
 from .qm_d1 import QMD1Playbook
 from .qm_m5 import QMM5Playbook
+from .range_regime import (
+    RANGE_PLAYBOOKS,
+    RangeCompressionBreakoutPlaybook,
+    RangeMeanReversionPlaybook,
+    RangeQMPlaybook,
+    RangeSweepReclaimPlaybook,
+)
 from .retracement_trap import RetracementTrapPlaybook
 from .sweep_reversal import SweepReversalPlaybook
 from .trendline_retest import TrendlineRetestPlaybook
@@ -41,6 +48,11 @@ __all__ = [
     "TrendlineRetestPlaybook",
     "QMD1Playbook",
     "QMM5Playbook",
+    "RANGE_PLAYBOOKS",
+    "RangeSweepReclaimPlaybook",
+    "RangeQMPlaybook",
+    "RangeMeanReversionPlaybook",
+    "RangeCompressionBreakoutPlaybook",
     "VReversalPlaybook",
     "RetracementTrapPlaybook",
     "InversionPlaybook",

@@ -449,6 +449,13 @@ class ConfluenceEngine:
            is the correct behaviour, not a regression.  ``None``
            means no stack was available (legacy single-TF feed):
            the gate is skipped, not faked.
+        0b. regime (when a verdict is supplied): the playbook's
+           ``regime_scope`` must match the verdict's ``regime`` —
+           range playbooks never fire in TREND verdicts, trend
+           playbooks never fire in RANGE verdicts.  Verdicts that
+           predate the regime field default to "trend", as do
+           playbooks without ``regime_scope``.  "hold" verdicts
+           never reach here (``allowed`` is False, gate 0 blocks).
         1. session scope (first-class; never fires outside it),
         2. the playbook's required-context tripwire,
         3. the measured hunting-ground exclusions,
@@ -464,6 +471,13 @@ class ConfluenceEngine:
                                          signal.direction)
             if not ok:
                 return False, reason
+            scope = getattr(pb, "regime_scope", "trend") or "trend"
+            regime = str(hierarchy_verdict.get("regime", "trend"))
+            if scope != "both" and regime in ("trend", "range") \
+                    and scope != regime:
+                return False, (
+                    f"regime: {pb.name} is {scope}-scoped, verdict "
+                    f"is {regime} regime — no mixing")
         ok, reason = self._session_allowed(pb, signal.index, ctx)
         if not ok:
             return False, reason

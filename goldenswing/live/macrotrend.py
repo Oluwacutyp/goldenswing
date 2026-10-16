@@ -14,6 +14,12 @@ goes beyond it in two ways:
    decides that. It only scales the size of a trade the hierarchy
    already allowed, and asks for a tap on Golden Swing setups.
 
+CONTRACT (see ``live/multitf.py`` module docstring for the full
+three-concern contract): ``evaluate_bias()`` = structure direction
+(the ONLY bias that gates, leg 1); THIS module = sizing only;
+DXY = confluence nudge only.  A flat D1 structure bias (``d1_flat``)
+is a HOLD (swing_n confirmation lag), never a feed error.
+
 EMA bias: last close vs EMA200 (EWMA, span=200, adjust=False —
 the owner's formula). Fewer than 200 bars -> NEUTRAL (0): a
 200-period average on 50 bars is not a bias, it is noise.
