@@ -204,8 +204,12 @@ def choose_entry_type(setup_kind: str, validation: CandleValidation) -> EntryTyp
 # SHAPE_PRIORITY).  ``context`` is the longer entry-TF frame the
 # composing bars come from; when omitted, ``frame`` is its own
 # context.  Causal by construction: every detector only uses bars
-# at or before its confirming bar.  SHADOW ONLY — nothing in the
-# live path may branch on this result.
+# at or before its confirming bar.  Since the 2026-10-15 trigger
+# redesign, the live path branches on this result: it IS the
+# trigger (zone touch + a confirming shape here).  The trigger
+# additionally requires the confirming bar to overlap the POI
+# band — the family itself does not require that for bos / choch /
+# sweep_reclaim / hh_hl, so the trigger enforces it.
 # ------------------------------------------------------------------
 
 #: Canonical shape order: listing order for ``shapes`` and the

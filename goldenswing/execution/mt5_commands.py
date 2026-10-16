@@ -785,3 +785,80 @@ def _mt5_harvest(ctx: CommandContext, args: list[str]) -> CommandResult:
                f"{len(files)} files, {manifest['zip_bytes'] // 1024}KB — "
                f"RESULTS.md inside has the full breakdown")
     return CommandResult(document=zip_path, caption=caption)
+
+
+# ------------------------------------------------- engine / backtest commands
+# Same contract as the OANDA loop's /backtest family, bound to the MT5
+# registry so the MT5 engine (the getUpdates owner at cutover) answers
+# them from its own journal.  Delegates to the shared implementation
+# in goldenswing.alerts.commands — one implementation, two registries.
+
+@mt5_command("/backtest", "build + send backtest report file + summary")
+def _mt5_backtest(ctx: CommandContext, args: list[str]) -> CommandResult:
+    from ..alerts.commands import build_backtest_result
+    return build_backtest_result(ctx, drop_back=False)
+
+
+@mt5_command("/backtest_send", "send backtest results file to drop back to Muse")
+def _mt5_backtest_send(ctx: CommandContext, args: list[str]) -> CommandResult:
+    from ..alerts.commands import build_backtest_result
+    return build_backtest_result(ctx, drop_back=True)
+
+
+@mt5_command("/journal", "journal head / record count / last record")
+def _mt5_journal(ctx: CommandContext, args: list[str]) -> CommandResult:
+    if ctx.journal is None:
+        return CommandResult(text="no journal attached.")
+    try:
+        records = ctx.journal.records()
+    except Exception:
+        records = []
+    lines = [f"MT5 journal: {ctx.journal_path or '(unknown path)'}",
+             f"records: {len(records)}"]
+    if records:
+        last = records[-1]
+        lines.append(
+            f"last: seq={last.get('seq', '?')} "
+            f"type={last.get('type', '?')} ts={last.get('ts', '?')}")
+    return CommandResult(text="\n".join(lines))
+
+
+@mt5_command("/snapshot", "deterministic-engine snapshot manifest (N / N_prev)")
+def _mt5_snapshot(ctx: CommandContext, args: list[str]) -> CommandResult:
+    from ..alerts.commands import _snapshot as _shared_snapshot
+    return _shared_snapshot(ctx, args)
+
+
+@mt5_command("/reconcile", "reconciliation status: unresolved / open vs closed")
+def _mt5_reconcile(ctx: CommandContext, args: list[str]) -> CommandResult:
+    from ..alerts.commands import _reconcile as _shared_reconcile
+    return _shared_reconcile(ctx, args)
+
+
+@mt5_command("/health", "feed + journal + open positions health")
+def _mt5_health(ctx: CommandContext, args: list[str]) -> CommandResult:
+    fs = ctx.feed_status or {}
+    feed_line = ("feed: OK" if fs.get("ok")
+                 else f"feed: STALE — {fs.get('reason', 'no status yet')}")
+    lines = ["MT5 HEALTH", feed_line]
+    if ctx.journal is not None:
+        try:
+            lines.append(f"journal records: {len(ctx.journal.records())}")
+        except Exception:
+            pass
+    lines.append(f"open MT5 positions: {len(ctx.live_positions)}")
+    lines.append(f"pending orders: {len(ctx.pending_orders)}")
+    ctrl = getattr(ctx, "mt5_control", None)
+    if ctrl is not None and hasattr(ctrl, "deterministic_status"):
+        try:
+            det = ctrl.deterministic_status()
+            if det.get("enabled"):
+                lines.append(
+                    f"deterministic: {det.get('phase')} "
+                    f"head={det.get('head')} commit={det.get('commit_index')} "
+                    f"unresolved={det.get('unresolved')}")
+            else:
+                lines.append(f"deterministic: disabled ({det.get('error')})")
+        except Exception:
+            pass
+    return CommandResult(text="\n".join(lines))
