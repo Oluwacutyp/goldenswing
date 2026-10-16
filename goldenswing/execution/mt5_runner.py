@@ -56,7 +56,7 @@ import os
 import math
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -66,7 +66,6 @@ from ..alerts.commands import CommandContext, is_owner_callback
 from ..backtest.data import REPO_ROOT
 from ..charts.engine import render_mt5_signal
 from ..confluence import ConfluenceEngine
-from ..entry.validator import confirm_at_poi
 from ..features.engine import read_and_featurize
 from ..feed.tick_log import TickLogger
 from ..live.dxy import DXYTracker
@@ -74,7 +73,7 @@ from ..live.health import HealthMonitor
 from ..live.urgency import urgency_score
 from ..live.volume_profile import volume_profile
 from ..live.hierarchy import (LEG_ORDER, TimeframeStack, TF_MINUTES,
-                              check_live_entry, check_live_trigger,
+                              check_live_trigger, check_zone_touch,
                               evaluate_hierarchy, live_setup,
                               qm_annotation)
 from ..live.macrotrend import (MacroTrendResult, compute_macrotrend)
@@ -96,6 +95,7 @@ from .entry_gates import (
     DEFAULT_SESSION_MULTIPLIERS, EntryGate, EntryGateConfig,
     is_friday_close, session_multiplier, signal_fingerprint)
 from .executor import OrderRequest, PendingOrder
+from ..engine.runtime import DeterministicRuntime
 from .learning import TradeJournal
 from .mt5 import MT5Executor, build_ladder, select_order_type
 from .signal_log import log_signal
@@ -108,6 +108,11 @@ from .tick_manager import (DEFAULT_TIME_EXIT_BARS, TickAction, TickConfig,
 from ..feed.mt5 import TRADE_MODE_REAL, MT5Feed, TickPump
 
 DATA_DIR = REPO_ROOT / "data"
+
+# Volume tolerance (lots) for fill comparisons: a broker fill
+# within this of the pending volume counts as full — float dust
+# must not manufacture a phantom partial fill.
+_VOL_EPS = 1e-9
 
 
 def _session_multipliers_from_env() -> dict:
@@ -174,6 +179,13 @@ class MT5RunnerConfig:
     min_score: float = 60.0
     signal_gap_bars: int = 0
     journal_path: Path = DATA_DIR / "mt5_journal.jsonl"
+    # Deterministic engine: when True the runner dual-writes every
+    # decision-critical frame to goldenswing/engine DeterministicJournal
+    # (chained, fenced, idempotent) alongside the legacy JSONL audit
+    # journal.  Legacy journal is never removed; deterministic journal
+    # is the authority for seq / chain / fencing / idempotency.
+    use_deterministic_engine: bool = True
+    deterministic_dir: Path | None = None  # default: <journal parent>/deterministic
     risk_state_path: Path = DATA_DIR / "mt5_risk_state.json"
     kill_switch_path: Path = DATA_DIR / "mt5_KILL"
     hierarchy_required: bool = True
@@ -287,6 +299,16 @@ class MT5RunnerConfig:
     score_decay_enabled: bool = True
     score_decay_floor: float | None = None
     score_decay_bars: int = 2
+    # Armed-state TTL (owner rule, 2026-10-15): an armed zone
+    # touch disarms as stale after armed_ttl_bars ENTRY-TF bars
+    # without confirmation.  Counted in entry-TF bars (the state
+    # machine runs on the entry clock), not wall clock.  The
+    # number 2 mirrors score_decay_bars (the codebase's existing
+    # "two bars of no-confirmation = stale" rule), counted on the
+    # entry clock instead of H1 closes.  On M15 it binds after
+    # 2 closes (30 min); on M30 it coincides with the H1-close
+    # expiry.  Config-file / env only.
+    armed_ttl_bars: int = 2
     # Multi-zone limit ladder (owner's-bot floor): a LIMIT order's
     # size staggers across rungs from the playbook level to the
     # adverse zone edge; only rung 0 is placed, the next rung
@@ -363,6 +385,8 @@ class MT5RunnerConfig:
                 if os.environ.get("GS_SCORE_DECAY_FLOOR") else None),
             score_decay_bars=int(os.environ.get(
                 "GS_SCORE_DECAY_BARS", "2")),
+            armed_ttl_bars=int(os.environ.get(
+                "GS_ARMED_TTL_BARS", "2")),
             ladder_enabled=os.environ.get(
                 "GS_LADDER_ENABLED", "0") != "0",
             ladder_rungs=int(os.environ.get("GS_LADDER_RUNGS", "3")),
@@ -446,6 +470,18 @@ class MT5Runner:
         self.executor = executor
         self.senders = senders or []
         self.journal = TradeJournal(self.cfg.journal_path)
+        # Deterministic engine runtime (bridge).  Best-effort: if it
+        # fails to initialise, the legacy journal path continues and
+        # the failure is noted — the live loop never dies on it.
+        self.deterministic = None
+        self._det_error: str | None = None
+        if getattr(self.cfg, "use_deterministic_engine", True):
+            try:
+                det_dir = self.cfg.deterministic_dir or (
+                    self.cfg.journal_path.parent / "deterministic")
+                self.deterministic = DeterministicRuntime(det_dir)
+            except Exception as exc:  # noqa: BLE001 - fallback is intentional
+                self._det_error = str(exc)
         # RiskGuards ENFORCED on the live path (previously constructed
         # but never consulted here).  max_total_risk_pct=0 disables
         # the money-at-stops exposure cap — on the Exness MT5 loop
@@ -481,16 +517,43 @@ class MT5Runner:
         # Daily QM shadow: last touch index already journal-logged
         # (the D1 scan logs each touch once, never re-logs history).
         self._qm_d1_last_logged: int = -1
-        # Live evaluation clock (tick-cross trigger, entry-TF entry):
+        # Live evaluation clock (zone-touch arm, family confirm):
         # the forming H1 bar tracked from ticks, the cached trigger
-        # levels from closed bars, and the pending (fired, still
-        # unconfirmed) trigger awaiting entry confirmation.
+        # levels from closed bars, and the pending (armed touch,
+        # still unconfirmed) awaiting POI confirmation.
         self._forming: dict | None = None
         self._live_setup: dict | None = None
         self._pending: dict | None = None
+        # Fired-window guard (trigger redesign): the H1 bar open
+        # time in which a trigger last fired.  The H1 bar IS the
+        # trigger's window (the pending expires at the H1 close),
+        # and the live setup is fixed within it — so a second fire
+        # in the same H1 bar is necessarily the same setup firing
+        # twice on the same composing bars (one trigger per
+        # window).  The arm path skips re-arm while
+        # ``bar_open == self._fired_h1_bar``; the next H1 bar is a
+        # fresh window.  Without this, every tick in the zone
+        # re-arms and re-fires on the same already-closed
+        # composing bars (trigger storm: dozens of fires per bar).
+        self._fired_h1_bar = None
+        # Stale-zone re-arm block (armed TTL, owner rule): after a
+        # stale disarm, (direction, zone bottom, zone top) of the
+        # dead zone.  Re-arm needs price to EXIT that zone and
+        # re-enter — no immediate re-arm while still inside, or
+        # the TTL is meaningless.  Cleared on exit, or when the
+        # setup's zone changes (a different POI is a fresh setup).
+        self._stale_zone: tuple | None = None
+        # Invalidated-zone re-arm block (Close Rule, owner rule):
+        # after a Close-Rule invalidation, (direction, zone bottom,
+        # zone top) of the FAILED zone.  Unlike the stale block,
+        # exit + re-entry does NOT revive a failed zone — the
+        # block lifts only when the setup's zone changes (a
+        # different POI is a different setup).  Monitoring for
+        # the failed setup is terminated.
+        self._invalidated_zone: tuple | None = None
         # Broker pending orders (LIMIT / STOP) this engine placed or
         # adopted: ticket -> PendingOrderState.  Distinct from
-        # ``self._pending`` (the fired, unconfirmed trigger of the
+        # ``self._pending`` (the armed zone touch of the
         # tick-clock machinery) — a pending ORDER is a broker order;
         # a pending TRIGGER is pre-signal state.
         self._pending_orders: dict[int, PendingOrderState] = {}
@@ -641,6 +704,28 @@ class MT5Runner:
                 "manipulation_blocked": self._manipulation_blocked,
                 "signal_counts": dict(self._signal_counts)}
 
+    # -------------------------------------------- deterministic engine
+    def _det_journal(self, kind: str, data: dict,
+                     *, idempotency_key: str | None = None) -> dict | None:
+        """Dual-write one decision-critical frame to the deterministic
+        journal.  Never raises, never breaks the live loop."""
+        if self.deterministic is None:
+            return None
+        try:
+            return self.deterministic.journal_event(
+                kind, data, idempotency_key=idempotency_key)
+        except Exception as exc:  # noqa: BLE001 - dual-write is best-effort
+            try:
+                self.journal.log_note(f"mt5: deterministic journal failed: {exc}")
+            except Exception:
+                pass
+            return None
+
+    def deterministic_status(self) -> dict:
+        if self.deterministic is None:
+            return {"enabled": False, "error": self._det_error}
+        return {"enabled": True, **self.deterministic.status()}
+
     def _get_engine(self) -> ConfluenceEngine:
         if self._engine is None:
             self._engine = ConfluenceEngine(
@@ -702,6 +787,20 @@ class MT5Runner:
         self._refresh_alignment()
         self.feed = feed
         self.executor = executor
+        # Deterministic lifecycle: REPLAY -> RECONCILING -> LIVE.
+        # Replay re-reads committed frames with effects suppressed;
+        # reconcile with no unresolved outbox flips to LIVE.  Failure
+        # here never blocks the legacy loop — it is noted, not fatal.
+        if self.deterministic is not None:
+            try:
+                self.deterministic.begin_live()
+            except Exception as exc:  # noqa: BLE001 - fallback is legacy
+                self.journal.log_note(
+                    f"mt5: deterministic begin_live failed: {exc}")
+        self._det_journal("runner_started", {
+            "symbol": self.cfg.symbol,
+            "login": acct.get("login"),
+            "trade_mode": acct.get("trade_mode")})
         self.journal.log_note(
             "mt5 runner: started "
             f"(symbol={self.cfg.symbol}) "
@@ -749,6 +848,7 @@ class MT5Runner:
             # management — a stale pending is never left behind.
             for ticket in list(self._pending_orders):
                 self._cancel_pending(ticket, "engine_stop", stats)
+            self._det_journal("runner_stopped", dict(stats))
             self.journal.log_note(
                 f"mt5 runner: stopped: {stats['ticks']} ticks, "
                 f"{stats['bars']} H1 bars, {stats['signals']} signals, "
@@ -790,15 +890,10 @@ class MT5Runner:
                         f"mt5: tick log failed (loop continues): {exc}")
             price = tick["mid"]
             self._manage_tick(price, stats)
-            # Pending LIMIT / STOP invalidation is tick-level (the
-            # zone breaking must kill a resting order now, not on
-            # the next reconcile): price beyond the adverse zone
-            # edge or the invalidation level cancels the order.
-            self._check_pending_orders(price, stats)
             if self._tick_count % self.cfg.reconcile_every_ticks == 0:
                 self._reconcile(price, stats)
             self._refresh_bars(tick, stats)
-            # Live evaluation clock: trigger on tick-cross, entry on
+            # Live evaluation clock: touch arms, family confirms on
             # entry-TF closes.  H1 closes never gate evaluation.
             self._evaluate_live_tick(tick, stats)
             # Golden Swing confirm timeouts are wall-clock: sweep
@@ -937,10 +1032,21 @@ class MT5Runner:
         # open record + fill chart), not as bare adoptions — adopting
         # first would double-handle them and lose the signal context.
         pending_alerts = {s.alert_id for s in self._pending_orders.values()}
+        # A broker position sharing an alert_id with a HELD position
+        # is the remainder of a partial fill (hedging: a second
+        # ticket for the same order) — never adopt it as a second
+        # position; the remainder fill lands on the held position
+        # via _record_pending_fill.
+        held_alerts = set()
+        for _t in self.tick_manager.tickets():
+            _p = self.tick_manager.position(_t)
+            if _p is not None and not _p.closed:
+                held_alerts.add(_p.alert_id)
         for ticket, pos in live.items():
             if ticket not in self.tick_manager.tickets() \
                     and pos.magic == self.cfg.magic \
-                    and pos.alert_id not in pending_alerts:
+                    and pos.alert_id not in pending_alerts \
+                    and pos.alert_id not in held_alerts:
                 self.tick_manager.adopt(
                     ticket=ticket, symbol=pos.symbol,
                     direction=pos.direction, volume=pos.volume,
@@ -958,7 +1064,17 @@ class MT5Runner:
         with our magic are adopted.  A pending that left
         ``orders_get`` is NEVER assumed cancelled — a position with
         the same ``alert_id`` proves it filled; only the absence of
-        both proves an external cancel."""
+        both proves an external cancel.
+
+        Fill detection is by broker VOLUME for the setup (live
+        volume minus already-tracked volume), not by the pending
+        leaving ``orders_get``: a PARTIAL fill leaves the
+        remainder resting, so "pending still there" must not
+        hide the fill.  A netting remainder fill grows the
+        already-tracked position (same ticket); a hedging one
+        appears as a new ticket — both are the same fill event
+        (the volume not yet tracked).
+        """
         try:
             live_pending = {o.ticket: o for o in
                             self.executor.pending_orders(self.cfg.symbol)}
@@ -968,21 +1084,42 @@ class MT5Runner:
             return
         for ticket in list(self._pending_orders):
             state = self._pending_orders.get(ticket)
-            if state is None or ticket in live_pending:
-                continue  # still resting on the broker
-            matched = [p for p in live_positions.values()
-                       if p.alert_id == state.alert_id
-                       and p.magic == self.cfg.magic]
-            if matched:
-                self._record_pending_fill(state, matched[0], stats)
-            else:
-                del self._pending_orders[ticket]
-                stats["pending_cancelled"] = stats.get(
-                    "pending_cancelled", 0) + 1
-                self.journal.log_note(
-                    f"mt5 pending gone: ticket {ticket} "
-                    f"{state.kind} @ {state.level:.2f} — cancelled "
-                    f"externally / broker expiry, no fill")
+            if state is None:
+                continue
+            still_resting = ticket in live_pending
+            mine = [p for p in live_positions.values()
+                    if p.alert_id == state.alert_id
+                    and p.magic == self.cfg.magic]
+            if not mine:
+                if not still_resting:
+                    del self._pending_orders[ticket]
+                    stats["pending_cancelled"] = stats.get(
+                        "pending_cancelled", 0) + 1
+                    self.journal.log_note(
+                        f"mt5 pending gone: ticket {ticket} "
+                        f"{state.kind} @ {state.level:.2f} — cancelled "
+                        f"externally / broker expiry, no fill")
+                continue
+            # New fill volume = live volume for this setup minus
+            # already-tracked volume for it.  Zero means nothing
+            # new (the fill was already recorded, or the pending
+            # is genuinely still resting with no fill).
+            tracked_vol = 0.0
+            for _t in self.tick_manager.tickets():
+                _pp = self.tick_manager.position(_t)
+                if _pp is not None and not _pp.closed \
+                        and _pp.alert_id == state.alert_id:
+                    tracked_vol += float(_pp.volume)
+            live_vol = sum(float(p.volume) for p in mine)
+            if live_vol - tracked_vol <= _VOL_EPS:
+                continue  # nothing new
+            # Representative position for the fill event: the
+            # untracked one if any (first fill / hedging), else
+            # the grown one (netting remainder / layer).
+            untracked = [p for p in mine
+                         if p.ticket not in self.tick_manager.tickets()]
+            pos = untracked[0] if untracked else mine[0]
+            self._record_pending_fill(state, pos, stats)
         for ticket, order in live_pending.items():
             if ticket not in self._pending_orders \
                     and order.magic == self.cfg.magic:
@@ -1079,6 +1216,11 @@ class MT5Runner:
             alert_id=pos.alert_id, ticket=ticket, exit_price=price,
             reason=reason, pnl_money=float(pnl_money), r_net=float(pnl_r),
             hold_bars=0, partial_taken=pos.partial_done)
+        self._det_journal("trade_closed", {
+            "alert_id": pos.alert_id, "ticket": ticket,
+            "exit": price, "reason": reason,
+            "pnl_money": float(pnl_money), "r_net": float(pnl_r)},
+            idempotency_key=f"close-{pos.alert_id}-{ticket}")
         self.journal.log_note(
             f"mt5 close: ticket {ticket} {display} at {price:.2f} "
             f"({pnl_r:+.2f}R)")
@@ -1232,6 +1374,7 @@ class MT5Runner:
         fresh = self.feed.fetch_new_all(cursors)
         # Phase 2: append every newly closed bar; refresh legs.
         appended: list[str] = []
+        appended_counts: dict[str, int] = {}
         h1_accepted = 0
         for tf in closed_tfs:
             new = fresh.get(tf)
@@ -1241,6 +1384,7 @@ class MT5Runner:
             if not accepted:
                 continue
             appended.append(tf)
+            appended_counts[tf] = accepted
             self._last_processed[tf] = (
                 self._stack.cursors[tf]
                 + pd.Timedelta(minutes=TF_MINUTES[tf]))
@@ -1264,12 +1408,31 @@ class MT5Runner:
             self._refresh_dxy()
         if any(tf in ("D1", "H4", "H1") for tf in appended):
             self._live_setup = live_setup(self._stack)
-        # Phase 3: the pending entry confirms on entry-TF closes
-        # BEFORE any H1-close expiry — the entry bar that closes
-        # with the H1 bar still belongs to that bar.
+        # Phase 3: entry-TF closes — the Close Rule FIRST (a bar
+        # closing beyond the invalidation level kills the setup
+        # instantly, before any confirmation on the same close),
+        # then the confirm shot, then the armed TTL.  The entry
+        # bar that closes with the H1 bar still belongs to that
+        # bar — confirmation is evaluated BEFORE any H1-close
+        # expiry.
+        self._check_close_rule(tick, appended, appended_counts, stats)
         if self._pending is not None and \
                 self._pending["entry_clock"] in appended:
+            pend = self._pending
+            # Confirm shot FIRST: a confirming close fires, and
+            # confirm always wins over TTL on the same bar.
             self._evaluate_pending_entry(tick, stats)
+            # Armed TTL (owner rule, 2026-10-15): if still armed,
+            # these entry bars closed without confirmation.
+            # At armed_ttl_bars the touch is stale (price lingered
+            # without reacting: absorbed, edge decayed) and disarms
+            # as ``stale``, distinct from exit/invalidation.
+            # Re-arm needs exit + re-entry (see _stale_zone).
+            if self._pending is pend and pend.get("armed"):
+                pend["armed_bars"] = pend.get("armed_bars", 0) + \
+                    appended_counts.get(pend["entry_clock"], 0)
+                if pend["armed_bars"] >= self.cfg.armed_ttl_bars:
+                    self._disarm_stale(stats)
         # Phase 4: H1 close — time stop, pending expiry, forming reset.
         if "H1" in appended:
             stats["bars"] = stats.get("bars", 0) + h1_accepted
@@ -1336,12 +1499,13 @@ class MT5Runner:
         return f"macro alignment: {self._alignment.describe()}"
 
     # ------------------------------------------- live evaluation clock
-    # The H1 close is NOT the signal clock.  The trigger fires when
-    # the tick crosses the trigger level; the entry leg evaluates on
-    # entry-TF closes; H1/H4/D1 closes only refresh their legs.  The
-    # hierarchy legs and gate formulas are unchanged (see
-    # live/hierarchy.py::live_setup / check_live_trigger /
-    # check_live_entry) — only the EVALUATION CLOCK changed.
+    # The H1 close is NOT the signal clock.  A touch arms the
+    # pending when the tick sits AT the H4 POI band; the
+    # confirmation family fires on entry-TF closes; H1/H4/D1
+    # closes only refresh their legs.  The hierarchy legs and gate
+    # formulas are unchanged (see
+    # live/hierarchy.py::live_setup / check_zone_touch /
+    # check_live_trigger) — only the TRIGGER changed.
 
     def _check_pending_score_decay(self, stats: dict) -> None:
         """Score-decay cancellation (owner's-bot PendingOrderTracker):
@@ -1526,8 +1690,9 @@ class MT5Runner:
     def _invalidate_pending(self, reason: str, stats: dict) -> None:
         """Drop a pending trigger: logged, never erased.
 
-        Non-confirmation is not repainting — the fired trigger stays
-        in the journal; only the pending state is cleared.
+        Non-confirmation is not repainting — the armed touch / fired
+        trigger stays in the journal; only the pending state is
+        cleared.
         """
         pend = self._pending
         if pend is None:
@@ -1540,9 +1705,141 @@ class MT5Runner:
             f"@ {pend['entry']:.2f} — entry never confirmed, "
             f"setup logged, never erased")
 
+    def _disarm_stale(self, stats: dict) -> None:
+        """TTL expiry: the armed touch lingered without confirmation.
+
+        Owner rule (2026-10-15): a zone price lingers in without
+        reacting is being absorbed — its edge decays, it doesn't
+        grow; a confirmation firing hours later would trigger on
+        stale context.  Journaled as ``stale`` (distinct from
+        exit/invalidation), and re-arm is blocked until price
+        EXITS this zone and re-enters.
+        """
+        pend = self._pending
+        if pend is None or not pend.get("armed"):
+            return
+        zone = pend["zone"]
+        self._stale_zone = (pend["direction"], zone["bottom"],
+                            zone["top"])
+        self._invalidate_pending("stale", stats)
+
+    def _invalidate_close_rule(self, stats: dict) -> None:
+        """Close-Rule invalidation of the armed touch: an entry-TF
+        bar CLOSED beyond the invalidation level — the setup's
+        premise is gone (the zone failed).  Terminates monitoring
+        for THIS setup: the zone is blocked until a different POI
+        appears (see _invalidated_zone) — unlike the stale block,
+        exit + re-entry does NOT revive a failed zone.  Zero
+        hesitation: no waiting for another bar, no hoping for a
+        bounce.
+        """
+        pend = self._pending
+        if pend is None or not pend.get("armed"):
+            return
+        zone = pend["zone"]
+        self._invalidated_zone = (pend["direction"], zone["bottom"],
+                                  zone["top"])
+        self._invalidate_pending("invalidation", stats)
+
+    @staticmethod
+    def _entry_clock_for(verdict, tick_time) -> str:
+        """Entry clock for a pre-entry entity: the verdict's clock
+        when known, else the session clock at this tick (the state
+        machine runs on the entry clock)."""
+        clock = (verdict or {}).get("entry_clock")
+        if clock:
+            return str(clock)
+        return _compose_session(pd.Timestamp(tick_time))["entry_clock"]
+
+    def _drop_staged_confirm(self, key: str, payload: dict,
+                             stats: dict) -> None:
+        """Drop a staged Golden Swing confirm on Close-Rule
+        invalidation: the confirmed setup died before entry, so
+        the order NEVER places.  Both the payload and its Confirm
+        token die (a tap on the dead token reports expired)."""
+        self._order_confirms.pop(key, None)
+        for token, staged in list(self._confirm_tokens.items()):
+            if staged.get("action") == "place_order" \
+                    and staged.get("arg") == key:
+                self._confirm_tokens.pop(token, None)
+        sig = payload.get("sig")
+        self.journal.log_note(
+            "mt5: Golden Swing order invalidated — setup failed "
+            "the Close Rule before entry, no order placed "
+            f"({getattr(sig, 'direction', '?'):+} "
+            f"invalidation {float(getattr(sig, 'invalidation', 0.0) or 0.0):.2f})")
+
+    def _check_close_rule(self, tick: dict, appended: list[str],
+                          appended_counts: dict[str, int],
+                          stats: dict) -> None:
+        """The Close Rule (owner, 2026-10-15): on EVERY entry-TF
+        bar close, exactly one check — the bar's ``close`` vs the
+        invalidation level.  A WICK beyond the level does NOT
+        invalidate (the expected stop-hunt); a CLOSE beyond
+        invalidates instantly.  Applies to every pre-entry entity:
+        the armed touch, resting pending orders, staged Golden
+        Swing confirms.  Once a position is open the stop loss
+        owns it — never touched here.  This is the ONE
+        invalidation condition: no tick-level, no second
+        condition.
+        """
+        if self._stack is None:
+            return
+        tick_time = pd.Timestamp(tick["time"])
+        for tf in appended:
+            frame = self._stack.frames.get(tf)
+            count = appended_counts.get(tf, 0)
+            if frame is None or count <= 0 or len(frame) < count:
+                continue
+            closes = frame["close"].iloc[-count:]
+            # Armed touch: close beyond its invalidation level.
+            pend = self._pending
+            if pend is not None and pend.get("armed") \
+                    and pend.get("entry_clock") == tf:
+                inv = pend.get("invalidation_level")
+                if inv is not None:
+                    for close in closes:
+                        if (pend["direction"] > 0
+                                and close < inv) or \
+                                (pend["direction"] < 0
+                                 and close > inv):
+                            self._invalidate_close_rule(stats)
+                            break
+            # Resting pending orders: close beyond the order's
+            # (playbook) invalidation — cancel immediately.
+            for ticket, state in list(self._pending_orders.items()):
+                if self._entry_clock_for(state.verdict,
+                                         tick_time) != tf:
+                    continue
+                inv = state.invalidation
+                for close in closes:
+                    if (state.direction > 0 and close < inv) or \
+                            (state.direction < 0 and close > inv):
+                        self._cancel_pending(
+                            ticket,
+                            f"invalidated: {tf} close {close:.2f} "
+                            f"beyond invalidation {inv:.2f}", stats)
+                        break
+            # Staged Golden Swing confirms (confirmed, not yet
+            # placed): close beyond the signal's invalidation —
+            # the order never places.
+            for key, payload in list(self._order_confirms.items()):
+                sig = payload.get("sig")
+                if sig is None:
+                    continue
+                if self._entry_clock_for(payload.get("verdict"),
+                                         tick_time) != tf:
+                    continue
+                inv = float(getattr(sig, "invalidation", 0.0) or 0.0)
+                for close in closes:
+                    if (int(sig.direction) > 0 and close < inv) or \
+                            (int(sig.direction) < 0 and close > inv):
+                        self._drop_staged_confirm(key, payload, stats)
+                        break
+
     def _evaluate_live_tick(self, tick: dict, stats: dict) -> None:
-        """Live evaluation clock: trigger on tick-cross, entry on
-        entry-TF closes.  H1 closes never gate evaluation."""
+        """Live evaluation clock: touch arms, family confirms, entry
+        on entry-TF closes.  H1 closes never gate evaluation."""
         if self._stack is None:
             return
         mid = float(tick["mid"])
@@ -1573,116 +1870,151 @@ class MT5Runner:
         # position.  The one-position rule lives in _run_signal_path
         # (new positions only when flat; layers only when holding).
         if self._pending is not None:
-            # Reversal: the break no longer holds — invalidate
-            # (logged, never erased).  The entry leg simply does not
-            # confirm.
+            # Armed touch: survives only while price stays in/near
+            # the zone (zone ± buf).  Ran away the other side
+            # without confirming = the moment passed (left_zone):
+            # the pending dies (logged, never erased) — a later
+            # re-entry is a NEW touch, not a stale arm.  The far
+            # side (price through the invalidation level) is NOT
+            # checked here: the Close Rule says a WICK beyond the
+            # level does not invalidate — only an entry-TF bar
+            # CLOSE beyond does (see _check_close_rule, run on
+            # entry closes in _refresh_bars phase 3).  A tick
+            # through the level is a wick (the expected stop-hunt),
+            # not an invalidation.  This is the sequential state
+            # machine: confirmation must arrive while price is
+            # still in/near the zone, not after it left.
+            # (Confirmation on an entry close is evaluated before
+            # this block runs — see _refresh_bars phase 3 — so a
+            # confirming close wins over a disarm on the same
+            # tick.)
             pend = self._pending
-            if (pend["direction"] > 0 and mid <= pend["level"]) or \
-                    (pend["direction"] < 0 and mid >= pend["level"]):
-                self._invalidate_pending("reversal", stats)
+            buf = pend["setup"]["buf"]
+            hi = pend["zone"]["top"] + buf
+            if (pend["direction"] > 0 and mid >= hi) or \
+                    (pend["direction"] < 0 and
+                     mid <= pend["zone"]["bottom"] - buf):
+                self._invalidate_pending("left_zone", stats)
             return
+        # Stale re-arm block: if a previous touch disarmed as stale,
+        # price must have EXITED that zone before any re-arm.  The
+        # clear runs here (before the setup-None return) so an exit
+        # lifts the block even while no setup is armed.
+        if self._stale_zone is not None:
+            _d, _b, _t = self._stale_zone
+            if not (_b <= mid <= _t):
+                self._stale_zone = None  # exited: re-arm allowed
         setup = self._live_setup
         if setup is None:
             return  # legs 1-2 not armed
-        # Cheap pre-filter: only a price past the trigger level AND
-        # at the POI band can fire — the full check runs rarely.
-        if setup["direction"] > 0 and mid <= setup["ref_high"]:
+        # Stale re-arm block (continued): if the block is still set,
+        # price is still inside the dead zone.  Re-arm only on a
+        # DIFFERENT zone (a different POI is a fresh setup) — the
+        # same zone re-arms only after exit + re-entry.
+        if self._stale_zone is not None:
+            _d, _b, _t = self._stale_zone
+            if (_d, _b, _t) == (setup["direction"],
+                                setup["zone"]["bottom"],
+                                setup["zone"]["top"]):
+                return  # still inside the stale zone: no re-arm
+            self._stale_zone = None  # zone changed: fresh setup
+        # Invalidated-zone block (Close Rule): a zone that failed
+        # the Close Rule is TERMINATED — exit + re-entry does not
+        # revive it.  Re-arm only on a DIFFERENT zone (a different
+        # POI is a different setup).
+        if self._invalidated_zone is not None:
+            _d, _b, _t = self._invalidated_zone
+            if (_d, _b, _t) == (setup["direction"],
+                                setup["zone"]["bottom"],
+                                setup["zone"]["top"]):
+                return  # zone failed: terminated, no re-arm
+            self._invalidated_zone = None  # zone changed: fresh setup
+        # One trigger per H1-bar window: this bar already fired —
+        # the setup is fixed within the bar, so a second fire here
+        # would be the same setup re-firing on the same composing
+        # bars (trigger storm).  The next H1 bar is a fresh window.
+        if bar_open == self._fired_h1_bar:
             return
-        if setup["direction"] < 0 and mid >= setup["ref_low"]:
+        # TRIGGER, REDESIGNED (2026-10-15): a tick AT the POI band
+        # arms the pending; the confirmation family decides whether
+        # it fires (see _evaluate_pending_entry).  The old
+        # pre-filter demanded price PAST the H1 swing level AND
+        # inside the zone — geometrically near-impossible (0/573
+        # armed windows in the full-engine backtest) and against
+        # the doctrine (entries AT the POI, never above it).
+        if not check_zone_touch(setup, mid=mid):
             return
-        zone = setup["zone"]
-        if not (zone["bottom"] <= mid <= zone["top"]):
-            return
-        trig = check_live_trigger(
-            setup, open_=forming["open"], high=forming["high"],
-            low=forming["low"], close=mid,
-            closed_h1=self._stack.frames["H1"])
-        if trig is None:
-            return
-        # Trigger fired on the tick — logged, never erased.  The
-        # entry leg decides whether it confirms (on this tick's
-        # already-closed composing entry bars, then on each
-        # entry-TF close).
         session = _compose_session(tick_time)
-        self._pending = {**trig, "fired_ts": tick_time,
-                         "h1_open": bar_open,
-                         "entry_clock": session["entry_clock"]}
-        stats["triggers"] = stats.get("triggers", 0) + 1
-        self.journal.log_note(
-            f"mt5: trigger fired {trig['trigger']} "
-            f"{'+' if trig['direction'] > 0 else '-'}1 @ {mid:.2f} "
-            f"(H1 bar {bar_open}) — awaiting "
-            f"{session['entry_clock']} entry")
+        direction = int(setup["direction"])
+        zone = setup["zone"]
+        # The armed pending's invalidation level is the far boundary
+        # of the zone (beyond the sweep extreme): a price through
+        # it on a TICK is a wick (the expected stop-hunt, not an
+        # invalidation); only an entry-TF bar CLOSE beyond it
+        # invalidates (the Close Rule — see _check_close_rule).
+        # A sweep inside the buffer survives (sweep_reclaim
+        # needs it).
+        invalidation_level = float(zone["bottom"] - setup["buf"]) \
+            if direction > 0 else \
+            float(zone["top"] + setup["buf"])
+        self._pending = {
+            "armed": True, "trigger": "zone_touch",
+            "direction": direction, "entry": mid, "zone": zone,
+            "entry_clock": session["entry_clock"],
+            "h1_open": bar_open, "touch_ts": tick_time,
+            "invalidation_level": invalidation_level,
+            "setup": setup,
+            # Armed TTL: entry-TF bars closed without confirmation
+            # (see _refresh_bars phase 3 / _disarm_stale).
+            "armed_bars": 0,
+        }
         self._evaluate_pending_entry(tick, stats)
 
     def _evaluate_pending_entry(self, tick: dict, stats: dict) -> None:
-        """Entry leg on entry-TF closes (or immediately on trigger
-        fire, against this tick's already-closed composing bars).
+        """Confirm an armed zone touch with the POI confirmation family.
 
-        A confirmed entry runs the signal path and consumes the
-        pending trigger.  Non-confirmation leaves the pending
-        trigger standing until the H1 close expires it, a reversal
-        invalidates it, or a bias flip kills it — the fired trigger
-        is logged, never erased.
+        Runs on the arming tick (against this tick's already-closed
+        composing entry bars) and on each entry-TF close.  A
+        confirmed touch FIRES the trigger — the pending is consumed
+        and the signal path runs.  Non-confirmation leaves the
+        pending armed until the H1 close expires it (the window
+        lapses), the armed TTL disarms it as stale (entry-TF bars
+        without confirmation — see _refresh_bars phase 3), the
+        Close Rule invalidates it (an entry-TF bar CLOSED beyond
+        the invalidation level — a tick through the level is a
+        wick, not an invalidation), price leaving the zone disarms
+        it, or a bias flip kills it — the touch is logged, never
+        erased.
         """
         pend = self._pending
         if pend is None or self._stack is None:
             return
+        if not pend.get("armed"):
+            return  # only armed pendings await confirmation
         # NOTE (layering): entry confirmation runs while holding — a
         # confirmed entry in the same direction becomes a layer
         # (_run_signal_path branches), never a second position.
         entry_frame = self._stack.frames.get(pend["entry_clock"])
-        # Shadow-only candle-shape confirmation at the POI
-        # (rejection / engulfing on the entry-TF bars composing the
-        # forming H1 bar).  Annotated on the pending, NEVER a gate:
-        # the live decision below comes from check_live_entry alone.
-        self._annotate_candle_confirm(pend, entry_frame)
-        event = check_live_entry(entry_frame, pend["direction"],
-                                 swing_n=3, since=pend["h1_open"],
-                                 entry_clock=pend["entry_clock"])
-        if event is None or event != pend["direction"]:
-            return  # no entry event yet, or against-bias: not confirmed
+        trig = check_live_trigger(
+            pend["setup"], entry_frame=entry_frame,
+            h1_open=pend["h1_open"], close=float(tick["mid"]))
+        if trig is None:
+            return  # no confirming shape yet: pending stands
         self._pending = None
-        self._run_live_signal(pend, tick, stats)
-
-    def _annotate_candle_confirm(self, pend: dict,
-                                 entry_frame) -> None:
-        """Shadow-only POI confirmation (full shape family) at the POI.
-
-        Computes :func:`confirm_at_poi` on the entry-TF bars
-        composing the forming H1 bar (index >= ``h1_open``) against
-        the pending's zone band, and stores it as
-        ``pend["candle_confirm"]``.  The first confirmed annotation
-        is journal-logged once.  Best-effort by design: any failure
-        here (missing zone, odd restored pending) skips silently —
-        shadow telemetry must never break the entry leg.
-        """
-        try:
-            zone = pend.get("zone")
-            h1_open = pend.get("h1_open")
-            if zone is None or h1_open is None:
-                return
-            if entry_frame is None or len(entry_frame) == 0:
-                return
-            composing = entry_frame[entry_frame.index >= h1_open]
-            ann = confirm_at_poi(composing, pend["direction"],
-                                 zone["bottom"], zone["top"],
-                                 context=entry_frame)
-            pend["candle_confirm"] = {
-                "confirmed": bool(ann.confirmed),
-                "shape": ann.shape,
-                "shapes": list(ann.shapes),
-                "detail": ann.detail,
-            }
-            if ann.confirmed and not pend.get("candle_confirm_logged"):
-                pend["candle_confirm_logged"] = True
-                self.journal.log_note(
-                    f"mt5: candle confirmation "
-                    f"{','.join(ann.shapes)} at POI "
-                    f"({ann.detail}) — shadow only, entry still "
-                    f"needs the structural event")
-        except Exception:
-            return
+        # One trigger per H1-bar window (see _fired_h1_bar): the
+        # window is spent once it fires.
+        self._fired_h1_bar = pend["h1_open"]
+        fired = {**trig, "fired_ts": pd.Timestamp(tick["time"]),
+                 "h1_open": pend["h1_open"],
+                 "entry_clock": pend["entry_clock"]}
+        stats["triggers"] = stats.get("triggers", 0) + 1
+        self.journal.log_note(
+            f"mt5: trigger fired {trig['trigger']} "
+            f"{'+' if trig['direction'] > 0 else '-'}1 "
+            f"@ {trig['entry']:.2f} (H1 bar {pend['h1_open']}) — "
+            f"zone touch + {pend['entry_clock']} POI confirm "
+            f"({','.join(trig['confirm_shapes'])})")
+        self._run_live_signal(fired, tick, stats)
 
     def _run_live_signal(self, pend: dict, tick: dict,
                          stats: dict) -> None:
@@ -1724,11 +2056,11 @@ class MT5Runner:
         """Live verdict: same shape as the closed-bar verdict.
 
         Legs 1-4 come from the fired trigger (closed-bar levels +
-        tick-cross); leg 5 from the confirmed entry-TF event.  Entry
-        is the confirm tick's mid (the actual market entry),
-        stop/target from the trigger computation, risk re-measured
-        from the confirm price.  AMD / QM / volume annotations as in
-        :meth:`_verdict_for_bar`.
+        zone touch); leg 5 from the confirmed POI shape on the
+        entry clock.  Entry is the confirm tick's mid (the actual
+        market entry), stop/target from the trigger computation,
+        risk re-measured from the confirm price.  AMD / QM / volume
+        annotations as in :meth:`_verdict_for_bar`.
         """
         direction = int(pend["direction"])
         state = states[t] if 0 <= t < len(states) else None
@@ -1748,10 +2080,11 @@ class MT5Runner:
         legs = {leg: {"passed": True, "reason": ""} for leg in LEG_ORDER}
         legs["d1_bias"]["reason"] = f"D1 bias {direction:+d} (closed bars)"
         legs["h4_agree"]["reason"] = f"H4 agrees {direction:+d} (closed)"
-        legs["h4_zone"]["reason"] = "live price at H4 POI (tick-cross)"
-        legs["h1_trigger"]["reason"] = f"tick-cross {pend['trigger']}"
+        legs["h4_zone"]["reason"] = "live price at H4 POI (zone touch)"
+        legs["h1_trigger"]["reason"] = \
+            f"zone touch + {pend['trigger']} confirm"
         legs["entry"]["reason"] = \
-            f"{pend['entry_clock']} event confirmed"
+            f"{pend['entry_clock']} POI confirm"
         return {
             "allowed": True, "blocked_leg": "", "legs": legs,
             "bias_d1": direction, "bias_h4": direction,
@@ -1792,7 +2125,7 @@ class MT5Runner:
         """Verdict -> playbooks -> gate -> order (shared signal path).
 
         The verdict may come from a closed H1 bar (legacy) or from a
-        tick-cross trigger + confirmed entry (live clock) — the path
+        zone touch + POI confirmation (live clock) — the path
         after the verdict is identical: same playbooks, same
         confluence gate, same hierarchy, manipulation filter
         (entry selection: no chasing a failed liquidity test),
@@ -3046,35 +3379,6 @@ class MT5Runner:
             chart_png=png)
         return True
 
-    def _check_pending_orders(self, price: float, stats: dict) -> None:
-        """Tick-level pending invalidation: price beyond the adverse
-        zone edge or the invalidation level kills the resting order
-        NOW (the zone failed — the setup's premise is gone)."""
-        for ticket, state in list(self._pending_orders.items()):
-            zone = state.zone
-            if state.direction > 0:
-                if zone is not None and price < float(zone["bottom"]):
-                    self._cancel_pending(
-                        ticket,
-                        f"invalidated: price {price:.2f} below POI "
-                        f"bottom {float(zone['bottom']):.2f}", stats)
-                elif price <= state.invalidation:
-                    self._cancel_pending(
-                        ticket,
-                        f"invalidated: price {price:.2f} through "
-                        f"invalidation {state.invalidation:.2f}", stats)
-            else:
-                if zone is not None and price > float(zone["top"]):
-                    self._cancel_pending(
-                        ticket,
-                        f"invalidated: price {price:.2f} above POI "
-                        f"top {float(zone['top']):.2f}", stats)
-                elif price >= state.invalidation:
-                    self._cancel_pending(
-                        ticket,
-                        f"invalidated: price {price:.2f} through "
-                        f"invalidation {state.invalidation:.2f}", stats)
-
     def _cancel_pending(self, ticket: int, reason: str,
                         stats: dict) -> bool:
         """Cancel one tracked pending order.  A failed cancel is
@@ -3103,24 +3407,102 @@ class MT5Runner:
                    if p.alert_id == state.alert_id
                    and p.magic == self.cfg.magic]
         if matched:
-            self._record_pending_fill(state, matched[0], stats)
+            # Prefer the untracked position (a hedging remainder
+            # fill is a NEW ticket; the already-tracked base
+            # position would read as zero new volume).
+            untracked = [p for p in matched
+                         if p.ticket not in self.tick_manager.tickets()]
+            self._record_pending_fill(
+                state, untracked[0] if untracked else matched[0], stats)
             return True
         self.journal.log_note(
             f"mt5 pending cancel FAILED ticket {ticket} ({reason}): "
             f"{res.message} — retry next tick")
         return False
 
+    def _position_for_alert(self, alert_id: str):
+        """Held OPEN TickManager position with this alert_id, if any.
+        Closed positions don't count: a remainder filling after the
+        base closed opens fresh (the broker filled a live order —
+        it must be tracked, not dropped)."""
+        for ticket in self.tick_manager.tickets():
+            pos = self.tick_manager.position(ticket)
+            if pos is not None and not pos.closed \
+                    and pos.alert_id == alert_id:
+                return pos
+        return None
+
+    def _fill_volume(self, state: PendingOrderState, pos) -> float:
+        """Volume of THIS fill event (not the position's total).
+
+        Netting (``pos`` already tracked, grown by the fill) ->
+        the growth.  Hedging / first fill (``pos`` untracked) ->
+        the position's volume.  A ``pos`` without a volume (direct
+        test calls) -> the state's volume (a full fill).
+        """
+        _pos_vol = getattr(pos, "volume", None)
+        if _pos_vol is None:
+            return float(state.volume)
+        if int(pos.ticket) in self.tick_manager.tickets():
+            tracked = self.tick_manager.position(int(pos.ticket))
+            base_vol = float(tracked.volume) \
+                if tracked is not None else 0.0
+            return max(0.0, float(_pos_vol) - base_vol)
+        return float(_pos_vol)
+
+    def _fill_track_request(self, state: PendingOrderState,
+                            volume: float, fill_bar: int):
+        """Placement-time track request re-pointed at the fill:
+        the management clocks start AT THE FILL (time-exit bars
+        from the fill bar — not the placement signal bar), and the
+        tracked volume is the filled volume.  SL/TP (invalidation
+        + targets) are the placement-time values from the signal —
+        attached unchanged, never recomputed from the fill price.
+        """
+        track = state.track_request
+        if track is None:
+            return OrderRequest(
+                symbol=self.cfg.symbol, direction=int(state.direction),
+                volume=float(volume),
+                stop_loss=float(state.invalidation),
+                entry_ref=float(state.level),
+                alert_id=state.alert_id, magic=self.cfg.magic,
+                bar_index=fill_bar)
+        return replace(track, volume=float(volume),
+                       bar_index=fill_bar)
+
     def _record_pending_fill(self, state: PendingOrderState,
                              pos, stats: dict) -> None:
-        """A pending order filled: TickManager tracking starts,
-        exactly like a market fill (same open record, same fill
-        chart/alert — the entry is the broker's fill price).  A
-        pending LAYER fills onto the held position instead (the
+        """A pending order filled — the fill event drives CONFIRMED
+        -> ACTIVE (reconcile matches the broker position to the
+        pending by alert_id; never price polling).
+
+        SL/TP are the PLACEMENT-time values from the playbook's
+        signal (SL = invalidation + buffer via planned_stop, TP =
+        the signal's targets) — attached unchanged, never
+        recomputed from the fill price.  A resting LIMIT fill is
+        at-or-better by construction, so it cannot slip against
+        you — the pre-computed R holds.
+
+        On fill: state -> ACTIVE; fill price/time/volume recorded
+        (open record + fill note); the filled order leaves pending
+        tracking (fully filled: nothing remains pending); the
+        management clocks start AT THE FILL (time-exit bars from
+        the fill bar, holding cap from the fill time); handoff to
+        the tick manager.  From this moment the SL owns
+        invalidation — pre-entry invalidation no longer applies.
+
+        Partial fill: state -> ACTIVE with the PARTIAL volume;
+        the unfilled remainder stays pending (reduced volume) —
+        not a full fill, not a failure.  When the remainder later
+        fills it lands on the held position as an added leg (same
+        setup, same alert_id), never a second position.
+
+        A pending LAYER fills onto the held position instead (the
         layer entry is the pending price — the deal price); if the
         position closed before the pending filled, the layer falls
         back to opening a fresh base position.
         """
-        self._pending_orders.pop(state.ticket, None)
         # Slippage: adverse fill vs the pending level (long filled
         # above it, short below it), in ATR units.  Adopted pendings
         # (restart) have no signal — no ATR, no sample.
@@ -3131,32 +3513,119 @@ class MT5Runner:
                 * (float(pos.entry_price) - float(state.level)),
                 float(getattr(_sig, "atr", 0.0) or 0.0))
             self._journal_new_breaches()
+        _pos_vol = getattr(pos, "volume", None)
+        filled_vol = self._fill_volume(state, pos)
+        fill_bar = self._current_h1_bar()
+        # --- layer fill (onto a held position) -------------------
         if state.is_layer and self.tick_manager.tickets():
+            if len(self.tick_manager.tickets()) == 1:
+                if filled_vol < state.volume - _VOL_EPS:
+                    # Partial layer fill: the leg lands partially,
+                    # the remainder stays pending.  No breakeven
+                    # move yet — that fires once per layer, when the
+                    # remainder completes it (see _record_layer_fill).
+                    self.tick_manager.add_layer(
+                        self.tick_manager.tickets()[0],
+                        entry=float(pos.entry_price),
+                        volume=filled_vol, sl=float(state.sl),
+                        alert_id=state.alert_id,
+                        playbook=state.playbook)
+                    state.volume = state.volume - filled_vol
+                    stats["pending_partial"] = stats.get(
+                        "pending_partial", 0) + 1
+                    self.journal.log_note(
+                        f"mt5 partial layer fill: ticket {pos.ticket} "
+                        f"{state.playbook or 'pending'} "
+                        f"{'+' if state.direction > 0 else '-'}1 "
+                        f"{filled_vol} lots @ "
+                        f"{float(pos.entry_price):.2f} "
+                        f"({state.volume} lots remain pending)")
+                    return
+                self._pending_orders.pop(state.ticket, None)
+                self._record_layer_fill(
+                    state.playbook or "pending", state.sig,
+                    fill=float(state.level), lots=float(state.volume),
+                    stop0=float(state.sl), stats=stats)
+                return
+            # No single held position: drop (same as a full layer
+            # fill with no position — see _record_layer_fill).
+            self._pending_orders.pop(state.ticket, None)
             self._record_layer_fill(
                 state.playbook or "pending", state.sig,
                 fill=float(state.level), lots=float(state.volume),
                 stop0=float(state.sl), stats=stats)
             return
-        track = state.track_request
-        if track is None:
-            track = OrderRequest(
-                symbol=self.cfg.symbol, direction=int(state.direction),
-                volume=float(state.volume),
-                stop_loss=float(state.invalidation),
-                entry_ref=float(state.level),
-                alert_id=state.alert_id, magic=self.cfg.magic)
+        # --- remainder fill (a partial fill's second leg) ---------
+        # ``filled_vol`` is already the NEW volume (the growth for
+        # netting, the new position's volume for hedging) — it
+        # lands on the held position as an added leg.
+        held = self._position_for_alert(state.alert_id)
+        if held is not None:
+            added = filled_vol
+            self._pending_orders.pop(state.ticket, None)
+            stats["pending_filled"] = stats.get("pending_filled", 0) + 1
+            if added > _VOL_EPS:
+                self.tick_manager.add_layer(
+                    held.ticket, entry=float(pos.entry_price),
+                    volume=added, sl=float(state.sl),
+                    alert_id=state.alert_id, playbook=state.playbook)
+                self.journal.log_note(
+                    f"mt5 fill: ticket {pos.ticket} "
+                    f"{state.playbook or 'pending'} "
+                    f"{'+' if state.direction > 0 else '-'}1 "
+                    f"{added} lots @ {float(pos.entry_price):.2f} "
+                    f"SL {state.sl:.2f} (PENDING {state.kind.upper()} "
+                    f"remainder filled — position now "
+                    f"{float(held.volume):.4g} lots)")
+            else:
+                self.journal.log_note(
+                    f"mt5 fill: ticket {pos.ticket} "
+                    f"{state.playbook or 'pending'} remainder "
+                    f"already accounted for (no volume added)")
+            return
+        # --- base fill (full, or the first partial leg) -----------
+        if filled_vol < state.volume - _VOL_EPS:
+            # Partial: ACTIVE with the partial volume; the
+            # remainder stays pending (reduced volume).
+            track = self._fill_track_request(state, filled_vol,
+                                             fill_bar)
+            self.tick_manager.open(
+                ticket=int(pos.ticket), request=track,
+                fill_price=float(pos.entry_price),
+                entry_bar=fill_bar, broker_sl=float(state.sl))
+            state.volume = state.volume - filled_vol
+            stats["executed"] = stats.get("executed", 0) + 1
+            stats["pending_filled"] = stats.get("pending_filled", 0) + 1
+            stats["pending_partial"] = stats.get("pending_partial", 0) + 1
+            self._journal_fill_open(state, pos, filled_vol, stats,
+                                    partial=True)
+            return
+        # Full fill: the order leaves pending tracking entirely.
+        self._pending_orders.pop(state.ticket, None)
+        track = self._fill_track_request(state, float(state.volume),
+                                         fill_bar)
         self.tick_manager.open(ticket=int(pos.ticket), request=track,
                                fill_price=float(pos.entry_price),
-                               entry_bar=int(state.placed_bar),
+                               entry_bar=fill_bar,
                                broker_sl=float(state.sl))
         stats["executed"] = stats.get("executed", 0) + 1
         stats["pending_filled"] = stats.get("pending_filled", 0) + 1
+        self._journal_fill_open(state, pos, float(state.volume), stats,
+                                partial=False)
+
+    def _journal_fill_open(self, state: PendingOrderState, pos,
+                           volume: float, stats: dict,
+                           *, partial: bool) -> None:
+        """Open record + fill note/alert for a base fill (full or
+        partial).  Same open record as a market fill — the entry
+        is the broker's fill price, the stop is the placement-time
+        invalidation, the volume is the filled volume."""
         sig = getattr(state, "sig", None)
         try:
             spec = self.executor.symbol_spec(self.cfg.symbol)
             risk_money = spec.money_for_move(
                 abs(float(pos.entry_price) - float(state.invalidation)),
-                float(state.volume))
+                float(volume))
         except Exception:
             risk_money = 0.0
         self.journal.log_open(
@@ -3168,15 +3637,25 @@ class MT5Runner:
             source="mt5", ticket=int(pos.ticket),
             entry=float(pos.entry_price),
             stop=float(state.invalidation),
-            volume=float(state.volume), risk_money=float(risk_money),
+            volume=float(volume), risk_money=float(risk_money),
             factors=list(getattr(sig, "factors", []) or [])
             if sig is not None else [])
+        self._det_journal("trade_opened", {
+            "alert_id": state.alert_id, "ticket": int(pos.ticket),
+            "entry": float(pos.entry_price),
+            "playbook": state.playbook or "pending",
+            "direction": int(state.direction),
+            "volume": float(volume)},
+            idempotency_key=f"open-{state.alert_id}-{int(pos.ticket)}")
         self.journal.log_note(
             f"mt5 fill: ticket {pos.ticket} "
             f"{state.playbook or 'pending'} "
             f"{'+' if state.direction > 0 else '-'}1 "
-            f"{state.volume} lots @ {float(pos.entry_price):.2f} "
-            f"SL {state.sl:.2f} (PENDING {state.kind.upper()} filled)")
+            f"{volume} lots @ {float(pos.entry_price):.2f} "
+            f"SL {state.sl:.2f} (PENDING {state.kind.upper()} filled"
+            + (" — PARTIAL, "
+               f"{state.volume} lots remain pending)" if partial
+               else ")"))
         # Fill chart when the signal is known (placed this run);
         # adopted pendings (restart) have no signal — text only.
         png = None
@@ -3188,8 +3667,9 @@ class MT5Runner:
         self._send_alert(
             f"MT5 FILL {state.playbook or 'pending'} "
             f"{'+' if state.direction > 0 else '-'}1 "
-            f"{state.volume} lots @ {float(pos.entry_price):.2f} "
-            f"SL {state.sl:.2f} (ticket {pos.ticket})",
+            f"{volume} lots @ {float(pos.entry_price):.2f} "
+            f"SL {state.sl:.2f} (ticket {pos.ticket})"
+            + (" — PARTIAL" if partial else ""),
             chart_png=png)
 
     def _adopt_existing_pending(self, executor: MT5Executor) -> None:
