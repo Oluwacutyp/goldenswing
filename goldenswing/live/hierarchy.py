@@ -277,6 +277,12 @@ def _range_verdict(verdict: dict, legs: dict,
     verdict["regime"] = "range"
     verdict["range"] = range_def.to_dict()
     verdict["size_mult"] = RANGE_SIZE_MULT
+    # Boundary-gate fields: the closed-bar path has no tracker, so
+    # no sweep is ever confirmed here and no edge is ever cooling —
+    # the sweep gate honestly blocks sweep signals on this path
+    # (a wick alone never fires), and the cooldown gate passes.
+    verdict["sweep_confirmed_edges"] = []
+    verdict["cooldown_edges"] = []
     verdict["bias_h4"] = int(evaluate_bias(sliced["H4"],
                                             swing_n=swing_n))
     verdict["h4_context"] = "range"

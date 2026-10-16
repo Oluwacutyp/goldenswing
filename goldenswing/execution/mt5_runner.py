@@ -79,9 +79,18 @@ from ..live.hierarchy import (LEG_ORDER, TimeframeStack, TF_MINUTES,
                               live_setup, live_setup_hold_state,
                               live_setup_reason, log_feed_error,
                               log_hold_state, qm_annotation,
-                              resolve_setup_for_touch)
-from ..live.range import RANGE_SIZE_MULT, RangeDef
+                              resolve_setup_for_touch, zones_by_side)
+from ..live.multitf import atr14
+from ..live.range import RANGE_SIZE_MULT, BoundaryTracker, RangeDef
+from ..live.regime_state import (RegimeState, load_regime_state,
+                                 save_regime_state)
+from ..live.zones import (TF_ORDER as _TF_ORDER, ZoneCache,
+                          ZoneStore, find_clusters)
 from ..live.macrotrend import (MacroTrendResult, compute_macrotrend)
+from ..live.narrative import (ENTRY as _NARR_ENTRY,
+                              NarrativeState, advance as advance_narrative,
+                              amd_for_state, load_narrative_state,
+                              save_narrative_state)
 from ..live.manipulation import chase_blocked
 from ..live.news import NewsCalendar
 from ..live.reasoning import build_reasoning, build_study
@@ -91,8 +100,8 @@ from ..reader.session_timeframes import (
     compose as _compose_session, session_of)
 from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
                          InversionPlaybook, JudasSwingPlaybook,
-                         KillzoneOpenPlaybook, OrderBlockPlaybook,
-                         QMD1Playbook, QMM5Playbook,
+                         KillzoneOpenPlaybook, NarrativePlaybook,
+                         OrderBlockPlaybook, QMD1Playbook, QMM5Playbook,
                          RangeCompressionBreakoutPlaybook,
                          RangeMeanReversionPlaybook, RangeQMPlaybook,
                          RangeSweepReclaimPlaybook,
@@ -580,6 +589,59 @@ class MT5Runner:
         # different POI is a different setup).  Monitoring for
         # the failed setup is terminated.
         self._invalidated_zone: tuple | None = None
+        # Range boundary machine (sweep vs breakout, live/range.py)
+        # + persisted hysteresis clock (live/regime_state.py).
+        # The tracker is fed on every TF-close refresh; its state
+        # is persisted atomically on every H1 close BEFORE any
+        # order decision using the new counts.
+        self._boundary: BoundaryTracker | None = None
+        self._boundary_snapshot: dict = {}
+        # breakout_id already fired on the tick clock (one fire per
+        # confirmed breakout — a confirmed breakout fires once, it
+        # never re-fires on later ticks).
+        self._breakout_fired_id: int = 0
+        # Persisted regime state: journal-adjacent
+        # (<journal dir>/regime_state.json), never /tmp.
+        self._regime_state_path = \
+            self.cfg.journal_path.parent / "regime_state.json"
+        self._regime_state_loaded = False
+        self._regime_state_status = "not loaded"
+        self._regime_state_saved_at: str | None = None
+        # Regime pause (checksum-mismatch decision tree — see
+        # _handle_corrupt_regime_state): None | "observation" |
+        # "paused_new" | "paused_complete".  "observation" = corrupt
+        # state rebuilt, no new orders until 2 clean H1 bars.
+        # "paused_new" = open risk exists: no new orders, management
+        # of open positions continues.  "paused_complete" = position
+        # state itself untrusted: no orders AND no management,
+        # await owner /resume.  NEVER silently continued.
+        self._regime_pause: str | None = None
+        self._regime_pause_reason: str = ""
+        self._regime_observation_remaining: int = 0
+        self._regime_stable_bars: int = 0
+        self._regime_stable_signature: str | None = None
+        # Last PendingOrderAudit summary (see
+        # _audit_pending_orders): {"cancelled": {reason: n},
+        # "kept": n, "filled": n, "cancel_failed": n} + timestamp.
+        # Shown on /status (boundary_line) until the next audit.
+        self._last_pending_audit: dict | None = None
+        self._last_pending_audit_at: str | None = None
+        # Multi-day structural zones (live/zones.py): the durable
+        # ZoneStore (SQLite, journal-adjacent) + the in-memory
+        # ZoneCache (execution path — the tick loop bisects the
+        # cache, never SQLite).  The store opens LAZILY on the
+        # first _update_zones (many tests construct a runner
+        # without ever refreshing zones).
+        self._structural_zones: list = []
+        self._zone_store: object | None = None
+        self._zone_cache = ZoneCache()
+        self._zone_store_failed = False
+        self._zones_seeded = False
+        self._last_zone_conflict_sig: tuple | None = None
+        self._zone_cluster_keys: set = set()
+        self._nearby_zones: list = []
+        self._near_major_zone: object | None = None
+        self._last_zone_atr: float = 0.0
         # Broker pending orders (LIMIT / STOP) this engine placed or
         # adopted: ticket -> PendingOrderState.  Distinct from
         # ``self._pending`` (the armed zone touch of the
@@ -685,7 +747,8 @@ class MT5Runner:
                                RangeSweepReclaimPlaybook(),
                                RangeQMPlaybook(),
                                RangeMeanReversionPlaybook(),
-                               RangeCompressionBreakoutPlaybook()]
+                               RangeCompressionBreakoutPlaybook(),
+                               NarrativePlaybook()]
         return self._playbooks
 
     # ------------------------------------------------- blocked-leg stats
@@ -921,8 +984,11 @@ class MT5Runner:
             self._maybe_send_rollover_recap(tick)
             # Friday close (action "close" only): existing positions
             # + pendings are closed at the Friday hour, once per day.
-            # Default action "hold" is a no-op here.
-            self._maybe_friday_close(tick, stats)
+            # Default action "hold" is a no-op here.  A COMPLETE
+            # regime pause stops even this: position state is
+            # untrusted, so nothing may act on it.
+            if self._regime_pause != "paused_complete":
+                self._maybe_friday_close(tick, stats)
             # Tick CSV: exactly as seen, never breaks the loop.
             if self._tick_logger is not None:
                 try:
@@ -931,9 +997,15 @@ class MT5Runner:
                     self.journal.log_note(
                         f"mt5: tick log failed (loop continues): {exc}")
             price = tick["mid"]
-            self._manage_tick(price, stats)
+            # Tick management (breakeven / trail / partial) keeps
+            # running under "paused_new" / "observation" — it reads
+            # position state, not regime_state.  Only a COMPLETE
+            # pause (position state itself untrusted) stops it.
+            if self._regime_pause != "paused_complete":
+                self._manage_tick(price, stats)
             if self._tick_count % self.cfg.reconcile_every_ticks == 0:
-                self._reconcile(price, stats)
+                if self._regime_pause != "paused_complete":
+                    self._reconcile(price, stats)
             self._refresh_bars(tick, stats)
             # Live evaluation clock: touch arms, family confirms on
             # entry-TF closes.  H1 closes never gate evaluation.
@@ -1479,6 +1551,9 @@ class MT5Runner:
         if "H1" in appended:
             stats["bars"] = stats.get("bars", 0) + h1_accepted
             self._on_h1_close(tick, stats)
+            # Post-rebuild observation / stability clock: one clean
+            # H1 close of observation or stability counting.
+            self._advance_regime_pause()
         # Phase 5: D1/H4 close flipped the bias — the pending
         # trigger's premise is gone (only if still pending).
         if any(tf in ("D1", "H4") for tf in appended):
@@ -1561,6 +1636,768 @@ class MT5Runner:
             if line != self._last_hold_logged:
                 self._last_hold_logged = line
                 log_hold_state(_log, self._live_hold_state)
+        # Boundary machine + persisted hysteresis clock (runs on
+        # every TF-close refresh, before any order decision on the
+        # new bars — see _update_boundary).
+        self._update_boundary()
+        # Multi-day structural zones (historical WHERE).
+        self._update_zones()
+
+    # --------------------------------------- boundary machine + state
+    def _update_boundary(self) -> None:
+        """Feed the sweep-vs-breakout machine, persist its clock.
+
+        Runs at the end of every TF-close refresh — i.e. BEFORE the
+        confirm / order phases of that close, so every order
+        decision reads counts that are already persisted.  Order:
+
+        1. Load the persisted state once (warm start): verified ->
+           restore the tracker exactly; corrupt/missing -> the
+           checksum-mismatch decision tree (never trade on
+           compromised memory, never fabricate counts).
+        2. Feed newly closed H1 + M15 bars into the tracker
+           (idempotent: bars at/before the persisted last-processed
+           close are skipped).
+        3. If the tracker confirmed a breakout, override the live
+           setup with the BREAKOUT_TREND setup (D1 still flat, so
+           it is NOT a D1 TREND — trend playbooks arm in the
+           breakout direction).
+        4. Atomically persist the new counts.  A persist failure
+           is a WARNING, never a crash — but it is never silent.
+
+        A persist/load failure must never break the engine loop:
+        everything here is wrapped, and failures degrade to
+        in-memory-only with a logged WARNING.
+        """
+        if self._stack is None:
+            return
+        try:
+            h1 = self._stack.frames.get("H1")
+            m15 = self._stack.frames.get("M15")
+            if h1 is None or m15 is None or not len(h1) \
+                    or not len(m15):
+                return
+            setup = self._live_setup
+            rng_def = None
+            if setup is not None and setup.get("regime") == "range" \
+                    and setup.get("range"):
+                try:
+                    rng_def = RangeDef.from_dict(setup["range"])
+                except Exception:
+                    rng_def = None
+            tracker = self._boundary
+            if tracker is not None and rng_def is None:
+                # No defined range from live_setup.  Keep the
+                # tracker alive only while it is mid-breakout
+                # (BREAKOUT_TREND, or a beyond-1/2 close pending):
+                # a breakout needs its 2nd close + BOS even after
+                # detect_range stops seeing the range.  Otherwise
+                # the range dissolved -> discard, HOLD resumes.
+                if tracker.regime != "breakout_trend" \
+                        and not tracker.breakout_pending:
+                    self._boundary = None
+                    self._boundary_snapshot = {}
+                    tracker = None
+                else:
+                    rng_def = tracker.range_def
+            if tracker is not None and rng_def is not None \
+                    and tracker.regime == "range" \
+                    and not tracker.breakout_pending \
+                    and (rng_def.high, rng_def.low) != \
+                    (tracker.range_def.high, tracker.range_def.low):
+                # New range (edges moved) -> fresh machine.
+                tracker = None
+                self._boundary = None
+                self._boundary_snapshot = {}
+            if tracker is None and rng_def is not None:
+                tracker = self._restore_or_fresh_tracker(
+                    rng_def, h1, m15)
+                self._boundary = tracker
+            if tracker is None:
+                # No range, no tracker: persist the plain regime
+                # (TREND / HOLD) so a restart still sees it.
+                self._persist_regime_state(None)
+                return
+            events = tracker.update(h1, m15)
+            for ev in events:
+                if ev.kind in ("breakout_confirmed",
+                               "false_breakout", "regime_reverted"):
+                    self.journal.log_note(
+                        f"mt5 boundary: {ev.kind} ({ev.edge}) — "
+                        f"{ev.detail}")
+                else:
+                    _log.info("mt5 boundary: %s (%s) — %s",
+                              ev.kind, ev.edge, ev.detail)
+            self._boundary_snapshot = tracker.snapshot()
+            if tracker.regime == "breakout_trend":
+                bias_h4 = 0
+                if setup is not None:
+                    try:
+                        bias_h4 = int(setup.get("bias_h4", 0))
+                    except Exception:
+                        bias_h4 = 0
+                self._live_setup = self._breakout_setup(
+                    tracker, bias_h4=bias_h4)
+                self._live_setup_reason = "armed_breakout_trend"
+            self._persist_regime_state(tracker)
+        except Exception as exc:
+            _log.warning("mt5 boundary update failed (in-memory "
+                         "only this refresh): %s", exc)
+
+    def _restore_or_fresh_tracker(self, rng_def: RangeDef,
+                                 h1, m15) -> BoundaryTracker:
+        """First-use tracker: restore from disk, or rebuild fresh.
+
+        Runs once per process (``_regime_state_loaded``).  A
+        verified state restores the hysteresis clock EXACTLY.
+        A CORRUPT state goes through the checksum-mismatch
+        decision tree (pause vs conservative fallback) — never a
+        silent zero, never fabricated counts.  A MISSING file is
+        a first boot, not corruption: fresh tracker, no pause.
+
+        A fresh tracker ALWAYS starts its cursors at the latest
+        closed bars: it counts only bars that close AFTER it is
+        created.  Replaying history into a fresh machine would
+        fabricate counts (a beyond-close from before the range
+        existed, a wick from an old regime) — the rebuild rule
+        is lock = 0, confirm = 0, cooldown = 0, full stop.
+        """
+        fresh = None
+        if not self._regime_state_loaded:
+            self._regime_state_loaded = True
+            try:
+                state, status, msg = load_regime_state(
+                    self._regime_state_path)
+            except Exception as exc:
+                state, status, msg = None, "corrupt", str(exc)
+            if status == "ok" and state is not None:
+                if state.regime in ("range", "breakout_trend") \
+                        and state.last_range_high is not None \
+                        and state.last_range_low is not None:
+                    tracker = BoundaryTracker(rng_def)
+                    tracker.apply_regime_state(state)
+                    self._regime_state_status = (
+                        f"restored: {state.regime.upper()}, lock "
+                        f"{state.lock_remaining_h1} H1 remaining, "
+                        f"breakout confirm "
+                        f"{state.breakout_confirm_count}/2")
+                    _log.info("mt5 regime state restored: %s",
+                              self._regime_state_status)
+                    self.journal.log_note(
+                        "mt5: regime state restored: "
+                        f"{self._regime_state_status}")
+                    return tracker
+                # Verified state, but TREND/HOLD (no tracker) or no
+                # range stored: nothing to restore, fresh tracker
+                # for the current range.
+                self._regime_state_status = (
+                    f"verified ({state.regime}), fresh tracker")
+                fresh = BoundaryTracker(rng_def)
+            elif status == "corrupt":
+                # Checksum mismatch: decision tree (pause vs
+                # conservative fallback).  Never trade on
+                # compromised memory.
+                self._handle_corrupt_regime_state(status, msg)
+                fresh = BoundaryTracker(rng_def)
+            else:  # missing: first boot, not corruption
+                self._regime_state_status = (
+                    "no regime state file yet — fresh tracker")
+                fresh = BoundaryTracker(rng_def)
+        else:
+            fresh = BoundaryTracker(rng_def)
+        # Fresh machine counts only NEW bars (see docstring).
+        try:
+            if h1 is not None and len(h1):
+                fresh.last_h1_ts = h1.index[-1]
+            if m15 is not None and len(m15):
+                fresh.last_m15_ts = m15.index[-1]
+        except Exception:
+            pass
+        return fresh
+
+    def _handle_corrupt_regime_state(self, status: str,
+                                     msg: str) -> None:
+        """Checksum-mismatch decision tree.  NEVER trade on
+        compromised memory, NEVER fabricate counts, NEVER silently
+        continue.  The branch depends on OPEN RISK, not one
+        blanket rule:
+
+        * Position state untrustworthy (journal corrupt / MT5
+          positions unreadable) -> PAUSE COMPLETELY: no new
+          orders, no management, CRITICAL + Telegram notify,
+          await owner /resume.  The only full-pause case.
+        * Open positions OR pending orders exist -> PAUSE NEW
+          EXECUTION, KEEP MANAGING EXISTING RISK: no new orders,
+          no arming, no regime switch acted on; tick management
+          (breakeven / trailing / partials / SL/TP / expiry /
+          margin shield) keeps working — it reads position
+          state (journal + MT5 positions), NOT regime_state.
+          Rebuild in background; after 2 clean H1 bars + no
+          contradiction with open risk -> auto-resume; if the
+          rebuild contradicts open risk, stay paused until owner
+          /resume or the rebuild stabilises for 4 H1 bars.
+        * No open risk -> CONSERVATIVE REBUILD: re-derive the
+          regime from bars (live_setup already did), lock = 0,
+          confirm = 0, cooldown = 0; no new orders until 2 H1 bars
+          have closed cleanly post-rebuild (observation window);
+          then resume.
+        """
+        # Any armed (unconfirmed) touch was armed on untrusted
+        # memory: drop it, journaled, never erased.
+        if self._pending is not None:
+            self._pending = None
+        trustworthy, why = self._position_state_trustworthy()
+        if not trustworthy:
+            self._regime_pause = "paused_complete"
+            self._regime_pause_reason = why
+            self._regime_state_status = (
+                f"CORRUPT ({status}): {msg} — position state "
+                f"untrusted ({why})")
+            _log.critical(
+                "mt5 regime_state corrupt, PAUSED COMPLETELY: %s; "
+                "position state untrusted (%s)", msg, why)
+            self.journal.log_note(
+                "CRITICAL mt5: regime_state corrupt, PAUSED "
+                f"COMPLETELY — {msg}; position state untrusted "
+                f"({why}); no new orders, no management; manual "
+                "/resume needed")
+            try:
+                self._send_alert(
+                    "🚨 MT5 PAUSED, state corrupt, manual check "
+                    "needed — regime_state checksum mismatch and "
+                    f"position state untrusted ({why}). No new "
+                    "orders, no management. Send /resume after "
+                    "checking.")
+            except Exception as exc:
+                _log.warning("mt5 corrupt-state Telegram notify "
+                             "failed: %s", exc)
+            return
+        if self._open_risk_exists():
+            self._regime_pause = "paused_new"
+            self._regime_pause_reason = (
+                "open positions / pending orders exist")
+            self._regime_observation_remaining = 2
+            self._regime_stable_bars = 0
+            self._regime_stable_signature = None
+            self._regime_state_status = (
+                f"CORRUPT ({status}): {msg} — new execution PAUSED, "
+                f"managing open positions only")
+            _log.error(
+                "mt5 regime_state corrupt, NEW execution PAUSED, "
+                "managing open positions only, awaiting rebuild: %s",
+                msg)
+            self.journal.log_note(
+                "ERROR mt5: regime_state corrupt, NEW execution "
+                "PAUSED, managing open positions only, awaiting "
+                f"rebuild ({msg})")
+            return
+        self._regime_pause = "observation"
+        self._regime_pause_reason = "no open risk — conservative rebuild"
+        self._regime_observation_remaining = 2
+        self._regime_state_status = (
+            f"CORRUPT ({status}): {msg} — rebuilt, observation "
+            f"window 2 H1 bars")
+        _log.warning(
+            "mt5 regime_state corrupt, rebuilt from bars, lock "
+            "reset conservative: %s", msg)
+        self.journal.log_note(
+            "WARNING mt5: regime_state corrupt, rebuilt from "
+            "bars, lock reset conservative — no new orders until "
+            f"2 H1 bars close cleanly ({msg})")
+
+    def _position_state_trustworthy(self) -> tuple[bool, str]:
+        """Is the POSITION state (not the regime state) readable?
+
+        Journal: every line must parse as JSON (``records()``
+        raises on a corrupt line).  MT5: ``executor.positions()``
+        must return.  Called only on the corrupt-regime path.
+        """
+        try:
+            self.journal.records()
+        except Exception as exc:
+            return False, f"journal corrupt: {exc}"
+        if self.executor is None:
+            return False, "no executor — positions unreadable"
+        try:
+            self.executor.positions()
+        except Exception as exc:
+            return False, f"MT5 positions unreadable: {exc}"
+        return True, ""
+
+    def _open_risk_exists(self) -> bool:
+        """Open positions (tracked) OR resting broker pending orders."""
+        try:
+            if self.tick_manager is not None \
+                    and self.tick_manager.tickets():
+                return True
+        except Exception:
+            pass
+        return bool(self._pending_orders)
+
+    def _rebuild_contradicts_open(self) -> bool:
+        """Does the rebuilt regime argue against the open risk?
+
+        Rebuilt TREND / BREAKOUT_TREND whose direction opposes an
+        open position, or a rebuilt RANGE with a sweep confirmed
+        on the edge that would trade against an open position
+        (open LONG + SHORT sweep armed on the high edge, or the
+        mirror).  A RANGE with no sweep confirmed, or HOLD, argues
+        nothing — no contradiction.  Never auto-trade against open
+        risk on rebuilt memory.
+        """
+        try:
+            from .reporting import open_positions
+            opens = open_positions(self.journal)
+        except Exception:
+            return True  # unreadable opens: stay paused (safe side)
+        if not opens:
+            return False
+        open_dirs = {int(o.get("direction") or 0) for o in opens}
+        setup = self._live_setup or {}
+        regime = str(setup.get("regime", ""))
+        if regime in ("trend", "breakout_trend"):
+            direction = int(setup.get("direction", 0) or 0)
+            if direction != 0 and -direction in open_dirs:
+                return True
+            return False
+        if regime == "range":
+            confirmed = set(
+                (self._boundary_snapshot or {}).get(
+                    "sweep_confirmed_edges") or [])
+            # Sweep on the high edge trades SHORT; on low, LONG.
+            if "high" in confirmed and +1 in open_dirs:
+                return True
+            if "low" in confirmed and -1 in open_dirs:
+                return True
+        return False
+
+    def _regime_stable_signature(self) -> str:
+        """Fingerprint of the rebuilt regime for stability counting."""
+        setup = self._live_setup or {}
+        confirmed = sorted(
+            (self._boundary_snapshot or {}).get(
+                "sweep_confirmed_edges") or [])
+        rng = setup.get("range") or {}
+        return (f"{setup.get('regime')}:{setup.get('direction')}:"
+                f"{','.join(confirmed)}:"
+                f"{rng.get('high')}-{rng.get('low')}")
+
+    def _advance_regime_pause(self) -> None:
+        """One clean H1 close of post-rebuild observation / stability.
+
+        Called from the H1-close phase of ``_refresh_bars``.
+        Observation (no open risk): 2 clean H1 bars -> resume.
+        Paused-new (open risk): after the 2-bar observation, no
+        contradiction -> auto-resume; contradiction -> stay paused
+        until owner /resume or 4 H1 bars of stable rebuilt regime.
+        A fresh open position appearing mid-observation escalates
+        observation -> paused_new (the rebuild continues, the
+        contradiction check now applies).
+        """
+        mode = self._regime_pause
+        if mode is None:
+            return
+        if mode == "paused_complete":
+            return  # only owner /resume lifts a complete pause
+        if mode == "observation" and self._open_risk_exists():
+            mode = "paused_new"
+            self._regime_pause = "paused_new"
+            self._regime_pause_reason = (
+                "open risk appeared during observation")
+            self._regime_stable_bars = 0
+            self._regime_stable_signature = None
+            _log.error(
+                "mt5 regime pause escalated observation -> "
+                "paused_new: open risk appeared during rebuild")
+            self.journal.log_note(
+                "ERROR mt5: regime pause escalated: open risk "
+                "appeared during rebuild observation — new "
+                "execution stays PAUSED, managing open positions")
+        if self._regime_observation_remaining > 0:
+            self._regime_observation_remaining -= 1
+            if self._regime_observation_remaining > 0:
+                return
+            # Observation window complete.
+            if mode == "observation":
+                # PendingOrderAudit BEFORE any new orders.
+                self._audit_pending_orders()
+                self._regime_pause = None
+                self._regime_pause_reason = ""
+                self._regime_state_status = (
+                    "re-established, resuming")
+                _log.info("mt5 regime state re-established, "
+                          "resuming")
+                self.journal.log_note(
+                    "mt5: regime state re-established, resuming")
+                return
+            # paused_new: contradiction check decides.
+            if not self._rebuild_contradicts_open():
+                # PendingOrderAudit BEFORE any new orders.
+                self._audit_pending_orders()
+                self._regime_pause = None
+                self._regime_pause_reason = ""
+                self._regime_state_status = (
+                    "re-established, resuming (open risk kept)")
+                _log.info("mt5 regime state re-established, "
+                          "resuming (open risk kept, no "
+                          "contradiction)")
+                self.journal.log_note(
+                    "mt5: regime state re-established, resuming "
+                    "(open risk kept, rebuilt regime does not "
+                    "contradict it)")
+                return
+            _log.error(
+                "mt5 rebuilt regime contradicts open risk — "
+                "staying PAUSED on new orders until /resume or "
+                "4 stable H1 bars")
+            self.journal.log_note(
+                "ERROR mt5: rebuilt regime contradicts open risk "
+                "— staying PAUSED on new orders until /resume or "
+                "4 stable H1 bars")
+            return
+        # Post-observation paused_new with contradiction: stability.
+        if mode == "paused_new":
+            sig = self._regime_stable_signature()
+            if sig == self._regime_stable_signature:
+                self._regime_stable_bars += 1
+            else:
+                self._regime_stable_signature = sig
+                self._regime_stable_bars = 1
+            if self._regime_stable_bars >= 4:
+                # PendingOrderAudit BEFORE any new orders.
+                self._audit_pending_orders()
+                self._regime_pause = None
+                self._regime_pause_reason = ""
+                self._regime_stable_bars = 0
+                self._regime_state_status = (
+                    "re-established, resuming (4 stable H1 bars)")
+                _log.info("mt5 regime state re-established after "
+                          "4 stable H1 bars, resuming")
+                self.journal.log_note(
+                    "mt5: regime state re-established after 4 "
+                    "stable H1 bars, resuming")
+
+    def _breakout_setup(self, tracker: BoundaryTracker, *,
+                        bias_h4: int = 0) -> dict:
+        """Live-setup dict for a confirmed breakout (BREAKOUT_TREND).
+
+        D1 is still flat, so this is NOT a D1 TREND: ``bias_d1``
+        stays 0, and the trend playbooks arm in the breakout
+        direction.  The zone is the broken edge as support /
+        resistance (retest level); size is the tracker's
+        (0.5x until the retest holds, then 1.0x).
+        """
+        rng = tracker.range_def
+        edge = rng.edge_zone(tracker.breakout_edge or "high")
+        return {
+            "regime": "breakout_trend", "bias_d1": 0,
+            "bias_h4": int(bias_h4), "h4_context": "breakout_trend",
+            "direction": int(tracker.breakout_direction),
+            "zone": edge, "edges": rng.edges(),
+            "range": rng.to_dict(),
+            "trigger_edge": tracker.breakout_edge,
+            "ref_level": float(edge["level"]),
+            "atr_h1": float(rng.atr),
+            "buf": float(0.5 * rng.atr),
+            "h4_highs": [], "h4_lows": [], "swing_n": 3,
+            "size_mult": float(tracker.size_mult),
+        }
+
+    def _persist_regime_state(
+            self, tracker: BoundaryTracker | None) -> None:
+        """Atomically persist the regime / hysteresis clock.
+
+        The runner's regime (TREND / RANGE / BREAKOUT_TREND /
+        HOLD) rides on the state; the tracker's counters ride
+        when a tracker exists.  While a regime pause is active
+        (observation / paused_new / paused_complete) NOTHING is
+        persisted: the corrupt file stays corrupt on disk, so a
+        crash mid-pause re-runs the decision tree on the next
+        boot instead of laundering the rebuild as verified
+        state.  Never raises — a persist failure is a WARNING,
+        never a crash.
+        """
+        if self._regime_pause is not None:
+            return  # paused: do not launder the rebuild as verified
+        try:
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone.utc).strftime(
+                "%H:%M:%S")
+            if tracker is not None:
+                state = tracker.to_regime_state()
+            else:
+                state = RegimeState()
+            setup = self._live_setup
+            if setup is not None:
+                state.regime = str(setup.get("regime", "hold"))
+                if setup.get("range"):
+                    rng = setup["range"]
+                    state.last_range_high = float(rng["high"])
+                    state.last_range_low = float(rng["low"])
+                    state.last_range_mid = float(rng["mid"])
+                    state.last_range_atr = float(rng["atr"])
+            else:
+                state.regime = "hold"
+            save_regime_state(self._regime_state_path, state,
+                              saved_at=now)
+            self._regime_state_saved_at = now
+            if not self._regime_state_status.startswith("CORRUPT"):
+                self._regime_state_status = f"persisted {now}"
+        except Exception as exc:
+            _log.warning("mt5 regime state persist failed "
+                         "(in-memory only): %s", exc)
+
+    def _get_zone_store(self) -> ZoneStore | None:
+        """Lazy-open the persistent zone store (journal-adjacent
+        ``zones.db``).  None when unavailable — zones are then
+        skipped, never fatal.  A failed open is remembered (no
+        retry spam every refresh)."""
+        if self._zone_store_failed:
+            return None
+        if self._zone_store is None:
+            try:
+                path = self.cfg.journal_path.parent / "zones.db"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self._zone_store = ZoneStore(path)
+            except Exception as exc:
+                _log.warning("mt5 zone store unavailable: %s", exc)
+                self._zone_store_failed = True
+                return None
+        return self._zone_store  # type: ignore[return-value]
+
+    def _update_zones(self) -> None:
+        """Refresh the multi-day structural zone book — ONE atomic
+        transaction per refresh (see live/zones.py).
+
+        Snapshot the stack's closed-bar frames -> store.apply()
+        (compute outcomes from that snapshot, persist ALL of them
+        in one SQLite transaction) -> swap the in-memory cache
+        (version++, copy-on-write).  A compute/persist failure
+        keeps the OLD cache — never partial.  Journal mitigated /
+        broken zones; log cluster conflicts near price (deduped);
+        annotate the live setup with top MAJOR zones + the MAJOR
+        zone the armed POI coincides with (``major_zone``), the
+        same-direction cluster flag, or ``zone_conflict`` (which
+        clears ``major_zone`` — the engine waits for immediate
+        confirm, never picks historical alone).
+
+        Zones never trigger a trade alone: they are the WHERE.
+        Arming still needs the POI touch + the confirm family
+        (the WHEN).  A broken zone does not switch the regime by
+        itself — the BoundaryTracker owns regime switches.
+        Never raises: a zone failure must not break the refresh.
+        """
+        if self._stack is None:
+            return
+        try:
+            store = self._get_zone_store()
+            if store is None:
+                return
+            frames = self._stack.frames
+            # Idempotency key: max closed-bar timestamp across
+            # frames.  A refresh with no new bars replays to [].
+            tick_id = None
+            for frame in frames.values():
+                if frame is not None and len(frame):
+                    ts = str(frame.index[-1])
+                    if tick_id is None or ts > tick_id:
+                        tick_id = ts
+            if tick_id is None:
+                return
+            if not self._zones_seeded:
+                outcomes = store.seed(frames)
+                self._zones_seeded = True
+            else:
+                outcomes = store.apply(frames, tick_id)
+            zones = store.active_zones()
+            self._zone_cache.swap(zones, outcomes, tick_id,
+                                   reason="bar close")
+            self._structural_zones = zones
+            # H1 ATR for the tick-path cache radii (once per
+            # refresh, never per tick).
+            try:
+                h1 = frames.get("H1")
+                if h1 is not None and len(h1):
+                    self._last_zone_atr = float(atr14(h1))
+            except Exception:
+                pass
+            # Journal mitigated / broken; info-log the rest.
+            for oc in outcomes:
+                if oc.outcome in ("MITIGATED", "BROKEN"):
+                    self.journal.log_note(
+                        f"mt5 zone {oc.outcome}: {oc.detail}")
+                elif oc.outcome in ("EXPIRED", "FADED", "ACTIVATED"):
+                    _log.info("mt5 zone %s: %s", oc.outcome, oc.detail)
+            # Clusters + conflict-near-price logging (deduped).
+            clusters = find_clusters(zones)
+            self._zone_cluster_keys = {
+                z.key for cl in clusters
+                if cl["same_direction"] for z in cl["zones"]}
+            last = self._last_tick or {}
+            mid = last.get("mid")
+            atr = self._last_zone_atr
+            if mid and atr > 0:
+                for cl in clusters:
+                    if not cl["conflict"]:
+                        continue
+                    if not any(abs(z.level - float(mid)) <= 0.5 * atr
+                               for z in cl["zones"]):
+                        continue
+                    sig = tuple(sorted(
+                        (z.tf, round(z.level, 1)) for z in cl["zones"]))
+                    if sig == self._last_zone_conflict_sig:
+                        continue
+                    self._last_zone_conflict_sig = sig
+                    slow = min(cl["zones"],
+                               key=lambda z: _TF_ORDER.index(z.tf)
+                               if z.tf in _TF_ORDER else 99)
+                    fast = max(cl["zones"],
+                               key=lambda z: _TF_ORDER.index(z.tf)
+                               if z.tf in _TF_ORDER else -1)
+                    _log.info(
+                        "zone conflict: multi-year %s %.1f vs fresh "
+                        "%s %.1f, awaiting immediate confirm",
+                        slow.tf, slow.level, fast.tf, fast.level)
+            # Annotate the live setup.
+            setup = self._live_setup
+            if setup is not None:
+                majors = [z.to_dict() for z in
+                          sorted((z for z in zones
+                                  if z.tier == "MAJOR"),
+                                 key=lambda z: -z.score)[:3]]
+                setup["structural_zones"] = majors
+                setup["major_zone"] = self._setup_major_zone(
+                    setup, majors)
+                setup["zone_conflict"] = None
+                levels: list[float] = []
+                zone = setup.get("zone") or {}
+                if zone.get("level") is not None:
+                    levels.append(float(zone["level"]))
+                for edge in setup.get("edges") or []:
+                    if edge.get("level") is not None:
+                        levels.append(float(edge["level"]))
+                if levels and atr > 0:
+                    tol = 0.5 * atr
+                    for cl in clusters:
+                        if not any(
+                                abs(z.level - lv) <= tol
+                                for z in cl["zones"] for lv in levels):
+                            continue
+                        if cl["conflict"]:
+                            setup["zone_conflict"] = {
+                                "levels": [float(z.level)
+                                           for z in cl["zones"]],
+                                "sides": sorted({z.side
+                                                 for z in cl["zones"]}),
+                            }
+                            setup["major_zone"] = None
+                        elif setup.get("major_zone") is not None:
+                            mz = setup["major_zone"]
+                            if any(abs(z.level - float(mz["level"]))
+                                   < 1e-9 for z in cl["zones"]):
+                                mz["cluster"] = True
+                                mz["cluster_score"] = \
+                                    cl["combined_score"]
+        except Exception as exc:
+            _log.warning("mt5 structural zones update failed: %s",
+                         exc)
+
+    def _tick_zone_cache(self, mid: float) -> None:
+        """Per-tick nearby-zone query (in-memory bisect, NO SQLite).
+
+        Updates the /status nearby list + the nearest MAJOR zone
+        within 0.5 ATR (immediate-proximity context).  Never
+        raises, never blocks on the store.
+        """
+        try:
+            atr = self._last_zone_atr
+            if not atr or atr <= 0:
+                return
+            _v, nearby = self._zone_cache.nearby(
+                float(mid), atr, radius_atr=2.0)
+            self._nearby_zones = nearby
+            _v2, majors = self._zone_cache.major_nearby(
+                float(mid), atr, radius_atr=0.5)
+            self._near_major_zone = majors[0] if majors else None
+        except Exception:
+            pass
+
+    @staticmethod
+    def _setup_major_zone(setup: dict, majors: list) -> dict | None:
+        """The MAJOR zone the armed POI coincides with, if any.
+
+        Coincidence = MAJOR level within 0.5x ATR of the setup's
+        POI level (trend) or either range edge (range).  None
+        means the armed POI is not a MAJOR structural zone —
+        the setup still arms (fresh POIs have no touches yet by
+        construction); the score prioritises, it does not gate.
+        """
+        try:
+            atr = float(setup.get("atr_h1", 0.0) or 0.0)
+            tol = 0.5 * atr if atr > 0 else 0.0
+            levels: list[float] = []
+            zone = setup.get("zone") or {}
+            if zone.get("level") is not None:
+                levels.append(float(zone["level"]))
+            for edge in setup.get("edges") or []:
+                if edge.get("level") is not None:
+                    levels.append(float(edge["level"]))
+            for major in majors:
+                if any(abs(float(major["level"]) - lv) <= max(tol, 1e-9)
+                       for lv in levels):
+                    return major
+        except Exception:
+            pass
+        return None
+
+    def zones_line(self) -> str:
+        """Cache version + top MAJOR structural zones + distance to
+        nearest, for /status (see mt5_commands).  Cache line:
+        ``Cache v1234, last update H1 close 14:00, zones applied:
+        D1 BROKEN 4227.5, H1 MITIGATED 4210.0, no partial`` and
+        ``Zone cache: 342 active zones, 3 nearby, last refresh H1
+        close, query p95 0.2ms``.
+        """
+        stats = self._zone_cache.stats()
+        lines = [
+            f"Cache v{stats['version']}, last update "
+            f"{stats['last_refresh_reason']} "
+            f"{stats['last_refresh_ts'][:16] if stats['last_refresh_ts'] else '---'}, "
+            f"zones applied: {stats['last_outcomes'] or 'no changes'}, "
+            f"no partial",
+            f"Zone cache: {stats['n_zones']} active zones, "
+            f"{len(self._nearby_zones)} nearby, last refresh "
+            f"{stats['last_refresh_reason']}, query p95 "
+            f"{stats['p95_ms']:.2f}ms",
+        ]
+        majors = [z for z in self._structural_zones
+                  if z.status == "active" and z.tier == "MAJOR"][:3]
+        if not majors:
+            minors = [z for z in self._structural_zones
+                      if z.status == "active"][:1]
+            if minors:
+                lines.append(
+                    "zones: no MAJOR structural zones — top "
+                    f"MINOR: {minors[0].describe()}")
+            else:
+                lines.append(
+                    "zones: no structural zones (insufficient bars)")
+            return "\n".join(lines)
+        for z in majors:
+            lines.append(
+                f"zones: {z.describe(cluster=z.key in self._zone_cluster_keys)}")
+        last = self._last_tick or {}
+        mid = last.get("mid")
+        if mid:
+            actives = [z for z in self._structural_zones
+                       if z.status == "active"]
+            if actives:
+                nearest = min(actives,
+                              key=lambda z: abs(z.level - mid))
+                lines.append(
+                    f"nearest zone {nearest.level:.1f} "
+                    f"(${abs(mid - nearest.level):.1f} away)")
+        return "\n".join(lines)
 
     def report_feed_status(self, feed_status: dict | None) -> None:
         """Log a feed failure on the SEPARATE FEED_ERROR channel.
@@ -1633,6 +2470,26 @@ class MT5Runner:
                                  f"(${d_high:.1f} from high edge — "
                                  f"SHORT side armed)")
             return line
+        if setup.get("regime") == "breakout_trend":
+            # BREAKOUT_TREND: D1 still flat, range edge broken —
+            # trend playbooks arm in the breakout direction.
+            direction = "LONG" if setup["direction"] > 0 else "SHORT"
+            edge = setup["zone"]
+            snap = self._boundary_snapshot or {}
+            lock = snap.get("lock_remaining_h1", 0)
+            size = float(setup.get("size_mult", 0.5) or 0.5)
+            retest = "held" if snap.get("retest_held") else "pending"
+            line = (f"setup: ARMED BREAKOUT_TREND {direction} · "
+                    f"broke {edge['side']} edge {edge['level']:.1f} "
+                    f"(retest {retest}, size {size:.1f}x, "
+                    f"lock {lock} more H1 bars)")
+            last = self._last_tick or {}
+            mid = last.get("mid")
+            if mid:
+                line += (f" · last price {mid:.1f} "
+                         f"(${abs(mid - edge['level']):.1f} from "
+                         f"broken edge)")
+            return line
         zone = setup["zone"]
         direction = "LONG" if setup["direction"] > 0 else "SHORT"
         context = setup.get("h4_context", "")
@@ -1649,6 +2506,115 @@ class MT5Runner:
             else:
                 line += f" · last price {mid:.1f} INSIDE zone (armed, awaiting POI confirm)"
         return line
+
+    def boundary_line(self) -> str:
+        """Edge-boundary + persisted-state lines for /status.
+
+        Shows the sweep-vs-breakout boundary state (wick awaiting
+        reclaim / breakout closes / retest / lock / cooldown), the
+        persisted hysteresis clock (last saved, lock, confirm
+        count), any active regime pause (never hidden), the state
+        file path, and the last pending-audit summary.  Multi-line
+        (one fact per line); /status joins lines with newlines.
+        """
+        out: list[str] = []
+        snap = self._boundary_snapshot or {}
+        # Regime pause states are NEVER hidden.
+        if self._regime_pause == "observation":
+            done = 2 - max(0, self._regime_observation_remaining)
+            out.append(
+                "Regime state: CORRUPT, rebuilt, new execution "
+                f"PAUSED for 2 H1 bars ({done}/2)")
+        elif self._regime_pause == "paused_new":
+            out.append(
+                "Regime state: CORRUPT, rebuilt — Managing open "
+                "positions only (new execution PAUSED)")
+            if self._regime_observation_remaining <= 0:
+                try:
+                    contra = self._rebuild_contradicts_open()
+                except Exception:
+                    contra = False
+                if contra:
+                    out.append(
+                        "rebuild contradicts open risk — /resume "
+                        "or 4 stable H1 bars to resume "
+                        f"({self._regime_stable_bars}/4)")
+        elif self._regime_pause == "paused_complete":
+            out.append(
+                "Regime state: CORRUPT — PAUSED COMPLETE, manual "
+                "/resume needed (position state untrusted)")
+        elif snap:
+            rng = snap.get("range") or {}
+            atr = float(rng.get("atr") or 0.0)
+            edge_states = snap.get("edge_states") or {}
+            for side in ("high", "low"):
+                level = rng.get(side)
+                if level is None:
+                    continue
+                st = (edge_states.get(side) or {}).get("state",
+                                                      "inside")
+                cooling = (snap.get("cooldown_remaining_h1") or {}
+                           ).get(side, 0)
+                if cooling and cooling > 0:
+                    text = f"cooling ({cooling} H1 left)"
+                elif st == "wick":
+                    text = ("last sweep: wick beyond, awaiting "
+                            "reclaim close")
+                elif st == "sweep_confirmed":
+                    text = "sweep confirmed, armed"
+                elif st == "beyond1":
+                    text = ("Breakout: close beyond 1/2, awaiting "
+                            "2nd close")
+                elif st == "beyond2_no_bos":
+                    text = ("Breakout: close beyond 2/2, awaiting "
+                            "M15 BOS")
+                elif st == "awaiting_retest":
+                    text = "Breakout confirmed, awaiting retest"
+                elif st == "retest_held":
+                    text = "Retest held"
+                elif st == "breakout_no_retest":
+                    text = "Breakout, no retest (0.5x)"
+                else:
+                    text = "inside"
+                out.append(
+                    f"Edge {side.upper()} {float(level):.1f}, "
+                    f"buffer ±{0.25 * atr:.1f} · {text}")
+            lock = int(snap.get("lock_remaining_h1", 0) or 0)
+            if lock > 0:
+                regime = str(snap.get("regime", "")).upper()
+                out.append(
+                    f"Regime locked {regime} for {lock} more "
+                    f"H1 bars")
+            edge = snap.get("breakout_edge")
+            confirm = 0
+            if edge:
+                confirm = int((edge_states.get(edge) or {}).get(
+                    "beyond_closes", 0) or 0)
+            out.append(
+                f"Regime state: {self._regime_state_status}, "
+                f"lock {lock} H1, confirm {confirm}/2")
+        else:
+            out.append(
+                f"Regime state: {self._regime_state_status}")
+        try:
+            import os as _os
+            disp = _os.path.relpath(str(self._regime_state_path))
+        except Exception:
+            disp = str(self._regime_state_path)
+        out.append(f"State file: {disp}")
+        audit = self._last_pending_audit
+        if audit is not None:
+            cancelled = audit.get("cancelled") or {}
+            total_cancelled = sum(cancelled.values())
+            breakdown = ", ".join(
+                f"{n} {k}" for k, n in sorted(cancelled.items())
+                if n > 0) or "none"
+            out.append(
+                "Pending audit on resume: "
+                f"{total_cancelled} cancelled ({breakdown}), "
+                f"{audit.get('kept', 0)} kept, "
+                f"{audit.get('filled', 0)} filled during downtime")
+        return "\n".join(out)
 
     def stack_line(self) -> str:
         """One-line per-TF last closed bar for /status.
@@ -1681,6 +2647,43 @@ class MT5Runner:
     # formulas are unchanged (see
     # live/hierarchy.py::live_setup / check_zone_touch /
     # check_live_trigger) — only the TRIGGER changed.
+
+    def _pending_current_score(self, state, playbooks: dict,
+                                states, t: int, h1
+                                ) -> tuple[float | None, str | None]:
+        """Re-score one pending against CURRENT bars.
+
+        Re-runs the originating playbook's ``live_signal`` on the
+        current H1 frame: the current score is the score of a
+        same-direction signal whose entry sits at this pending's
+        level (within 0.5x its ATR).  Returns ``(score, crash)``:
+
+        - ``(score, None)`` — re-evaluation ran; ``score`` is None
+          when no such signal exists (the setup is gone) or the
+          playbook is unknown (the setup cannot be re-confirmed).
+        - ``(None, error)`` — the re-evaluation CRASHED.  A crash is
+          NOT "gone": callers must fail open on it (decay leaves
+          the pending alone; the audit keeps it and lets the normal
+          machinery re-check).  Never raises.
+        """
+        try:
+            pb = playbooks.get(state.playbook)
+            if pb is None:
+                return None, None
+            for sig in pb.live_signal(states, t, h1) or []:
+                if int(sig.direction) != state.direction:
+                    continue
+                atr = float(getattr(sig, "atr", 0.0) or 0.0)
+                tol = 0.5 * atr if atr > 0 else 0.0
+                if abs(float(sig.entry_ref) - state.level) \
+                        <= max(tol, 1e-9):
+                    return float(sig.score), None
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: pending re-score failed for ticket "
+                f"{state.ticket} (treated as crash, not gone): {exc}")
+            return None, str(exc)
+        return None, None
 
     def _check_pending_score_decay(self, stats: dict) -> None:
         """Score-decay cancellation (owner's-bot PendingOrderTracker):
@@ -1715,22 +2718,14 @@ class MT5Runner:
         playbooks = {pb.name: pb for pb in self._get_playbooks()}
         for ticket, state in list(self._pending_orders.items()):
             try:
-                pb = playbooks.get(state.playbook)
-                if pb is None:
-                    # Playbook unknown: the setup cannot be
-                    # re-confirmed — count it as decayed.
-                    current = None
-                else:
-                    current = None
-                    for sig in pb.live_signal(states, t, h1) or []:
-                        if int(sig.direction) != state.direction:
-                            continue
-                        atr = float(getattr(sig, "atr", 0.0) or 0.0)
-                        tol = 0.5 * atr if atr > 0 else 0.0
-                        if abs(float(sig.entry_ref) - state.level) \
-                                <= max(tol, 1e-9):
-                            current = float(sig.score)
-                            break
+                current, crash = self._pending_current_score(
+                    state, playbooks, states, t, h1)
+                if crash is not None:
+                    # Fail-open: a re-evaluation crash never cancels.
+                    self.journal.log_note(
+                        f"mt5: score-decay check failed for ticket "
+                        f"{ticket} (pending left alone): {crash}")
+                    continue
                 if current is not None and current >= floor:
                     if state.decay_bars:
                         self.journal.log_note(
@@ -1761,6 +2756,282 @@ class MT5Runner:
                 self.journal.log_note(
                     f"mt5: score-decay check failed for ticket "
                     f"{ticket} (pending left alone): {exc}")
+
+    # ------------------------------------------- PendingOrderAudit
+    def _audit_pending_orders(self, stats: dict | None = None
+                              ) -> dict:
+        """Audit resting pending orders on resume from a regime pause.
+
+        Stale pendings NEVER auto-resume: the audit runs BEFORE
+        any new order after a rebuild (auto-resume after the
+        observation window / stable bars, or owner /resume), and
+        every transition out of a regime pause goes through it.
+
+        1. Reconcile: MT5 live pendings + recorded pendings.
+           Filled during downtime (a broker position with this
+           pending's alert_id + magic) -> journal "pending filled
+           during downtime, reconciled", counted, NEVER
+           double-placed (the fill is left for the normal
+           reconcile to record into the position book).
+           Broker-cancelled (neither resting nor filled) ->
+           dropped, counted ``broker_cancelled``.
+        2. Re-validate each survivor against CURRENT state (never
+           pre-pause state): expiry (``pending_expiry_bars``),
+           POI still valid (price not through POI + buffer, POI
+           level still in the current H4 zones), distance
+           (entry vs price > 2.0x ATR14, or price already through
+           the entry — would fill instantly at a bad price),
+           regime still supports the direction, score /
+           manipulation re-evaluated on current bars.
+        3. Cancel stale via MT5 + journal with reason codes
+           (``stale_poi`` / ``expired`` / ``distance`` /
+           ``regime_flip`` / ``score_drop`` /
+           ``filled_during_downtime``) + Telegram per cancel.
+           Keep valid only if ALL checks pass, logged "Pending X
+           kept on resume, still valid".  NEVER reprice: the
+           pending price IS the POI — if the POI moved, cancel +
+           re-arm a fresh setup (the normal tick clock re-arms
+           from current bars on subsequent ticks; the audit
+           itself never places orders or re-arms the same price
+           just because it existed pre-pause).
+
+        Returns the summary dict (also stored on
+        ``_last_pending_audit`` for /status).  Never raises: a
+        failed audit step leaves the pending alone and is
+        journalled (the normal per-tick machinery re-checks it).
+        """
+        stats = stats if stats is not None else {}
+        summary: dict = {"cancelled": {}, "kept": 0, "filled": 0,
+                         "cancel_failed": 0}
+        try:
+            # --- 1. Reconcile: live MT5 vs recorded pendings.
+            try:
+                live_pending = {
+                    o.ticket: o for o in
+                    self.executor.pending_orders(self.cfg.symbol)
+                } if self.executor is not None else {}
+            except Exception as exc:
+                live_pending = {}
+                self.journal.log_note(
+                    "mt5 audit: live pending fetch failed "
+                    f"({exc}) — validating recorded pendings only")
+            try:
+                live_positions = list(self.executor.positions()) \
+                    if self.executor is not None else []
+            except Exception as exc:
+                live_positions = []
+                self.journal.log_note(
+                    "mt5 audit: live positions fetch failed "
+                    f"({exc}) — fill detection skipped")
+            for ticket, state in list(self._pending_orders.items()):
+                filled = any(
+                    getattr(p, "alert_id", None) == state.alert_id
+                    and getattr(p, "magic", None) == self.cfg.magic
+                    for p in live_positions)
+                resting = ticket in live_pending
+                if filled:
+                    summary["filled"] += 1
+                    self.journal.log_note(
+                        f"mt5: pending ticket {ticket} filled "
+                        f"during downtime, reconciled — no "
+                        f"double-place (position kept, normal "
+                        f"reconcile records the fill)")
+                    continue  # left tracked: normal reconcile
+                    # records the fill into the position book
+                if not resting:
+                    del self._pending_orders[ticket]
+                    summary["cancelled"]["broker_cancelled"] = \
+                        summary["cancelled"].get(
+                            "broker_cancelled", 0) + 1
+                    self.journal.log_note(
+                        f"mt5: pending ticket {ticket} gone — "
+                        f"cancelled externally / broker expiry, "
+                        f"no fill (audit)")
+            # --- 2. Re-validate survivors against CURRENT state.
+            h1 = self._stack.frames.get("H1") \
+                if self._stack is not None else None
+            price = (self._last_tick or {}).get("mid")
+            try:
+                atr = float(atr14(h1)) \
+                    if h1 is not None and len(h1) else 0.0
+            except Exception:
+                atr = 0.0
+            for ticket, state in list(self._pending_orders.items()):
+                # Already-filled pendings (step 1) skip validation:
+                # they are positions now, not pendings.
+                if any(getattr(p, "alert_id", None)
+                       == state.alert_id
+                       and getattr(p, "magic", None)
+                       == self.cfg.magic for p in live_positions):
+                    continue
+                reason = self._audit_pending_reason(
+                    state, h1, price, atr)
+                if reason is None:
+                    summary["kept"] += 1
+                    self.journal.log_note(
+                        f"mt5: Pending {ticket} kept on resume, "
+                        f"still valid ({state.kind} @ "
+                        f"{state.level:.2f})")
+                    continue
+                code, detail = reason
+                ok = self._cancel_pending(
+                    ticket, f"resume_audit:{code}: {detail}", stats)
+                if ok:
+                    summary["cancelled"][code] = \
+                        summary["cancelled"].get(code, 0) + 1
+                    self.journal.log_note(
+                        f"mt5: pending ticket {ticket} cancelled "
+                        f"on resume: {code} — {detail}")
+                    try:
+                        self._send_alert(
+                            f"Pending {ticket} cancelled on "
+                            f"resume: {code} — {detail}")
+                    except Exception:
+                        pass
+                else:
+                    summary["cancel_failed"] += 1
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: pending audit failed ({exc}) — pendings "
+                f"left alone, normal machinery re-checks")
+        import datetime as _dt
+        self._last_pending_audit = summary
+        self._last_pending_audit_at = _dt.datetime.now(
+            _dt.timezone.utc).strftime("%H:%M:%S")
+        cancelled = summary["cancelled"]
+        self.journal.log_note(
+            "mt5: pending audit on resume: "
+            f"{sum(cancelled.values())} cancelled "
+            f"({', '.join(f'{n} {k}' for k, n in sorted(cancelled.items()) if n > 0) or 'none'}), "
+            f"{summary['kept']} kept, "
+            f"{summary['filled']} filled during downtime")
+        return summary
+
+    def _audit_pending_reason(self, state, h1, price, atr
+                              ) -> tuple[str, str] | None:
+        """First failing re-validation for one pending, or None (keep).
+
+        Check order (first failure wins the reason): expiry ->
+        POI -> distance/through -> regime -> score/manipulation.
+        """
+        # Expiry: pending_expiry_bars (config) elapsed during
+        # downtime -> stale.
+        last_bar_index = len(h1) - 1 \
+            if h1 is not None and len(h1) else 0
+        if last_bar_index >= state.expiry_bar:
+            return ("expired",
+                    f"expiry_bar {state.expiry_bar} passed "
+                    f"(now {last_bar_index})")
+        # POI still valid?  Price through the POI + buffer kills
+        # it; a POI level that no longer exists in the current H4
+        # zones is a dead setup (never reprice silently).
+        zone = state.zone
+        if zone is None:
+            return ("stale_poi",
+                    "unverifiable POI (adopted pending, no zone)")
+        buf = 0.5 * atr if atr > 0 else 0.0
+        if price is not None:
+            if state.direction > 0 \
+                    and price < float(zone["bottom"]) - buf:
+                return ("stale_poi",
+                        f"price {float(price):.2f} through POI "
+                        f"support {float(zone['bottom']):.2f} "
+                        f"+ buffer")
+            if state.direction < 0 \
+                    and price > float(zone["top"]) + buf:
+                return ("stale_poi",
+                        f"price {float(price):.2f} through POI "
+                        f"resistance {float(zone['top']):.2f} "
+                        f"+ buffer")
+        try:
+            h4 = self._stack.frames.get("H4") \
+                if self._stack is not None else None
+            if h4 is not None and len(h4):
+                zones = zones_by_side(h4, swing_n=3)
+                want = "support" if state.direction > 0 \
+                    else "resistance"
+                cur = zones.get(want)
+                tol = 0.5 * atr if atr > 0 else 0.0
+                if cur is None or abs(
+                        float(cur["level"])
+                        - float(zone["level"])) > max(tol, 1e-9):
+                    return ("stale_poi",
+                            f"POI level {float(zone['level']):.2f} "
+                            f"no longer in current H4 {want} zones")
+        except Exception:
+            pass  # zone recompute failure: fail-open on this check
+        # Distance: entry too far from current price (setup gone),
+        # or price already through the entry (would fill
+        # instantly at a bad price).
+        if price is not None and atr > 0:
+            if abs(float(price) - state.level) > 2.0 * atr:
+                return ("distance",
+                        f"entry {state.level:.2f} vs price "
+                        f"{float(price):.2f} > 2.0x ATR")
+            through = (
+                (state.direction > 0 and state.kind == "limit"
+                 and price <= state.level)
+                or (state.direction > 0 and state.kind == "stop"
+                    and price >= state.level)
+                or (state.direction < 0 and state.kind == "limit"
+                    and price >= state.level)
+                or (state.direction < 0 and state.kind == "stop"
+                    and price <= state.level))
+            if through:
+                return ("distance",
+                        f"price {float(price):.2f} already "
+                        f"through entry {state.level:.2f} — would "
+                        f"fill instantly at a bad price")
+        # Regime still supports the direction?
+        setup = self._live_setup or {}
+        regime = str(setup.get("regime", ""))
+        if not regime or regime == "hold":
+            return ("regime_flip",
+                    "no live setup post-rebuild (HOLD)")
+        if regime in ("trend", "breakout_trend"):
+            if int(setup.get("direction", 0) or 0) != state.direction:
+                return ("regime_flip",
+                        f"rebuilt {regime} direction "
+                        f"{setup.get('direction')} vs pending "
+                        f"{state.direction:+d}")
+        elif regime == "range":
+            confirmed = set(
+                (self._boundary_snapshot or {}).get(
+                    "sweep_confirmed_edges") or [])
+            if state.direction > 0 and "high" in confirmed:
+                return ("regime_flip",
+                        "rebuilt RANGE has SHORT sweep armed, "
+                        "pending is LONG")
+            if state.direction < 0 and "low" in confirmed:
+                return ("regime_flip",
+                        "rebuilt RANGE has LONG sweep armed, "
+                        "pending is SHORT")
+        # Score / manipulation re-evaluated on current bars.
+        if h1 is not None and len(h1):
+            floor = self.cfg.score_decay_floor \
+                if self.cfg.score_decay_floor is not None \
+                else self.cfg.min_score
+            try:
+                states = read_and_featurize(h1, None)
+            except Exception:
+                states = None
+            if states is not None:
+                current, crash = self._pending_current_score(
+                    state,
+                    {pb.name: pb for pb in self._get_playbooks()},
+                    states, len(h1) - 1, h1)
+                if crash is None and (current is None
+                                      or current < floor):
+                    return ("score_drop",
+                            f"re-scored {current} vs floor "
+                            f"{floor:.0f}")
+            if price is not None and atr > 0:
+                blocked, why = chase_blocked(
+                    h1, state.direction, state.level, atr)
+                if blocked:
+                    return ("score_drop",
+                            f"manipulation filter ON: {why}")
+        return None
 
     def _on_h1_close(self, tick: dict, stats: dict) -> None:
         """An H1 close: time stop + pending expiry + forming reset.
@@ -1914,6 +3185,19 @@ class MT5Runner:
         zone = pend["zone"]
         self._invalidated_zone = (pend["direction"], zone["bottom"],
                                   zone["top"])
+        # Boundary cooldown: a Close-Rule invalidation on a range
+        # edge cools that edge for 2 H1 bars (BoundaryTracker).
+        if self._boundary is not None:
+            try:
+                setup = pend.get("setup") or {}
+                if setup.get("regime") == "range":
+                    ev = self._boundary.note_invalidation(
+                        (zone or {}).get("side"))
+                    if ev is not None:
+                        _log.info("mt5 boundary: %s (%s) — %s",
+                                  ev.kind, ev.edge, ev.detail)
+            except Exception:
+                pass
         self._invalidate_pending("invalidation", stats)
 
     @staticmethod
@@ -2018,6 +3302,10 @@ class MT5Runner:
         if self._stack is None:
             return
         mid = float(tick["mid"])
+        # Zone cache: per-tick nearby query (in-memory bisect, no
+        # SQLite) — runs even while paused / holding, so /status
+        # nearby zones stay fresh on every tick.
+        self._tick_zone_cache(mid)
         tick_time = pd.Timestamp(tick["time"])
         bar_open = tick_time.floor("h")
         forming = self._forming
@@ -2071,6 +3359,12 @@ class MT5Runner:
                      mid <= pend["zone"]["bottom"] - buf):
                 self._invalidate_pending("left_zone", stats)
             return
+        # Regime pause (corrupt-state rebuild): no arming, no
+        # breakout fire, no new setups — the rebuild must finish
+        # (2 clean H1 bars) or the owner must /resume first.
+        # Tick management runs elsewhere and is unaffected.
+        if self._regime_pause is not None:
+            return
         # Stale re-arm block: if a previous touch disarmed as stale,
         # price must have EXITED that zone before any re-arm.  The
         # clear runs here (before the setup-None return) so an exit
@@ -2123,26 +3417,30 @@ class MT5Runner:
         # bars (trigger storm).  The next H1 bar is a fresh window.
         if bar_open == self._fired_h1_bar:
             return
-        # RANGE BREAKOUT: a compressed range whose entry-clock bar
-        # just CLOSED beyond an edge fires outward — it never
-        # touches the edge band on the way out, so the touch-arm
-        # below cannot carry it, by construction.  The breakout
-        # bypasses the pending (a pending would die the moment
-        # price left the zone) and goes straight to the signal
-        # path with a resolved outward setup.
-        if setup.get("regime") == "range" \
-                and setup.get("zone") is None:
-            fired = self._range_breakout_fired(setup, tick, bar_open)
-            if fired is not None:
-                self._fired_h1_bar = bar_open
-                stats["triggers"] = stats.get("triggers", 0) + 1
-                self.journal.log_note(
-                    f"mt5: trigger fired range_breakout "
-                    f"{'+' if fired['direction'] > 0 else '-'}1 "
-                    f"@ {fired['entry']:.2f} (H1 bar {bar_open}) — "
-                    f"compressed range breakout")
-                self._run_live_signal(fired, tick, stats)
-                return
+        # BREAKOUT_TREND fire: the boundary machine confirmed the
+        # breakout (2 H1 closes beyond + M15 BOS); the tick clock
+        # fires the outward trade ONCE per confirmed breakout
+        # (breakout_id).  The compression-breakout playbook
+        # re-verifies the pattern on the H1 frame in the signal
+        # path; the tracker is the gate, the playbook is the
+        # scorer.  A single close beyond never fires (see
+        # BoundaryTracker); the old 1-close trigger is gone.
+        if setup.get("regime") == "breakout_trend" \
+                and self._boundary is not None:
+            tracker = self._boundary
+            if tracker.breakout_id != self._breakout_fired_id:
+                self._breakout_fired_id = tracker.breakout_id
+                fired = self._breakout_fired(setup, tick, bar_open)
+                if fired is not None:
+                    self._fired_h1_bar = bar_open
+                    stats["triggers"] = stats.get("triggers", 0) + 1
+                    self.journal.log_note(
+                        f"mt5: trigger fired range_breakout "
+                        f"{'+' if fired['direction'] > 0 else '-'}1 "
+                        f"@ {fired['entry']:.2f} (H1 bar {bar_open}) — "
+                        f"tracker-confirmed breakout (2 closes + BOS)")
+                    self._run_live_signal(fired, tick, stats)
+                    return
         # TRIGGER, REDESIGNED (2026-10-15): a tick AT the POI band
         # arms the pending; the confirmation family decides whether
         # it fires (see _evaluate_pending_entry).  The old
@@ -2177,6 +3475,52 @@ class MT5Runner:
             "armed_bars": 0,
         }
         self._evaluate_pending_entry(tick, stats)
+
+    def _breakout_fired(self, setup: dict, tick: dict,
+                       bar_open) -> dict | None:
+        """Fired dict for a tracker-confirmed breakout.
+
+        The boundary machine already confirmed it (2 H1 closes
+        beyond + M15 BOS); this only packages the outward trade
+        (direction outward, entry = confirm tick, stop just inside
+        the edge, target = measured move edge +/- width) in the
+        same shape as a confirmed pending trigger, so
+        :meth:`_run_live_signal` needs no special case.  The
+        breakout playbook re-verifies the pattern on the H1 frame
+        in the signal path.
+        """
+        if self._stack is None:
+            return None
+        try:
+            rng = RangeDef.from_dict(setup["range"])
+        except Exception:
+            return None
+        direction = int(setup.get("direction", 0) or 0)
+        if direction not in (1, -1):
+            return None
+        mid = float(tick["mid"])
+        buf = float(setup.get("buf") or 0.5 * rng.atr)
+        edge = setup.get("zone") or rng.edge_zone(
+            "high" if direction > 0 else "low")
+        if direction > 0:
+            stop = float(rng.high - buf)
+            target = float(rng.high + rng.width)
+        else:
+            stop = float(rng.low + buf)
+            target = float(rng.low - rng.width)
+        risk = abs(mid - stop)
+        if risk <= 0:
+            return None
+        session = _compose_session(pd.Timestamp(tick["time"]))
+        return {"trigger": "range_breakout",
+                "confirm_shapes": ["range_breakout"],
+                "direction": direction, "entry": float(mid),
+                "stop": stop, "target": target, "risk": float(risk),
+                "level": stop, "zone": edge,
+                "fired_ts": pd.Timestamp(tick["time"]),
+                "h1_open": bar_open,
+                "entry_clock": session["entry_clock"],
+                "setup": setup}
 
     def _evaluate_pending_entry(self, tick: dict, stats: dict) -> None:
         """Confirm an armed zone touch with the POI confirmation family.
@@ -2285,6 +3629,13 @@ class MT5Runner:
         setup = pend.get("setup") or {}
         bias_h4 = int(setup.get("bias_h4", direction))
         h4_context = str(setup.get("h4_context", "") or "")
+        # Regime rides on the verdict: "trend" (default), "range"
+        # (D1 flat + defined range), and the range def itself.
+        # Range verdicts carry bias_d1 == 0 (the D1 bias really is
+        # flat) and size_mult 0.5 (choppy regime = half size).
+        regime = str(setup.get("regime", "trend"))
+        bias_d1 = int(setup.get("bias_d1", direction))
+        size_mult = float(setup.get("size_mult", 1.0) or 1.0)
         state = states[t] if 0 <= t < len(states) else None
         feats = getattr(state, "features", None) \
             if state is not None else None
@@ -2300,7 +3651,16 @@ class MT5Runner:
         mid = float(tick["mid"])
         stop = float(pend["stop"])
         legs = {leg: {"passed": True, "reason": ""} for leg in LEG_ORDER}
-        legs["d1_bias"]["reason"] = f"D1 bias {direction:+d} (closed bars)"
+        if regime == "range":
+            legs["d1_bias"]["reason"] = (
+                "RANGE regime (D1 flat -> range edge)")
+        elif regime == "breakout_trend":
+            legs["d1_bias"]["reason"] = (
+                "BREAKOUT_TREND (D1 flat, range edge broken — "
+                "trend playbooks armed in breakout direction)")
+        else:
+            legs["d1_bias"]["reason"] = \
+                f"D1 bias {direction:+d} (closed bars)"
         legs["h4_agree"]["reason"] = (
             f"H4 {h4_context or 'context'} {bias_h4:+d} (closed) — "
             f"POI supplier, direction stays D1 {direction:+d}")
@@ -2311,8 +3671,28 @@ class MT5Runner:
             f"{pend['entry_clock']} POI confirm"
         return {
             "allowed": True, "blocked_leg": "", "legs": legs,
-            "bias_d1": direction, "bias_h4": bias_h4,
+            "bias_d1": bias_d1, "bias_h4": bias_h4,
             "h4_context": h4_context,
+            "regime": regime, "range": setup.get("range"),
+            "size_mult": size_mult,
+            # Boundary-gate fields (confluence gate): sweep
+            # confirmations + edge cooldowns from the persisted
+            # boundary machine.  A wick alone never passes the
+            # sweep gate; a cooling edge never passes the
+            # cooldown gate.
+            "sweep_confirmed_edges": list(
+                (self._boundary_snapshot or {}).get(
+                    "sweep_confirmed_edges") or []),
+            "cooldown_edges": list(
+                (self._boundary_snapshot or {}).get(
+                    "cooldown_edges") or []),
+            # Multi-day structural zones (historical WHERE):
+            # top MAJOR zones + the MAJOR zone the armed POI
+            # coincides with, if any.  Context only — zones
+            # never trigger a trade alone.
+            "structural_zones": list(
+                (setup.get("structural_zones") or [])[:3]),
+            "major_zone": setup.get("major_zone"),
             "direction": direction, "zone": pend["zone"],
             "trigger": pend["trigger"], "entry": mid,
             "stop": stop, "target": float(pend["target"]),
@@ -2373,6 +3753,17 @@ class MT5Runner:
             self.journal.log_note(
                 "mt5: signal path paused — confirmed entry dropped, "
                 "no order")
+            return
+        # Regime pause (corrupt-state rebuild): evaluate nothing
+        # into orders — the confirmed entry is dropped, tick
+        # management of the held position continues elsewhere.
+        if self._regime_pause is not None:
+            self._record_blocked(
+                f"paused: regime pause ({self._regime_pause}) — "
+                f"confirmed entry dropped")
+            self.journal.log_note(
+                "mt5: signal path regime-paused — confirmed entry "
+                "dropped, no order")
             return
         # Market-closed guard (signal processing): the tick pump
         # delivers nothing while the market is closed, so this is
@@ -2825,12 +4216,52 @@ class MT5Runner:
                 "(breakeven / trail / partial) continues")
 
     def resume_engine(self) -> str:
-        if not self.cfg.paused:
+        """Owner /resume: clear the Telegram pause AND any regime
+        pause.  A regime pause is never cleared silently: every
+        transition out of it runs the PendingOrderAudit first
+        (stale pendings never auto-resume).  A COMPLETE pause
+        (position state untrusted) re-verifies position state
+        first — if still untrusted it stays paused — then audits
+        and drops to the 2-bar observation window.
+        """
+        msgs: list[str] = []
+        if self.cfg.paused:
+            self.cfg.paused = False
+            self._persist_live_config()
+            self.journal.log_note("mt5: engine RESUMED via Telegram")
+            msgs.append("engine RESUMED — new signals live again")
+        if self._regime_pause == "paused_complete":
+            trustworthy, why = self._position_state_trustworthy()
+            if not trustworthy:
+                return ("regime pause NOT lifted — position state "
+                        f"still untrusted ({why}); check + /resume "
+                        "again")
+            self._audit_pending_orders()
+            self._regime_pause = "observation"
+            self._regime_pause_reason = (
+                "owner /resume after complete pause")
+            self._regime_observation_remaining = 2
+            self._regime_stable_bars = 0
+            self._regime_stable_signature = None
+            self.journal.log_note(
+                "mt5: regime pause lifted by owner /resume — "
+                "observation window 2 H1 bars")
+            msgs.append("regime pause -> observation (2 H1 bars, "
+                        "pending audit done)")
+        elif self._regime_pause in ("paused_new", "observation"):
+            self._audit_pending_orders()
+            self._regime_pause = None
+            self._regime_pause_reason = ""
+            self._regime_stable_bars = 0
+            self._regime_stable_signature = None
+            self.journal.log_note(
+                "mt5: regime pause cleared by owner /resume "
+                "(pending audit done)")
+            msgs.append("regime pause cleared by owner — pending "
+                        "audit done")
+        if not msgs:
             return "engine already running"
-        self.cfg.paused = False
-        self._persist_live_config()
-        self.journal.log_note("mt5: engine RESUMED via Telegram")
-        return "engine RESUMED — new signals live again"
+        return "; ".join(msgs)
 
     def cancel_all_pending(self) -> str:
         tickets = list(self._pending_orders)
@@ -3282,6 +4713,17 @@ class MT5Runner:
             # NOT multiplied here — they scale via the layer risk
             # budget, which derives from the (multiplied) base risk.
             lots = self._apply_alignment_multiplier(lots, spec, pb.name)
+            # Regime sizing (base orders only): RANGE regime trades
+            # at 0.5x (choppy regime = smaller).  Same no-multiply
+            # rules as alignment: fixed_lots is an explicit
+            # override and is never multiplied; layers scale via
+            # the layer risk budget, which derives from the
+            # (multiplied) base risk.
+            lots = self._apply_size_multiplier(
+                lots, spec,
+                float((verdict or {}).get("size_mult", 1.0) or 1.0),
+                f"regime {(verdict or {}).get('regime', 'trend')} "
+                f"{pb.name}")
             # News-adaptive sizing: shrink entries in the post-news
             # cooldown blend (1.0 far from news).  Same no-multiply
             # rules as alignment (risk-% base orders only).

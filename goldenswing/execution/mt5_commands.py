@@ -359,6 +359,24 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("🎯", "Live Setup"))
             lines.append(setup_line())
             lines.append("")
+    # Edge boundary (sweep vs breakout) + persisted hysteresis
+    # clock + regime pause + pending-audit summary.  Guarded —
+    # old runners lack it.  Never hidden: a corrupt state /
+    # pause shows here, not behind a healthy-looking setup.
+    if ctrl is not None:
+        boundary_line = getattr(ctrl, "boundary_line", None)
+        if callable(boundary_line):
+            lines.append(fmt_section("🧱", "Boundary"))
+            lines.append(boundary_line())
+            lines.append("")
+    # Multi-day structural zones (top MAJOR).  Guarded — old
+    # runners lack it.
+    if ctrl is not None:
+        zones_line = getattr(ctrl, "zones_line", None)
+        if callable(zones_line):
+            lines.append(fmt_section("🏛️", "Structural Zones"))
+            lines.append(zones_line())
+            lines.append("")
     # Engine state
     lines.append(fmt_section("⚙️", "Engine"))
     if cfg is not None and cfg.get("paused"):

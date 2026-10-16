@@ -456,6 +456,17 @@ class ConfluenceEngine:
            predate the regime field default to "trend", as do
            playbooks without ``regime_scope``.  "hold" verdicts
            never reach here (``allowed`` is False, gate 0 blocks).
+           ``breakout_trend`` counts as ``trend`` for scoping
+           (trend playbooks arm in the breakout direction; the
+           breakout playbook itself is scope "both").
+        0c. sweep confirmation: a playbook with
+           ``requires_sweep_confirmation`` fires only when the
+           verdict lists its edge in ``sweep_confirmed_edges``
+           (wick + close inside + M15 BOS reclaim + FVG, per the
+           boundary machine).  Wick alone never fires.
+        0d. edge cooldown: a range-scoped playbook never fires on
+           an edge listed in the verdict's ``cooldown_edges``
+           (false breakout / Close-Rule invalidation, 2 H1 bars).
         1. session scope (first-class; never fires outside it),
         2. the playbook's required-context tripwire,
         3. the measured hunting-ground exclusions,
@@ -473,11 +484,50 @@ class ConfluenceEngine:
                 return False, reason
             scope = getattr(pb, "regime_scope", "trend") or "trend"
             regime = str(hierarchy_verdict.get("regime", "trend"))
-            if scope != "both" and regime in ("trend", "range") \
-                    and scope != regime:
+            # BREAKOUT_TREND counts as TREND for scoping: trend
+            # playbooks arm in the breakout direction, range
+            # playbooks stop (the breakout playbook itself is
+            # scope "both" and passes either way).
+            effective = "trend" if regime == "breakout_trend" \
+                else regime
+            if scope != "both" and effective in ("trend", "range") \
+                    and scope != effective:
                 return False, (
                     f"regime: {pb.name} is {scope}-scoped, verdict "
                     f"is {regime} regime — no mixing")
+            # Sweep confirmation: wick alone never fires.
+            if getattr(pb, "requires_sweep_confirmation", False):
+                side = "high" if int(signal.direction) < 0 else "low"
+                confirmed = hierarchy_verdict.get(
+                    "sweep_confirmed_edges") or []
+                if side not in confirmed:
+                    return False, (
+                        "sweep_unconfirmed: wick alone — awaiting "
+                        "reclaim close (M15 BOS + FVG) on the "
+                        f"{side} edge")
+            # Edge cooldown: after a false breakout / Close-Rule
+            # invalidation, no range trade on that edge for 2 H1.
+            if scope == "range":
+                side = "high" if int(signal.direction) < 0 else "low"
+                cooling = hierarchy_verdict.get("cooldown_edges") or []
+                if side in cooling:
+                    return False, (
+                        f"cooldown: {side} edge cooling after false "
+                        f"breakout / invalidation — no range trade")
+            # 0e. Narrative chain: a playbook with
+            # requires_narrative_chain fires only with a COMPLETE
+            # chain (ENTRY state at the signal's direction).  A
+            # single pattern alone never trades.
+            if getattr(pb, "requires_narrative_chain", False):
+                from .live.narrative import chain_check
+                narr = hierarchy_verdict.get("narrative")
+                if narr is None:
+                    return False, (
+                        "narrative chain unproven: verdict carries "
+                        "no narrative state — chain never confirmed")
+                ok, why = chain_check(narr, signal.direction)
+                if not ok:
+                    return False, f"narrative: {why}"
         ok, reason = self._session_allowed(pb, signal.index, ctx)
         if not ok:
             return False, reason

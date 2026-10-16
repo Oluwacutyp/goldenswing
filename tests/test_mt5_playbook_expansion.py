@@ -48,10 +48,17 @@ def test_mt5_execute_list_is_exactly_the_validated_set():
     executed = set(MT5RunnerConfig().execute_playbooks)
     # Validated set: the promoted anchor + sleeves + the setups
     # that passed the iron rule (inversion PF 1.11, killzone_open
-    # PF 2.23, judas_swing PF 1.93).
+    # PF 2.23, judas_swing PF 1.93) + the four RANGE-regime
+    # playbooks (D1 flat is a range, not a shutdown).  The range
+    # set is regime-gated (confluence gate 0b): range playbooks
+    # never fire in a TREND verdict, trend playbooks never fire
+    # in a RANGE verdict.
     assert executed == {"sweep_reversal", "fvg_midline",
                         "trendline_retest", "fvg_limit",
-                        "inversion", "killzone_open", "judas_swing"}
+                        "inversion", "killzone_open", "judas_swing",
+                        "range_sweep_reclaim", "range_qm",
+                        "range_mean_reversion",
+                        "range_compression_breakout"}
     # QM M5 stays shadow: unvalidated, annotation only.
     assert "qm_m5" not in executed
     assert QMM5Playbook.live is False
@@ -69,3 +76,15 @@ def test_mt5_execute_list_is_exactly_the_validated_set():
                 InversionPlaybook, KillzoneOpenPlaybook,
                 JudasSwingPlaybook):
         assert cls.live is True
+    # Range playbooks are live AND regime-scoped (never in trend).
+    from goldenswing.playbooks.range_regime import (
+        RangeCompressionBreakoutPlaybook, RangeMeanReversionPlaybook,
+        RangeQMPlaybook, RangeSweepReclaimPlaybook)
+    for cls in (RangeSweepReclaimPlaybook, RangeQMPlaybook,
+                RangeMeanReversionPlaybook):
+        assert cls.live is True
+        assert cls.regime_scope == "range"
+    # The compression-breakout playbook is the boundary playbook:
+    # it trades the breakout moment itself (scope "both").
+    assert RangeCompressionBreakoutPlaybook.live is True
+    assert RangeCompressionBreakoutPlaybook.regime_scope == "both"

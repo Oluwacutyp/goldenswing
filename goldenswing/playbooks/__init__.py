@@ -18,6 +18,7 @@ from .fvg_midline import FVGMidlinePlaybook
 from .inversion import InversionPlaybook
 from .judas_swing import JudasSwingPlaybook
 from .killzone_open import KillzoneOpenPlaybook
+from .narrative import NarrativePlaybook
 from .order_block import OrderBlockPlaybook
 from .qm_d1 import QMD1Playbook
 from .qm_m5 import QMM5Playbook
@@ -59,4 +60,5 @@ __all__ = [
     "JudasSwingPlaybook",
     "OrderBlockPlaybook",
     "KillzoneOpenPlaybook",
+    "NarrativePlaybook",
 ]

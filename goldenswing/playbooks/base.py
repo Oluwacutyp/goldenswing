@@ -106,6 +106,22 @@ class Playbook(abc.ABC):
     #: playbook can never fire in a RANGE verdict.  Default
     #: "trend": every pre-existing playbook is a trend playbook.
     regime_scope: str = "trend"
+    #: True -> this playbook fires only when the boundary machine
+    #: (``live/range.py`` BoundaryTracker) has CONFIRMED a sweep on
+    #: the signal's edge (wick beyond + close inside + M15 BOS
+    #: reclaim + FVG).  A wick alone never arms it.  Enforced by
+    #: ``confluence.ConfluenceEngine.gate_live_signal`` against the
+    #: verdict's ``sweep_confirmed_edges``.  Default False; only the
+    #: range edge sweep playbook opts in.
+    requires_sweep_confirmation: bool = False
+    #: True -> this playbook fires only with a COMPLETE narrative
+    #: chain (``live/narrative.py`` ENTRY state at the signal's
+    #: direction: HTF zone -> sweep -> displacement -> CHoCH/BOS +
+    #: FVG).  A single pattern alone never trades.  Enforced by
+    #: ``confluence.ConfluenceEngine.gate_live_signal`` (gate 0e)
+    #: against the verdict's ``narrative`` state.  Default False;
+    #: only the narrative playbook opts in.
+    requires_narrative_chain: bool = False
     #: minimum base_score for live-book membership (anchor: 60.0).
     live_threshold: float = 60.0
     #: Where this playbook is genuinely good, in the words of its

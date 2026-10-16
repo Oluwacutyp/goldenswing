@@ -202,13 +202,16 @@ class FakeApi:
 
 # ------------------------------------------------------- playbook wiring
 
-def test_get_playbooks_instantiates_all_twelve(tmp_path):
+def test_get_playbooks_instantiates_all_sixteen(tmp_path):
     runner = _runner(tmp_path)
     names = {pb.name for pb in runner._get_playbooks()}
     assert names == {"sweep_reversal", "fvg_midline", "trendline_retest",
                      "fvg_limit", "inversion", "killzone_open",
                      "judas_swing", "turtle_soup", "v_reversal",
-                     "retracement_trap", "order_block", "qm_m5"}
+                     "retracement_trap", "order_block", "qm_m5",
+                     "range_sweep_reclaim", "range_qm",
+                     "range_mean_reversion",
+                     "range_compression_breakout"}
     assert set(runner.cfg.execute_playbooks) <= names
     assert {"turtle_soup", "v_reversal", "retracement_trap",
             "order_block", "qm_m5"} <= names

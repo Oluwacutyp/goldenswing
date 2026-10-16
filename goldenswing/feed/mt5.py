@@ -36,8 +36,11 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import logging
 
 import pandas as pd
+
+_log = logging.getLogger(__name__)
 
 from ..live.hierarchy import STACK_TFS, TF_MINUTES
 
@@ -51,11 +54,22 @@ TRADE_MODE_REAL = 2
 #: weekend / market-closed state; CLOSEONLY (3) accepts closes only.
 SYMBOL_TRADE_MODE_FULL = 4
 
-#: Warm-start bar counts per timeframe (matches the OANDA feed's).
-#: W1 500 (~9.6y) and MN1 300 (25y) both clear the 200 bars the
-#: EMA200 alignment needs, with margin for the broker's history.
+#: Warm-start bar counts per timeframe.
+#:
+#: ROOT CAUSE (2026-10-16, owner-confirmed): the engine was STARVED
+#: OF DATA — 20 D1 bars, short history, no multi-year zones, no
+#: persistent zone memory, H1-centric view.  The bias gate and the
+#: session were SYMPTOMS, not the cause: with 20 D1 bars the D1
+#: structure bias flips on noise and the zone book is empty, so the
+#: engine looks dead.  The fix is data, not gates: fetch 3+ years
+#: everywhere it matters.  D1 2000 (~5.5y), H4 4200 (~2.9y),
+#: H1 2000, W1 500 (~9.6y), MN1 300 (25y) all clear the 3-year
+#: floor with margin for the broker's history.  If the terminal
+#: returns fewer bars than requested, :meth:`MT5Feed.bars_for`
+#: logs a WARNING with the bars returned — never silently uses a
+#: short history.
 _WARM_BARS: dict[str, int] = {
-    "D1": 2000, "H4": 2000, "H1": 2000, "M15": 2000, "M30": 2000,
+    "D1": 2000, "H4": 4200, "H1": 2000, "M15": 2000, "M30": 2000,
     "M5": 2000, "W1": 500, "MN1": 300,
 }
 
@@ -329,6 +343,17 @@ class MT5Feed:
             rates = mt5.copy_rates_from_pos(
                 symbol, self._tf_const(tf), 0, int(count))
             if rates is not None and len(rates) > 0:
+                # Starvation guard: the terminal returned FEWER
+                # bars than requested — log it with the counts,
+                # never silently use a short history.  (The zone
+                # book + hierarchy need 3+ years; a short fetch
+                # is a data outage, not a normal state.)
+                if len(rates) < int(count):
+                    _log.warning(
+                        "MT5 %s %s: terminal returned %d bars, "
+                        "requested %d — short history, zone book "
+                        "will be thinner than 3 years",
+                        symbol, tf, len(rates), int(count))
                 return self._frame(rates)
             last_err = mt5.last_error()
             if attempt < self.cfg.max_fetch_retries:
