@@ -32,7 +32,10 @@ from pathlib import Path
 from ..feed.tick_log import export_tick_history
 from ..feed.mt5 import MT5Feed
 from ..alerts.commands import (CommandContext, CommandResult,
-                              CommandRouter, build_zip_bundle)
+                               CommandRouter, build_zip_bundle,
+                               fmt_code, fmt_feed_line, fmt_next_cta,
+                               fmt_none, fmt_pnl, fmt_progress, fmt_r,
+                               fmt_section)
 from .mt5_config import (EXECUTE_PLAYBOOK_NAMES, SHADOW_PLAYBOOK_NAMES,
                         describe_change, parse_set)
 
@@ -104,9 +107,12 @@ def mt5_confirm_keyboard(token: str) -> dict:
 # keyboard in place, so both surfaces coexist.
 MENU_KEYBOARD: dict = {
     "keyboard": [
-        [{"text": "Status"}, {"text": "Positions"}, {"text": "Pendings"}],
-        [{"text": "Playbooks"}, {"text": "Config"}, {"text": "Trades"}],
-        [{"text": "Harvest"}, {"text": "Pause"}, {"text": "Resume"}],
+        [{"text": "📊 Status"}, {"text": "📈 Positions"},
+         {"text": "⏳ Pendings"}],
+        [{"text": "🎯 Playbooks"}, {"text": "⚙️ Config"},
+         {"text": "📊 Trades"}],
+        [{"text": "📦 Harvest"}, {"text": "⏸️ Pause"},
+         {"text": "▶️ Resume"}],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": False,
@@ -115,6 +121,8 @@ MENU_KEYBOARD: dict = {
 
 #: Reply-keyboard button text (case-insensitive) -> slash command.
 #: Pause / Resume go through the same confirm flow as /pause /resume.
+#: Both the plain labels ("Status") and the emoji labels ("📊 Status")
+#: resolve — the button text Telegram sends back carries the emoji.
 MENU_ALIASES: dict[str, str] = {
     "status": "/status",
     "positions": "/position",
@@ -125,6 +133,15 @@ MENU_ALIASES: dict[str, str] = {
     "harvest": "/harvest",
     "pause": "/pause",
     "resume": "/resume",
+    "📊 status": "/status",
+    "📈 positions": "/position",
+    "⏳ pendings": "/pending",
+    "🎯 playbooks": "/playbooks",
+    "⚙️ config": "/config",
+    "📊 trades": "/trades",
+    "📦 harvest": "/harvest",
+    "⏸️ pause": "/pause",
+    "▶️ resume": "/resume",
 }
 
 
@@ -161,15 +178,18 @@ def _position_lines(ctx: CommandContext) -> list[str]:
     lines: list[str] = []
     if live:
         for p in live:
-            side = "LONG" if (p.get("direction") or 0) > 0 else "SHORT"
+            side = ("LONG 🟢" if (p.get("direction") or 0) > 0
+                    else "SHORT 🔴")
             entry = float(p.get("entry_price") or p.get("entry") or 0)
             stop = float(p.get("sl") or p.get("stop") or 0)
             risk = abs(entry - stop)
             r_now = "?"
             if ctx.last_price and risk > 0:
-                r_now = (f"{(p.get('direction') or 0) * (ctx.last_price - entry) / risk:+.2f}R")
+                r_now = fmt_r((p.get('direction') or 0)
+                              * (ctx.last_price - entry) / risk)
             lines.append(f"#{p.get('ticket', '?')} {p.get('playbook', '?')} "
-                         f"{side} @ {entry:,.1f} sl {stop:,.1f} now ≈{r_now}")
+                         f"{side} @ {fmt_code(f'{entry:,.1f}')} "
+                         f"sl {fmt_code(f'{stop:,.1f}')} now ≈{r_now}")
             layers = p.get("layers") or []
             if len(layers) > 1:
                 legs = " + ".join(
@@ -177,22 +197,25 @@ def _position_lines(ctx: CommandContext) -> list[str]:
                     f"{float(ly.get('entry') or 0):,.1f} "
                     f"({float(ly.get('volume') or 0)} lots)"
                     for ly in layers)
-                lines.append(f"   layers ({len(layers)}): {legs}")
+                lines.append(f"   🧱 layers ({len(layers)}): {legs}")
         return lines
     from ..execution.reporting import open_positions
     journal_opens = open_positions(ctx.journal) if ctx.journal else []
     if not journal_opens:
-        return ["(none)"]
+        return [fmt_none()]
     for o in journal_opens:
-        side = "LONG" if (o.get("direction") or 0) > 0 else "SHORT"
+        side = ("LONG 🟢" if (o.get("direction") or 0) > 0
+                else "SHORT 🔴")
         entry = float(o.get("entry") or 0)
         stop = float(o.get("stop") or 0)
         risk = abs(entry - stop)
         r_now = "?"
         if ctx.last_price and risk > 0:
-            r_now = (f"{(o.get('direction') or 0) * (ctx.last_price - entry) / risk:+.2f}R")
+            r_now = fmt_r((o.get('direction') or 0)
+                          * (ctx.last_price - entry) / risk)
         lines.append(f"#{o.get('ticket', '?')} {o.get('playbook', '?')} {side} "
-                     f"@ {entry:,.1f} sl {stop:,.1f} now ≈{r_now}")
+                     f"@ {fmt_code(f'{entry:,.1f}')} "
+                     f"sl {fmt_code(f'{stop:,.1f}')} now ≈{r_now}")
     return lines
 
 
@@ -200,16 +223,20 @@ def _pending_lines(ctx: CommandContext) -> list[str]:
     """Resting LIMIT / STOP orders the engine is responsible for."""
     pendings = list(getattr(ctx, "pending_orders", None) or [])
     if not pendings:
-        return ["(none)"]
+        return [fmt_none()]
     lines = []
     for p in pendings:
-        side = "LONG" if (p.get("direction") or 0) > 0 else "SHORT"
-        lines.append(f"#{p.get('ticket', '?')} {p.get('kind', '?').upper()} "
+        side = ("LONG 🟢" if (p.get("direction") or 0) > 0
+                else "SHORT 🔴")
+        level = float(p.get("level") or 0)
+        sl = float(p.get("sl") or 0)
+        lines.append(f"#{p.get('ticket', '?')} "
+                     f"{p.get('kind', '?').upper()} "
                      f"{p.get('playbook', '?')} {side} "
-                     f"@ {float(p.get('level') or 0):,.1f} "
+                     f"@ {fmt_code(f'{level:,.1f}')} "
                      f"({float(p.get('volume') or 0)} lots) "
-                     f"SL {float(p.get('sl') or 0):,.1f} "
-                     f"expires H1 bar {p.get('expiry_bar', '?')}")
+                     f"SL {fmt_code(f'{sl:,.1f}')} "
+                     f"expires H1 bar {fmt_code(p.get('expiry_bar', '?'))}")
     return lines
 
 
@@ -222,19 +249,22 @@ def _config_text(ctx: CommandContext) -> str:
                 "Safe keys: fixed_lots, max_layers, manipulation_filter, "
                 "pending_expiry_bars, playbook.<name>.")
     cfg = ctrl.get_live_config()
-    lines = ["MT5 LIVE CONFIG (safe keys only):",
-             f"fixed_lots = "
-             f"{'auto (risk-% sizing)' if cfg.get('fixed_lots') is None else cfg.get('fixed_lots')}",
-             f"max_layers = {cfg.get('max_layers')}",
-             f"manipulation_filter = "
-             f"{'on' if cfg.get('manipulation_filter') else 'off'}",
-             f"pending_expiry_bars = {cfg.get('pending_expiry_bars')}",
-             f"paused = {'yes' if cfg.get('paused') else 'no'}",
-             "", "playbooks:"]
+    lines = [fmt_section("⚙️", "MT5 LIVE CONFIG (safe keys only):"), "",
+             f"`fixed_lots` = "
+             f"{fmt_code('auto (risk-% sizing)') if cfg.get('fixed_lots') is None else fmt_code(cfg.get('fixed_lots'))}",
+             f"`max_layers` = {fmt_code(cfg.get('max_layers'))}",
+             f"`manipulation_filter` = "
+             f"{fmt_code('on' if cfg.get('manipulation_filter') else 'off')}",
+             f"`pending_expiry_bars` = "
+             f"{fmt_code(cfg.get('pending_expiry_bars'))}",
+             f"`paused` = {fmt_code('yes' if cfg.get('paused') else 'no')}",
+             "", fmt_section("🎯", "Playbooks:")]
     for name, enabled in (cfg.get("playbooks") or {}).items():
-        lines.append(f"  {name}: {'on' if enabled else 'off'}")
-    lines += ["", "Change with /set <key> <value> (confirm required).",
-              "Pause is not a /set key — use Pause / Resume."]
+        mark = "✅" if enabled else "⏸️"
+        lines.append(f"  {mark} {name}: {'on' if enabled else 'off'}")
+    lines += ["", "Change with `/set <key> <value>` (confirm required).",
+              "Pause is not a `/set` key — use ⏸️ Pause / ▶️ Resume.",
+              fmt_next_cta("/status", "/playbooks", "/set")]
     return "\n".join(lines)
 
 
@@ -243,17 +273,19 @@ def _config_text(ctx: CommandContext) -> str:
 @mt5_command("/start", "show the persistent bottom menu")
 def _mt5_start(ctx: CommandContext, args: list[str]) -> CommandResult:
     return CommandResult(
-        text=("GoldenSwing MT5 engine — use the menu below, or /help "
+        text=("🤖 GoldenSwing MT5 engine — use the menu below, or /help "
               "for the full command list.  Status / position / pending "
-              "messages carry their own action buttons."),
+              "messages carry their own action buttons.\n"
+              + fmt_next_cta("/status", "/playbooks", "/help")),
         reply_markup=MENU_KEYBOARD)
 
 
 @mt5_command("/menu", "re-show the persistent bottom menu")
 def _mt5_menu(ctx: CommandContext, args: list[str]) -> CommandResult:
     return CommandResult(
-        text="MT5 menu — Status / Positions / Pendings / Playbooks / "
-             "Config / Trades / Harvest / Pause / Resume.",
+        text=("📋 MT5 menu — 📊 Status / 📈 Positions / ⏳ Pendings / "
+              "🎯 Playbooks / ⚙️ Config / 📊 Trades / 📦 Harvest / "
+              "⏸️ Pause / ▶️ Resume."),
         reply_markup=MENU_KEYBOARD)
 
 
@@ -265,30 +297,36 @@ def _mt5_playbooks(ctx: CommandContext, args: list[str]) -> CommandResult:
     if ctrl is not None:
         enabled = (ctrl.get_live_config().get("playbooks") or {})
         counts = (ctrl.blocked_stats().get("signal_counts") or {})
-    lines = ["MT5 PLAYBOOKS (executing = may order; shadow = evaluated + "
-             "logged, never ordered):", ""]
+    lines = [fmt_section("🎯", "MT5 PLAYBOOKS"),
+             "executing = may order · shadow = evaluated + logged, "
+             "never ordered", ""]
     for name in EXECUTE_PLAYBOOK_NAMES:
         on = enabled.get(name, True)
-        lines.append(f"  {name}: executing, "
+        mark = "✅" if on else "⏸️"
+        lines.append(f"  {mark} {name}: executing, "
                      f"{'on' if on else 'off'}, "
                      f"signals {counts.get(name, 0)}")
     for name in SHADOW_PLAYBOOK_NAMES:
         on = enabled.get(name, True)
-        lines.append(f"  {name}: shadow, "
+        mark = "✅" if on else "⏸️"
+        lines.append(f"  {mark} {name}: shadow, "
                      f"{'on' if on else 'off'}, "
                      f"signals {counts.get(name, 0)}")
-    lines += ["", "Toggle with /set playbook.<name> on/off "
-                  "(confirm required)."]
+    lines += ["", "Toggle with `/set playbook.<name> on/off` "
+                  "(confirm required).",
+              fmt_next_cta("/status", "/config", "/set")]
     return CommandResult(text="\n".join(lines),
                          reply_markup=mt5_control_keyboard())
 
 
 @mt5_command("/help", "list the MT5 engine commands")
 def _mt5_help(ctx: CommandContext, args: list[str]) -> CommandResult:
-    lines = ["MT5 engine commands (this engine's own journal/state):"]
+    lines = [fmt_section("📋", "MT5 engine commands"),
+             "This engine's own journal/state:", ""]
     for name in sorted(MT5_COMMANDS):
         desc, _ = MT5_COMMANDS[name]
-        lines.append(f"{name} — {desc}")
+        lines.append(f"`{name}` — {desc}")
+    lines += ["", fmt_next_cta("/status", "/playbooks", "/health")]
     return CommandResult(text="\n".join(lines))
 
 
@@ -296,64 +334,71 @@ def _mt5_help(ctx: CommandContext, args: list[str]) -> CommandResult:
 def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
     from ..execution.reporting import (iter_paper_trades, open_positions)
     fs = ctx.feed_status or {}
-    feed_line = ("feed: OK (MT5 terminal connected)" if fs.get("ok")
-                 else f"feed: STALE — {fs.get('reason', 'no status yet')}")
-    if ctx.last_bar_time:
-        feed_line += f" (last bar {ctx.last_bar_time})"
-    if ctx.last_price:
-        feed_line += f" last price {ctx.last_price:,.1f}"
-
     ctrl = _control(ctx)
     cfg = ctrl.get_live_config() if ctrl is not None else None
+
+    lines = [fmt_section("📊", "MT5 ENGINE STATUS"), ""]
+    # Feed
+    lines.append(fmt_section("📡", "Feed"))
+    lines.append(fmt_feed_line(fs, ctx.last_bar_time, ctx.last_price))
+    lines.append("")
+    # Engine state
+    lines.append(fmt_section("⚙️", "Engine"))
     if cfg is not None and cfg.get("paused"):
-        state_line = ("engine: PAUSED — new signals blocked, tick "
-                      "management (breakeven / trail / partial) continues")
+        lines.append("⏸️ engine: PAUSED — new signals blocked, tick "
+                     "management (breakeven / trail / partial) continues")
     else:
-        state_line = "engine: RUNNING"
-    lines = ["MT5 ENGINE STATUS", feed_line, state_line, ""]
+        lines.append("🟢 engine: RUNNING")
+    lines.append("")
     if ctrl is not None:
         # MacroTrend alignment (D1/W1/MN1): sizing + Golden Swing
         # confirmation state.  Guarded — old runners lack it.
         alignment = getattr(ctrl, "alignment_line", None)
         if callable(alignment):
+            lines.append(fmt_section("🌍", "Macro Alignment"))
             lines.append(alignment())
             lines.append("")
         # DXY correlation: confluence context, never a gate.
         # Guarded — old runners lack it.
         dxy = getattr(ctrl, "dxy_line", None)
         if callable(dxy):
+            lines.append(fmt_section("💵", "DXY"))
             lines.append(dxy())
             lines.append("")
         # Execution health: tick freshness / order latency /
         # slippage.  Guarded — old runners lack it.
         health = getattr(ctrl, "health_line", None)
         if callable(health):
+            lines.append(fmt_section("❤️", "Health"))
             lines.append(health())
             lines.append("")
     if cfg is not None:
+        lines.append(fmt_section("🔧", "Config"))
         lines.append(
-            f"config: fixed_lots="
-            f"{'auto' if cfg.get('fixed_lots') is None else cfg.get('fixed_lots')} "
-            f"max_layers={cfg.get('max_layers')} "
-            f"manipulation_filter="
-            f"{'on' if cfg.get('manipulation_filter') else 'off'} "
-            f"pending_expiry={cfg.get('pending_expiry_bars')} bars")
+            f"config: `fixed_lots=`"
+            f"{fmt_code('auto' if cfg.get('fixed_lots') is None else cfg.get('fixed_lots'))} "
+            f"`max_layers=`{fmt_code(cfg.get('max_layers'))} "
+            f"`manipulation_filter=`"
+            f"{fmt_code('on' if cfg.get('manipulation_filter') else 'off')} "
+            f"`pending_expiry=`{fmt_code(cfg.get('pending_expiry_bars'))} bars")
         lines.append("")
     # Live positions from the terminal (MT5 = source of truth) win
     # over journal opens: they include restart-adopted positions that
     # have no signal record.  Journal opens are the fallback.
-    lines.append("open MT5 positions:")
+    lines.append(fmt_section("📈", "Open Positions"))
     lines += _position_lines(ctx)
     lines.append("")
-    lines.append("pending orders:")
+    lines.append(fmt_section("⏳", "Pending Orders"))
     lines += _pending_lines(ctx)
 
     trades = iter_paper_trades(ctx.journal) if ctx.journal else []
     today = _today_utc()
     todays = [t for t in trades if (t["closed_ts"] or "")[:10] == today]
-    lines += ["", f"today (UTC): {len(todays)} closed, "
-                  f"{sum(t['r_net'] for t in todays):+.2f}R "
-                  f"({sum(t['pnl_money'] for t in todays):+.2f})"]
+    day_r = sum(t["r_net"] for t in todays)
+    day_pnl = sum(t["pnl_money"] for t in todays)
+    lines += ["", fmt_section("📅", "Today (UTC)"),
+              f"today (UTC): {len(todays)} closed, "
+              f"{fmt_r(day_r)} ({fmt_pnl(day_pnl)})"]
     opens = open_positions(ctx.journal) if ctx.journal else []
     if opens:
         last_open = max(opens, key=lambda r: r.get("ts") or "")
@@ -366,39 +411,43 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
     if ctrl is not None:
         stats = ctrl.blocked_stats()
         lines.append("")
-        lines.append("why no trades — blocked legs:")
+        lines.append(fmt_section("🚫", "why no trades — blocked legs:"))
         legs = stats.get("legs") or {}
         if not legs and not stats.get("manipulation_blocked"):
-            lines.append("  (nothing blocked yet)")
+            lines.append(f"  {fmt_none()} (nothing blocked yet)")
         for leg, count in sorted(legs.items(), key=lambda kv: -kv[1]):
-            lines.append(f"  {leg}: {count}")
+            lines.append(f"  ⛔ `{leg}`: {count}")
         if stats.get("manipulation_blocked"):
-            lines.append(f"  manipulation_filter: "
+            lines.append(f"  ⛔ `manipulation_filter`: "
                          f"{stats['manipulation_blocked']}")
         lines.append(f"  last blocked: {stats.get('last') or '(none)'}")
         counts = stats.get("signal_counts") or {}
         lines.append("")
+        lines.append(fmt_section("🎯", "Per-Playbook Signals"))
         lines.append("per-playbook signals (passed gate+score):")
         if not counts:
-            lines.append("  (none yet)")
+            lines.append(f"  {fmt_none()} yet")
         for name in sorted(counts):
-            lines.append(f"  {name}: {counts[name]}")
+            lines.append(f"  🎯 `{name}`: {counts[name]}")
+    lines.append(fmt_next_cta("/playbooks", "/health", "/trades"))
     return CommandResult(text="\n".join(lines),
                          reply_markup=mt5_control_keyboard())
 
 
 @mt5_command("/position", "open MT5 positions with layers")
 def _mt5_position(ctx: CommandContext, args: list[str]) -> CommandResult:
-    lines = ["MT5 OPEN POSITIONS:"]
+    lines = [fmt_section("📈", "MT5 OPEN POSITIONS:"), ""]
     lines += _position_lines(ctx)
+    lines.append(fmt_next_cta("/status", "/pending", "/trades"))
     return CommandResult(text="\n".join(lines),
                          reply_markup=mt5_control_keyboard())
 
 
 @mt5_command("/pending", "resting MT5 pending LIMIT / STOP orders")
 def _mt5_pending(ctx: CommandContext, args: list[str]) -> CommandResult:
-    lines = ["MT5 PENDING ORDERS:"]
+    lines = [fmt_section("⏳", "MT5 PENDING ORDERS:"), ""]
     lines += _pending_lines(ctx)
+    lines.append(fmt_next_cta("/status", "/position", "/cancel_pending"))
     return CommandResult(text="\n".join(lines),
                          reply_markup=mt5_control_keyboard())
 
@@ -467,12 +516,13 @@ def _mt5_trades(ctx: CommandContext, args: list[str]) -> CommandResult:
     trades = iter_paper_trades(ctx.journal)[-n:]
     if not trades:
         return CommandResult(text="no closed MT5 trades yet.")
-    lines = [f"last {len(trades)} MT5 trades:"]
+    lines = [fmt_section("📊", f"last {len(trades)} MT5 trades:"), ""]
     for t in trades:
-        side = "LONG" if t["direction"] > 0 else "SHORT"
+        side = "LONG 🟢" if t["direction"] > 0 else "SHORT 🔴"
         ts = (t["closed_ts"] or "?")[:16].replace("T", " ")
         lines.append(f"{ts} {t['playbook']} {side} "
-                     f"{t['r_net']:+.2f}R ({t['reason']})")
+                     f"{fmt_r(t['r_net'])} ({t['reason']})")
+    lines.append(fmt_next_cta("/status", "/report", "/recap"))
     return CommandResult(text="\n".join(lines))
 
 
@@ -486,7 +536,7 @@ def _mt5_db(ctx: CommandContext, args: list[str]) -> CommandResult:
             if size_mb > 40 else "")
     return CommandResult(
         document=path,
-        caption=f"MT5 journal ({path.name}){note}")
+        caption=f"📓 MT5 journal ({path.name}){note}")
 
 
 @mt5_command("/report", "send the latest MT5 results as a file")
@@ -503,7 +553,7 @@ def _mt5_report(ctx: CommandContext, args: list[str]) -> CommandResult:
             text=f"report build failed: {type(exc).__name__}: {exc}")
     return CommandResult(
         document=path,
-        caption="MT5 engine report (fresh from the MT5 journal)")
+        caption="📊 MT5 engine report (fresh from the MT5 journal)")
 
 
 @mt5_command("/recap", "daily / weekly recap — every closed trade, "
@@ -523,14 +573,33 @@ def _mt5_recap(ctx: CommandContext, args: list[str]) -> CommandResult:
     # Short recaps go out as text; a long week goes out as a file
     # (Telegram truncates long messages — the file loses nothing).
     if len(text) <= 3500 or not ctx.reports_dir:
-        return CommandResult(text=text)
+        header = fmt_section("📅", f"MT5 {period} recap")
+        bar = ""
+        try:
+            from ..execution.reporting import recap_trades
+            now = datetime.now(timezone.utc)
+            window = (timedelta(days=7) if period == "weekly"
+                      else timedelta(days=1))
+            window_trades = recap_trades(ctx.journal, since=now - window,
+                                         until=now)
+            if window_trades:
+                wins = sum(1 for t in window_trades
+                           if t["r_net"] > 0)
+                bar = (f"\n🏆 Win rate: "
+                       f"{fmt_progress(wins / len(window_trades))} "
+                       f"({wins}/{len(window_trades)} wins)")
+        except Exception:
+            bar = ""
+        return CommandResult(
+            text=header + "\n\n" + text + bar
+            + fmt_next_cta("/status", "/trades", "/report"))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     path = Path(ctx.reports_dir) / f"mt5-recap-{period}-{stamp}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     return CommandResult(
         document=path,
-        caption=f"MT5 {period} recap (every closed trade, wins and losses)")
+        caption=f"📅 MT5 {period} recap (every closed trade, wins and losses)")
 
 
 @mt5_command("/ticks", "export the last N days of MT5 tick history as CSV (default 1, max 7)")
@@ -556,7 +625,7 @@ def _mt5_ticks(ctx: CommandContext, args: list[str]) -> CommandResult:
             text=f"tick export failed: {type(exc).__name__}: {exc}")
     return CommandResult(
         document=path,
-        caption=f"MT5 tick history, last {days} day(s): {rows} ticks "
+        caption=f"📈 MT5 tick history, last {days} day(s): {rows} ticks "
                 f"(exactly as seen — no resampling)")
 
 
@@ -605,7 +674,7 @@ def _mt5_d1(ctx: CommandContext, args: list[str]) -> CommandResult:
         span = "no closed bars"
     return CommandResult(
         document=out_path,
-        caption=f"MT5 D1 bars: {len(out)} closed bars, {span} "
+        caption=f"📅 MT5 D1 bars: {len(out)} closed bars, {span} "
                 f"(real MT5 bars — no resampling)")
 
 
@@ -781,7 +850,7 @@ def _mt5_harvest(ctx: CommandContext, args: list[str]) -> CommandResult:
             total_r = f", {book.get('total_r', 0):+.2f}R"
         except Exception:
             pass
-    caption = (f"MT5 harvest {scope} — {n_trades} trades{total_r}, "
+    caption = (f"📦 MT5 harvest {scope} — {n_trades} trades{total_r}, "
                f"{len(files)} files, {manifest['zip_bytes'] // 1024}KB — "
                f"RESULTS.md inside has the full breakdown")
     return CommandResult(document=zip_path, caption=caption)
@@ -813,13 +882,16 @@ def _mt5_journal(ctx: CommandContext, args: list[str]) -> CommandResult:
         records = ctx.journal.records()
     except Exception:
         records = []
-    lines = [f"MT5 journal: {ctx.journal_path or '(unknown path)'}",
+    lines = [fmt_section("📓", "MT5 Journal"),
+             f"journal: {fmt_code(ctx.journal_path or '(unknown path)')}",
              f"records: {len(records)}"]
     if records:
         last = records[-1]
         lines.append(
-            f"last: seq={last.get('seq', '?')} "
-            f"type={last.get('type', '?')} ts={last.get('ts', '?')}")
+            f"last: seq={fmt_code(last.get('seq', '?'))} "
+            f"type={fmt_code(last.get('type', '?'))} "
+            f"ts={fmt_code(last.get('ts', '?'))}")
+    lines.append(fmt_next_cta("/snapshot", "/health", "/status"))
     return CommandResult(text="\n".join(lines))
 
 
@@ -838,27 +910,34 @@ def _mt5_reconcile(ctx: CommandContext, args: list[str]) -> CommandResult:
 @mt5_command("/health", "feed + journal + open positions health")
 def _mt5_health(ctx: CommandContext, args: list[str]) -> CommandResult:
     fs = ctx.feed_status or {}
-    feed_line = ("feed: OK" if fs.get("ok")
-                 else f"feed: STALE — {fs.get('reason', 'no status yet')}")
-    lines = ["MT5 HEALTH", feed_line]
+    lines = [fmt_section("❤️", "MT5 HEALTH"), "",
+             fmt_section("📡", "Feed"),
+             fmt_feed_line(fs, ctx.last_bar_time, ctx.last_price)]
     if ctx.journal is not None:
         try:
-            lines.append(f"journal records: {len(ctx.journal.records())}")
+            lines += ["", fmt_section("📓", "Journal"),
+                      f"journal records: {len(ctx.journal.records())}"]
         except Exception:
             pass
-    lines.append(f"open MT5 positions: {len(ctx.live_positions)}")
-    lines.append(f"pending orders: {len(ctx.pending_orders)}")
+    lines += ["", fmt_section("📈", "Open Positions"),
+              f"open MT5 positions: {len(ctx.live_positions)}",
+              "", fmt_section("⏳", "Pending Orders"),
+              f"pending orders: {len(ctx.pending_orders)}"]
     ctrl = getattr(ctx, "mt5_control", None)
     if ctrl is not None and hasattr(ctrl, "deterministic_status"):
         try:
             det = ctrl.deterministic_status()
+            lines += ["", fmt_section("🧱", "Deterministic Engine")]
             if det.get("enabled"):
                 lines.append(
-                    f"deterministic: {det.get('phase')} "
-                    f"head={det.get('head')} commit={det.get('commit_index')} "
+                    f"deterministic: 🟢 {det.get('phase')} "
+                    f"head={fmt_code(det.get('head'))} "
+                    f"commit={fmt_code(det.get('commit_index'))} "
                     f"unresolved={det.get('unresolved')}")
             else:
-                lines.append(f"deterministic: disabled ({det.get('error')})")
+                lines.append(
+                    f"deterministic: ⚠️ disabled ({det.get('error')})")
         except Exception:
             pass
+    lines.append(fmt_next_cta("/status", "/reconcile", "/journal"))
     return CommandResult(text="\n".join(lines))

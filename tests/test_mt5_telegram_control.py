@@ -625,9 +625,10 @@ def test_start_and_menu_show_persistent_keyboard(tmp_path):
         assert kb["resize_keyboard"] is True
         assert kb["one_time_keyboard"] is False
         rows = [[b["text"] for b in row] for row in kb["keyboard"]]
-        assert rows == [["Status", "Positions", "Pendings"],
-                        ["Playbooks", "Config", "Trades"],
-                        ["Harvest", "Pause", "Resume"]]
+        # Septorch-style: bottom-menu buttons carry emoji labels.
+        assert rows == [["📊 Status", "📈 Positions", "⏳ Pendings"],
+                        ["🎯 Playbooks", "⚙️ Config", "📊 Trades"],
+                        ["📦 Harvest", "⏸️ Pause", "▶️ Resume"]]
 
 
 def test_menu_buttons_route_to_handlers(tmp_path):

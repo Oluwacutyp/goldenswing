@@ -86,6 +86,74 @@ class CommandContext:
     deterministic: object = None        # DeterministicRuntime | None (/health)
 
 
+# ------------------------------------------------- Septorch-style formatting
+# Chat replies are plain text (no HTML — Telegram HTML would leak
+# into WhatsApp-style plain-text surfaces).  Every command reply
+# uses the same vocabulary: emoji section headers, monospace values,
+# ➖ for empty states, ✅/❌/⚠️ for status, and an explicit next-action
+# CTA at the end.  Facts are unchanged — only presentation.
+
+def fmt_section(emoji: str, title: str) -> str:
+    """One emoji section header, e.g. ``📊 MT5 ENGINE STATUS``."""
+    return f"{emoji} {title}"
+
+
+def fmt_none() -> str:
+    """Empty-state line — never a bare ``(none)`` without the marker."""
+    return "➖ (none)"
+
+
+def fmt_r(r: float) -> str:
+    """An R multiple with a sign-coloured marker."""
+    if r > 0:
+        return f"🟢 {r:+.2f}R"
+    if r < 0:
+        return f"🔴 {r:+.2f}R"
+    return f"➖ {r:+.2f}R"
+
+
+def fmt_pnl(pnl: float) -> str:
+    """A money P&L with a sign-coloured marker."""
+    if pnl > 0:
+        return f"🟢 +{pnl:.2f}"
+    if pnl < 0:
+        return f"🔴 {pnl:+.2f}"
+    return f"➖ +{pnl:.2f}"
+
+
+def fmt_code(value) -> str:
+    """A value in monospace backticks (`` `4,176.4` ``)."""
+    return f"`{value}`"
+
+
+def fmt_progress(frac: float, width: int = 10) -> str:
+    """A text progress bar: ``▓▓▓▓▓░░░░░ 50%``."""
+    frac = max(0.0, min(1.0, float(frac)))
+    filled = round(frac * width)
+    return f"{'▓' * filled}{'░' * (width - filled)} {frac * 100:.0f}%"
+
+
+def fmt_next_cta(*commands: str) -> str:
+    """Explicit next-action CTA, e.g. ``➡️ Next: /playbooks • /health``."""
+    return "\n➡️ Next: " + " • ".join(commands)
+
+
+def fmt_feed_line(fs: dict | None, last_bar_time, last_price,
+                  *, label: str = "feed") -> str:
+    """Feed status line with ✅/⚠️ and monospace values."""
+    fs = fs or {}
+    if fs.get("ok"):
+        line = f"{label}: OK ✅ (MT5 terminal connected)"
+    else:
+        line = (f"{label}: STALE ⚠️ — "
+                f"{fs.get('reason', 'no status yet')}")
+    if last_bar_time:
+        line += f" · last bar {fmt_code(last_bar_time)}"
+    if last_price:
+        line += f" · last price {fmt_code(f'{last_price:,.1f}')}"
+    return line
+
+
 def _is_owner(update: dict, owner_chat_id: str | int | None) -> bool:
     if owner_chat_id in (None, ""):
         return False                     # fail closed: unconfigured = nobody
@@ -176,7 +244,7 @@ def _open_position_lines(ctx: CommandContext) -> list[str]:
         return ["(paper executor not attached)"]
     positions = ctx.paper.positions()
     if not positions:
-        return ["(none)"]
+        return [fmt_none()]
     pb_by_alert: dict[str, str] = {}
     if ctx.journal is not None:
         for r in ctx.journal.records():
@@ -184,17 +252,18 @@ def _open_position_lines(ctx: CommandContext) -> list[str]:
                 pb_by_alert[r["alert_id"]] = r.get("playbook", "?")
     lines = []
     for p in positions:
-        side = "LONG" if p.direction > 0 else "SHORT"
+        side = "LONG 🟢" if p.direction > 0 else "SHORT 🔴"
         pb = pb_by_alert.get(p.alert_id, "")
         risk_dist = abs((p.entry_price or 0) - (p.sl or 0))
         r_now = "?"
         if ctx.last_price and risk_dist > 0:
             r_val = p.direction * (ctx.last_price - p.entry_price) \
                 / risk_dist
-            r_now = f"{r_val:+.2f}R"
+            r_now = fmt_r(r_val)
         lines.append(
             f"#{p.ticket} {pb} {side} {p.symbol} {p.volume:.2f} lots "
-            f"@ {p.entry_price:,.1f} sl {p.sl:,.1f} now ≈{r_now}")
+            f"@ {fmt_code(f'{p.entry_price:,.1f}')} "
+            f"sl {fmt_code(f'{p.sl:,.1f}')} now ≈{r_now}")
     return lines
 
 
@@ -202,10 +271,11 @@ def _open_position_lines(ctx: CommandContext) -> list[str]:
 
 @command("/help", "list the commands")
 def _help(ctx: CommandContext, args: list[str]) -> CommandResult:
-    lines = ["GoldenSwing commands:"]
+    lines = [fmt_section("📋", "GoldenSwing commands:"), ""]
     for name in sorted(COMMANDS):
         desc, _ = COMMANDS[name]
-        lines.append(f"{name} — {desc}")
+        lines.append(f"`{name}` — {desc}")
+    lines += ["", fmt_next_cta("/status", "/trades", "/health")]
     return CommandResult(text="\n".join(lines))
 
 
@@ -213,13 +283,11 @@ def _help(ctx: CommandContext, args: list[str]) -> CommandResult:
 def _status(ctx: CommandContext, args: list[str]) -> CommandResult:
     from goldenswing.execution.reporting import iter_paper_trades
     fs = ctx.feed_status or {}
-    feed_line = ("feed: OK" if fs.get("ok")
-                 else f"feed: STALE — {fs.get('reason', 'no status yet')}")
-    if ctx.last_bar_time:
-        feed_line += f" (last bar {ctx.last_bar_time})"
 
-    lines = ["PAPER LOOP STATUS", feed_line, "",
-             "open paper positions:"]
+    lines = [fmt_section("📊", "PAPER LOOP STATUS"), "",
+             fmt_section("📡", "Feed"),
+             fmt_feed_line(fs, ctx.last_bar_time, None), "",
+             fmt_section("📈", "Open Paper Positions")]
     lines += _open_position_lines(ctx)
 
     trades = iter_paper_trades(ctx.journal) if ctx.journal else []
@@ -228,8 +296,9 @@ def _status(ctx: CommandContext, args: list[str]) -> CommandResult:
               if (t["closed_ts"] or "")[:10] == today]
     day_r = sum(t["r_net"] for t in todays)
     day_pnl = sum(t["pnl_money"] for t in todays)
-    lines += ["", f"today (UTC): {len(todays)} closed, "
-                  f"{day_r:+.2f}R ({day_pnl:+.2f})"]
+    lines += ["", fmt_section("📅", "Today (UTC)"),
+              f"today (UTC): {len(todays)} closed, "
+              f"{fmt_r(day_r)} ({fmt_pnl(day_pnl)})"]
     last_open = None
     if ctx.journal:
         opens = [r for r in ctx.journal.records()
@@ -241,6 +310,7 @@ def _status(ctx: CommandContext, args: list[str]) -> CommandResult:
                      f"{last_open.get('ts', '?')}")
     else:
         lines.append("last signal: none journaled yet")
+    lines.append(fmt_next_cta("/trades", "/health", "/report"))
     return CommandResult(text="\n".join(lines))
 
 
@@ -256,12 +326,13 @@ def _trades(ctx: CommandContext, args: list[str]) -> CommandResult:
     trades = iter_paper_trades(ctx.journal)[-n:]
     if not trades:
         return CommandResult(text="no closed paper trades yet.")
-    lines = [f"last {len(trades)} paper trades:"]
+    lines = [fmt_section("📊", f"last {len(trades)} paper trades:"), ""]
     for t in trades:
-        side = "LONG" if t["direction"] > 0 else "SHORT"
+        side = "LONG 🟢" if t["direction"] > 0 else "SHORT 🔴"
         ts = (t["closed_ts"] or "?")[:16].replace("T", " ")
         lines.append(f"{ts} {t['playbook']} {side} "
-                     f"{t['r_net']:+.2f}R ({t['reason']})")
+                     f"{fmt_r(t['r_net'])} ({t['reason']})")
+    lines.append(fmt_next_cta("/status", "/report", "/recap"))
     return CommandResult(text="\n".join(lines))
 
 
@@ -275,7 +346,7 @@ def _db(ctx: CommandContext, args: list[str]) -> CommandResult:
             if size_mb > 40 else "")
     return CommandResult(
         document=path,
-        caption=f"paper journal ({path.name}){note}")
+        caption=f"📓 paper journal ({path.name}){note}")
 
 
 @command("/report", "send the latest backtest/paper results as a file")
@@ -292,7 +363,7 @@ def _report(ctx: CommandContext, args: list[str]) -> CommandResult:
             text=f"report build failed: {type(exc).__name__}: {exc}")
     return CommandResult(
         document=path,
-        caption="GoldenSwing paper-book report (fresh from the journal)")
+        caption="📊 GoldenSwing paper-book report (fresh from the journal)")
 
 
 # ------------------------------------------------------------------ /harvest
@@ -667,13 +738,16 @@ def _journal(ctx: CommandContext, args: list[str]) -> CommandResult:
         records = ctx.journal.records()
     except Exception:
         records = []
-    lines = [f"journal: {ctx.journal_path or '(unknown path)'}",
+    lines = [fmt_section("📓", "Journal"),
+             f"journal: {fmt_code(ctx.journal_path or '(unknown path)')}",
              f"records: {len(records)}"]
     if records:
         last = records[-1]
         lines.append(
-            f"last: seq={last.get('seq', '?')} "
-            f"type={last.get('type', '?')} ts={last.get('ts', '?')}")
+            f"last: seq={fmt_code(last.get('seq', '?'))} "
+            f"type={fmt_code(last.get('type', '?'))} "
+            f"ts={fmt_code(last.get('ts', '?'))}")
+    lines.append(fmt_next_cta("/snapshot", "/health", "/status"))
     return CommandResult(text="\n".join(lines))
 
 
@@ -696,11 +770,13 @@ def _snapshot(ctx: CommandContext, args: list[str]) -> CommandResult:
     snaps = manifest.get("snapshots", [])
     if not snaps:
         return CommandResult(text="snapshot manifest is empty.")
-    lines = ["snapshots (newest first):"]
+    lines = [fmt_section("📸", "Snapshots (newest first):"), ""]
     for s in snaps:
         lines.append(
-            f"N={s.get('watermark')} root={str(s.get('snapshot_root'))[:12]}… "
-            f"chain={str(s.get('chain_n'))[:12]}…")
+            f"N={fmt_code(s.get('watermark'))} "
+            f"root={fmt_code(str(s.get('snapshot_root'))[:12] + '…')} "
+            f"chain={fmt_code(str(s.get('chain_n'))[:12] + '…')}")
+    lines.append(fmt_next_cta("/journal", "/health", "/status"))
     return CommandResult(text="\n".join(lines))
 
 
@@ -710,11 +786,14 @@ def _reconcile(ctx: CommandContext, args: list[str]) -> CommandResult:
     if reconciler is not None:
         unresolved = reconciler.unresolved()
         return CommandResult(
-            text=f"reconciler phase: {reconciler.phase}\n"
-                 f"unresolved: {len(unresolved)}\n"
-                 f"reconciliation_complete: "
-                 f"{reconciler.reconciliation_complete}\n"
-                 f"holding queue: {len(reconciler.holding)}")
+            text="\n".join([
+                fmt_section("🔄", "Reconciliation"),
+                f"reconciler phase: {fmt_code(reconciler.phase)}",
+                f"unresolved: {len(unresolved)}",
+                f"reconciliation_complete: "
+                f"{reconciler.reconciliation_complete}",
+                f"holding queue: {len(reconciler.holding)}",
+                fmt_next_cta("/health", "/journal", "/status")]))
     if ctx.journal is None:
         return CommandResult(text="no journal attached.")
     from goldenswing.execution.reporting import open_positions
@@ -723,37 +802,45 @@ def _reconcile(ctx: CommandContext, args: list[str]) -> CommandResult:
     except Exception:
         opens = []
     return CommandResult(
-        text="no live reconciler attached to this loop.\n"
-             f"journal open positions (unclosed): {len(opens)}\n"
-             "Run the deterministic engine for live "
-             "UNCONFIRMED/UNKNOWN reconciliation status.")
+        text="\n".join([
+            fmt_section("🔄", "Reconciliation"),
+            "no live reconciler attached to this loop.",
+            f"journal open positions (unclosed): {len(opens)}",
+            "Run the deterministic engine for live "
+            "UNCONFIRMED/UNKNOWN reconciliation status.",
+            fmt_next_cta("/health", "/journal", "/status")]))
 
 
 @command("/health", "feed + journal + open positions health")
 def _health(ctx: CommandContext, args: list[str]) -> CommandResult:
     fs = ctx.feed_status or {}
-    feed_line = ("feed: OK" if fs.get("ok")
-                 else f"feed: STALE — {fs.get('reason', 'no status yet')}")
-    lines = ["HEALTH", feed_line]
+    lines = [fmt_section("❤️", "HEALTH"), "",
+             fmt_section("📡", "Feed"),
+             fmt_feed_line(fs, ctx.last_bar_time, ctx.last_price)]
     if getattr(ctx, "deterministic", None) is not None:
         try:
             det = ctx.deterministic.status()
-            lines.append(
-                f"deterministic: {det.get('phase')} head={det.get('head')} "
-                f"commit={det.get('commit_index')} "
-                f"unresolved={det.get('unresolved')}")
+            lines += ["", fmt_section("🧱", "Deterministic Engine"),
+                      f"deterministic: {det.get('phase')} "
+                      f"head={fmt_code(det.get('head'))} "
+                      f"commit={fmt_code(det.get('commit_index'))} "
+                      f"unresolved={det.get('unresolved')}"]
         except Exception:
             pass
     if ctx.journal is not None:
         try:
-            lines.append(f"journal records: {len(ctx.journal.records())}")
+            lines += ["", fmt_section("📓", "Journal"),
+                      f"journal records: {len(ctx.journal.records())}"]
         except Exception:
             pass
     if ctx.paper is not None:
         try:
-            lines.append(f"open paper positions: {len(ctx.paper.positions())}")
+            lines += ["", fmt_section("📈", "Open Paper Positions"),
+                      f"open paper positions: "
+                      f"{len(ctx.paper.positions())}"]
         except Exception:
             pass
+    lines.append(fmt_next_cta("/status", "/reconcile", "/journal"))
     return CommandResult(text="\n".join(lines))
 
 
@@ -783,7 +870,7 @@ def _harvest(ctx: CommandContext, args: list[str]) -> CommandResult:
             total_r = f", {book.get('total_r', 0):+.2f}R"
         except Exception:
             pass
-    caption = (f"harvest {scope} — {n_trades} trades{total_r}, "
+    caption = (f"📦 harvest {scope} — {n_trades} trades{total_r}, "
                f"{len(files)} files, {manifest['zip_bytes'] // 1024}KB — "
                f"RESULTS.md inside has the full breakdown")
     return CommandResult(document=zip_path, caption=caption)
