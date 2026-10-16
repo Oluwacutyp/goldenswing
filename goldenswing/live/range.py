@@ -149,19 +149,18 @@ def detect_range(d1, h4, h1, *, swing_n: int = 3,
 
     ``d1`` is accepted for signature symmetry with the trend path
     (callers pass the whole stack); the range itself is an H4/H1
-    object, so D1 is not read.  ``h4`` may be None when only H1 is
-    available (playbook ``live_signal``): it is resampled from H1,
-    which derives from the same ticks as the real H4 bars.
+    object, so D1 is not read.  ``h4`` MUST be the terminal's own
+    native H4 bars — when it is None this returns None.  There is
+    NO H4-resample fallback: resampling H1 -> H4 fabricates TF
+    structure (real H4 bars have their own opens/closes, session
+    boundaries, gaps).  Callers pass native H4 (the runner threads
+    ``TimeframeStack`` H4 into the range playbooks; the hierarchy
+    passes its sliced native H4).
     """
     if h1 is None or len(h1) < 30:
         return None
     if h4 is None:
-        try:
-            h4 = h1.resample("4h").agg(
-                {"open": "first", "high": "max",
-                 "low": "min", "close": "last"})
-        except Exception:
-            return None
+        return None
     if h4 is None or len(h4) < 2 * swing_n + 5:
         return None
     highs, lows = find_swings(h4["high"].to_numpy(),
@@ -203,6 +202,204 @@ def detect_range(d1, h4, h1, *, swing_n: int = 3,
                     touches_high=touches_high, touches_low=touches_low,
                     compressed=bool(compressed),
                     high_index=int(high_idx), low_index=int(low_idx))
+
+
+def _ewm_atr(trs: list[float], period: int = 14) -> float:
+    """ATR over a TR list, exactly as :func:`multitf.atr14`.
+
+    pandas EWM (adjust=False, alpha=1/period) seeded at the first
+    TR; mean when shorter than the period. The incremental
+    detector uses this on its stored TR history so its ATR matches
+    the stateless path bit-for-bit (up to float rounding).
+    """
+    if not trs:
+        return 0.0
+    if len(trs) < period:
+        return float(sum(trs) / len(trs))
+    ema = float(trs[0])
+    alpha = 1.0 / period
+    for tr in trs[1:]:
+        ema = alpha * float(tr) + (1.0 - alpha) * ema
+    return float(ema)
+
+
+class RangeDetector:
+    """Incremental range detector — the O(n) replacement for
+    calling :func:`detect_range` on a growing prefix per bar.
+
+    The old playbook scan called ``detect_range`` (full-prefix
+    ``find_swings`` + full-prefix ATR) every 24 H1 bars, so a
+    full-history fast-forward was O(n^2). This class keeps the
+    state and only processes NEWLY appended bars:
+
+    - H4 swings: a swing at position ``i`` is confirmed once
+      ``n`` bars exist after it. Positions already confirmable
+      before an update never change (their neighbourhood is
+      fixed), so each update only evaluates candidates in
+      ``[old_len - n, new_len - n)`` — O(new bars * n).
+    - H1 ATR: Wilder's ATR is recursive; each new bar updates it
+      in O(1). TR history (last 40) gives the tail-20 ATR for the
+      compression check, via :func:`_ewm_atr`.
+    - Touches / outside closes / inside bars: computed over the
+      last 120 / 60 / 10 H1 bars kept in a deque — O(1) per
+      ``detect()`` call.
+
+    ``update(h4, h1)`` takes FULL frames and appends only bars
+    newer than the last seen timestamp (idempotent on re-feeds).
+    Frames must be appended in time order and must never be
+    rewritten in place (the runner's stack only appends). ``detect()``
+    returns the same ``RangeDef`` :func:`detect_range` would return
+    on the same full frames (up to float rounding), or None.
+    """
+
+    def __init__(self, *, swing_n: int = 3,
+                 min_touches: int = MIN_TOUCHES,
+                 min_width_atr: float = MIN_WIDTH_ATR) -> None:
+        self.swing_n = int(swing_n)
+        self.min_touches = int(min_touches)
+        self.min_width_atr = float(min_width_atr)
+        self._h4_high: list[float] = []
+        self._h4_low: list[float] = []
+        self._h4_last_ts = None
+        self._swing_highs: list[tuple[int, float]] = []
+        self._swing_lows: list[tuple[int, float]] = []
+        self._h1: list[tuple[float, float, float]] = []  # (h, l, c)
+        self._h1_last_ts = None
+        self._atr = 0.0  # pandas-EWM value once count >= 14
+        self._ema = 0.0  # EWM recursion seeded at the first TR
+        self._atr_count = 0
+        self._prev_close: float | None = None
+        self._trs: list[float] = []  # last 40 true ranges
+
+    # ------------------------------------------------------------ feed
+    def update(self, h4, h1) -> None:
+        """Append newly closed bars from full ``h4`` / ``h1`` frames."""
+        if h4 is not None and len(h4):
+            idx = h4.index
+            for pos in range(len(h4)):
+                ts = idx[pos]
+                if self._h4_last_ts is not None and ts <= self._h4_last_ts:
+                    continue
+                self._h4_last_ts = ts
+                self._h4_high.append(float(h4.iloc[pos]["high"]))
+                self._h4_low.append(float(h4.iloc[pos]["low"]))
+            self._confirm_new_swings()
+        if h1 is not None and len(h1):
+            idx = h1.index
+            for pos in range(len(h1)):
+                ts = idx[pos]
+                if self._h1_last_ts is not None and ts <= self._h1_last_ts:
+                    continue
+                self._h1_last_ts = ts
+                row = h1.iloc[pos]
+                high = float(row["high"])
+                low = float(row["low"])
+                close = float(row["close"])
+                self._h1.append((high, low, close))
+                if self._prev_close is None:
+                    tr = high - low
+                else:
+                    tr = max(high - low,
+                             abs(high - self._prev_close),
+                             abs(low - self._prev_close))
+                self._prev_close = close
+                self._trs.append(tr)
+                if len(self._trs) > 40:
+                    self._trs.pop(0)
+                self._atr_count += 1
+                # pandas EWM (adjust=False, alpha=1/14) seeded at
+                # the first TR — tracked from bar 1 so the value
+                # at bar 14+ matches atr14 exactly. Below 14 bars
+                # atr14 returns the mean instead (see detect()).
+                if self._atr_count == 1:
+                    self._ema = float(tr)
+                else:
+                    self._ema = (tr / 14.0
+                                 + (13.0 / 14.0) * self._ema)
+                self._atr = self._ema
+
+    def _confirm_new_swings(self) -> None:
+        """Confirm swings that became confirmable with the new bars.
+
+        Only candidates in ``[old_len - n, new_len - n)`` are
+        evaluated: positions before that were already confirmable
+        in a previous update (and their verdicts are final).
+        ``_pending_from`` tracks the first not-yet-evaluated
+        position across updates.
+        """
+        n = self.swing_n
+        total = len(self._h4_high)
+        start = getattr(self, "_pending_from", n)
+        end = total - n  # positions [start, end) are now confirmable
+        if end <= start:
+            return
+        for i in range(start, end):
+            lo = i - n
+            hi = i + n + 1
+            h = self._h4_high[i]
+            if all(h > self._h4_high[j] for j in range(lo, hi)
+                   if j != i):
+                self._swing_highs.append((i, h))
+            low = self._h4_low[i]
+            if all(low < self._h4_low[j] for j in range(lo, hi)
+                   if j != i):
+                self._swing_lows.append((i, low))
+        self._pending_from = end
+
+    # ------------------------------------------------------------ detect
+    def detect(self) -> RangeDef | None:
+        """Current range, or None — same contract as detect_range."""
+        if len(self._h1) < 30:
+            return None
+        if not self._swing_highs or not self._swing_lows:
+            return None
+        high_idx, high = self._swing_highs[-1]
+        low_idx, low = self._swing_lows[-1]
+        if not high > low:
+            return None
+        # Below 14 bars atr14 returns the mean of TRs, not the EWM.
+        atr_h1 = self._atr if self._atr_count >= 14 else \
+            (sum(self._trs) / len(self._trs) if self._trs else 0.0)
+        if atr_h1 <= 0:
+            return None
+        width = float(high - low)
+        if width < self.min_width_atr * atr_h1:
+            return None
+        tail = self._h1[-LOOKBACK_H1:]
+        tol = TOUCH_TOL_ATR * atr_h1
+        touches_high = sum(1 for h, _l, _c in tail if h >= high - tol)
+        touches_low = sum(1 for _h, l, _c in tail if l <= low + tol)
+        if touches_high < self.min_touches \
+                or touches_low < self.min_touches:
+            return None
+        recent = self._h1[-60:]
+        outside = sum(1 for _h, _l, c in recent
+                      if c > high or c < low)
+        if outside > MAX_OUTSIDE_CLOSES:
+            return None
+        recent_atr = _ewm_atr(self._trs[-20:])
+        inside = 0
+        last10 = self._h1[-10:]
+        for i in range(1, len(last10)):
+            if last10[i][0] <= last10[i - 1][0] \
+                    and last10[i][1] >= last10[i - 1][1]:
+                inside += 1
+        compressed = (recent_atr < COMPRESS_ATR_RATIO * atr_h1) \
+            or inside >= 3
+        return RangeDef(high=float(high), low=float(low),
+                        mid=float((high + low) / 2.0), width=width,
+                        atr=float(atr_h1),
+                        touches_high=int(touches_high),
+                        touches_low=int(touches_low),
+                        compressed=bool(compressed),
+                        high_index=int(high_idx),
+                        low_index=int(low_idx))
+
+    def reset(self) -> None:
+        """Drop all state (fresh backtest / symbol change)."""
+        self.__init__(swing_n=self.swing_n,
+                      min_touches=self.min_touches,
+                      min_width_atr=self.min_width_atr)
 
 
 def resolve_range_touch(range_def: RangeDef,

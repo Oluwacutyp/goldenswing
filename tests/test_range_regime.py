@@ -172,6 +172,13 @@ def test_check_zone_touch_range_aware():
 
 
 # ------------------------------------------------------------ playbooks
+
+def _h4_of(df):
+    """Native-style H4 frame for a test H1 frame (fixture data)."""
+    return df.resample("4h").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"})
+
+
 def test_range_sweep_reclaim_fires():
     rng, h1 = _range_def()
     atr = rng.atr
@@ -181,6 +188,7 @@ def test_range_sweep_reclaim_fires():
             (4195.0, 4196.0, 4175.0, 4180.0)]
     df = _append_bars(h1, rows)
     pb = RangeSweepReclaimPlaybook()
+    pb.set_h4_frame(_h4_of(df))
     sigs = pb.live_signal([], len(df) - 1, df)
     assert len(sigs) == 1
     sig = sigs[0]
@@ -197,6 +205,7 @@ def test_range_qm_fires():
             (4128.0, 4130.0, 4120.0, 4125.0)]  # break < neckline
     df = _append_bars(h1, rows)
     pb = RangeQMPlaybook()
+    pb.set_h4_frame(_h4_of(df))
     sigs = pb.live_signal([], len(df) - 1, df)
     assert len(sigs) == 1
     assert sigs[0].direction == -1
@@ -212,6 +221,7 @@ def test_range_mean_reversion_fires():
     rows = [(4180.0, hi, 4170.0, 4182.0)]
     df = _append_bars(h1, rows)
     pb = RangeMeanReversionPlaybook()
+    pb.set_h4_frame(_h4_of(df))
     sigs = pb.live_signal([], len(df) - 1, df)
     assert len(sigs) == 1
     assert sigs[0].direction == -1
@@ -230,6 +240,7 @@ def test_range_compression_breakout_fires():
             (4105.0, 4216.0, 4100.0, 4215.0)]  # breakout close
     df = _append_bars(h1, rows)
     pb = RangeCompressionBreakoutPlaybook()
+    pb.set_h4_frame(_h4_of(df))
     sigs = pb.live_signal([], len(df) - 1, df)
     assert len(sigs) == 1
     assert sigs[0].direction == +1

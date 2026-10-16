@@ -13,10 +13,11 @@ verdict is BREAKOUT_TREND.
 
 Shared anatomy (all four):
 
-- The range comes from ``live.range.detect_range`` on the H1 frame
-  (H4 resampled from H1 inside ``detect_range`` when no H4 frame is
-  passed — same ticks, same closes).  A playbook that cannot see a
-  defined range emits nothing: no range, no signal, never a guess.
+- The range comes from the incremental ``RangeDetector`` fed with
+  the terminal's native H4 frame (threaded in by the runner via
+  ``set_h4_frame``) + the H1 frame. No H4 -> no range -> no
+  signal. There is NO H4-resample fallback: resampled H4
+  fabricates TF structure.
 - Every signal points at the range structure: edge-sweep / QM /
   rejection entries stop beyond the edge extreme (+ buffer) and
   target the range mid (or the opposite edge for breakouts, the
@@ -57,7 +58,7 @@ import pandas as pd
 from ..backtest.harness import Outcome, simulate_signal_v2
 from ..contextmap import HuntingGround
 from ..golden.detector import GoldenSignal
-from ..live.range import RangeDef, detect_range
+from ..live.range import RangeDef, RangeDetector, detect_range
 from .base import Candidate, EngineContext, Playbook
 
 STOP_BUFFER_ATR = 0.25
@@ -106,6 +107,21 @@ class _RangeBase(Playbook):
 
     def __init__(self) -> None:
         self._processed = -1  # last bar run through live_signal
+        # Native H4 frame, threaded in by the runner
+        # (``MT5Runner`` sets it from ``TimeframeStack`` before
+        # calling ``live_signal``). No H4 -> no range -> no signal:
+        # there is NO H4-resample fallback anywhere on this path.
+        self._h4 = None
+        self._detector = RangeDetector()
+
+    def set_h4_frame(self, h4) -> None:
+        """Thread the terminal's native H4 frame into the playbook.
+
+        Cheap (stores a reference); the incremental detector does
+        the work in ``_range_upto``. Called by the runner on every
+        signal evaluation — the stack frame grows as bars close.
+        """
+        self._h4 = h4
 
     # -- detection hook: subclasses implement _detect_at(j) -> signal
     def _detect_at(self, o, h, l, c, j: int, range_def: RangeDef,
@@ -113,7 +129,22 @@ class _RangeBase(Playbook):
         raise NotImplementedError
 
     def _range_upto(self, df, j: int) -> RangeDef | None:
-        return detect_range(None, None, df.iloc[:j + 1])
+        """Range as of H1 bar ``j``, via the incremental detector.
+
+        H4 is causally sliced: only H4 bars CLOSED by H1 bar ``j``
+        (open-stamped: index + 240min <= H1 close) feed the
+        detector — no lookahead. The detector only processes
+        newly appended bars, so a full-history fast-forward is
+        O(n) total, not O(n^2) like the old per-bar full-prefix
+        ``detect_range`` calls.
+        """
+        if self._h4 is None:
+            return None
+        h1_close = df.index[j] + pd.Timedelta(minutes=60)
+        h4_closed = self._h4[self._h4.index
+                              <= h1_close - pd.Timedelta(minutes=240)]
+        self._detector.update(h4_closed, df.iloc[:j + 1])
+        return self._detector.detect()
 
     def _scan(self, df, start: int, end: int):
         """Yield signals for bars ``start..end`` (inclusive).

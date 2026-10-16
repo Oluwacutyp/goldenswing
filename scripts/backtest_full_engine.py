@@ -1082,6 +1082,52 @@ def analyze(journal_path: Path, runner, stats: dict,
     sig_reasons = Counter(s.get("reason", "") for s in signals
                           if s.get("decision") == "gated")
 
+    # TP1/TP2/TP3 hit rates (owner addendum 2026-10-16): the journal
+    # carries no explicit "TP" close reason — TPs are banked as
+    # ordered partial closes (reason="partial"). The 1st partial on
+    # a ticket IS its TP1, the 2nd its TP2, the 3rd its TP3 (the
+    # engine banks TPs in order). Hit rate = tickets with >=k
+    # partials / closed tickets. Open-at-end tickets are excluded
+    # from the denominator (their TPs may still be pending) — the
+    # denominator is stated, not hidden.
+    tp_hit_rates: dict[str, dict] = {}
+    for k in (1, 2, 3):
+        hits = sum(1 for t in closed_t
+                   if len(partials.get(t["ticket"], [])) >= k)
+        tp_hit_rates[f"tp{k}"] = {
+            "hits": hits, "denominator": len(closed_t),
+            "rate": round(hits / len(closed_t), 4) if closed_t else 0.0}
+
+    # Regime breakdown (owner addendum): regime is NOT journalled
+    # per trade, so it is derived from the playbook family —
+    # range_* -> RANGE (compression breakout is the boundary
+    # moment -> BREAKOUT), narrative -> NARRATIVE (its regime is
+    # not journalled per trade, so it gets its own bucket rather
+    # than being mislabelled TREND), everything else -> TREND.
+    # The per-playbook table below is the precise breakdown; this
+    # is the regime roll-up of it.
+    def _regime_of(playbook: str) -> str:
+        if "narrative" in playbook:
+            return "NARRATIVE"
+        if playbook == "range_compression_breakout":
+            return "BREAKOUT"
+        if playbook.startswith("range_"):
+            return "RANGE"
+        return "TREND"
+
+    regime_breakdown: dict[str, dict] = {}
+    for t in closed_t:
+        reg = _regime_of(t["playbook"])
+        d = regime_breakdown.setdefault(
+            reg, {"trades": 0, "total_r": 0.0, "wins": 0})
+        d["trades"] += 1
+        d["total_r"] += t["total_r"]
+        d["wins"] += 1 if t["total_r"] > 0 else 0
+    for d in regime_breakdown.values():
+        d["total_r"] = round(d["total_r"], 2)
+        d["win_rate"] = round(d["wins"] / d["trades"], 4) \
+            if d["trades"] else 0.0
+
     # Golden Swing: impossible on this window (W1/MN1 < 200 bars)?
     w1_bars = len(frames["W1"])
     mn1_bars = len(frames["MN1"])
@@ -1110,6 +1156,8 @@ def analyze(journal_path: Path, runner, stats: dict,
             "close_displays": dict(displays),
             "layer_opens": sum(t["layer_opens"] for t in tickets),
         },
+        "tp_hit_rates": tp_hit_rates,
+        "regime_breakdown": regime_breakdown,
         "per_playbook": {k: {"trades": v["trades"],
                              "total_r": round(v["total_r"], 2),
                              "total_dollar": round(v["total_dollar"], 2)}
@@ -1163,6 +1211,17 @@ def print_report(report: dict) -> None:
           f"(${t['total_dollar']:+,.2f}) | avg {t['avg_r']:+.3f}R | "
           f"PF {t['profit_factor']} | max DD {t['max_drawdown_r']:.2f}R")
     print(f"close reasons: {t['close_reasons']}")
+    print(f"TP HIT RATES (partials in order, / closed trades): "
+          + ", ".join(
+              f"{k.upper()} {v['hits']}/{v['denominator']} "
+              f"({v['rate']:.1%})"
+              for k, v in report.get("tp_hit_rates", {}).items()))
+    print(f"REGIME BREAKDOWN (by playbook family): "
+          + ", ".join(
+              f"{reg} {d['trades']} trades {d['total_r']:+.2f}R "
+              f"WR {d['win_rate']:.1%}"
+              for reg, d in report.get(
+                  "regime_breakdown", {}).items()))
     print(f"close displays: {t['close_displays']}")
     print(f"layer opens: {t['layer_opens']}")
     print("\nPER-PLAYBOOK (closed trades):")

@@ -925,8 +925,12 @@ class MT5Runner:
 
         # Fast-forward playbook streaming state over history; past
         # signals are discarded — only the latest close trades.
+        # Range playbooks get the native H4 frame (no resample).
         states = read_and_featurize(h1, None)
         for pb in self._get_playbooks():
+            if hasattr(pb, "set_h4_frame"):
+                pb.set_h4_frame(
+                    self._stack.frames.get("H4"))
             for t2 in range(len(h1)):
                 pb.live_signal(states, t2, h1)
         # Adopt positions the broker already holds with our magic
@@ -3895,6 +3899,10 @@ class MT5Runner:
         them.  Instantiation never orders by itself.
         """
         ctx, engine = sig_ctx
+        # Range playbooks need the native H4 frame (threaded in
+        # here — no H4-resample fallback anywhere on this path).
+        if hasattr(pb, "set_h4_frame"):
+            pb.set_h4_frame(self._stack.frames.get("H4"))
         # Positional, as before: playbook live_signal signatures name
         # the frame parameter differently (df / h1).
         sigs = pb.live_signal(ctx.states, t, h1) or []
