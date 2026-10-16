@@ -23,18 +23,20 @@ explicitly and is always flagged ``ticks: m1_proxy`` in any report.
 It is never presented as real MT5 ticks.
 
 Tick-aggregation fallback (2026-10-16): the terminal often has no
-cached M1/M5/M15/M30 bars for a 3y window (M1 3y is ~1M bars),
-even though it HAS the tick stream. When a sub-hourly TF's bars
-are missing but ticks are present, ``build_bars_from_ticks``
-aggregates the tick stream itself into that TF's OHLC bars
-(open = first bid, high = max bid, low = min bid, close = last
-bid, per minute bucket). This is NOT resampling from H1: it
-aggregates the finest-grained source (ticks — the same stream
-MT5 itself builds bars from), never a coarser bar series. The
-provenance flags every such TF as ``built_from_ticks``. If ticks
-are missing too, loading still blocks. HTF bars (H1/H4/D1/W1/MN1)
-are never built from ticks — they stay native-only, because
-their session boundaries must come from the terminal.
+cached bars for a window (M1 3y is ~1M bars; the owner tried the
+F2 history download and H1 STILL came back empty), even though it
+HAS the tick stream. When ANY TF's bars are missing but ticks are
+present, ``build_bars_from_ticks`` aggregates the tick stream
+itself into that TF's OHLC bars (open = first bid, high = max bid,
+low = min bid, close = last bid, per bucket). This is NOT
+resampling from H1: it aggregates the finest-grained source
+(ticks — the same stream MT5 itself builds bars from), never a
+coarser bar series. The provenance flags every such TF as
+``built_from_ticks``. If ticks are missing too, loading still
+blocks. HTF buckets are aligned to the broker server timezone
+when the terminal reports an offset (``server_utc_offset_hours``);
+without an offset they fall back to UTC buckets, flagged the same
+way — the provenance never hides which TFs were tick-built.
 """
 from __future__ import annotations
 
@@ -65,14 +67,45 @@ TF_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60,
 #: the same symbol so fetch cache and loader never disagree.
 DEFAULT_SYMBOL = "XAUUSDm"
 
-#: Sub-hourly TFs that may be aggregated from the MT5 tick stream
-#: when the terminal has no cached bars for them. HTF bars are
-#: never built this way (session boundaries must come from the
-#: terminal). See module docstring for the tick-aggregation rule.
-BUILDABLE_FROM_TICKS = ("M1", "M5", "M15", "M30")
+#: EVERY timeframe may be aggregated from the MT5 tick stream
+#: when the terminal has no cached bars for it. Ticks are the
+#: source truth and they contain the session boundaries; blocking
+#: on missing native HTF history (the owner tried the F2 download
+#: and H1 still came back empty) was the bug, not missing data.
+#: Tick-built TFs are always flagged ``built_from_ticks`` in the
+#: provenance — never hidden.
+BUILDABLE_FROM_TICKS = ("M1", "M5", "M15", "M30",
+                        "H1", "H4", "D1", "W1", "MN1")
 
 
-def build_bars_from_ticks(ticks_df: pd.DataFrame, tf: str) -> pd.DataFrame:
+def _bucket_times(times: pd.Series, tf: str,
+                  offset_hours: float = 0.0) -> pd.Series:
+    """Bucket boundaries for ``tf`` in broker server time.
+
+    ``times`` are absolute (UTC) tick timestamps. MT5 bars are
+    stamped in server local time, so the bucket grid is computed
+    on ``times + offset`` and shifted back. Without an offset the
+    grid is UTC. H4 buckets are 00/04/08/... server time, D1 is
+    server midnight, W1 is Monday 00:00 server time, MN1 is the
+    1st 00:00 server time.
+    """
+    shifted = times + pd.Timedelta(hours=float(offset_hours))
+    if tf == "W1":
+        bucket = (shifted - pd.to_timedelta(
+            shifted.dt.weekday, unit="D")).dt.floor("D")
+    elif tf == "MN1":
+        bucket = (shifted - pd.to_timedelta(
+            shifted.dt.day - 1, unit="D")).dt.floor("D")
+    elif tf == "D1":
+        bucket = shifted.dt.floor("D")
+    else:
+        bucket = shifted.dt.floor(f"{TF_MINUTES[tf]}min")
+    return bucket - pd.Timedelta(hours=float(offset_hours))
+
+
+def build_bars_from_ticks(ticks_df: pd.DataFrame, tf: str,
+                          server_utc_offset_hours: float = 0.0
+                          ) -> pd.DataFrame:
     """Aggregate an MT5 tick stream into OHLC bars for one TF.
 
     ``ticks_df`` needs ``time`` (datetime), ``bid``, ``ask`` and
@@ -80,19 +113,24 @@ def build_bars_from_ticks(ticks_df: pd.DataFrame, tf: str) -> pd.DataFrame:
     like MT5 chart bars: open = first bid in the bucket, high =
     max bid, low = min bid, close = last bid. ``volume`` is the
     summed tick volume; ``spread`` is the mean ask-bid in the
-    bucket. Buckets are UTC minute boundaries (``floor``) — a
-    bucket contains only ticks inside it, so aggregation is
-    causal with no lookahead. Minutes with no ticks produce no
-    bar (the terminal likewise has no bar without ticks).
+    bucket. Buckets are aligned to broker server time (see
+    :func:`_bucket_times`) — a bucket contains only ticks inside
+    it, so aggregation is causal with no lookahead. Time buckets
+    with no ticks produce no bar (the terminal likewise has no
+    bar without ticks).
     This aggregates the tick stream itself — it never touches a
     coarser bar series, so it is not H1 resampling by another
-    name. Only ``BUILDABLE_FROM_TICKS`` may be built this way.
+    name. Any TF may be built this way; the provenance flags it
+    ``built_from_ticks``. Building H4/W1/MN1 from ticks with a
+    UTC fallback grid (no server offset reported) can shift
+    bucket boundaries vs the terminal's own bars — that is why
+    the flag exists and why native bars are preferred whenever
+    the terminal has them.
     """
     if tf not in BUILDABLE_FROM_TICKS:
         raise ValueError(
-            f"{tf} is not buildable from ticks — only "
-            f"{BUILDABLE_FROM_TICKS} may be aggregated from the "
-            f"tick stream; HTF bars must come from the terminal.")
+            f"{tf} is not a known timeframe — buildable TFs are "
+            f"{BUILDABLE_FROM_TICKS}.")
     if ticks_df is None or len(ticks_df) == 0:
         return pd.DataFrame(columns=["open", "high", "low", "close",
                                      "volume", "real_volume", "spread"])
@@ -109,8 +147,8 @@ def build_bars_from_ticks(ticks_df: pd.DataFrame, tf: str) -> pd.DataFrame:
     if "volume" not in df.columns:
         df["volume"] = 1.0
     df["spread_tick"] = df["ask"].astype(float) - df["bid"].astype(float)
-    minutes = TF_MINUTES[tf]
-    df["bucket"] = df["time"].dt.floor(f"{minutes}min")
+    df["bucket"] = _bucket_times(df["time"], tf,
+                                 server_utc_offset_hours)
     grouped = df.groupby("bucket")
     bars = pd.DataFrame({
         "open": grouped["bid"].first(),
@@ -138,10 +176,13 @@ def _tf_candidates(symbol: str) -> dict[str, tuple[str, ...]]:
     file exists in the repo.
     """
     return {
-        "D1": (f"MT5_{symbol}_D1_native*.csv",),
+        "D1": (f"MT5_{symbol}_D1_native*.csv",
+               f"MT5_{symbol}_D1_from_ticks*.csv",),
         "H4": (f"MT5_{symbol}_H4_native*.csv",
+               f"MT5_{symbol}_H4_from_ticks*.csv",
                "OANDA_XAU_USD_H4_*.csv"),
         "H1": (f"MT5_{symbol}_H1_native*.csv",
+               f"MT5_{symbol}_H1_from_ticks*.csv",
                "OANDA_XAU_USD_H1_*.csv"),
         "M15": (f"MT5_{symbol}_M15_native*.csv",
                 f"MT5_{symbol}_M15_from_ticks*.csv",
@@ -152,8 +193,10 @@ def _tf_candidates(symbol: str) -> dict[str, tuple[str, ...]]:
         "M1": (f"MT5_{symbol}_M1_native*.csv",
                f"MT5_{symbol}_M1_from_ticks*.csv",
                "OANDA_XAU_USD_M1_*.csv"),
-        "W1": (f"MT5_{symbol}_W1_native*.csv",),
-        "MN1": (f"MT5_{symbol}_MN1_native*.csv",),
+        "W1": (f"MT5_{symbol}_W1_native*.csv",
+               f"MT5_{symbol}_W1_from_ticks*.csv",),
+        "MN1": (f"MT5_{symbol}_MN1_native*.csv",
+                f"MT5_{symbol}_MN1_from_ticks*.csv",),
         "M30": (f"MT5_{symbol}_M30_native*.csv",
                 f"MT5_{symbol}_M30_from_ticks*.csv"),
     }
@@ -310,13 +353,11 @@ def load_native_frames(data_dir: Path | None = None,
                        ) -> tuple[dict[str, pd.DataFrame], dict]:
     """Load every required TF from its own native file.
 
-    Returns (frames, provenance). A sub-hourly TF (M1/M5/M15/M30)
-    with no bars file is aggregated from the MT5 tick file when
-    ticks are present (see :func:`build_bars_from_ticks`) and
-    flagged ``built_from_ticks`` in the provenance. Raises
-    MissingNativeData if ANY other TF has no file, or if a
-    buildable TF has no file AND no ticks — no H1 aggregation,
-    no partial run.
+    Returns (frames, provenance). A TF with no bars file is
+    aggregated from the MT5 tick file when ticks are present (see
+    :func:`build_bars_from_ticks`) and flagged ``built_from_ticks``
+    in the provenance. Raises MissingNativeData if ANY TF has no
+    file AND no ticks — no H1 aggregation, no partial run.
     """
     cov = coverage_report(data_dir, symbol)
     missing = [tf for tf, c in cov.items() if c.missing]

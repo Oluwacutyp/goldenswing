@@ -22,7 +22,11 @@ M1/M5/M15/M30 fallback: when the terminal has no cached bars
 for a sub-hourly TF but HAS ticks, that TF's bars are
 aggregated from the tick stream itself (Bid OHLC per minute
 bucket) and flagged ``built_from_ticks`` in the provenance —
-never resampled from H1. No ticks at all still BLOCKS.
+never resampled from H1. The same tick-aggregation fallback
+applies to HTF bars (H1/H4/D1/W1/MN1): ticks are the source
+truth and contain the session boundaries, so a TF with no
+native bars is built from ticks (flagged) instead of blocking.
+No ticks at all still BLOCKS — with diagnostics.
 
 Ticks: real MT5 ``copy_ticks_range`` from the terminal. Without
 real ticks the run refuses unless ``--allow-m1-proxy`` smoke-runs
@@ -340,9 +344,10 @@ def main(argv: list[str] | None = None) -> int:
         if not args.allow_m1_proxy:
             print("BLOCKED — no MT5 tick file. The backtest "
                   "auto-fetches ticks from the running MT5 terminal; "
-                  "if the fetch returned no ticks, download history "
-                  "in the terminal (F2) and rerun. Re-run with "
-                  "--allow-m1-proxy for a labelled smoke run.",
+                  "if the fetch returned no ticks, the fetch error "
+                  "carries diagnostics (terminal / symbol / probe). "
+                  "Re-run with --allow-m1-proxy for a labelled "
+                  "smoke run.",
                   file=sys.stderr)
             return 3
         print("WARNING: NO REAL MT5 TICKS — smoke run on M1 proxy "

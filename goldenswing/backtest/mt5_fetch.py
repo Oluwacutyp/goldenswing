@@ -28,16 +28,21 @@ Ticks are fetched in chunks (default 90 days) so a multi-year
 call per TF (small).
 
 Tick-aggregation fallback (2026-10-16): the terminal often has
-no cached M1/M5/M15/M30 bars for a 3y window even though it
-HAS the tick stream. When a sub-hourly TF's ``copy_rates_range``
-comes back empty but ticks were fetched, the bars for that TF
-are aggregated from the tick stream itself
-(:func:`build_bars_from_ticks`) and cached as
-``MT5_{symbol}_{TF}_from_ticks.csv``, flagged
-``built_from_ticks`` in the manifest. This aggregates ticks —
-the same stream MT5 builds bars from — never H1 bars. HTF bars
-(H1/H4/D1/W1/MN1) with no terminal history still BLOCK with
-the F2 message, and no ticks at all still BLOCKS.
+no cached bars for a window even though it HAS the tick stream
+(the owner tried the F2 history download and H1 STILL came back
+empty). When ANY TF's ``copy_rates_range`` comes back empty but
+ticks were fetched, the bars for that TF are aggregated from the
+tick stream itself (:func:`build_bars_from_ticks`) and cached as
+``MT5_{symbol}_{TF}_from_ticks.csv``, flagged ``built_from_ticks``
+in the manifest. This aggregates ticks — the same stream MT5
+builds bars from — never a coarser bar series. Ticks are the
+source truth and they contain the session boundaries, so HTF
+bars are built this way too (buckets aligned to the broker
+server timezone when the terminal reports one, UTC otherwise).
+Only a window with no ticks at all still BLOCKS — and then it
+blocks WITH diagnostics (terminal/server/symbol state, last
+error, a 30-day H1 probe, requested vs returned range), not
+with a bare "F2 download" message.
 """
 from __future__ import annotations
 
@@ -62,10 +67,13 @@ TF_ATTRS = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5",
             "MN1": "TIMEFRAME_MN1"}
 REQUIRED_TFS = tuple(TF_ATTRS)
 
-#: Sub-hourly TFs whose bars may be aggregated from the fetched
-#: tick stream when the terminal has no cached bars for them.
-#: HTF bars are never built this way — missing HTF history BLOCKS.
-BUILDABLE_FROM_TICKS = ("M1", "M5", "M15", "M30")
+#: EVERY TF's bars may be aggregated from the fetched tick
+#: stream when the terminal has no cached bars for them. Ticks
+#: are the source truth and contain the session boundaries, so
+#: HTF bars are built this way too — blocking on missing native
+#: HTF history (owner tried F2, H1 still empty) was the bug.
+#: Tick-built TFs are always flagged ``built_from_ticks``.
+BUILDABLE_FROM_TICKS = REQUIRED_TFS
 
 #: Default broker symbol for the backtest fetch. The owner's
 #: terminal is Exness, where gold is listed as ``XAUUSDm`` — plain
@@ -82,6 +90,131 @@ MT5_NOT_RUNNING_MSG = (
 
 class MT5Unavailable(RuntimeError):
     """MT5 is not reachable — terminal not running / not logged in."""
+
+
+def _server_utc_offset_hours(mt5) -> float:
+    """Broker server UTC offset in hours, best-effort.
+
+    Reads ``terminal_info().timezone`` when the terminal reports
+    it (MQL5 TERMINAL_TIMEZONE is seconds; some builds report
+    minutes or hours — normalize by magnitude). Returns 0.0
+    (UTC buckets) when the terminal reports nothing usable.
+    Never raises — a missing offset must not block the fetch.
+    """
+    try:
+        raw = getattr(mt5.terminal_info(), "timezone", None)
+    except Exception:
+        return 0.0
+    if raw is None:
+        return 0.0
+    try:
+        raw = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if abs(raw) > 24 * 60:  # seconds
+        return raw / 3600.0
+    if abs(raw) > 24:  # minutes
+        return raw / 60.0
+    return raw  # hours
+
+
+def _copy_rates(mt5, symbol: str, tf_attr: str,
+                start_dt, end_dt) -> tuple[object, str]:
+    """``copy_rates_range`` with a naive-datetime retry.
+
+    MT5 ``copy_rates`` interprets datetimes in broker server
+    time. Passing tz-aware UTC datetimes usually works (epoch is
+    absolute), but some terminal builds treat them differently
+    and return nothing. If the first call comes back empty, retry
+    once with tz-naive datetimes (server-time interpretation) and
+    report which representation was used. Returns (rates, mode)
+    where mode is ``"tz_aware"``, ``"naive_server_time"`` or
+    ``"empty"``.
+    """
+    rates = mt5.copy_rates_range(symbol, tf_attr, start_dt, end_dt)
+    if rates is not None and len(rates) > 0:
+        return rates, "tz_aware"
+    naive_start = start_dt.replace(tzinfo=None) \
+        if getattr(start_dt, "tzinfo", None) else start_dt
+    naive_end = end_dt.replace(tzinfo=None) \
+        if getattr(end_dt, "tzinfo", None) else end_dt
+    rates = mt5.copy_rates_range(symbol, tf_attr,
+                                 naive_start, naive_end)
+    if rates is not None and len(rates) > 0:
+        return rates, "naive_server_time"
+    return rates, "empty"
+
+
+def diagnose_mt5(mt5, symbol: str, start, end) -> dict:
+    """Why is MT5 returning nothing? Collect the evidence.
+
+    Returns terminal state (connected / server / trade_allowed /
+    build), symbol state (visible / select / trade mode),
+    ``last_error()``, and a 30-day H1 probe (rows returned for
+    the most recent 30 days — if the probe returns rows while
+    the 3y window returns none, the broker's history is depth-
+    limited, not missing). Never raises — every field is guarded,
+    because a diagnostics call must never be the thing that
+    breaks the fetch. Collected lazily on failure paths only, so
+    a healthy fetch makes no extra terminal calls.
+    """
+    diag: dict = {"symbol": symbol,
+                  "requested": {"start": str(start), "end": str(end)}}
+    try:
+        ti = mt5.terminal_info()
+        diag["terminal"] = {
+            k: str(getattr(ti, k, None))
+            for k in ("connected", "trade_allowed", "server",
+                      "build", "name", "company", "path")}
+    except Exception as exc:  # noqa: BLE001 - diagnostics
+        diag["terminal"] = {"error": str(exc)}
+    try:
+        si = mt5.symbol_info(symbol)
+        if si is None:
+            diag["symbol_info"] = {"exists": False}
+        else:
+            diag["symbol_info"] = {
+                k: str(getattr(si, k, None))
+                for k in ("visible", "select", "trade_mode",
+                          "digits", "point", "description")}
+    except Exception as exc:  # noqa: BLE001 - diagnostics
+        diag["symbol_info"] = {"error": str(exc)}
+    try:
+        diag["last_error"] = str(mt5.last_error())
+    except Exception as exc:  # noqa: BLE001 - diagnostics
+        diag["last_error"] = f"last_error() failed: {exc}"
+    try:
+        probe_start = end - timedelta(days=30)
+        rates, mode = _copy_rates(
+            mt5, symbol, getattr(mt5, TF_ATTRS["H1"]),
+            probe_start.to_pydatetime()
+            if hasattr(probe_start, "to_pydatetime") else probe_start,
+            end.to_pydatetime()
+            if hasattr(end, "to_pydatetime") else end)
+        diag["probe_h1_last_30d"] = {
+            "rows": int(len(rates)) if rates is not None else 0,
+            "mode": mode,
+            "window": f"{probe_start.date()}..{end.date()}"}
+    except Exception as exc:  # noqa: BLE001 - diagnostics
+        diag["probe_h1_last_30d"] = {"error": str(exc)}
+    return diag
+
+
+def _diag_summary(diag: dict) -> str:
+    """One-line diagnostics for error messages."""
+    term = diag.get("terminal", {}) or {}
+    sym = diag.get("symbol_info", {}) or {}
+    probe = diag.get("probe_h1_last_30d", {}) or {}
+    req = diag.get("requested", {}) or {}
+    return (
+        f"diagnostics: terminal_connected={term.get('connected')}, "
+        f"server={term.get('server')}, "
+        f"trade_allowed={term.get('trade_allowed')}, "
+        f"symbol_visible={sym.get('visible')}, "
+        f"symbol_select={sym.get('select')}, "
+        f"last_error={diag.get('last_error')}, "
+        f"probe_H1_last_30d_rows={probe.get('rows')}, "
+        f"requested={req.get('start')}..{req.get('end')}")
 
 
 def _rates_filename(tf: str, symbol: str) -> str:
@@ -181,10 +314,12 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                 chunks.append(tdf)
             chunk_start = chunk_end
         if not chunks:
+            diag = diagnose_mt5(mt5, symbol, start, end)
+            manifest["diagnostics"] = diag
             raise MT5Unavailable(
                 f"MT5 returned no ticks for {symbol} "
-                f"{start.date()}..{end.date()} — download history "
-                f"in the terminal (F2) and rerun.")
+                f"{start.date()}..{end.date()}. "
+                f"{_diag_summary(diag)}")
         ticks_df = pd.concat(chunks, ignore_index=True)
         ticks_df = ticks_df.sort_values("time").drop_duplicates("time")
         ticks_df.to_csv(cache_dir / _ticks_filename(symbol), index=False)
@@ -192,10 +327,15 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
             "rows": int(len(ticks_df)),
             "start": str(ticks_df["time"].min()),
             "end": str(ticks_df["time"].max())}
+        offset = _server_utc_offset_hours(mt5)
+        manifest["server_utc_offset_hours"] = offset
         built_from_ticks: list[str] = []
+        datetime_modes: dict[str, str] = {}
         for tf in REQUIRED_TFS:
-            rates = mt5.copy_rates_range(
-                symbol, getattr(mt5, TF_ATTRS[tf]), start_dt, end_dt)
+            rates, mode = _copy_rates(
+                mt5, symbol, getattr(mt5, TF_ATTRS[tf]),
+                start_dt, end_dt)
+            datetime_modes[tf] = mode
             if rates is not None and len(rates) > 0:
                 df = pd.DataFrame(rates)
                 df["time"] = pd.to_datetime(df["time"], unit="s",
@@ -206,16 +346,23 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                     "rows": int(len(df)),
                     "start": str(df["time"].min()),
                     "end": str(df["time"].max()),
-                    "source": "mt5_copy_rates_native"}
+                    "source": "mt5_copy_rates_native",
+                    "datetime_mode": mode,
+                    "requested": f"{start.date()}..{end.date()}",
+                    "returned": f"{df['time'].min()}..{df['time'].max()}"}
                 continue
             if tf in BUILDABLE_FROM_TICKS:
-                bars = build_bars_from_ticks(ticks_df, tf)
+                bars = build_bars_from_ticks(
+                    ticks_df, tf,
+                    server_utc_offset_hours=offset)
                 if len(bars) == 0:
+                    diag = diagnose_mt5(mt5, symbol, start, end)
+                    manifest["diagnostics"] = diag
                     raise MT5Unavailable(
                         f"MT5 returned no {tf} bars for {symbol} "
                         f"{start.date()}..{end.date()} and tick "
-                        f"aggregation produced none — download "
-                        f"history in the terminal (F2) and rerun.")
+                        f"aggregation produced none. "
+                        f"{_diag_summary(diag)}")
                 bars.reset_index().rename(
                     columns={"timestamp": "time"}).to_csv(
                         cache_dir / _from_ticks_filename(tf, symbol),
@@ -226,14 +373,19 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                     "end": str(bars.index[-1]),
                     "source": "built_from_ticks",
                     "note": "aggregated from the MT5 tick stream; "
-                            f"terminal had no cached {tf} bars"}
+                            f"terminal had no cached {tf} bars",
+                    "requested": f"{start.date()}..{end.date()}",
+                    "returned": f"{bars.index[0]}..{bars.index[-1]}"}
                 built_from_ticks.append(tf)
                 continue
+            diag = diagnose_mt5(mt5, symbol, start, end)
+            manifest["diagnostics"] = diag
             raise MT5Unavailable(
                 f"MT5 returned no {tf} bars for {symbol} "
-                f"{start.date()}..{end.date()} — download history "
-                f"in the terminal (F2) and rerun.")
+                f"{start.date()}..{end.date()}. "
+                f"{_diag_summary(diag)}")
         manifest["built_from_ticks"] = built_from_ticks
+        manifest["datetime_modes"] = datetime_modes
         return manifest
     finally:
         try:

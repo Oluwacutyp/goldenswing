@@ -60,11 +60,68 @@ def test_build_m5_aggregates_across_minutes():
     assert bars["volume"].iloc[0] == 12.0
 
 
-def test_build_rejects_htf():
+def test_build_htf_from_ticks():
+    # HTF bars ARE buildable from ticks now (2026-10-16 fix): ticks
+    # are the source truth and contain the session boundaries.
+    # H1: ticks across two hours -> two hourly bars.
+    bars = build_bars_from_ticks(_tick_df(), "H1")
+    assert len(bars) == 1  # all 6 ticks inside one UTC hour
+    assert bars["open"].iloc[0] == 100.0
+    assert bars["high"].iloc[0] == 105.0
+    assert bars["low"].iloc[0] == 99.0
+    assert bars["close"].iloc[0] == 105.0
+    # D1: same ticks -> one daily bar.
+    bars_d1 = build_bars_from_ticks(_tick_df(), "D1")
+    assert len(bars_d1) == 1
+    assert bars_d1["open"].iloc[0] == 100.0
+    assert bars_d1["close"].iloc[0] == 105.0
+    # H4 / W1 / MN1: one bucket for this tiny tick set.
+    for tf in ("H4", "W1", "MN1"):
+        bars_tf = build_bars_from_ticks(_tick_df(), tf)
+        assert len(bars_tf) == 1
+        assert bars_tf["open"].iloc[0] == 100.0
+
+
+def test_build_unknown_tf_still_rejected():
     with pytest.raises(ValueError):
-        build_bars_from_ticks(_tick_df(), "H1")
-    with pytest.raises(ValueError):
-        build_bars_from_ticks(_tick_df(), "D1")
+        build_bars_from_ticks(_tick_df(), "M99")
+
+
+def test_build_h1_buckets_split_on_hour_boundary():
+    base = pd.Timestamp("2026-01-01 00:55", tz="UTC")
+    df = pd.DataFrame({
+        "time": [base, base + pd.Timedelta(minutes=5),
+                 base + pd.Timedelta(minutes=10)],
+        "bid": [100.0, 101.0, 102.0],
+        "ask": [100.2, 101.2, 102.2],
+        "volume": [1.0, 1.0, 1.0]})
+    bars = build_bars_from_ticks(df, "H1")
+    assert len(bars) == 2
+    assert bars.index[0] == pd.Timestamp("2026-01-01 00:00", tz="UTC")
+    assert bars.index[1] == pd.Timestamp("2026-01-01 01:00", tz="UTC")
+    assert bars["close"].iloc[0] == 100.0
+    assert bars["open"].iloc[1] == 101.0
+    assert bars["close"].iloc[1] == 102.0
+
+
+def test_build_d1_respects_server_offset():
+    # Server at UTC+2: server midnight = 22:00 UTC. A tick at
+    # 23:00 UTC (01:00 server) belongs to the server day that
+    # started 22:00 UTC, NOT the UTC day starting 00:00.
+    base = pd.Timestamp("2026-01-01 23:00", tz="UTC")
+    df = pd.DataFrame({
+        "time": [base, base + pd.Timedelta(hours=2)],
+        "bid": [100.0, 101.0],
+        "ask": [100.2, 101.2],
+        "volume": [1.0, 1.0]})
+    bars_utc = build_bars_from_ticks(df, "D1",
+                                     server_utc_offset_hours=0.0)
+    assert len(bars_utc) == 2  # UTC days split at 00:00
+    bars_srv = build_bars_from_ticks(df, "D1",
+                                     server_utc_offset_hours=2.0)
+    assert len(bars_srv) == 1  # same server day
+    assert bars_srv.index[0] == pd.Timestamp(
+        "2026-01-01 22:00", tz="UTC")
 
 
 def _native_tf_file(tmp_path, tf, idx):
@@ -113,12 +170,25 @@ def test_loader_missing_m1_and_missing_ticks_still_blocks(tmp_path):
     assert "M1" in exc.value.missing
 
 
-def test_loader_missing_htf_still_blocks_even_with_ticks(tmp_path):
-    # D1 missing + ticks present -> D1 is HTF, never built from ticks.
+def test_loader_builds_missing_htf_from_ticks(tmp_path):
+    # D1 missing + ticks present -> D1 is built from ticks now
+    # (2026-10-16 fix): ticks contain the session boundaries, so
+    # blocking on missing native HTF history was the bug.
     idx = pd.date_range("2024-10-01", "2024-11-10", periods=40, tz="UTC")
     for tf in ("M1", "M5", "M15", "M30", "H1", "H4", "W1", "MN1"):
         _native_tf_file(tmp_path, tf, idx)
     _ticks_file(tmp_path, "2024-10-01", "2024-11-10")
+    frames, prov = load_native_frames(tmp_path)
+    assert "D1" in frames
+    assert prov["D1"]["built_from_ticks"] is True
+    assert "D1" in prov["built_from_ticks"]
+
+
+def test_loader_missing_htf_and_missing_ticks_still_blocks(tmp_path):
+    # D1 missing AND no ticks file -> still MissingNativeData.
+    idx = pd.date_range("2024-10-01", "2024-11-10", periods=40, tz="UTC")
+    for tf in ("M1", "M5", "M15", "M30", "H1", "H4", "W1", "MN1"):
+        _native_tf_file(tmp_path, tf, idx)
     with pytest.raises(MissingNativeData) as exc:
         load_native_frames(tmp_path)
     assert "D1" in exc.value.missing
@@ -207,14 +277,61 @@ def test_fetch_builds_missing_m1_from_ticks(tmp_path):
     assert prov["M1"]["built_from_ticks"] is True
 
 
-def test_fetch_missing_htf_still_blocks(tmp_path):
+def test_fetch_builds_missing_h1_from_ticks(tmp_path):
+    # H1 native missing + ticks present -> H1 built from ticks,
+    # no block (2026-10-16 fix: owner tried F2, H1 still empty).
     start = pd.Timestamp("2026-01-01", tz="UTC")
     end = pd.Timestamp("2026-01-03", tz="UTC")
     fake = _FakeMT5MissingM1(missing_tfs=("H1",))
+    manifest = mf.fetch_mt5_native("XAUUSDm", start, end, tmp_path,
+                                   mt5_module=fake)
+    derived = tmp_path / "MT5_XAUUSDm_H1_from_ticks.csv"
+    assert derived.exists()
+    assert manifest["tfs"]["H1"]["source"] == "built_from_ticks"
+    assert "H1" in manifest["built_from_ticks"]
+    assert mf._cache_covers(tmp_path, "XAUUSDm", start, end) is True
+
+
+def test_fetch_missing_h1_and_no_ticks_blocks_with_diagnostics(tmp_path):
+    # H1 native missing AND no ticks -> blocks, and the error
+    # carries diagnostics (not a bare "F2 download" message).
+    class _NoTicks(_FakeMT5MissingM1):
+        def copy_ticks_range(self, symbol, start, end, flags):
+            return None
+
+        def terminal_info(self):
+            class _TI:
+                connected = True
+                trade_allowed = True
+                server = "Exness-MT5Trial10"
+                build = 5000
+                name = "MetaTrader 5"
+                company = "Exness"
+                path = "C:/MT5"
+            return _TI()
+
+        def symbol_info(self, symbol):
+            class _SI:
+                visible = True
+                select = True
+                trade_mode = 0
+                digits = 2
+                point = 0.01
+                description = "Gold vs US Dollar"
+            return _SI()
+
+        def last_error(self):
+            return (1, "no data")
+
+    start = pd.Timestamp("2026-01-01", tz="UTC")
+    end = pd.Timestamp("2026-01-03", tz="UTC")
     with pytest.raises(mf.MT5Unavailable) as exc:
         mf.fetch_mt5_native("XAUUSDm", start, end, tmp_path,
-                            mt5_module=fake)
-    assert "H1" in str(exc.value)
+                            mt5_module=_NoTicks(missing_tfs=("H1",)))
+    msg = str(exc.value)
+    assert "diagnostics" in msg
+    assert "Exness-MT5Trial10" in msg
+    assert "probe_H1_last_30d_rows" in msg
 
 
 def test_fetch_no_ticks_still_blocks(tmp_path):
@@ -240,3 +357,83 @@ def test_no_resample_in_tick_aggregation_code():
         assert ".resample(" not in inspect.getsource(mod)
     assert ".resample(" not in inspect.getsource(
         build_bars_from_ticks)
+
+
+def test_diagnose_reports_terminal_symbol_probe(tmp_path):
+    # Fake MT5 that answers diagnostics + returns rows only for the
+    # 30-day probe window (simulating a depth-limited broker).
+    import datetime as _dt
+
+    class _DiagMT5(_FakeMT5MissingM1):
+        def terminal_info(self):
+            class _TI:
+                connected = True
+                trade_allowed = True
+                server = "Exness-MT5Trial10"
+                build = 5000
+                name = "MetaTrader 5"
+                company = "Exness"
+                path = "C:/MT5"
+            return _TI()
+
+        def symbol_info(self, symbol):
+            class _SI:
+                visible = True
+                select = True
+                trade_mode = 0
+                digits = 2
+                point = 0.01
+                description = "Gold"
+            return _SI()
+
+        def last_error(self):
+            return (0, "ok")
+
+        def copy_rates_range(self, symbol, tf, start, end):
+            # Probe window (last 30d) returns rows; 3y window empty.
+            span = (pd.Timestamp(end) - pd.Timestamp(start)).days
+            if span <= 31:
+                return super().copy_rates_range(symbol, tf, start, end)
+            return None
+
+    fake = _DiagMT5()
+    start = pd.Timestamp("2023-10-17", tz="UTC")
+    end = pd.Timestamp("2026-10-16", tz="UTC")
+    diag = mf.diagnose_mt5(fake, "XAUUSDm", start, end)
+    assert diag["terminal"]["connected"] == "True"
+    assert diag["terminal"]["server"] == "Exness-MT5Trial10"
+    assert diag["symbol_info"]["visible"] == "True"
+    assert diag["probe_h1_last_30d"]["rows"] > 0  # probe finds data
+    assert "diagnostics" in mf._diag_summary(diag)
+
+
+def test_copy_rates_naive_retry(tmp_path):
+    # Terminal that returns nothing for tz-aware datetimes but rows
+    # for naive (server-time) datetimes -> retry rescues the fetch.
+    import datetime as _dt
+    import numpy as np
+
+    class _NaiveOnly(_FakeMT5MissingM1):
+        def copy_rates_range(self, symbol, tf, start, end):
+            if getattr(start, "tzinfo", None) is not None:
+                return None
+            return super().copy_rates_range(symbol, tf, start, end)
+
+    fake = _NaiveOnly()
+    rates, mode = mf._copy_rates(
+        fake, "XAUUSDm", fake.TIMEFRAME_H1,
+        _dt.datetime(2026, 1, 1, tzinfo=_dt.timezone.utc),
+        _dt.datetime(2026, 1, 3, tzinfo=_dt.timezone.utc))
+    assert mode == "naive_server_time"
+    assert rates is not None and len(rates) > 0
+
+
+def test_fetch_records_datetime_mode_and_requested_range(tmp_path):
+    start = pd.Timestamp("2026-01-01", tz="UTC")
+    end = pd.Timestamp("2026-01-03", tz="UTC")
+    fake = _FakeMT5MissingM1()
+    manifest = mf.fetch_mt5_native("XAUUSDm", start, end, tmp_path,
+                                   mt5_module=fake)
+    assert manifest["datetime_modes"]["H1"] == "tz_aware"
+    assert manifest["tfs"]["H1"]["requested"] == "2026-01-01..2026-01-03"
+    assert "returned" in manifest["tfs"]["H1"]
