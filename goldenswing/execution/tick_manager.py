@@ -180,6 +180,25 @@ class _TickState:
     broker_sl: float | None = None
     #: Entry legs: base first, added layers after.
     layers: list = field(default_factory=list)
+    #: Narrative management plan (``live/management.py`` dict from
+    #: ``mark_entered``) attached by the runner.  When present, the
+    #: plan OWNS breakeven / partials / trailing / time-stop for
+    #: this position — the TickConfig defaults below are NOT used
+    #: for those (profit-lock, the R-trail and the Chandelier are
+    #: skipped, so two trailing mechanisms never fight).  Panic,
+    #: scalp-cap and the broker stop are safety, not management,
+    #: and stay active.  None = legacy TickConfig behaviour.
+    narrative_plan: dict | None = None
+    #: ATR at fill for the narrative trailing step (ATR-step
+    #: trailing = best price since entry minus trail_step_atr x
+    #: this ATR).  The SL locked at fill is never recalculated
+    #: from a LATER ATR — this snapshot only sets the trailing
+    #: step.
+    narrative_atr: float = 0.0
+    #: Narrative invalidation context: {"choch_extreme": float|None,
+    #: "fvg": {"top": float, "bottom": float}|None}.  See
+    #: :meth:`TickManager.check_narrative_invalidation`.
+    narrative_context: dict = field(default_factory=dict)
 
     @property
     def effective_stop(self) -> float:
@@ -217,7 +236,11 @@ class TickManager:
     def open(self, *, ticket: int, request: OrderRequest,
              fill_price: float, entry_bar: int,
              broker_sl: float | None = None,
-             now: float | None = None) -> TrackedPosition:
+             now: float | None = None,
+             narrative_plan: dict | None = None,
+             narrative_atr: float = 0.0,
+             narrative_choch_extreme: float | None = None,
+             narrative_fvg: dict | None = None) -> TrackedPosition:
         """Start tracking a live position (after the order filled).
 
         ``request.stop_loss`` is the raw structural invalidation;
@@ -226,6 +249,11 @@ class TickManager:
         (``planned_stop``); when omitted it defaults to stop0.
         ``now`` is the wall-clock open time (epoch seconds) for the
         scalp cap — defaults to ``time.time()``.
+        ``narrative_plan`` is the management dict from
+        ``mark_entered`` (attached via
+        :meth:`attach_narrative_plan`); when given, the plan owns
+        breakeven / partials / trailing / time-stop for this
+        position instead of the TickConfig defaults.
         """
         pos = self._stepper.open(ticket=ticket, request=request,
                                  fill_price=fill_price,
@@ -241,7 +269,88 @@ class TickManager:
                           else float(pos.stop0),
                           alert_id=request.alert_id,
                           playbook=getattr(request, "playbook", ""))])
+        if narrative_plan is not None:
+            self.attach_narrative_plan(
+                ticket, narrative_plan, atr=narrative_atr,
+                choch_extreme=narrative_choch_extreme,
+                fvg=narrative_fvg)
         return pos
+
+    # --------------------------------------------- narrative plan wiring
+    def attach_narrative_plan(self, ticket: int, plan: dict, *,
+                              atr: float = 0.0,
+                              choch_extreme: float | None = None,
+                              fvg: dict | None = None) -> bool:
+        """Attach a narrative management plan to a tracked position.
+
+        Returns False when the ticket is unknown (never creates a
+        phantom position).  The plan is stored as-is; derived
+        values (breakeven trigger, partial tiers, trailing step,
+        time-stop) are read from it on every tick, so a plan the
+        runner updates (e.g. an upgrade) takes effect on the next
+        tick without re-attaching.  ``atr`` is the ATR snapshot at
+        fill for the trailing step; ``choch_extreme`` / ``fvg``
+        are the invalidation context (see
+        :meth:`check_narrative_invalidation`).
+        """
+        st = self._states.get(ticket)
+        if st is None:
+            return False
+        st.narrative_plan = dict(plan)
+        st.narrative_atr = float(atr)
+        st.narrative_context = {"choch_extreme": choch_extreme,
+                                "fvg": dict(fvg) if fvg else None}
+        return True
+
+    def narrative_plan(self, ticket: int) -> dict | None:
+        """The narrative management plan attached to a position
+        (copy), or None when the position runs on TickConfig."""
+        st = self._states.get(ticket)
+        return dict(st.narrative_plan) \
+            if st is not None and st.narrative_plan is not None else None
+
+    def check_narrative_invalidation(self, ticket: int, price: float,
+                                     *, fvg_mitigated: bool = False) -> bool:
+        """Tick-level narrative invalidation query for the runner.
+
+        True when price is back through the CHoCH extreme AND the
+        confirm FVG is mitigated — both required, one alone is
+        noise (mirrors ``live/management.py``).  With no FVG
+        recorded (e.g. a breakout-stop entry) the CHoCH break
+        alone invalidates.  False when no narrative plan is
+        attached or no CHoCH extreme was recorded.  Query only:
+        the runner decides the exit — this never closes anything.
+        """
+        st = self._states.get(ticket)
+        if st is None or st.narrative_plan is None:
+            return False
+        choch = st.narrative_context.get("choch_extreme")
+        if choch is None:
+            return False
+        d = st.pos.direction
+        through = (d == 1 and price < choch) or \
+            (d == -1 and price > choch)
+        if not through:
+            return False
+        if st.narrative_context.get("fvg") is None:
+            return True
+        return bool(fvg_mitigated)
+
+    @staticmethod
+    def _narrative_tiers(plan: dict) -> tuple[tuple[float, float], ...]:
+        """Partial tiers from a narrative plan: (TP_R, fraction)
+        per TP with a price and a positive fraction.  TP3 None
+        (opposing GREEN, exit all at TP2) is skipped — the TP2
+        fraction already includes the runner there."""
+        tiers = []
+        for key in ("tp1", "tp2", "tp3"):
+            r = plan.get(f"{key}_r")
+            pct = plan.get(f"{key}_pct")
+            if r is None or pct is None:
+                continue
+            if float(pct) > 0:
+                tiers.append((float(r), float(pct)))
+        return tuple(tiers)
 
     def adopt(self, *, ticket: int, symbol: str, direction: int,
               volume: float, entry_price: float, sl: float | None,
@@ -396,10 +505,17 @@ class TickManager:
         pos.best_r = max(pos.best_r,
                          d * (price - pos.entry_price) / pos.risk_price)
 
-        # 2. Partial bank: tiered partials own partials when
-        #    configured and the position is big enough; otherwise
-        #    the legacy single pool partial.
-        tiers = self.tick_cfg.partial_tiers
+        # 2. Partial bank: a narrative plan owns partials (its TP
+        #    ladder); otherwise tiered partials own them when
+        #    configured and the position is big enough, else the
+        #    legacy single pool partial.  A plan with no usable
+        #    TPs falls back to the TickConfig tiers.
+        plan = st.narrative_plan
+        if plan is not None:
+            tiers = self._narrative_tiers(plan) \
+                or self.tick_cfg.partial_tiers
+        else:
+            tiers = self.tick_cfg.partial_tiers
         if tiers and not pos.no_partial \
                 and pos.orig_volume >= self.tick_cfg.tier_min_volume:
             if pos.tiers_done < len(tiers):
@@ -430,36 +546,67 @@ class TickManager:
         #    stays pending (its level stays a candidate next tick).
         #    A candidate that would LOOSEN the stop never fires.
         candidates: list[tuple[float, str]] = []
-        if not pos.profit_lock_done and tcfg.profit_lock_enabled:
-            tp = pos.targets[0] if pos.targets else None
-            target_dist = abs(tp - pos.entry_price) if tp is not None \
-                else 2.0 * pos.risk_price
-            progress = abs(price - pos.entry_price) / target_dist \
-                if target_dist > 0 else 0.0
-            if pos.best_r >= tcfg.profit_lock_trigger_r \
-                    or progress >= tcfg.profit_lock_progress:
-                lock_dist = max(
-                    tcfg.profit_lock_fraction_of_risk * pos.risk_price,
-                    tcfg.profit_lock_atr_mult * pos.atr
-                    if pos.atr > 0 else 0.0)
+        if plan is not None:
+            # Narrative plan owns SL moves: breakeven at the
+            # plan's threshold (late confirm 0.0 = immediate)
+            # and ATR-step trailing behind the best excursion
+            # (best price since entry minus trail_step_atr x
+            # the ATR snapshot at fill, capped at the opposing
+            # barrier).  Profit-lock, the R-trail and the
+            # Chandelier are skipped — the plan is the single
+            # owner of SL moves.  Structure-level (FVG/swing)
+            # trailing stays in live/management.py on bar
+            # closes; this tick trailing is its best-excursion
+            # equivalent.
+            be_trig = float(plan.get("breakeven_at_r", 1.0))
+            if not st.breakeven_done and pos.best_r >= be_trig:
+                candidates.append((pos.entry_price, "breakeven"))
+            if st.narrative_atr > 0:
+                best_price = pos.entry_price + d * pos.best_r \
+                    * pos.risk_price
+                cand = best_price - d * float(
+                    plan.get("trail_step_atr", 0.5)) \
+                    * st.narrative_atr
+                cap = plan.get("trail_cap_price")
+                if cap is not None:
+                    if d == 1 and float(cap) >= stop:
+                        cand = min(cand, float(cap))
+                    elif d == -1 and float(cap) <= stop:
+                        cand = max(cand, float(cap))
+                candidates.append((cand, "trail"))
+        else:
+            if not pos.profit_lock_done and tcfg.profit_lock_enabled:
+                tp = pos.targets[0] if pos.targets else None
+                target_dist = abs(tp - pos.entry_price) \
+                    if tp is not None else 2.0 * pos.risk_price
+                progress = abs(price - pos.entry_price) / target_dist \
+                    if target_dist > 0 else 0.0
+                if pos.best_r >= tcfg.profit_lock_trigger_r \
+                        or progress >= tcfg.profit_lock_progress:
+                    lock_dist = max(
+                        tcfg.profit_lock_fraction_of_risk
+                        * pos.risk_price,
+                        tcfg.profit_lock_atr_mult * pos.atr
+                        if pos.atr > 0 else 0.0)
+                    candidates.append((
+                        pos.entry_price + d * lock_dist, "profit_lock"))
+            if not st.breakeven_done \
+                    and pos.best_r >= tcfg.breakeven_trigger_r:
                 candidates.append((
-                    pos.entry_price + d * lock_dist, "profit_lock"))
-        if not st.breakeven_done \
-                and pos.best_r >= tcfg.breakeven_trigger_r:
-            candidates.append((
-                pos.entry_price + d * tcfg.breakeven_offset_r
-                * pos.risk_price, "breakeven"))
-        if pos.best_r >= ex.trail_trigger_r:
-            candidates.append((
-                pos.entry_price + d * (
-                    pos.best_r - ex.trail_dist_r) * pos.risk_price,
-                "trail"))
-        if tcfg.chandelier_enabled and pos.atr > 0 \
-                and pos.best_r >= tcfg.chandelier_activation_r:
-            best_price = pos.entry_price + d * pos.best_r * pos.risk_price
-            candidates.append((
-                best_price - d * tcfg.chandelier_atr_mult * pos.atr,
-                "chandelier"))
+                    pos.entry_price + d * tcfg.breakeven_offset_r
+                    * pos.risk_price, "breakeven"))
+            if pos.best_r >= ex.trail_trigger_r:
+                candidates.append((
+                    pos.entry_price + d * (
+                        pos.best_r - ex.trail_dist_r) * pos.risk_price,
+                    "trail"))
+            if tcfg.chandelier_enabled and pos.atr > 0 \
+                    and pos.best_r >= tcfg.chandelier_activation_r:
+                best_price = pos.entry_price + d * pos.best_r \
+                    * pos.risk_price
+                candidates.append((
+                    best_price - d * tcfg.chandelier_atr_mult
+                    * pos.atr, "chandelier"))
         tighter = [(lvl, rsn) for lvl, rsn in candidates
                    if (d == 1 and lvl > stop)
                    or (d == -1 and lvl < stop)]
@@ -538,9 +685,16 @@ class TickManager:
         if pos.closed:
             return []
         horizon = self.exits.horizon
-        time_map = self.tick_cfg.time_exit_bars
-        if time_map and regime_structure is not None:
-            horizon = int(time_map.get(regime_structure, horizon))
+        # A narrative plan owns the time-stop: its time_stop_h1
+        # (tier- and ATR-scaled at fill) replaces both the fixed
+        # horizon and the regime-structure map for this position.
+        if st.narrative_plan is not None and \
+                st.narrative_plan.get("time_stop_h1") is not None:
+            horizon = int(st.narrative_plan["time_stop_h1"])
+        else:
+            time_map = self.tick_cfg.time_exit_bars
+            if time_map and regime_structure is not None:
+                horizon = int(time_map.get(regime_structure, horizon))
         if bar_index - pos.signal_bar >= horizon:
             return [TickAction("timeout", level=None, volume=pos.volume,
                                reason="timeout")]

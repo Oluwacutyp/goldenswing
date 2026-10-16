@@ -1,0 +1,243 @@
+{
+  "window": {
+    "start": "2024-10-01 00:00:00+00:00",
+    "end": "2026-10-11 23:00:00+00:00",
+    "h1_bars_walked": 11987,
+    "h4_bars": 3241,
+    "d1_bars": 633,
+    "w1_bars": 106,
+    "mn1_bars": 25
+  },
+  "harness": "bar-level (NOT tick engine). See module docstring.",
+  "zone_seed_s": 0.1,
+  "zone_counts": {
+    "active": 217,
+    "by_tf": {
+      "MN1": 2,
+      "W1": 12,
+      "D1": 31,
+      "H4": 54,
+      "H1": 118
+    },
+    "by_tier": {
+      "MAJOR": 203,
+      "MINOR": 14
+    },
+    "by_status": {
+      "active": 217
+    }
+  },
+  "regime_walk_s": 112.7,
+  "regime_bars": {
+    "insufficient_data": 205,
+    "hold": 3254,
+    "range": 898,
+    "trend": 7630
+  },
+  "bias_d1_bars": {
+    "0": 4357,
+    "1": 5231,
+    "-1": 2399
+  },
+  "hierarchy_allowed_bars": {
+    "false": 11984,
+    "true": 3
+  },
+  "hierarchy_blocked_leg": {
+    "data": 205,
+    "d1_bias": 3254,
+    "h1_trigger": 1447,
+    "entry": 183,
+    "h4_zone": 6895,
+    "": 3
+  },
+  "range_stretches": 76,
+  "range_stretch_bars": 898,
+  "per_playbook": {
+    "range_sweep_reclaim": {
+      "signals": 118,
+      "fills": 118,
+      "trades": 118,
+      "win_rate": 0.4068,
+      "total_r": -7.35,
+      "avg_r": -0.062,
+      "profit_factor": 0.9,
+      "max_drawdown_r": 13.2,
+      "gross_win_r": 64.19,
+      "gross_loss_r": -71.54,
+      "exit_reasons": {
+        "stop": 70,
+        "timeout": 8,
+        "trail": 40
+      },
+      "partial_taken": 16,
+      "gated_signals": 16,
+      "gated": {
+        "trades": 16,
+        "win_rate": 0.5,
+        "total_r": 3.5,
+        "avg_r": 0.218,
+        "profit_factor": 1.43,
+        "max_drawdown_r": 4.07,
+        "gross_win_r": 11.7,
+        "gross_loss_r": -8.21
+      },
+      "scan_s": 43.0
+    },
+    "range_qm": {
+      "signals": 37,
+      "fills": 37,
+      "trades": 37,
+      "win_rate": 0.5405,
+      "total_r": 16.88,
+      "avg_r": 0.456,
+      "profit_factor": 2.2,
+      "max_drawdown_r": 3.93,
+      "gross_win_r": 30.92,
+      "gross_loss_r": -14.05,
+      "exit_reasons": {
+        "stop": 13,
+        "timeout": 12,
+        "trail": 12
+      },
+      "partial_taken": 5,
+      "gated_signals": 4,
+      "gated": {
+        "trades": 4,
+        "win_rate": 0.75,
+        "total_r": 5.21,
+        "avg_r": 1.304,
+        "profit_factor": 94.13,
+        "max_drawdown_r": 0.06,
+        "gross_win_r": 5.27,
+        "gross_loss_r": -0.06
+      },
+      "scan_s": 42.8
+    },
+    "range_mean_reversion": {
+      "signals": 85,
+      "fills": 85,
+      "trades": 85,
+      "win_rate": 0.3882,
+      "total_r": -6.78,
+      "avg_r": -0.08,
+      "profit_factor": 0.87,
+      "max_drawdown_r": 15.33,
+      "gross_win_r": 47.45,
+      "gross_loss_r": -54.23,
+      "exit_reasons": {
+        "stop": 54,
+        "trail": 31
+      },
+      "partial_taken": 19,
+      "gated_signals": 17,
+      "gated": {
+        "trades": 17,
+        "win_rate": 0.2941,
+        "total_r": -7.68,
+        "avg_r": -0.452,
+        "profit_factor": 0.38,
+        "max_drawdown_r": 9.52,
+        "gross_win_r": 4.8,
+        "gross_loss_r": -12.48
+      },
+      "scan_s": 42.9
+    },
+    "range_compression_breakout": {
+      "signals": 9,
+      "fills": 9,
+      "trades": 9,
+      "win_rate": 0.5556,
+      "total_r": 1.61,
+      "avg_r": 0.179,
+      "profit_factor": 1.39,
+      "max_drawdown_r": 2.28,
+      "gross_win_r": 5.71,
+      "gross_loss_r": -4.1,
+      "exit_reasons": {
+        "trail": 5,
+        "stop": 4
+      },
+      "partial_taken": 1,
+      "gated_signals": 1,
+      "gated": {
+        "trades": 1,
+        "win_rate": 1.0,
+        "total_r": 0.6,
+        "avg_r": 0.595,
+        "profit_factor": Infinity,
+        "max_drawdown_r": 0.0,
+        "gross_win_r": 0.6,
+        "gross_loss_r": 0
+      },
+      "scan_s": 47.3
+    }
+  },
+  "all_signals": {
+    "trades": 249,
+    "win_rate": 0.4257,
+    "total_r": 4.35,
+    "avg_r": 0.017,
+    "profit_factor": 1.03,
+    "max_drawdown_r": 15.33,
+    "gross_win_r": 148.27,
+    "gross_loss_r": -143.92
+  },
+  "all_signals_gated": {
+    "note": "gated = signal bar regime == range (live gate 0b); see per_playbook[].gated for per-playbook gated stats",
+    "gated_trades": 38,
+    "gated_total_r": 1.63,
+    "gated_win_rate": 0.4474
+  },
+  "exit_reasons": {
+    "stop": 141,
+    "timeout": 20,
+    "trail": 88
+  },
+  "partial_taken": 41,
+  "avg_hold_bars": 17.5,
+  "boundary_events": {
+    "breakout_pending": 11,
+    "sweep_wick": 3,
+    "false_breakout": 1,
+    "cooldown_started": 1,
+    "sweep_expired": 1
+  },
+  "boundary_events_warm_start_diagnostic": {
+    "breakout_pending": 567,
+    "breakout_stalled": 235,
+    "false_breakout": 66,
+    "cooldown_started": 66,
+    "breakout_confirmed": 8,
+    "retest_missed": 5,
+    "retest_held": 6,
+    "regime_reverted": 1,
+    "sweep_wick": 16,
+    "sweep_expired": 15,
+    "sweep_confirmed": 10
+  },
+  "warm_sweep_confirmed": 10,
+  "warm_breakout_confirmed": 8,
+  "warm_false_breakout": 66,
+  "sweep_events": 0,
+  "breakout_events": 0,
+  "false_breakout_events": 1,
+  "false_breakout_rate": null,
+  "false_breakout_rate_note": "None when zero breakouts were CONFIRMED (rate undefined); 1 false breakout with 0 confirmed is not a 100% rate.",
+  "regime_state_roundtrip_ok": true,
+  "not_measured": [
+    "tick fills",
+    "TP1/TP2/TP3 hit rates",
+    "opposing-zone TP adjustment",
+    "ATR-dynamic management",
+    "min-lot floor",
+    "footprint score",
+    "STATE 6 management"
+  ],
+  "elapsed_s": 293.5,
+  "sweep_confirmation_gap": {
+    "note": "RangeSweepReclaimPlaybook.requires_sweep_confirmation=True (confluence gate): live engine fires it ONLY on tracker-confirmed sweeps. Tracker (cold-start, runner-faithful) confirmed 0 sweeps in this window, so the live take would be ~0, NOT the 16 gated H1-detector signals. Playbook detector (H1 wick+reclaim) and tracker (M15 BOS+FVG) disagree: owner decision whether tracker is too strict or playbook too loose.",
+    "gated_h1_detector_signals": 16,
+    "tracker_confirmed_sweeps": 0
+  }
+}

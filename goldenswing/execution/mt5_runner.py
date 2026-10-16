@@ -87,6 +87,12 @@ from ..live.regime_state import (RegimeState, load_regime_state,
 from ..live.zones import (TF_ORDER as _TF_ORDER, ZoneCache,
                           ZoneStore, find_clusters)
 from ..live.macrotrend import (MacroTrendResult, compute_macrotrend)
+from ..live.narrative import (ENTRY as _NARR_ENTRY,
+                              NarrativeState, advance as advance_narrative,
+                              amd_for_state, finalize_exit as
+                              _finalize_narrative_exit, load_narrative_state,
+                              mark_entered as _mark_narrative_entered,
+                              save_narrative_state)
 from ..live.manipulation import chase_blocked
 from ..live.news import NewsCalendar
 from ..live.reasoning import build_reasoning, build_study
@@ -96,7 +102,7 @@ from ..reader.session_timeframes import (
     compose as _compose_session, session_of)
 from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
                          InversionPlaybook, JudasSwingPlaybook,
-                         KillzoneOpenPlaybook,
+                         KillzoneOpenPlaybook, NarrativePlaybook,
                          OrderBlockPlaybook, QMD1Playbook, QMM5Playbook,
                          RangeCompressionBreakoutPlaybook,
                          RangeMeanReversionPlaybook, RangeQMPlaybook,
@@ -644,6 +650,12 @@ class MT5Runner:
         # tick-clock machinery) — a pending ORDER is a broker order;
         # a pending TRIGGER is pre-signal state.
         self._pending_orders: dict[int, PendingOrderState] = {}
+        # Narrative chain state per live ticket (CHUNK 3): the
+        # MANAGEMENT state built at fill by _narrative_fill_plan.
+        # Only narrative trades get an entry; _record_close pops
+        # it and runs finalize_exit (STATE 7).  Never consulted
+        # for non-narrative tickets.
+        self._narrative_states: dict[int, NarrativeState] = {}
         self._last_processed: dict[str, pd.Timestamp] = {}
         self._last_sig_bar: dict[str, int] = {}
         self._tick_count = 0
@@ -743,7 +755,8 @@ class MT5Runner:
                                RangeSweepReclaimPlaybook(),
                                RangeQMPlaybook(),
                                RangeMeanReversionPlaybook(),
-                               RangeCompressionBreakoutPlaybook()]
+                               RangeCompressionBreakoutPlaybook(),
+                               NarrativePlaybook()]
         return self._playbooks
 
     # ------------------------------------------------- blocked-leg stats
@@ -1296,6 +1309,65 @@ class MT5Runner:
             return "SL hit (trail)"
         return "SL hit"
 
+    def _narrative_fill_plan(self, sig, fill_price: float):
+        """Build the narrative MANAGEMENT state for a fill.
+
+        Only narrative signals (``kind == "narrative"``) get a plan.
+        The chain is rebuilt from the live frames at fill time
+        (``advance`` from a fresh state — the same evaluation the
+        NarrativePlaybook ran when it emitted the signal); when the
+        chain is no longer in ENTRY at fill time, no plan is
+        attached rather than a stale one.  ``mark_entered`` locks
+        the SL at fill and builds the differentiated management
+        plan (clean/late, tier, opposing, ATR regime).
+
+        Returns ``(state, kwargs)`` where ``kwargs`` are the
+        ``tick_manager.open`` narrative kwargs; ``(None, {})``
+        when no plan applies.  Fail-open: any failure journals a
+        note and the position runs on TickConfig defaults.
+        """
+        try:
+            if getattr(sig, "kind", "") != "narrative":
+                return None, {}
+            if self._stack is None:
+                return None, {}
+            frames = dict(self._stack.frames or {})
+            if not frames:
+                return None, {}
+            state = advance_narrative(NarrativeState(), frames)
+            if state.state != _NARR_ENTRY:
+                self.journal.log_note(
+                    "mt5 narrative: chain no longer ENTRY at fill, "
+                    "no management plan attached")
+                return None, {}
+            state = _mark_narrative_entered(
+                state, entry_price=float(fill_price),
+                stop=float(sig.invalidation),
+                targets=[float(x) for x in (sig.targets or [])])
+            plan = dict(getattr(state, "management", None) or {})
+            if not plan:
+                return None, {}
+            confirm = getattr(state, "confirm", None) or {}
+            fvg = confirm.get("fvg") if isinstance(confirm, dict) else None
+            kwargs = {
+                "narrative_plan": plan,
+                "narrative_atr": float(
+                    getattr(state, "atr_value", 0.0) or 0.0),
+                "narrative_choch_extreme": getattr(
+                    state, "invalidation", None),
+                "narrative_fvg": dict(fvg) if isinstance(fvg, dict)
+                else None,
+            }
+            return state, kwargs
+        except Exception as exc:
+            try:
+                self.journal.log_note(
+                    f"mt5 narrative: fill-plan build failed ({exc}) — "
+                    "position runs on TickConfig defaults")
+            except Exception:
+                pass
+            return None, {}
+
     def _record_close(self, ticket: int, price: float, reason: str,
                       stats: dict) -> None:
         pos = self.tick_manager.position(ticket)
@@ -1362,6 +1434,26 @@ class MT5Runner:
             self.entry_gate.record_close(time.time(), pnl_r > 0)
         except Exception:
             pass
+        # Narrative STATE 7: a narrative trade's close finalizes the
+        # chain (journal entry + reset to IDLE).  Fail-open: a
+        # finalize failure never breaks the close path.  Partials
+        # never reach here (they go through tick_manager.apply),
+        # so this is the full close only.
+        _narr_state = self._narrative_states.pop(ticket, None)
+        if _narr_state is not None:
+            try:
+                _idle, _entry = _finalize_narrative_exit(
+                    _narr_state, reason=reason, final_r=float(pnl_r),
+                    pnl_dollars=float(pnl_money), exit_price=float(price))
+                self.journal.log_note(
+                    f"mt5 narrative STATE 7 EXIT: "
+                    f"{_entry.get('exit_reason', reason)} "
+                    f"R={_entry.get('realized_r', pnl_r):+.2f} "
+                    f"(ticket {ticket})")
+            except Exception as exc:
+                self.journal.log_note(
+                    f"mt5 narrative finalize failed for ticket "
+                    f"{ticket}: {exc}")
         self.tick_manager.remove(ticket)
         stats["reconciled_closed"] += 1
 
@@ -4859,11 +4951,15 @@ class MT5Runner:
             return
         if fingerprint:
             self.entry_gate.record_open(time.time(), fingerprint)
+        _narr_state, _narr_kwargs = self._narrative_fill_plan(sig, fill)
         h1 = self._stack.frames["H1"]
         self.tick_manager.open(ticket=int(res.ticket),
                                request=track_request, fill_price=fill,
                                entry_bar=len(h1) - 1 if entry_bar is None
-                               else entry_bar, broker_sl=stop0)
+                               else entry_bar, broker_sl=stop0,
+                               **_narr_kwargs)
+        if _narr_state is not None:
+            self._narrative_states[int(res.ticket)] = _narr_state
         stats["executed"] = stats.get("executed", 0) + 1
         # Open record: without it, /trades /report /harvest cannot see
         # this fill (they join close -> open by alert_id).  Stop here is
@@ -5251,10 +5347,15 @@ class MT5Runner:
             # remainder stays pending (reduced volume).
             track = self._fill_track_request(state, filled_vol,
                                              fill_bar)
+            _narr_state, _narr_kwargs = self._narrative_fill_plan(
+                getattr(state, "sig", None), float(pos.entry_price))
             self.tick_manager.open(
                 ticket=int(pos.ticket), request=track,
                 fill_price=float(pos.entry_price),
-                entry_bar=fill_bar, broker_sl=float(state.sl))
+                entry_bar=fill_bar, broker_sl=float(state.sl),
+                **_narr_kwargs)
+            if _narr_state is not None:
+                self._narrative_states[int(pos.ticket)] = _narr_state
             state.volume = state.volume - filled_vol
             stats["executed"] = stats.get("executed", 0) + 1
             stats["pending_filled"] = stats.get("pending_filled", 0) + 1
@@ -5266,10 +5367,15 @@ class MT5Runner:
         self._pending_orders.pop(state.ticket, None)
         track = self._fill_track_request(state, float(state.volume),
                                          fill_bar)
+        _narr_state, _narr_kwargs = self._narrative_fill_plan(
+            getattr(state, "sig", None), float(pos.entry_price))
         self.tick_manager.open(ticket=int(pos.ticket), request=track,
                                fill_price=float(pos.entry_price),
                                entry_bar=fill_bar,
-                               broker_sl=float(state.sl))
+                               broker_sl=float(state.sl),
+                               **_narr_kwargs)
+        if _narr_state is not None:
+            self._narrative_states[int(pos.ticket)] = _narr_state
         stats["executed"] = stats.get("executed", 0) + 1
         stats["pending_filled"] = stats.get("pending_filled", 0) + 1
         self._journal_fill_open(state, pos, float(state.volume), stats,

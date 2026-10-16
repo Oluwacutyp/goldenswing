@@ -335,3 +335,64 @@ def test_zones_have_no_trigger_or_order_path():
     for name in ("place_order", "trigger", "fire", "signal",
                  "enter", "buy", "sell"):
         assert not hasattr(ZoneCache, name), f"ZoneCache.{name}"
+
+
+# ------------------------------------------------------------- _bos fast path
+
+def test_bos_fast_equals_uncached_across_prefixes(tmp_path):
+    """_bos_fast (precomputed M15 swings) == _bos_uncached (full
+    prefix find_swings) for every sampled (direction, ts).
+
+    A swing at position i depends only on bars [i-n, i+n], so the
+    swings valid for a prefix of length L are exactly the
+    full-frame swings with i < L - n — no lookahead, same values.
+    """
+    rng = np.random.default_rng(7)
+    n = 3000
+    walk = 4200.0 + np.cumsum(rng.normal(0, 3.0, n))
+    rows = []
+    for i in range(n):
+        c = walk[i]
+        rows.append([c, c + abs(rng.normal(0, 2.0)),
+                     c - abs(rng.normal(0, 2.0)), c, 1000.0])
+    m15 = _frame(rows, start="2024-01-01", freq="15min")
+    store = ZoneStore(str(tmp_path / "zones.db"))
+    store._bos_cache = {}
+    try:
+        for ts in list(m15.index[::137]) + [m15.index[-1]]:
+            for direction in (1, -1):
+                fast = store._bos(m15, direction, ts)
+                slow = store._bos_uncached(m15, direction, ts)
+                assert fast == slow, (direction, ts, fast, slow)
+    finally:
+        store._bos_cache = None
+    # Outside a transaction the cache is None and _bos still agrees.
+    for ts in (m15.index[500], m15.index[1500], m15.index[-1]):
+        assert store._bos(m15, 1, ts) == \
+            store._bos_uncached(m15, 1, ts)
+    store.close()
+
+
+def test_seed_scales_linearly_with_bos_memo(tmp_path):
+    """Seed over ~2y of bars finishes fast: _bos is answered from
+    one precomputed M15 swing pass per transaction, not one
+    full-prefix find_swings per zone per bar (which never finished
+    the first refresh in the full-engine backtest)."""
+    import time
+
+    rng = np.random.default_rng(11)
+    n_h1 = 2000
+    walk = 4200.0 + np.cumsum(rng.normal(0, 4.0, n_h1))
+    rows = [[c, c + 6.0, c - 6.0, c, 1000.0] for c in walk]
+    h1 = _frame(rows, start="2024-01-01", freq="h")
+    m15 = _frame([[c, c + 3.0, c - 3.0, c, 1000.0]
+                  for c in 4200.0 + np.cumsum(rng.normal(0, 2.0, 8000))],
+                 start="2024-01-01", freq="15min")
+    store = ZoneStore(str(tmp_path / "zones.db"))
+    t0 = time.monotonic()
+    store.seed({"H1": h1, "M15": m15})
+    elapsed = time.monotonic() - t0
+    assert store._bos_cache is None  # transaction cache cleared
+    assert elapsed < 60.0, f"seed took {elapsed:.1f}s"
+    assert len(store.active_zones()) > 0
+    store.close()

@@ -202,7 +202,7 @@ class FakeApi:
 
 # ------------------------------------------------------- playbook wiring
 
-def test_get_playbooks_instantiates_all_sixteen(tmp_path):
+def test_get_playbooks_instantiates_all_seventeen(tmp_path):
     runner = _runner(tmp_path)
     names = {pb.name for pb in runner._get_playbooks()}
     assert names == {"sweep_reversal", "fvg_midline", "trendline_retest",
@@ -211,7 +211,11 @@ def test_get_playbooks_instantiates_all_sixteen(tmp_path):
                      "retracement_trap", "order_block", "qm_m5",
                      "range_sweep_reclaim", "range_qm",
                      "range_mean_reversion",
-                     "range_compression_breakout"}
+                     "range_compression_breakout",
+                     # CHUNK 3: NarrativePlaybook is wired into the
+                     # runner (fill -> management plan, close ->
+                     # STATE 7), so it is the 17th playbook.
+                     "narrative"}
     assert set(runner.cfg.execute_playbooks) <= names
     assert {"turtle_soup", "v_reversal", "retracement_trap",
             "order_block", "qm_m5"} <= names

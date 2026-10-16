@@ -123,7 +123,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -206,11 +206,23 @@ class StructuralZone:
     last_pattern: str | None = None  # "OB" | "sweep" (bar-shape mapping)
     seen_inside: bool = False  # a close inside the zone (no mitigate yet)
     consec_beyond: int = 0    # consecutive closes beyond the far edge
+    _key_cache: tuple | None = field(  # lazy key() memo, compare=False
+        default=None, compare=False, repr=False)  # (eq ignores it)
 
     @property
     def key(self) -> tuple:
-        """Stable identity: (tf, side, swing_ts).  Unique in the DB."""
-        return (self.tf, self.side, _ts_iso(self.swing_ts))
+        """Stable identity: (tf, side, swing_ts).  Unique in the DB.
+
+        Lazily cached: tf/side/swing_ts never mutate after
+        construction, and key is read once per zone per bar in the
+        per-bar loop — recomputing pd.Timestamp().isoformat() on
+        every access was the seed's remaining hotspot.
+        """
+        cached = self._key_cache
+        if cached is None:
+            cached = (self.tf, self.side, _ts_iso(self.swing_ts))
+            self._key_cache = cached
+        return cached
 
     @property
     def zone_id(self) -> str:
@@ -423,6 +435,8 @@ class ZoneStore:
         self._cursors: dict[str, str] = {}      # tf -> last bar ts (ISO)
         self._swing_marks: dict[str, str] = {}  # tf -> last swing ts checked
         self._last_applied_tick_id: str | None = None
+        self._bos_cache: dict | None = None  # per-transaction _bos memo;
+        # None outside a transaction (see apply() / _bos()).
         self.vacuumed = False
         self.rtree_available = False
         self._load()
@@ -629,7 +643,19 @@ class ZoneStore:
         outcomes; on ANY failure raises (the caller keeps the old
         cache — never partial).
         """
-        outcomes, changed, new_marks = self.compute(frames, tick_id)
+        # Per-transaction _bos memo: _bos depends only on the (fixed)
+        # M15 snapshot + (direction, bar ts), but _apply_bar calls it
+        # once per zone per bar — without the memo a seed re-runs
+        # find_swings over the whole M15 prefix thousands of times
+        # (the full-engine backtest never finished its first
+        # refresh).  The cache lives only for this transaction and
+        # is cleared in finally, so a later transaction with a
+        # different M15 snapshot can never read a stale entry.
+        self._bos_cache = {}
+        try:
+            outcomes, changed, new_marks = self.compute(frames, tick_id)
+        finally:
+            self._bos_cache = None
         if not changed and not new_marks:
             return outcomes
         self.persist(changed, new_marks, tick_id)
@@ -950,7 +976,92 @@ class ZoneStore:
     def _bos(self, m15, direction: int, up_to_ts) -> bool:
         """M15 break of structure in ``direction``, causal: only
         M15 bars with ts <= ``up_to_ts``.  No/short M15 -> True
-        (closes alone decide; documented, not fabricated)."""
+        (closes alone decide; documented, not fabricated).
+
+        Pure in (M15 snapshot, direction, up_to_ts): within one
+        transaction the M15 snapshot is fixed, so results are
+        memoized per transaction by apply() (see _bos_cache).
+        Outside a transaction the cache is None and this computes
+        directly.
+        """
+        cache = self._bos_cache
+        key = None
+        if cache is not None:
+            try:
+                key = (int(direction), _ts_iso(up_to_ts))
+            except Exception:
+                key = None
+            if key is not None and key in cache:
+                return cache[key]
+        result = self._bos_fast(m15, direction, up_to_ts)
+        if cache is not None and key is not None:
+            cache[key] = result
+        return result
+
+    def _bos_ctx(self, m15):
+        """Precomputed M15 swings for this transaction, or None.
+
+        ``_bos`` is called once per zone per bar; recomputing
+        ``find_swings`` over the whole M15 prefix on every call is
+        O(bars x zones x M15) and never finished the first refresh
+        in the full-engine backtest.  The swings are computed ONCE
+        per transaction over the full M15 frame and reused: a swing
+        at position ``i`` depends only on bars ``[i-n, i+n]``, so
+        the swings valid for a prefix of length ``L`` are exactly
+        the full-frame swings with ``i < L - n`` (no lookahead —
+        same window, same values).  Returns ``(index, highs,
+        lows)`` or None (no cache / non-monotonic index -> the
+        caller falls back to the direct computation).
+        """
+        cache = self._bos_cache
+        if cache is None or m15 is None:
+            return None
+        ctx = cache.get("_ctx")
+        if ctx is not None:
+            if ctx[0] is m15:
+                return ctx
+            # Different M15 snapshot inside one transaction (should
+            # not happen): recompute rather than reuse.
+        try:
+            if not m15.index.is_monotonic_increasing:
+                return None
+            highs, lows = find_swings(
+                m15["high"].to_numpy(dtype=float),
+                m15["low"].to_numpy(dtype=float), SWING_N)
+        except Exception:
+            return None
+        ctx = (m15, m15.index, highs, lows,
+               [p[0] for p in highs], [p[0] for p in lows])
+        cache["_ctx"] = ctx
+        return ctx
+
+    def _bos_fast(self, m15, direction: int, up_to_ts) -> bool:
+        """BOS via the precomputed per-transaction M15 swings."""
+        ctx = self._bos_ctx(m15)
+        if ctx is None:
+            return self._bos_uncached(m15, direction, up_to_ts)
+        _, index, highs, lows, high_pos, low_pos = ctx
+        try:
+            ts = pd.Timestamp(up_to_ts)
+        except Exception:
+            return True
+        length = int(index.searchsorted(ts, side="right"))
+        if length < 2 * SWING_N + 5:
+            return True
+        try:
+            close = float(m15["close"].iloc[length - 1])
+        except Exception:
+            return True
+        # Swings valid for this prefix: position i < length - n
+        # (their [i-n, i+n] window lies fully inside the prefix).
+        limit = length - SWING_N
+        if direction > 0:
+            k = bisect.bisect_right(high_pos, limit - 1)
+            return k > 0 and close > highs[k - 1][1]
+        k = bisect.bisect_right(low_pos, limit - 1)
+        return k > 0 and close < lows[k - 1][1]
+
+    def _bos_uncached(self, m15, direction: int, up_to_ts) -> bool:
         if m15 is None or len(m15) < 2 * SWING_N + 5:
             return True
         try:
@@ -986,18 +1097,26 @@ class ZoneStore:
         # dead and does not propagate; EXPIRED / FADED zones keep
         # their own terminal state.
         terminal = {"BROKEN", "MITIGATED"}
+        # Precompute once: the original code re-scanned ALL outcomes
+        # per zone (zones x outcomes) while recomputing z.key
+        # (pd.Timestamp().isoformat()) on every comparison — 176s
+        # of a 189s seed.  Set lookups are exactly equivalent here:
+        # candidates are computed before the loop mutates outcomes.
+        terminal_keys = {o.zone_key for o in outcomes
+                         if o.outcome in terminal}
         candidates = [
             z for z in view
-            if z.status == "active" or any(
-                o.zone_key == z.key and o.outcome in terminal
-                for o in outcomes)]
+            if z.status == "active" or z.key in terminal_keys]
         for cluster in find_clusters(
                 candidates,
                 include_statuses=("active", "broken", "mitigated")):
             zones = cluster["zones"]
-            broken = [z for z in zones
-                      if any(o.zone_key == z.key and
-                             o.outcome == "BROKEN" for o in outcomes)]
+            # Recomputed per cluster: prior iterations mutate
+            # outcomes (sub-zone -> BROKEN), and the original code
+            # saw the mutated list here.
+            broken_keys = {o.zone_key for o in outcomes
+                           if o.outcome == "BROKEN"}
+            broken = [z for z in zones if z.key in broken_keys]
             if not broken:
                 continue
             parent = min(broken, key=lambda z: TF_ORDER.index(z.tf))

@@ -514,6 +514,20 @@ class ConfluenceEngine:
                     return False, (
                         f"cooldown: {side} edge cooling after false "
                         f"breakout / invalidation — no range trade")
+            # 0e. Narrative chain: a playbook with
+            # requires_narrative_chain fires only with a COMPLETE
+            # chain (ENTRY state at the signal's direction).  A
+            # single pattern alone never trades.
+            if getattr(pb, "requires_narrative_chain", False):
+                from .live.narrative import chain_check
+                narr = hierarchy_verdict.get("narrative")
+                if narr is None:
+                    return False, (
+                        "narrative chain unproven: verdict carries "
+                        "no narrative state — chain never confirmed")
+                ok, why = chain_check(narr, signal.direction)
+                if not ok:
+                    return False, f"narrative: {why}"
         ok, reason = self._session_allowed(pb, signal.index, ctx)
         if not ok:
             return False, reason
