@@ -279,7 +279,7 @@ def test_fetch_builds_missing_m1_from_ticks(tmp_path):
 
 def test_fetch_builds_missing_h1_from_ticks(tmp_path):
     # H1 native missing + ticks present -> H1 built from ticks,
-    # no block (2026-10-16 fix: owner tried F2, H1 still empty).
+    # no block (2026-10-16 fix: manual download did not fix it, H1 still empty).
     start = pd.Timestamp("2026-01-01", tz="UTC")
     end = pd.Timestamp("2026-01-03", tz="UTC")
     fake = _FakeMT5MissingM1(missing_tfs=("H1",))
@@ -294,7 +294,7 @@ def test_fetch_builds_missing_h1_from_ticks(tmp_path):
 
 def test_fetch_missing_h1_and_no_ticks_blocks_with_diagnostics(tmp_path):
     # H1 native missing AND no ticks -> blocks, and the error
-    # carries diagnostics (not a bare "F2 download" message).
+    # carries diagnostics (not a bare "download history" message).
     class _NoTicks(_FakeMT5MissingM1):
         def copy_ticks_range(self, symbol, start, end, flags):
             return None
@@ -437,3 +437,102 @@ def test_fetch_records_datetime_mode_and_requested_range(tmp_path):
     assert manifest["datetime_modes"]["H1"] == "tz_aware"
     assert manifest["tfs"]["H1"]["requested"] == "2026-01-01..2026-01-03"
     assert "returned" in manifest["tfs"]["H1"]
+
+
+def test_diagnose_includes_terminal_path_account_and_from_pos(tmp_path):
+    # Owner evidence (2026-10-16): chart shows H1 back to Jun 2023,
+    # yet copy_rates_range returned 0. Diagnostics must show WHICH
+    # terminal Python connected to (path / data path / account)
+    # and whether from_pos fetch works at all.
+    class _FullDiag(_FakeMT5MissingM1):
+        def terminal_info(self):
+            class _TI:
+                connected = True
+                trade_allowed = True
+                server = "Exness-MT5Trial10"
+                build = 5000
+                name = "MetaTrader 5"
+                company = "Exness"
+                path = r"C:\Program Files\Exness MT5\terminal64.exe"
+                data_path = r"C:\Users\Admin\AppData\Roaming\MetaQuotes\Terminal\ABC"
+            return _TI()
+
+        def account_info(self):
+            class _AI:
+                login = 81800936
+                server = "Exness-MT5Trial10"
+                name = "Demo"
+                currency = "USD"
+                company = "Exness"
+            return _AI()
+
+        def copy_rates_range(self, symbol, tf, start, end):
+            return None  # range returns nothing (the reported bug)
+
+        def copy_rates_from_pos(self, symbol, tf, start_pos, count):
+            times = pd.date_range("2026-10-01", periods=count,
+                                  freq="h", tz="UTC")
+            arr = np.zeros(count, dtype=[("time", "i8"), ("open", "f8"),
+                                         ("high", "f8"), ("low", "f8"),
+                                         ("close", "f8"),
+                                         ("tick_volume", "i8"),
+                                         ("spread", "i8"),
+                                         ("real_volume", "i8")])
+            arr["time"] = (times.astype("int64") // 10 ** 9).to_numpy()
+            arr["open"] = 4000.0
+            arr["high"] = 4001.0
+            arr["low"] = 3999.0
+            arr["close"] = 4000.5
+            return arr
+
+    fake = _FullDiag()
+    start = pd.Timestamp("2023-10-17", tz="UTC")
+    end = pd.Timestamp("2026-10-16", tz="UTC")
+    diag = mf.diagnose_mt5(fake, "XAUUSDm", start, end)
+    assert diag["terminal"]["path"] == (
+        r"C:\Program Files\Exness MT5\terminal64.exe")
+    assert diag["terminal"]["data_path"].endswith("ABC")
+    assert diag["account"]["login"] == "81800936"
+    assert diag["account"]["server"] == "Exness-MT5Trial10"
+    # Range probe empty, from_pos probe finds bars -> date-param /
+    # terminal-window bug, NOT a history limit.
+    assert diag["probe_h1_last_30d"]["rows"] == 0
+    assert diag["probe_from_pos_h1"]["rows"] == 100
+    summary = mf._diag_summary(diag)
+    assert "terminal_path=" in summary
+    assert "account_login=81800936" in summary
+    assert "probe_from_pos_H1_rows=100" in summary
+
+
+def test_initialize_with_path_passes_path(tmp_path):
+    # --terminal-path / MT5_TERMINAL_PATH must reach initialize(path=...).
+    seen: dict = {}
+
+    class _PathFake(_FakeMT5MissingM1):
+        def initialize(self, path=None, **kwargs):
+            seen["path"] = path
+            return True
+
+    start = pd.Timestamp("2026-01-01", tz="UTC")
+    end = pd.Timestamp("2026-01-03", tz="UTC")
+    mf.fetch_mt5_native("XAUUSDm", start, end, tmp_path,
+                        mt5_module=_PathFake(),
+                        terminal_path=r"C:\MT5\terminal64.exe")
+    assert seen["path"] == r"C:\MT5\terminal64.exe"
+
+
+def test_terminal_path_env_var(tmp_path, monkeypatch):
+    seen: dict = {}
+
+    class _PathFake(_FakeMT5MissingM1):
+        def initialize(self, path=None, **kwargs):
+            seen["path"] = path
+            return True
+
+    monkeypatch.setenv("MT5_TERMINAL_PATH", r"C:\MT5\terminal64.exe")
+    start = pd.Timestamp("2026-01-01", tz="UTC")
+    end = pd.Timestamp("2026-01-03", tz="UTC")
+    manifest = mf.fetch_mt5_native("XAUUSDm", start, end, tmp_path,
+                                   mt5_module=_PathFake())
+    assert seen["path"] == r"C:\MT5\terminal64.exe"
+    assert manifest["terminal_path"] == r"C:\MT5\terminal64.exe"

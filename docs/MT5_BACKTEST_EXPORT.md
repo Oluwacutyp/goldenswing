@@ -19,6 +19,14 @@ On the EC2 MT5 terminal (or any terminal with full history):
 ```python
 import MetaTrader5 as mt5
 import pandas as pd
+# If several MT5 terminals are installed, initialize() with NO path
+# can attach to a DIFFERENT terminal (different data path, no
+# history, wrong broker) — and copy_rates then returns 0 even
+# though the chart on the running terminal shows years of data.
+# Point at the RUNNING terminal's exe explicitly:
+#   mt5.initialize(path=r"C:\Program Files\Exness MT5\terminal64.exe")
+# Verify with mt5.terminal_info().path / .data_path and
+# mt5.account_info().login — the diagnostics in mt5_fetch.py log all three.
 mt5.initialize()
 SYMBOL = "XAUUSDm"  # broker symbol on that terminal (Exness)
 FROM = pd.Timestamp("2024-10-01", tz="UTC")
@@ -48,16 +56,19 @@ Copy the 10 CSVs to `goldenswing/data/` and re-run.
 
 - Same window for every TF. Common intersection must be non-empty.
 - Closed bars only (`copy_rates_range` returns closed bars).
-- Sub-hourly fallback: if the terminal has no cached M1/M5/M15/M30
-  bars for the window but HAS ticks, those TFs' bars are aggregated
-  from the tick stream itself (Bid OHLC per minute bucket) and
-  flagged `built_from_ticks` in the provenance. This is NOT
+- Tick-build fallback (any TF): if the terminal has no cached
+  bars for a TF's window but HAS ticks, that TF's bars are
+  aggregated from the tick stream itself (Bid OHLC per bucket)
+  and flagged `built_from_ticks` in the provenance. This is NOT
   resampling from H1 — it aggregates the tick stream, the same
-  source MT5 builds bars from. HTF bars (H1/H4/D1/W1/MN1) with no
-  terminal history still BLOCK. No ticks at all still BLOCKS.
+  source MT5 builds bars from. No ticks at all still BLOCKS —
+  with diagnostics (terminal path / account / probe).
 - Do NOT stitch across history holes. If the terminal returns gapped
-  history, re-download first (F2 → download) or export a window
-  inside one contiguous segment. The loader reports segments and the
+  history, request the window via the API (`copy_rates_range`
+  pulls history from the server) or export a window inside one
+  contiguous segment. NOTE: in MT5 there is NO History Center
+  (that is MT4 — in MT5, F2 is Task Manager). History comes via
+  chart scroll / API request. The loader reports segments and the
   largest gap per TF — see `scripts/backtest_mt5_full.py --coverage`.
 - Ticks: `COPY_TICKS_ALL`. Without ticks the harness can smoke-run on
   the labelled M1 proxy (`--allow-m1-proxy`), but that is NOT a tick

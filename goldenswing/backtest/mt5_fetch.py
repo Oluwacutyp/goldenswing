@@ -29,7 +29,7 @@ call per TF (small).
 
 Tick-aggregation fallback (2026-10-16): the terminal often has
 no cached bars for a window even though it HAS the tick stream
-(the owner tried the F2 history download and H1 STILL came back
+(manual history download did not fix it and H1 STILL came back
 empty). When ANY TF's ``copy_rates_range`` comes back empty but
 ticks were fetched, the bars for that TF are aggregated from the
 tick stream itself (:func:`build_bars_from_ticks`) and cached as
@@ -42,11 +42,12 @@ server timezone when the terminal reports one, UTC otherwise).
 Only a window with no ticks at all still BLOCKS — and then it
 blocks WITH diagnostics (terminal/server/symbol state, last
 error, a 30-day H1 probe, requested vs returned range), not
-with a bare "F2 download" message.
+with a bare "download history" message.
 """
 from __future__ import annotations
 
 import importlib
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -71,7 +72,7 @@ REQUIRED_TFS = tuple(TF_ATTRS)
 #: stream when the terminal has no cached bars for them. Ticks
 #: are the source truth and contain the session boundaries, so
 #: HTF bars are built this way too — blocking on missing native
-#: HTF history (owner tried F2, H1 still empty) was the bug.
+#: HTF history (manual download did not fix it, H1 still empty) was the bug.
 #: Tick-built TFs are always flagged ``built_from_ticks``.
 BUILDABLE_FROM_TICKS = REQUIRED_TFS
 
@@ -116,6 +117,49 @@ def _server_utc_offset_hours(mt5) -> float:
     if abs(raw) > 24:  # minutes
         return raw / 60.0
     return raw  # hours
+
+
+def _initialize(mt5, terminal_path: str | None = None) -> bool:
+    """Connect to MT5, pinned to the RUNNING terminal when known.
+
+    ``initialize()`` with no path can attach to a DIFFERENT MT5
+    terminal than the one on screen (several installs / brokers)
+    — different data path, no history, wrong broker — and then
+    ``copy_rates`` returns 0 even though the chart shows years of
+    data. That is exactly the 2026-10-16 failure: the terminal's
+    H1 chart scrolled back to Jun 2023, yet the fetch reported
+    "no H1 bars". Pass the running terminal's exe via
+    ``terminal_path`` (or ``MT5_TERMINAL_PATH`` env) to pin it.
+    Falls back to bare ``initialize()`` when the module does not
+    accept ``path`` (test fakes).
+    """
+    if terminal_path:
+        try:
+            return bool(mt5.initialize(path=terminal_path))
+        except TypeError:
+            pass
+    return bool(mt5.initialize())
+
+
+def _copy_rates_from_pos(mt5, symbol: str, tf_attr: str,
+                         count: int = 100) -> tuple[object, str]:
+    """``copy_rates_from_pos`` probe: last ``count`` bars, no dates.
+
+    Proves whether the fetch works AT ALL. If this returns rows
+    while ``copy_rates_range`` returns 0 for the same TF, the bug
+    is in the date params / terminal history window — NOT a
+    history limit and NOT missing data. Returns (rates, mode).
+    """
+    fn = getattr(mt5, "copy_rates_from_pos", None)
+    if fn is None:
+        return None, "unavailable"
+    try:
+        rates = fn(symbol, tf_attr, 0, count)
+    except Exception:
+        return None, "error"
+    if rates is not None and len(rates) > 0:
+        return rates, "from_pos"
+    return rates, "empty"
 
 
 def _copy_rates(mt5, symbol: str, tf_attr: str,
@@ -165,9 +209,20 @@ def diagnose_mt5(mt5, symbol: str, start, end) -> dict:
         diag["terminal"] = {
             k: str(getattr(ti, k, None))
             for k in ("connected", "trade_allowed", "server",
-                      "build", "name", "company", "path")}
+                      "build", "name", "company", "path", "data_path")}
     except Exception as exc:  # noqa: BLE001 - diagnostics
         diag["terminal"] = {"error": str(exc)}
+    try:
+        ai = mt5.account_info()
+        if ai is None:
+            diag["account"] = {"logged_in": False}
+        else:
+            diag["account"] = {
+                k: str(getattr(ai, k, None))
+                for k in ("login", "server", "name", "currency",
+                          "company")}
+    except Exception as exc:  # noqa: BLE001 - diagnostics
+        diag["account"] = {"error": str(exc)}
     try:
         si = mt5.symbol_info(symbol)
         if si is None:
@@ -183,6 +238,25 @@ def diagnose_mt5(mt5, symbol: str, start, end) -> dict:
         diag["last_error"] = str(mt5.last_error())
     except Exception as exc:  # noqa: BLE001 - diagnostics
         diag["last_error"] = f"last_error() failed: {exc}"
+    # from_pos probe: last 100 H1 bars with NO dates. If this
+    # returns rows while copy_rates_range returns 0, the fetch
+    # works and the bug is in the date params / window — the
+    # terminal DOES have the history (owner's chart proves it:
+    # H1 back to Jun 2023, inside the requested window).
+    try:
+        rates, mode = _copy_rates_from_pos(
+            mt5, symbol, getattr(mt5, TF_ATTRS["H1"]), 100)
+        if rates is not None and len(rates) > 0:
+            import pandas as _pd
+            times = _pd.to_datetime(
+                _pd.DataFrame(rates)["time"], unit="s", utc=True)
+            diag["probe_from_pos_h1"] = {
+                "rows": int(len(rates)), "mode": mode,
+                "first": str(times.min()), "last": str(times.max())}
+        else:
+            diag["probe_from_pos_h1"] = {"rows": 0, "mode": mode}
+    except Exception as exc:  # noqa: BLE001 - diagnostics
+        diag["probe_from_pos_h1"] = {"error": str(exc)}
     try:
         probe_start = end - timedelta(days=30)
         rates, mode = _copy_rates(
@@ -203,17 +277,24 @@ def diagnose_mt5(mt5, symbol: str, start, end) -> dict:
 def _diag_summary(diag: dict) -> str:
     """One-line diagnostics for error messages."""
     term = diag.get("terminal", {}) or {}
+    acct = diag.get("account", {}) or {}
     sym = diag.get("symbol_info", {}) or {}
     probe = diag.get("probe_h1_last_30d", {}) or {}
+    from_pos = diag.get("probe_from_pos_h1", {}) or {}
     req = diag.get("requested", {}) or {}
     return (
         f"diagnostics: terminal_connected={term.get('connected')}, "
         f"server={term.get('server')}, "
+        f"terminal_path={term.get('path')}, "
+        f"account_login={acct.get('login')}, "
+        f"account_server={acct.get('server')}, "
         f"trade_allowed={term.get('trade_allowed')}, "
         f"symbol_visible={sym.get('visible')}, "
         f"symbol_select={sym.get('select')}, "
         f"last_error={diag.get('last_error')}, "
         f"probe_H1_last_30d_rows={probe.get('rows')}, "
+        f"probe_from_pos_H1_rows={from_pos.get('rows')} "
+        f"({from_pos.get('first')}..{from_pos.get('last')}), "
         f"requested={req.get('start')}..{req.get('end')}")
 
 
@@ -278,10 +359,11 @@ def _cache_covers(cache_dir: Path, symbol: str, start: pd.Timestamp,
 
 def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                        end: pd.Timestamp, cache_dir: Path,
-                       tick_chunk_days: int = 90) -> dict:
+                       tick_chunk_days: int = 90,
+                       terminal_path: str | None = None) -> dict:
     """Fetch via an already-imported MetaTrader5 module. Raises
     MT5Unavailable when initialize / symbol_select fails."""
-    if not mt5.initialize():
+    if not _initialize(mt5, terminal_path):
         raise MT5Unavailable(MT5_NOT_RUNNING_MSG)
     try:
         if not mt5.symbol_select(symbol, True):
@@ -293,6 +375,8 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                           "start": str(start), "end": str(end),
                           "source": "mt5_terminal_live_fetch",
                           "resampling": "NONE",
+                          "terminal_path": terminal_path
+                          or "(bare initialize() — no path pinned)",
                           "tfs": {}}
         start_dt = start.to_pydatetime()
         end_dt = end.to_pydatetime()
@@ -397,14 +481,20 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
 def fetch_mt5_native(symbol: str, start: pd.Timestamp,
                      end: pd.Timestamp, cache_dir: Path | None = None,
                      *, mt5_module=None,
-                     tick_chunk_days: int = 90) -> dict:
+                     tick_chunk_days: int = 90,
+                     terminal_path: str | None = None) -> dict:
     """Fetch native MT5 bars + ticks into ``cache_dir``. Always
     fetches (no cache check) — use :func:`ensure_mt5_native` for
     the cached path. ``mt5_module`` injects a fake MetaTrader5 for
     tests; when None the real ``MetaTrader5`` package is imported.
+    ``terminal_path`` pins ``initialize(path=...)`` to the running
+    terminal's exe (else ``MT5_TERMINAL_PATH`` env, else bare
+    ``initialize()`` — which can attach to the wrong terminal).
     """
     cache = Path(cache_dir) if cache_dir is not None \
         else DEFAULT_CACHE_DIR
+    if terminal_path is None:
+        terminal_path = os.environ.get("MT5_TERMINAL_PATH") or None
     if mt5_module is None:
         try:
             mt5_module = importlib.import_module("MetaTrader5")
@@ -414,13 +504,15 @@ def fetch_mt5_native(symbol: str, start: pd.Timestamp,
                 "machine — pip install MetaTrader5, start MT5 and "
                 "log in, then rerun. " + MT5_NOT_RUNNING_MSG)
     return _fetch_with_module(mt5_module, symbol, start, end, cache,
-                              tick_chunk_days=tick_chunk_days)
+                              tick_chunk_days=tick_chunk_days,
+                              terminal_path=terminal_path)
 
 
 def ensure_mt5_native(symbol: str, start: pd.Timestamp,
                       end: pd.Timestamp, cache_dir: Path | None = None,
                       *, mt5_module=None, force: bool = False,
-                      tick_chunk_days: int = 90) -> dict:
+                      tick_chunk_days: int = 90,
+                      terminal_path: str | None = None) -> dict:
     """Fetch unless the cache already covers [start, end].
 
     Returns the manifest. ``source`` is ``mt5_cache`` on a cache hit
@@ -435,7 +527,8 @@ def ensure_mt5_native(symbol: str, start: pd.Timestamp,
                 "cache_dir": str(cache)}
     manifest = fetch_mt5_native(symbol, start, end, cache,
                                 mt5_module=mt5_module,
-                                tick_chunk_days=tick_chunk_days)
+                                tick_chunk_days=tick_chunk_days,
+                                terminal_path=terminal_path)
     manifest["cache_dir"] = str(cache)
     return manifest
 

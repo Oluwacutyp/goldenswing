@@ -115,7 +115,8 @@ def _ensure_data(args) -> tuple[pd.Timestamp, pd.Timestamp, dict]:
                             "cache_dir": str(cache)}
     try:
         manifest = ensure_mt5_native(args.symbol, start, end, cache,
-                                     force=args.force_fetch)
+                                     force=args.force_fetch,
+                                     terminal_path=args.terminal_path)
     except MT5Unavailable as exc:
         print(f"BLOCKED — {exc}", file=sys.stderr)
         raise SystemExit(3)
@@ -294,6 +295,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-telegram", action="store_true",
                     help="do not export the summary to Telegram "
                          "(tests / local runs only — real runs send)")
+    ap.add_argument("--terminal-path", type=str, default=None,
+                    help="pin MT5 initialize(path=...) to the RUNNING "
+                         "terminal's terminal64.exe (default: "
+                         "$MT5_TERMINAL_PATH, else bare initialize() — "
+                         "which can attach to the wrong terminal and "
+                         "return 0 bars despite the chart showing data)")
     ap.add_argument("--telegram-chat", type=str, default=None,
                     help="Telegram chat id (default: "
                          "$GS_TELEGRAM_CHAT_ID or 5478650254)")

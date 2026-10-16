@@ -23,8 +23,8 @@ explicitly and is always flagged ``ticks: m1_proxy`` in any report.
 It is never presented as real MT5 ticks.
 
 Tick-aggregation fallback (2026-10-16): the terminal often has no
-cached bars for a window (M1 3y is ~1M bars; the owner tried the
-F2 history download and H1 STILL came back empty), even though it
+cached bars for a window (M1 3y is ~1M bars; manual history
+download did not fix it and H1 STILL came back empty), even though it
 HAS the tick stream. When ANY TF's bars are missing but ticks are
 present, ``build_bars_from_ticks`` aggregates the tick stream
 itself into that TF's OHLC bars (open = first bid, high = max bid,
@@ -70,8 +70,8 @@ DEFAULT_SYMBOL = "XAUUSDm"
 #: EVERY timeframe may be aggregated from the MT5 tick stream
 #: when the terminal has no cached bars for it. Ticks are the
 #: source truth and they contain the session boundaries; blocking
-#: on missing native HTF history (the owner tried the F2 download
-#: and H1 still came back empty) was the bug, not missing data.
+#: on missing native HTF history (the owner tried manual history
+#: download and H1 still came back empty) was the bug, not missing data.
 #: Tick-built TFs are always flagged ``built_from_ticks`` in the
 #: provenance — never hidden.
 BUILDABLE_FROM_TICKS = ("M1", "M5", "M15", "M30",
@@ -240,8 +240,12 @@ Copy the 10 CSVs to goldenswing/data/ and re-run. Requirements:
 - Same window for every TF (common intersection must be non-empty).
 - Closed bars only (copy_rates_range returns closed bars).
 - Do NOT stitch across history holes: if the terminal returns
-  gapped history, the loader reports segments; re-download history
-  first (F2 -> download) or export a window inside one segment.
+  gapped history, the loader reports segments; request the
+  window via the API (``copy_rates_range`` pulls history from
+  the server) or export a window inside one segment. NOTE: in
+  MT5 there is NO History Center (that is MT4 — in MT5, F2 is
+  Task Manager). History comes via chart scroll / API request,
+  and the tick-build fallback is the fix, not manual download.
 - Ticks: COPY_TICKS_ALL. Without ticks the harness can smoke-run on
   the labelled M1 proxy, but that is NOT a tick backtest.
 """
