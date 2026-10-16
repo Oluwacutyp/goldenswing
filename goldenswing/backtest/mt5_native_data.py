@@ -3,10 +3,12 @@
 OWNER RULE (2026-10-16): no resampling. Every timeframe's bars must
 come from that timeframe's own file — MT5 ``copy_rates`` output for
 that TF, or that vendor's own per-TF file (OANDA's H4 file is OANDA's
-own H4 bars, NOT H1 bars aggregated by us). A timeframe with no file
-is MISSING, and loading raises :class:`MissingNativeData` with the
-exact MT5 export needed. There is no fallback, no silent aggregation,
-and this module contains no resampling call of any kind.
+own H4 bars, NOT H1 bars aggregated by us) — or be aggregated from
+the MT5 tick stream (flagged ``built_from_ticks``). A timeframe with
+no file AND no ticks is MISSING, and loading raises
+:class:`MissingNativeData` with auto-fetch diagnostics. There is no
+manual CSV step: the backtest fetches from the running MT5 terminal
+itself. This module contains no resampling call of any kind.
 
 Why this matters: resampling H1 -> H4/D1/W1/MN1 fabricates TF
 structure. Real H4/D1 bars have their own opens/closes (broker
@@ -206,49 +208,18 @@ def _tick_candidates(symbol: str) -> tuple[str, ...]:
     """MT5 tick export candidates (copy_ticks_range CSV)."""
     return (f"MT5_{symbol}_ticks*.csv",)
 
-MT5_EXPORT_SPEC = """\
-MT5 EXPORT NEEDED — one common window, every timeframe native.
-
-On the EC2 MT5 terminal (or any terminal with full history), run
-MetaTrader5 Python (pip install MetaTrader5) with this script:
-
-    import MetaTrader5 as mt5
-    import pandas as pd
-    mt5.initialize()
-    SYMBOL = "XAUUSDm"  # broker symbol on that terminal (Exness)
-    FROM = pd.Timestamp("2024-10-01", tz="UTC")
-    TO = pd.Timestamp("2026-10-12", tz="UTC")
-    TFS = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
-           "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
-           "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
-           "D1": mt5.TIMEFRAME_D1, "W1": mt5.TIMEFRAME_W1,
-           "MN1": mt5.TIMEFRAME_MN1}
-    for name, tf in TFS.items():
-        rates = mt5.copy_rates_range(SYMBOL, tf, FROM.to_pydatetime(),
-                                     TO.to_pydatetime())
-        df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-        df.to_csv(f"MT5_XAUUSDm_{name}_native.csv", index=False)
-    # Ticks (single stream, NOT per-TF):
-    ticks = mt5.copy_ticks_range(SYMBOL, FROM.to_pydatetime(),
-                                 TO.to_pydatetime(), mt5.COPY_TICKS_ALL)
-    tdf = pd.DataFrame(ticks)
-    tdf["time"] = pd.to_datetime(tdf["time"], unit="s", utc=True)
-    tdf.to_csv("MT5_XAUUSDm_ticks.csv", index=False)
-
-Copy the 10 CSVs to goldenswing/data/ and re-run. Requirements:
-- Same window for every TF (common intersection must be non-empty).
-- Closed bars only (copy_rates_range returns closed bars).
-- Do NOT stitch across history holes: if the terminal returns
-  gapped history, the loader reports segments; request the
-  window via the API (``copy_rates_range`` pulls history from
-  the server) or export a window inside one segment. NOTE: in
-  MT5 there is NO History Center (that is MT4 — in MT5, F2 is
-  Task Manager). History comes via chart scroll / API request,
-  and the tick-build fallback is the fix, not manual download.
-- Ticks: COPY_TICKS_ALL. Without ticks the harness can smoke-run on
-  the labelled M1 proxy, but that is NOT a tick backtest.
-"""
+#: Short note used in missing-data errors. The backtest
+#: auto-fetches from the running MT5 terminal
+#: (``copy_rates_range`` per TF + ``copy_ticks_range``) — there is
+#: no manual CSV step. If data is missing, start MT5, log in, and
+#: re-run; the fetch pulls the data itself and reports
+#: diagnostics (terminal path / account / probe) when the
+#: terminal returns nothing.
+AUTO_FETCH_NOTE = (
+    "The backtest auto-fetches from the running MT5 terminal "
+    "(copy_rates_range per TF + copy_ticks_range) — no manual "
+    "CSV step. Start MT5, log in, and re-run; the fetch reports "
+    "diagnostics when the terminal returns nothing.")
 
 
 class MissingNativeData(RuntimeError):
@@ -259,8 +230,7 @@ class MissingNativeData(RuntimeError):
         self.coverage = coverage or {}
         msg = ("Native backtest data missing for: "
                + ", ".join(self.missing)
-               + ". No resampling fallback — export native MT5 bars.\n"
-               + MT5_EXPORT_SPEC)
+               + ". " + AUTO_FETCH_NOTE)
         super().__init__(msg)
 
 
@@ -352,16 +322,67 @@ def coverage_report(data_dir: Path | None = None,
     return out
 
 
+def _bar_window_covers(frame: pd.DataFrame, tf: str,
+                       start: pd.Timestamp, end: pd.Timestamp) -> bool:
+    """True iff ``frame``'s bars cover [``start``, ``end``].
+
+    Bars are stamped by OPEN time, so the last bar covers up to
+    ``last_open + TF length``. A TF whose native file ends before
+    the tick window ends (e.g. a stale file ending Dec 2025 while
+    ticks run to Oct 2026) does NOT cover the window — its bars
+    are rebuilt from ticks instead of blocking the run.
+    """
+    if frame is None or len(frame) == 0:
+        return False
+    first = frame.index[0]
+    last = frame.index[-1]
+    last_covers_to = last + pd.Timedelta(minutes=TF_MINUTES[tf])
+    return bool(first <= start
+                and last_covers_to >= end - pd.Timedelta(seconds=1))
+
+
+def _tick_window_coverage(frames: dict[str, pd.DataFrame],
+                          ticks_df: pd.DataFrame
+                          ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """(tick_start, tick_end) iff every frame covers the tick window.
+
+    Used by the fetch cache check: a cache is sufficient for a
+    tick-window run when ticks exist and every TF's bars cover
+    [first tick, last tick] — even when the tick window is
+    narrower than the originally requested window (broker tick
+    history is limited: bars go back to 2023, ticks only from
+    Jan 2026).
+    """
+    if ticks_df is None or len(ticks_df) == 0:
+        return None
+    tick_start = ticks_df["time"].min()
+    tick_end = ticks_df["time"].max()
+    if tick_end <= tick_start:
+        return None
+    for tf, frame in frames.items():
+        if not _bar_window_covers(frame, tf, tick_start, tick_end):
+            return None
+    return (tick_start, tick_end)
+
+
 def load_native_frames(data_dir: Path | None = None,
                        symbol: str = DEFAULT_SYMBOL,
                        ) -> tuple[dict[str, pd.DataFrame], dict]:
     """Load every required TF from its own native file.
 
-    Returns (frames, provenance). A TF with no bars file is
-    aggregated from the MT5 tick file when ticks are present (see
-    :func:`build_bars_from_ticks`) and flagged ``built_from_ticks``
-    in the provenance. Raises MissingNativeData if ANY TF has no
-    file AND no ticks — no H1 aggregation, no partial run.
+    Run window = the TICK window. Broker tick history is LIMITED
+    (bars go back to 2023, ticks only from Jan 2026), so requiring
+    every TF to share one identical 3-year window blocks forever.
+    Instead: ticks define the run window
+    [first tick, last tick]; every TF must cover that window —
+    native bars when they cover it, tick-built bars (flagged
+    ``built_from_ticks``) when the native file is missing or does
+    not cover the tick window (e.g. a stale file ending Dec 2025
+    while ticks run to Oct 2026). No TF is ever aggregated from
+    H1 bars; tick-built TFs aggregate the tick stream itself.
+    Raises MissingNativeData if ticks are missing AND any TF has
+    no file — with auto-fetch diagnostics, never a manual
+    export instruction.
     """
     cov = coverage_report(data_dir, symbol)
     missing = [tf for tf, c in cov.items() if c.missing]
@@ -371,47 +392,96 @@ def load_native_frames(data_dir: Path | None = None,
                        "gap_days": round(c.gap_days, 1),
                        "built_from_ticks": bool(c.built_from_ticks)}
                   for tf, c in cov.items()}
-    built: dict[str, pd.DataFrame] = {}
-    for tf in list(missing):
-        if tf not in BUILDABLE_FROM_TICKS:
-            continue
-        try:
-            tick_list = load_native_ticks(data_dir, symbol)
-        except MissingNativeData:
-            continue
+    # Ticks once: they define the run window when present.
+    try:
+        tick_list = load_native_ticks(data_dir, symbol)
+    except MissingNativeData:
+        tick_list = None
+    ticks_df: pd.DataFrame | None = None
+    tick_start: pd.Timestamp | None = None
+    tick_end: pd.Timestamp | None = None
+    if tick_list:
         ticks_df = pd.DataFrame(tick_list).rename(
             columns={"tick_volume": "volume"})
-        bars = build_bars_from_ticks(ticks_df, tf)
-        if len(bars) == 0:
-            continue
-        built[tf] = bars
-        missing.remove(tf)
-        if len(bars) > 1:
-            diffs = bars.index[1:] - bars.index[:-1]
-            gap = float(diffs.max().total_seconds() / 86400)
-        else:
-            gap = 0.0
-        provenance[tf] = {
-            "source": f"built_from_ticks (MT5_{symbol}_ticks.csv)",
-            "rows": len(bars),
-            "start": str(bars.index[0]),
-            "end": str(bars.index[-1]),
-            "segments": _segments(bars.index, tf),
-            "gap_days": round(gap, 1),
-            "built_from_ticks": True,
-        }
+        ticks_df["time"] = pd.to_datetime(ticks_df["time"], utc=True)
+        ticks_df = ticks_df.sort_values("time").drop_duplicates("time")
+        if len(ticks_df) >= 2:
+            tick_start = ticks_df["time"].min()
+            tick_end = ticks_df["time"].max()
+
+    if ticks_df is not None and tick_start is not None \
+            and tick_end is not None:
+        frames: dict[str, pd.DataFrame] = {}
+        still_missing: list[str] = []
+        for tf in REQUIRED_TFS:
+            native = None if cov[tf].missing else \
+                cov[tf]._frame.copy()  # type: ignore[attr-defined]
+            if native is not None and _bar_window_covers(
+                    native, tf, tick_start, tick_end):
+                frames[tf] = native
+                continue
+            # Native missing OR native does not cover the tick
+            # window (stale / short file): rebuild from ticks.
+            bars = build_bars_from_ticks(ticks_df, tf)
+            if len(bars) == 0:
+                still_missing.append(tf)
+                continue
+            frames[tf] = bars
+            note = ""
+            if native is not None:
+                note = (f" — native file existed but did not cover "
+                        f"the tick window (native "
+                        f"{native.index[0]}..{native.index[-1]})")
+            if len(bars) > 1:
+                diffs = bars.index[1:] - bars.index[:-1]
+                gap = float(diffs.max().total_seconds() / 86400)
+            else:
+                gap = 0.0
+            provenance[tf] = {
+                "source": f"built_from_ticks "
+                          f"(MT5_{symbol}_ticks.csv){note}",
+                "rows": len(bars),
+                "start": str(bars.index[0]),
+                "end": str(bars.index[-1]),
+                "segments": _segments(bars.index, tf),
+                "gap_days": round(gap, 1),
+                "built_from_ticks": True,
+            }
+        if still_missing:
+            raise MissingNativeData(still_missing, provenance)
+        provenance["window"] = {"start": str(tick_start),
+                                "end": str(tick_end)}
+        provenance["tick_window"] = {
+            "start": str(tick_start), "end": str(tick_end),
+            "rows": int(len(ticks_df)),
+            "source": f"MT5_{symbol}_ticks.csv (copy_ticks_range — "
+                      "broker tick history is limited; bars run "
+                      "on the tick window)"}
+        provenance["tick_coverage"] = (
+            f"ticks available {tick_start}..{tick_end}; "
+            f"full-engine tick run on the tick window")
+        provenance["built_from_ticks"] = sorted(
+            tf for tf in REQUIRED_TFS
+            if provenance.get(tf, {}).get("built_from_ticks"))
+        provenance["resampling"] = (
+            "NONE — every TF from its own native file or aggregated "
+            "from the MT5 tick stream (never from H1 bars)")
+        return frames, provenance
+
+    # No usable ticks: fall back to native files only. A TF with
+    # no file cannot be built — raise, with auto-fetch diagnostics.
     if missing:
         raise MissingNativeData(missing, provenance)
     frames = {tf: cov[tf]._frame.copy()  # type: ignore[attr-defined]
-              for tf in REQUIRED_TFS if tf not in built}
-    frames.update(built)
-    # Common intersection must be non-empty, else the run is vacuous.
+              for tf in REQUIRED_TFS}
+    # Native-only intersection: the run window when no ticks exist.
     start = max(f.index[0] for f in frames.values())
     end = min(f.index[-1] for f in frames.values())
     if start >= end:
         raise MissingNativeData(
-            [f"common window empty (latest start {start} >= "
-             f"earliest end {end}) — export one common window"],
+            [f"native TF files do not share a run window "
+             f"(latest first bar {start} >= earliest last bar "
+             f"{end})"],
             provenance)
     provenance["window"] = {"start": str(start), "end": str(end)}
     provenance["built_from_ticks"] = sorted(

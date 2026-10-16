@@ -1,60 +1,52 @@
-> AUTO-FETCH (2026-10-16): you do NOT need this manual export anymore.
-> `scripts/backtest_mt5_full.py` fetches the data itself from the running
-> MT5 terminal on start (`copy_rates_range` per TF + `copy_ticks_range`),
-> cached to `data/mt5_native/`. One command: `python scripts/backtest_mt5_full.py --out data/mt5_bt_out`.
-> This document is kept as the manual fallback / reference for the exact
-> calls the auto-fetch makes.
-
-# MT5 native backtest export — no resampling
+# MT5 native backtest data — auto-fetch, no resampling
 
 The full-engine backtest (`scripts/backtest_mt5_full.py`) runs the REAL
 `MT5Runner` on NATIVE per-timeframe data. Every TF's bars come from
-that TF's own file. A missing TF fails loudly — there is no
-resampling fallback anywhere on this path.
+that TF's own file, or are aggregated from the MT5 tick stream
+(flagged `built_from_ticks`). There is no resampling anywhere on
+this path, and there is **no manual CSV step**.
 
-## What to export
+## Auto-fetch (the only path)
 
-On the EC2 MT5 terminal (or any terminal with full history):
+On start, the backtest fetches the data itself from the running MT5
+terminal (`goldenswing/backtest/mt5_fetch.py`):
+`copy_rates_range` per TF + `copy_ticks_range` (one tick stream),
+cached to `data/mt5_native/` so a second run is instant. One command:
 
-```python
-import MetaTrader5 as mt5
-import pandas as pd
-# If several MT5 terminals are installed, initialize() with NO path
-# can attach to a DIFFERENT terminal (different data path, no
-# history, wrong broker) — and copy_rates then returns 0 even
-# though the chart on the running terminal shows years of data.
-# Point at the RUNNING terminal's exe explicitly:
-#   mt5.initialize(path=r"C:\Program Files\Exness MT5\terminal64.exe")
-# Verify with mt5.terminal_info().path / .data_path and
-# mt5.account_info().login — the diagnostics in mt5_fetch.py log all three.
-mt5.initialize()
-SYMBOL = "XAUUSDm"  # broker symbol on that terminal (Exness)
-FROM = pd.Timestamp("2024-10-01", tz="UTC")
-TO = pd.Timestamp("2026-10-12", tz="UTC")
-TFS = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
-       "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
-       "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
-       "D1": mt5.TIMEFRAME_D1, "W1": mt5.TIMEFRAME_W1,
-       "MN1": mt5.TIMEFRAME_MN1}
-for name, tf in TFS.items():
-    rates = mt5.copy_rates_range(SYMBOL, tf, FROM.to_pydatetime(),
-                                 TO.to_pydatetime())
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df.to_csv(f"MT5_XAUUSDm_{name}_native.csv", index=False)
-# Ticks — a SINGLE stream, not one per TF:
-ticks = mt5.copy_ticks_range(SYMBOL, FROM.to_pydatetime(),
-                             TO.to_pydatetime(), mt5.COPY_TICKS_ALL)
-tdf = pd.DataFrame(ticks)
-tdf["time"] = pd.to_datetime(tdf["time"], unit="s", utc=True)
-tdf.to_csv("MT5_XAUUSDm_ticks.csv", index=False)
+```powershell
+python scripts\backtest_mt5_full.py --out data\mt5_bt_out
 ```
 
-Copy the 10 CSVs to `goldenswing/data/` and re-run.
+If MT5 is not running / not logged in, it FAILS with diagnostics
+(terminal path / account / probe) — never a manual-export script.
+
+If several MT5 terminals are installed, bare `initialize()` can
+attach to a DIFFERENT terminal (different data path, no history,
+wrong broker) and `copy_rates` then returns 0 even though the chart
+on the running terminal shows years of data. Pin the running
+terminal with `--terminal-path "C:\...\terminal64.exe"` (or the
+`MT5_TERMINAL_PATH` env var) and verify via
+`terminal_info().path / .data_path` and `account_info().login`.
+
+## Tick window (broker tick history is limited)
+
+Broker tick history is LIMITED: bars go back to 2023, ticks only
+from about Jan 2026. Requiring every TF to share one identical
+3-year window blocks forever — that was the empty-intersection
+block bug.
+
+The run window is the **tick window**: [first tick, last tick].
+Every TF must cover the tick window — native bars when they cover
+it, tick-built bars (flagged `built_from_ticks`) when the native
+file is missing or does not cover it (e.g. a stale file ending
+Dec 2025 while ticks run to Oct 2026). The report states the tick
+window explicitly ("ticks available 2026-01-01..2026-10-16, bars
+2023-06-28..2026-10-16, full-engine tick run on tick window").
+A cache that covers the tick window is reused; re-fetching would
+return the same limited ticks.
 
 ## Rules
 
-- Same window for every TF. Common intersection must be non-empty.
 - Closed bars only (`copy_rates_range` returns closed bars).
 - Tick-build fallback (any TF): if the terminal has no cached
   bars for a TF's window but HAS ticks, that TF's bars are
@@ -64,38 +56,18 @@ Copy the 10 CSVs to `goldenswing/data/` and re-run.
   source MT5 builds bars from. No ticks at all still BLOCKS —
   with diagnostics (terminal path / account / probe).
 - Do NOT stitch across history holes. If the terminal returns gapped
-  history, request the window via the API (`copy_rates_range`
-  pulls history from the server) or export a window inside one
-  contiguous segment. NOTE: in MT5 there is NO History Center
-  (that is MT4 — in MT5, F2 is Task Manager). History comes via
-  chart scroll / API request. The loader reports segments and the
-  largest gap per TF — see `scripts/backtest_mt5_full.py --coverage`.
+  history, the loader reports segments and the largest gap per TF —
+  see `scripts/backtest_mt5_full.py --coverage`. NOTE: in MT5 there
+  is NO History Center (that is MT4 — in MT5, F2 is Task Manager).
+  History comes via chart scroll / API request.
 - Ticks: `COPY_TICKS_ALL`. Without ticks the harness can smoke-run on
   the labelled M1 proxy (`--allow-m1-proxy`), but that is NOT a tick
   backtest and is always flagged `ticks: m1_proxy` in the report.
 
-## Current repo state (2026-10-16)
-
-| TF | File | Coverage |
-|---|---|---|
-| D1 | MT5 native | 727 bars, gapped (longest segment 2024-03-31→2026-07-17) |
-| H4 | OANDA per-TF | 2022-01→2024-10 only — no overlap with H1 |
-| H1 | OANDA per-TF | 2024-10→2026-10 |
-| M15 | OANDA per-TF | 2024-10→2026-10 |
-| M5 | OANDA per-TF | 2026-04→2026-10 only |
-| M1 | OANDA per-TF | 2026-09→2026-10 only |
-| M30 / W1 / MN1 | — | NO FILE — export required |
-| Ticks | — | NO FILE — export required |
-
-OANDA per-TF files are that vendor's own bars for that TF — not H1
-bars aggregated by us. They are usable as native bars, but their
-windows do not line up, so the full native run is BLOCKED until the
-MT5 export above lands with one common window.
-
 ## What "no resampling" means here
 
-MT5 ticks are one stream. TF bars are MT5's own per-TF `copy_rates`.
-"MT5 ticks for every timeframe" = real tick stream + native bars
-for every TF. Resampling H1 → H4/D1 fabricates TF structure (own
-opens/closes, session boundaries, Sunday candles, gaps) and is
-refused on this path.
+MT5 ticks are one stream. TF bars are MT5's own per-TF `copy_rates`
+or tick-stream aggregations. "MT5 ticks for every timeframe" = real
+tick stream + bars for every TF. Resampling H1 → H4/D1 fabricates TF
+structure (own opens/closes, session boundaries, Sunday candles,
+gaps) and is refused on this path.

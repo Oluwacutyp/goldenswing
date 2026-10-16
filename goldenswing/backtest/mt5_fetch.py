@@ -47,13 +47,14 @@ with a bare "download history" message.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 
-from .mt5_native_data import build_bars_from_ticks
+from .mt5_native_data import TF_MINUTES, build_bars_from_ticks
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "mt5_native"
@@ -322,14 +323,29 @@ def _rates_file(cache_dir: Path, symbol: str, tf: str) -> Path | None:
     return None
 
 
+def _bar_covers(first: pd.Timestamp, last: pd.Timestamp, tf: str,
+                start: pd.Timestamp, end: pd.Timestamp) -> bool:
+    """True iff bars stamped [``first``..``last``] cover [``start``, ``end``].
+
+    Bars are stamped by OPEN time, so the last bar covers up to
+    ``last_open + TF length``. A naive ``last >= end`` check fails
+    real caches (the last closed H1 bar always opens before
+    ``end``) and forces a pointless re-fetch every run.
+    """
+    last_covers_to = last + pd.Timedelta(minutes=TF_MINUTES[tf])
+    return bool(first <= start
+                and last_covers_to >= end - pd.Timedelta(seconds=1))
+
+
 def _cache_covers(cache_dir: Path, symbol: str, start: pd.Timestamp,
                   end: pd.Timestamp) -> bool:
-    """True iff every TF CSV + ticks CSV exists and covers [start, end].
+    """True iff every TF CSV + ticks CSV covers [start, end].
 
     Reads only the ``time`` column. A missing or short file means
     the cache does NOT cover the window — fetch (or re-fetch) it.
     Filenames carry the symbol (``MT5_{symbol}_...``) so caches
-    for different broker symbols never get mixed up.
+    for different broker symbols never get mixed up. Bars are
+    checked bar-aware (last open + TF length covers ``end``).
     """
     for tf in REQUIRED_TFS:
         path = _rates_file(cache_dir, symbol, tf)
@@ -342,7 +358,7 @@ def _cache_covers(cache_dir: Path, symbol: str, start: pd.Timestamp,
         if len(times) == 0:
             return False
         ts = pd.to_datetime(times["time"], utc=True)
-        if ts.min() > start or ts.max() < end:
+        if not _bar_covers(ts.min(), ts.max(), tf, start, end):
             return False
     ticks = cache_dir / _ticks_filename(symbol)
     if not ticks.exists():
@@ -354,7 +370,49 @@ def _cache_covers(cache_dir: Path, symbol: str, start: pd.Timestamp,
     if len(times) == 0:
         return False
     ts = pd.to_datetime(times["time"], utc=True)
-    return bool(ts.min() <= start and ts.max() >= end)
+    return bool(ts.min() <= start
+                and ts.max() >= end - pd.Timedelta(hours=1))
+
+
+def _cache_covers_tick_window(cache_dir: Path, symbol: str
+                              ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """(tick_start, tick_end) iff the cache covers the TICK window.
+
+    Broker tick history is LIMITED (bars go back to 2023, ticks
+    only from Jan 2026), so a cache that covers the tick window
+    is sufficient for a tick-window run even though it does not
+    cover the originally requested 3-year window. Returns None
+    when ticks are missing or any TF's bars do not cover
+    [first tick, last tick].
+    """
+    ticks = cache_dir / _ticks_filename(symbol)
+    if not ticks.exists():
+        return None
+    try:
+        times = pd.read_csv(ticks, usecols=["time"])
+    except Exception:
+        return None
+    if len(times) == 0:
+        return None
+    ts = pd.to_datetime(times["time"], utc=True)
+    tick_start, tick_end = ts.min(), ts.max()
+    if tick_end <= tick_start:
+        return None
+    for tf in REQUIRED_TFS:
+        path = _rates_file(cache_dir, symbol, tf)
+        if path is None:
+            return None
+        try:
+            ftimes = pd.read_csv(path, usecols=["time"])
+        except Exception:
+            return None
+        if len(ftimes) == 0:
+            return None
+        fts = pd.to_datetime(ftimes["time"], utc=True)
+        if not _bar_covers(fts.min(), fts.max(), tf,
+                           tick_start, tick_end):
+            return None
+    return (tick_start, tick_end)
 
 
 def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
@@ -411,6 +469,18 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
             "rows": int(len(ticks_df)),
             "start": str(ticks_df["time"].min()),
             "end": str(ticks_df["time"].max())}
+        # Broker tick history is LIMITED: the terminal returns
+        # ticks only for the recent window (e.g. from Jan 2026)
+        # even when bars go back to 2023. Record the actual tick
+        # window — the loader runs the full engine on it instead
+        # of blocking on the requested 3-year window.
+        manifest["tick_window"] = {
+            "start": str(ticks_df["time"].min()),
+            "end": str(ticks_df["time"].max())}
+        manifest["tick_history_limited"] = bool(
+            ticks_df["time"].min() > start)
+        manifest["requested_window"] = {"start": str(start),
+                                        "end": str(end)}
         offset = _server_utc_offset_hours(mt5)
         manifest["server_utc_offset_hours"] = offset
         built_from_ticks: list[str] = []
@@ -470,6 +540,11 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                 f"{_diag_summary(diag)}")
         manifest["built_from_ticks"] = built_from_ticks
         manifest["datetime_modes"] = datetime_modes
+        try:
+            (cache_dir / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, default=str))
+        except OSError:
+            pass  # manifest is a debugging aid; cache files matter
         return manifest
     finally:
         try:
@@ -516,7 +591,11 @@ def ensure_mt5_native(symbol: str, start: pd.Timestamp,
     """Fetch unless the cache already covers [start, end].
 
     Returns the manifest. ``source`` is ``mt5_cache`` on a cache hit
-    (no terminal contact), ``mt5_terminal_live_fetch`` on a fetch.
+    (no terminal contact), ``mt5_cache_tick_window`` when the cache
+    covers the broker-limited tick window (ticks start after the
+    requested start — re-fetching would return the same limited
+    ticks, so the run proceeds on the tick window instead of
+    re-fetching forever), ``mt5_terminal_live_fetch`` on a fetch.
     """
     cache = Path(cache_dir) if cache_dir is not None \
         else DEFAULT_CACHE_DIR
@@ -525,6 +604,28 @@ def ensure_mt5_native(symbol: str, start: pd.Timestamp,
                 "source": "mt5_cache",
                 "resampling": "NONE",
                 "cache_dir": str(cache)}
+    if not force:
+        tick_win = _cache_covers_tick_window(cache, symbol)
+        if tick_win is not None:
+            tick_start, tick_end = tick_win
+            overlap_start = max(tick_start, start)
+            overlap_end = min(tick_end, end)
+            # Ticks must be current (reach the requested end) and
+            # the overlap must be a real run window (>= 30 days).
+            # A historical request that does not overlap the tick
+            # window falls through to a fresh fetch.
+            if tick_end >= end - pd.Timedelta(days=1) and \
+                    (overlap_end - overlap_start) >= pd.Timedelta(
+                        days=30):
+                return {"symbol": symbol,
+                        "start": str(start), "end": str(end),
+                        "source": "mt5_cache_tick_window",
+                        "resampling": "NONE",
+                        "cache_dir": str(cache),
+                        "tick_window": {"start": str(tick_start),
+                                        "end": str(tick_end)},
+                        "run_window": {"start": str(overlap_start),
+                                       "end": str(overlap_end)}}
     manifest = fetch_mt5_native(symbol, start, end, cache,
                                 mt5_module=mt5_module,
                                 tick_chunk_days=tick_chunk_days,

@@ -142,7 +142,7 @@ def _print_coverage(args) -> int:
     try:
         frames, prov = load_native_frames(cache, args.symbol)
         w = prov["window"]
-        print(f"\nCommon window: {w['start']} -> {w['end']}")
+        print(f"\nRun window (tick window): {w['start']} -> {w['end']}")
         if prov.get("built_from_ticks"):
             print(f"Built from MT5 ticks (terminal had no cached "
                   f"bars): {', '.join(prov['built_from_ticks'])}")
@@ -336,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  {provenance['resampling']}")
 
     dxy = bfe._load_csv(bfe.DATA_DIR / "DOLLAR_H1_2y.csv")
-    # FULL WINDOW: the whole common window runs — no --days slice,
+    # FULL WINDOW: the whole tick window runs — no --days slice,
     # no --max-bars cap, no sampling. run() below consumes EVERY
     # tick (max_ticks=len(ticks)) for as long as it needs.
     start = pd.Timestamp(provenance["window"]["start"])
