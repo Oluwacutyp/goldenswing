@@ -938,7 +938,16 @@ def _run_backtest_subprocess(job: BacktestJob) -> dict:
                           timeout=BACKTEST_TIMEOUT_S)
     results_path = job.out_dir / "results.json"
     if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "")[-500:]
+        combined = proc.stderr or proc.stdout or ""
+        # Missing-feed failure must surface as the clear message,
+        # never a pandas traceback as the first signal.
+        if "Backtest data missing:" in combined:
+            line = next(
+                (ln.strip() for ln in combined.splitlines()
+                 if "Backtest data missing:" in ln),
+                combined.strip())
+            raise RuntimeError(line)
+        tail = combined[-500:]
         raise RuntimeError(
             f"backtest subprocess failed (exit {proc.returncode}): {tail}")
     if not results_path.exists():
@@ -971,11 +980,19 @@ def _finish_backtest_job(job: BacktestJob, ctx: CommandContext,
     except Exception as exc:  # noqa: BLE001 — a failed run still reports
         job.status = "failed"
         job.error = f"{type(exc).__name__}: {exc}"
-        result = CommandResult(
-            text=f"📊 Backtest failed: {job.error}\n"
-                 f"({job.days} days, playbook "
-                 f"{job.playbook or 'all'}) — the run itself errored, "
-                 f"not the engine. Re-run with /backtest.")
+        if "Backtest data missing:" in str(exc):
+            result = CommandResult(
+                text=f"📊 Backtest data missing — no run started.\n"
+                     f"{exc}\n"
+                     f"({job.days} days, playbook "
+                     f"{job.playbook or 'all'}) — pull the latest "
+                     f"main on EC2, then re-run with /backtest.")
+        else:
+            result = CommandResult(
+                text=f"📊 Backtest failed: {job.error}\n"
+                     f"({job.days} days, playbook "
+                     f"{job.playbook or 'all'}) — the run itself errored, "
+                     f"not the engine. Re-run with /backtest.")
     finally:
         with _BACKTEST_LOCK:
             _BACKTEST_JOBS.pop("global", None)

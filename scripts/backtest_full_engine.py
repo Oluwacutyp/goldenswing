@@ -134,6 +134,30 @@ from goldenswing.live.news import NewsCalendar  # noqa: E402
 
 DATA_DIR = REPO_ROOT / "data"
 START_BALANCE = 10_000.0
+
+#: Backtest feed files. These ship with the repo (force-added despite
+#: ``data/*.csv`` in .gitignore) so an EC2 ``git pull`` has the feed.
+#: Never run the backtest without them — see missing_backtest_data().
+BACKTEST_CSVS = (
+    "OANDA_XAU_USD_H1_20241001_20261012.csv",
+    "OANDA_XAU_USD_M15_20241001_20261012.csv",
+    "OANDA_XAU_USD_M5_20260401_20261012.csv",
+    "DOLLAR_H1_2y.csv",
+)
+
+#: Distinct exit code for missing feed data (2 = arg validation).
+BACKTEST_MISSING_DATA_EXIT = 3
+
+BACKTEST_DATA_MISSING_MSG = (
+    "Backtest data missing: {missing}. On EC2: git pull origin main "
+    "(CSVs ship with the repo), or run /harvest. "
+    "Do not run backtest without feed.")
+
+
+def missing_backtest_data(data_dir: Path | None = None) -> list[str]:
+    """Names of backtest CSVs absent from ``data_dir`` (default DATA_DIR)."""
+    base = Path(data_dir) if data_dir is not None else DATA_DIR
+    return [name for name in BACKTEST_CSVS if not (base / name).is_file()]
 LEVERAGE = 500.0
 SPREAD = 0.20
 CONTRACT = 100.0  # 1 lot = 100 oz
@@ -773,6 +797,18 @@ def _main_impl(argv: list[str] | None = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     print(f"out: {out}")
     _LAST_NOTIFY.update({"notify": bool(args.notify_telegram), "out": out})
+
+    # ------------------------------------------------------------ feed check
+    # Fail gracefully with a clear message, never a pandas traceback
+    # as the first signal (EC2 pulls once lacked these: data/*.csv
+    # is gitignored, the CSVs ship force-added).
+    missing = missing_backtest_data()
+    if missing:
+        msg = BACKTEST_DATA_MISSING_MSG.format(missing=", ".join(missing))
+        print(msg, file=sys.stderr)
+        if args.notify_telegram:
+            print(notify_telegram(None, out, error=RuntimeError(msg)))
+        return BACKTEST_MISSING_DATA_EXIT
 
     # ------------------------------------------------------------ data
     h1 = _with_feed_cols(_load_csv(DATA_DIR / "OANDA_XAU_USD_H1_20241001_20261012.csv"))

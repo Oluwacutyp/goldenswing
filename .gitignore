@@ -3,6 +3,11 @@ __pycache__/
 .venv/
 .pytest_cache/
 data/*.csv
+# Backtest feed ships with the repo (force-added): EC2 pulls need it.
+!data/OANDA_XAU_USD_H1_20241001_20261012.csv
+!data/OANDA_XAU_USD_M15_20241001_20261012.csv
+!data/OANDA_XAU_USD_M5_20260401_20261012.csv
+!data/DOLLAR_H1_2y.csv
 *.egg-info/
 forecast_models.joblib
 forecast_oof_probs.csv
