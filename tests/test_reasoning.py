@@ -185,6 +185,11 @@ def test_runner_accepted_signal_carries_reasoning_and_study(tmp_path):
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
         execute_playbooks=("fvg_midline",),
+        # News pause OFF: the order path's news check reads the
+        # REAL wall-clock calendar — this test must not fail on
+        # a real news day (e.g. PPI).  The pause itself is covered
+        # by test_news_calendar.py.
+        news_pause_enabled=False,
         golden_swing_confirm_enabled=False)
     feed = MT5Feed(MT5FeedConfig(), mt5_module=FakeMT5())
     feed.connect()
@@ -241,6 +246,11 @@ def test_runner_shadow_signal_gets_no_reasoning(tmp_path):
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
         execute_playbooks=(),  # fvg_midline is shadow here
+        # News pause OFF: the order path's news check reads the
+        # REAL wall-clock calendar — this test must not fail on
+        # a real news day (e.g. PPI).  The pause itself is covered
+        # by test_news_calendar.py.
+        news_pause_enabled=False,
         golden_swing_confirm_enabled=False)
     feed = MT5Feed(MT5FeedConfig(), mt5_module=FakeMT5())
     feed.connect()

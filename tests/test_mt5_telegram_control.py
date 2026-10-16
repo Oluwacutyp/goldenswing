@@ -98,6 +98,11 @@ def _runner(tmp_path, *, executor=None, **cfg_kw):
         kill_switch_path=tmp_path / "mt5_KILL",
         poll_interval_seconds=0,
         fixed_lots=0.01,
+        # News pause OFF: the order path's news check reads the
+        # REAL wall-clock calendar — these tests must not fail on
+        # a real news day (e.g. PPI).  The pause itself is covered
+        # by test_news_calendar.py.
+        news_pause_enabled=False,
         **cfg_kw)
     runner = MT5Runner(cfg, executor=executor or FakeExecutor())
     runner.feed = SimpleNamespace(
