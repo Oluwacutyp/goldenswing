@@ -48,6 +48,13 @@ Copy the 10 CSVs to `goldenswing/data/` and re-run.
 
 - Same window for every TF. Common intersection must be non-empty.
 - Closed bars only (`copy_rates_range` returns closed bars).
+- Sub-hourly fallback: if the terminal has no cached M1/M5/M15/M30
+  bars for the window but HAS ticks, those TFs' bars are aggregated
+  from the tick stream itself (Bid OHLC per minute bucket) and
+  flagged `built_from_ticks` in the provenance. This is NOT
+  resampling from H1 — it aggregates the tick stream, the same
+  source MT5 builds bars from. HTF bars (H1/H4/D1/W1/MN1) with no
+  terminal history still BLOCK. No ticks at all still BLOCKS.
 - Do NOT stitch across history holes. If the terminal returns gapped
   history, re-download first (F2 → download) or export a window
   inside one contiguous segment. The loader reports segments and the

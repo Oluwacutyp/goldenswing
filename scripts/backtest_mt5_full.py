@@ -18,6 +18,12 @@ falls back to OANDA CSVs, never resamples, never silently uses
 the M1 proxy. ``--no-fetch`` runs on the cache only (fails if the
 cache does not cover the window).
 
+M1/M5/M15/M30 fallback: when the terminal has no cached bars
+for a sub-hourly TF but HAS ticks, that TF's bars are
+aggregated from the tick stream itself (Bid OHLC per minute
+bucket) and flagged ``built_from_ticks`` in the provenance —
+never resampled from H1. No ticks at all still BLOCKS.
+
 Ticks: real MT5 ``copy_ticks_range`` from the terminal. Without
 real ticks the run refuses unless ``--allow-m1-proxy`` smoke-runs
 on the labelled M1 approximation (4 invented ticks per M1 bar) —
@@ -132,6 +138,9 @@ def _print_coverage(args) -> int:
         frames, prov = load_native_frames(cache, args.symbol)
         w = prov["window"]
         print(f"\nCommon window: {w['start']} -> {w['end']}")
+        if prov.get("built_from_ticks"):
+            print(f"Built from MT5 ticks (terminal had no cached "
+                  f"bars): {', '.join(prov['built_from_ticks'])}")
     except MissingNativeData as exc:
         print(f"\nBLOCKED: {exc.missing}")
         return 3
@@ -305,9 +314,14 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     print("Frames (native, no resampling):")
     for tf, meta in provenance.items():
-        if tf in ("window", "resampling"):
+        if tf in ("window", "resampling", "built_from_ticks"):
             continue
-        print(f"  {tf:4} {meta['rows']:>6} rows  {meta['source']}")
+        tag = " [built from MT5 ticks]" \
+            if meta.get("built_from_ticks") else ""
+        print(f"  {tf:4} {meta['rows']:>6} rows  {meta['source']}{tag}")
+    if provenance.get("built_from_ticks"):
+        print(f"  Built from ticks: "
+              f"{', '.join(provenance['built_from_ticks'])}")
     print(f"  {provenance['resampling']}")
 
     dxy = bfe._load_csv(bfe.DATA_DIR / "DOLLAR_H1_2y.csv")

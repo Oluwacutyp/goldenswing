@@ -26,6 +26,18 @@ OANDA CSVs, never resamples, never silently uses the M1 proxy.
 Ticks are fetched in chunks (default 90 days) so a multi-year
 ``copy_ticks_range`` does not blow up in one call. Rates are one
 call per TF (small).
+
+Tick-aggregation fallback (2026-10-16): the terminal often has
+no cached M1/M5/M15/M30 bars for a 3y window even though it
+HAS the tick stream. When a sub-hourly TF's ``copy_rates_range``
+comes back empty but ticks were fetched, the bars for that TF
+are aggregated from the tick stream itself
+(:func:`build_bars_from_ticks`) and cached as
+``MT5_{symbol}_{TF}_from_ticks.csv``, flagged
+``built_from_ticks`` in the manifest. This aggregates ticks —
+the same stream MT5 builds bars from — never H1 bars. HTF bars
+(H1/H4/D1/W1/MN1) with no terminal history still BLOCK with
+the F2 message, and no ticks at all still BLOCKS.
 """
 from __future__ import annotations
 
@@ -34,6 +46,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+
+from .mt5_native_data import build_bars_from_ticks
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "mt5_native"
@@ -47,6 +61,11 @@ TF_ATTRS = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5",
             "D1": "TIMEFRAME_D1", "W1": "TIMEFRAME_W1",
             "MN1": "TIMEFRAME_MN1"}
 REQUIRED_TFS = tuple(TF_ATTRS)
+
+#: Sub-hourly TFs whose bars may be aggregated from the fetched
+#: tick stream when the terminal has no cached bars for them.
+#: HTF bars are never built this way — missing HTF history BLOCKS.
+BUILDABLE_FROM_TICKS = ("M1", "M5", "M15", "M30")
 
 #: Default broker symbol for the backtest fetch. The owner's
 #: terminal is Exness, where gold is listed as ``XAUUSDm`` — plain
@@ -73,6 +92,22 @@ def _ticks_filename(symbol: str) -> str:
     return f"MT5_{symbol}_ticks.csv"
 
 
+def _from_ticks_filename(tf: str, symbol: str) -> str:
+    return f"MT5_{symbol}_{tf}_from_ticks.csv"
+
+
+def _rates_file(cache_dir: Path, symbol: str, tf: str) -> Path | None:
+    """Native rates file for ``tf`` if present, else the
+    tick-aggregated file, else None."""
+    native = cache_dir / _rates_filename(tf, symbol)
+    if native.exists():
+        return native
+    derived = cache_dir / _from_ticks_filename(tf, symbol)
+    if derived.exists():
+        return derived
+    return None
+
+
 def _cache_covers(cache_dir: Path, symbol: str, start: pd.Timestamp,
                   end: pd.Timestamp) -> bool:
     """True iff every TF CSV + ticks CSV exists and covers [start, end].
@@ -83,8 +118,8 @@ def _cache_covers(cache_dir: Path, symbol: str, start: pd.Timestamp,
     for different broker symbols never get mixed up.
     """
     for tf in REQUIRED_TFS:
-        path = cache_dir / _rates_filename(tf, symbol)
-        if not path.exists():
+        path = _rates_file(cache_dir, symbol, tf)
+        if path is None:
             return False
         try:
             times = pd.read_csv(path, usecols=["time"])
@@ -128,23 +163,10 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                           "tfs": {}}
         start_dt = start.to_pydatetime()
         end_dt = end.to_pydatetime()
-        for tf in REQUIRED_TFS:
-            rates = mt5.copy_rates_range(
-                symbol, getattr(mt5, TF_ATTRS[tf]), start_dt, end_dt)
-            if rates is None or len(rates) == 0:
-                raise MT5Unavailable(
-                    f"MT5 returned no {tf} bars for {symbol} "
-                    f"{start.date()}..{end.date()} — download history "
-                    f"in the terminal (F2) and rerun.")
-            df = pd.DataFrame(rates)
-            df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-            df.to_csv(cache_dir / _rates_filename(tf, symbol), index=False)
-            manifest["tfs"][tf] = {
-                "rows": int(len(df)),
-                "start": str(df["time"].min()),
-                "end": str(df["time"].max())}
-        # Ticks: single stream, chunked so a multi-year range does
-        # not blow up in one call.
+        # Ticks FIRST: the tick stream is the source of truth. If
+        # the terminal has no ticks, nothing else can be built and
+        # the run blocks. Sub-hourly bars fall back to tick
+        # aggregation below, so they need the ticks in hand.
         chunks: list[pd.DataFrame] = []
         chunk_start = start_dt
         step = timedelta(days=tick_chunk_days)
@@ -170,6 +192,48 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
             "rows": int(len(ticks_df)),
             "start": str(ticks_df["time"].min()),
             "end": str(ticks_df["time"].max())}
+        built_from_ticks: list[str] = []
+        for tf in REQUIRED_TFS:
+            rates = mt5.copy_rates_range(
+                symbol, getattr(mt5, TF_ATTRS[tf]), start_dt, end_dt)
+            if rates is not None and len(rates) > 0:
+                df = pd.DataFrame(rates)
+                df["time"] = pd.to_datetime(df["time"], unit="s",
+                                            utc=True)
+                df.to_csv(cache_dir / _rates_filename(tf, symbol),
+                          index=False)
+                manifest["tfs"][tf] = {
+                    "rows": int(len(df)),
+                    "start": str(df["time"].min()),
+                    "end": str(df["time"].max()),
+                    "source": "mt5_copy_rates_native"}
+                continue
+            if tf in BUILDABLE_FROM_TICKS:
+                bars = build_bars_from_ticks(ticks_df, tf)
+                if len(bars) == 0:
+                    raise MT5Unavailable(
+                        f"MT5 returned no {tf} bars for {symbol} "
+                        f"{start.date()}..{end.date()} and tick "
+                        f"aggregation produced none — download "
+                        f"history in the terminal (F2) and rerun.")
+                bars.reset_index().rename(
+                    columns={"timestamp": "time"}).to_csv(
+                        cache_dir / _from_ticks_filename(tf, symbol),
+                        index=False)
+                manifest["tfs"][tf] = {
+                    "rows": int(len(bars)),
+                    "start": str(bars.index[0]),
+                    "end": str(bars.index[-1]),
+                    "source": "built_from_ticks",
+                    "note": "aggregated from the MT5 tick stream; "
+                            f"terminal had no cached {tf} bars"}
+                built_from_ticks.append(tf)
+                continue
+            raise MT5Unavailable(
+                f"MT5 returned no {tf} bars for {symbol} "
+                f"{start.date()}..{end.date()} — download history "
+                f"in the terminal (F2) and rerun.")
+        manifest["built_from_ticks"] = built_from_ticks
         return manifest
     finally:
         try:

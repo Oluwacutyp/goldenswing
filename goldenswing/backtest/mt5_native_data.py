@@ -21,6 +21,20 @@ it raises. ``ticks_from_m1`` is a labelled APPROXIMATION (M1
 OHLC -> 4 ticks) for smoke runs only — it must be opted into
 explicitly and is always flagged ``ticks: m1_proxy`` in any report.
 It is never presented as real MT5 ticks.
+
+Tick-aggregation fallback (2026-10-16): the terminal often has no
+cached M1/M5/M15/M30 bars for a 3y window (M1 3y is ~1M bars),
+even though it HAS the tick stream. When a sub-hourly TF's bars
+are missing but ticks are present, ``build_bars_from_ticks``
+aggregates the tick stream itself into that TF's OHLC bars
+(open = first bid, high = max bid, low = min bid, close = last
+bid, per minute bucket). This is NOT resampling from H1: it
+aggregates the finest-grained source (ticks — the same stream
+MT5 itself builds bars from), never a coarser bar series. The
+provenance flags every such TF as ``built_from_ticks``. If ticks
+are missing too, loading still blocks. HTF bars (H1/H4/D1/W1/MN1)
+are never built from ticks — they stay native-only, because
+their session boundaries must come from the terminal.
 """
 from __future__ import annotations
 
@@ -51,6 +65,70 @@ TF_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60,
 #: the same symbol so fetch cache and loader never disagree.
 DEFAULT_SYMBOL = "XAUUSDm"
 
+#: Sub-hourly TFs that may be aggregated from the MT5 tick stream
+#: when the terminal has no cached bars for them. HTF bars are
+#: never built this way (session boundaries must come from the
+#: terminal). See module docstring for the tick-aggregation rule.
+BUILDABLE_FROM_TICKS = ("M1", "M5", "M15", "M30")
+
+
+def build_bars_from_ticks(ticks_df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    """Aggregate an MT5 tick stream into OHLC bars for one TF.
+
+    ``ticks_df`` needs ``time`` (datetime), ``bid``, ``ask`` and
+    optionally ``volume`` / ``real_volume``. Bars are Bid-based,
+    like MT5 chart bars: open = first bid in the bucket, high =
+    max bid, low = min bid, close = last bid. ``volume`` is the
+    summed tick volume; ``spread`` is the mean ask-bid in the
+    bucket. Buckets are UTC minute boundaries (``floor``) — a
+    bucket contains only ticks inside it, so aggregation is
+    causal with no lookahead. Minutes with no ticks produce no
+    bar (the terminal likewise has no bar without ticks).
+    This aggregates the tick stream itself — it never touches a
+    coarser bar series, so it is not H1 resampling by another
+    name. Only ``BUILDABLE_FROM_TICKS`` may be built this way.
+    """
+    if tf not in BUILDABLE_FROM_TICKS:
+        raise ValueError(
+            f"{tf} is not buildable from ticks — only "
+            f"{BUILDABLE_FROM_TICKS} may be aggregated from the "
+            f"tick stream; HTF bars must come from the terminal.")
+    if ticks_df is None or len(ticks_df) == 0:
+        return pd.DataFrame(columns=["open", "high", "low", "close",
+                                     "volume", "real_volume", "spread"])
+    df = ticks_df.copy()
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.sort_values("time")
+    if "bid" not in df.columns:
+        if "mid" not in df.columns:
+            raise ValueError(
+                "build_bars_from_ticks needs bid (or mid)")
+        df["bid"] = df["mid"]
+    if "ask" not in df.columns:
+        df["ask"] = df["bid"]
+    if "volume" not in df.columns:
+        df["volume"] = 1.0
+    df["spread_tick"] = df["ask"].astype(float) - df["bid"].astype(float)
+    minutes = TF_MINUTES[tf]
+    df["bucket"] = df["time"].dt.floor(f"{minutes}min")
+    grouped = df.groupby("bucket")
+    bars = pd.DataFrame({
+        "open": grouped["bid"].first(),
+        "high": grouped["bid"].max(),
+        "low": grouped["bid"].min(),
+        "close": grouped["bid"].last(),
+        "volume": grouped["volume"].sum(),
+        "spread": grouped["spread_tick"].mean(),
+    })
+    if "real_volume" in df.columns:
+        bars["real_volume"] = grouped["real_volume"].sum()
+    else:
+        bars["real_volume"] = 0.0
+    bars.index.name = "timestamp"
+    bars = bars[["open", "high", "low", "close", "volume",
+                 "real_volume", "spread"]].sort_index()
+    return bars
+
 
 def _tf_candidates(symbol: str) -> dict[str, tuple[str, ...]]:
     """Candidate files per TF for ``symbol``, best first.
@@ -66,14 +144,18 @@ def _tf_candidates(symbol: str) -> dict[str, tuple[str, ...]]:
         "H1": (f"MT5_{symbol}_H1_native*.csv",
                "OANDA_XAU_USD_H1_*.csv"),
         "M15": (f"MT5_{symbol}_M15_native*.csv",
+                f"MT5_{symbol}_M15_from_ticks*.csv",
                 "OANDA_XAU_USD_M15_*.csv"),
         "M5": (f"MT5_{symbol}_M5_native*.csv",
+               f"MT5_{symbol}_M5_from_ticks*.csv",
                "OANDA_XAU_USD_M5_*.csv"),
         "M1": (f"MT5_{symbol}_M1_native*.csv",
+               f"MT5_{symbol}_M1_from_ticks*.csv",
                "OANDA_XAU_USD_M1_*.csv"),
         "W1": (f"MT5_{symbol}_W1_native*.csv",),
         "MN1": (f"MT5_{symbol}_MN1_native*.csv",),
-        "M30": (f"MT5_{symbol}_M30_native*.csv",),
+        "M30": (f"MT5_{symbol}_M30_native*.csv",
+                f"MT5_{symbol}_M30_from_ticks*.csv"),
     }
 
 
@@ -145,6 +227,7 @@ class TFCoverage:
     segments: list[tuple[str, str, int]] = field(default_factory=list)
     gap_days: float = 0.0
     missing: bool = False
+    built_from_ticks: bool = False
 
 
 def _normalize_bars(df: pd.DataFrame, source: str) -> pd.DataFrame:
@@ -207,6 +290,7 @@ def coverage_report(data_dir: Path | None = None,
             frame = pd.concat(frames)
             frame = frame[~frame.index.duplicated(keep="first")].sort_index()
             cov.source = ", ".join(p.name for p in matches)
+            cov.built_from_ticks = "_from_ticks" in pattern
             cov.rows = len(frame)
             cov.start = str(frame.index[0])
             cov.end = str(frame.index[-1])
@@ -226,20 +310,56 @@ def load_native_frames(data_dir: Path | None = None,
                        ) -> tuple[dict[str, pd.DataFrame], dict]:
     """Load every required TF from its own native file.
 
-    Returns (frames, provenance). Raises MissingNativeData if ANY
-    required TF has no file — no resampling, no partial run.
+    Returns (frames, provenance). A sub-hourly TF (M1/M5/M15/M30)
+    with no bars file is aggregated from the MT5 tick file when
+    ticks are present (see :func:`build_bars_from_ticks`) and
+    flagged ``built_from_ticks`` in the provenance. Raises
+    MissingNativeData if ANY other TF has no file, or if a
+    buildable TF has no file AND no ticks — no H1 aggregation,
+    no partial run.
     """
     cov = coverage_report(data_dir, symbol)
     missing = [tf for tf, c in cov.items() if c.missing]
     provenance = {tf: {"source": c.source, "rows": c.rows,
                        "start": c.start, "end": c.end,
                        "segments": c.segments,
-                       "gap_days": round(c.gap_days, 1)}
+                       "gap_days": round(c.gap_days, 1),
+                       "built_from_ticks": bool(c.built_from_ticks)}
                   for tf, c in cov.items()}
+    built: dict[str, pd.DataFrame] = {}
+    for tf in list(missing):
+        if tf not in BUILDABLE_FROM_TICKS:
+            continue
+        try:
+            tick_list = load_native_ticks(data_dir, symbol)
+        except MissingNativeData:
+            continue
+        ticks_df = pd.DataFrame(tick_list).rename(
+            columns={"tick_volume": "volume"})
+        bars = build_bars_from_ticks(ticks_df, tf)
+        if len(bars) == 0:
+            continue
+        built[tf] = bars
+        missing.remove(tf)
+        if len(bars) > 1:
+            diffs = bars.index[1:] - bars.index[:-1]
+            gap = float(diffs.max().total_seconds() / 86400)
+        else:
+            gap = 0.0
+        provenance[tf] = {
+            "source": f"built_from_ticks (MT5_{symbol}_ticks.csv)",
+            "rows": len(bars),
+            "start": str(bars.index[0]),
+            "end": str(bars.index[-1]),
+            "segments": _segments(bars.index, tf),
+            "gap_days": round(gap, 1),
+            "built_from_ticks": True,
+        }
     if missing:
         raise MissingNativeData(missing, provenance)
     frames = {tf: cov[tf]._frame.copy()  # type: ignore[attr-defined]
-              for tf in REQUIRED_TFS}
+              for tf in REQUIRED_TFS if tf not in built}
+    frames.update(built)
     # Common intersection must be non-empty, else the run is vacuous.
     start = max(f.index[0] for f in frames.values())
     end = min(f.index[-1] for f in frames.values())
@@ -249,7 +369,12 @@ def load_native_frames(data_dir: Path | None = None,
              f"earliest end {end}) — export one common window"],
             provenance)
     provenance["window"] = {"start": str(start), "end": str(end)}
-    provenance["resampling"] = "NONE — every TF from its own file"
+    provenance["built_from_ticks"] = sorted(
+        tf for tf in REQUIRED_TFS
+        if provenance.get(tf, {}).get("built_from_ticks"))
+    provenance["resampling"] = (
+        "NONE — every TF from its own native file or aggregated "
+        "from the MT5 tick stream (never from H1 bars)")
     return frames, provenance
 
 
