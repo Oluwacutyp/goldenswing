@@ -286,6 +286,9 @@ def _print_frames(provenance: dict) -> None:
     """
     print("Frames (native, no resampling):")
     for tf, meta in provenance.items():
+        if tf in ("window", "tick_window", "tick_coverage",
+                  "resampling", "built_from_ticks"):
+            continue
         if not isinstance(meta, dict) or "rows" not in meta:
             continue
         tag = " [built from MT5 ticks]" \

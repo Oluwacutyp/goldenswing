@@ -242,17 +242,8 @@ class MT5Executor(Executor):
                 server: str | None = None) -> tuple[bool, str]:
         """Initialise the library against the running terminal.  With
         no credentials it attaches to the terminal as-is (the normal
-        case: the owner logs the terminal in by hand).
-
-        ``path`` pins ``initialize(path=...)`` to the running
-        terminal's exe.  None = ``MT5_TERMINAL_PATH`` env, else bare
-        ``initialize()`` — which can attach to a DIFFERENT MT5
-        install/broker than the one on screen (the 2026-10-16
-        backtest failure)."""
+        case: the owner logs the terminal in by hand)."""
         mt5 = self._lib()
-        if path is None:
-            import os
-            path = os.environ.get("MT5_TERMINAL_PATH") or None
         kwargs = {}
         if path:
             kwargs["path"] = path

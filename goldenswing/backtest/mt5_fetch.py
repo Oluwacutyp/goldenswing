@@ -190,6 +190,32 @@ def _copy_rates(mt5, symbol: str, tf_attr: str,
     return rates, "empty"
 
 
+def _copy_ticks_range(mt5, symbol: str, start_dt,
+                      end_dt) -> tuple[object, str]:
+    """``copy_ticks_range`` with a naive-datetime retry.
+
+    Mirrors :func:`_copy_rates`: MT5 interprets datetimes in broker
+    server time, and some terminal builds return nothing for
+    tz-aware UTC datetimes. If the tz-aware call comes back empty,
+    retry once with tz-naive datetimes and report which
+    representation was used. Returns (ticks, mode) where mode is
+    ``"tz_aware"``, ``"naive_server_time"`` or ``"empty"``.
+    """
+    ticks = mt5.copy_ticks_range(symbol, start_dt, end_dt,
+                                 mt5.COPY_TICKS_ALL)
+    if ticks is not None and len(ticks) > 0:
+        return ticks, "tz_aware"
+    naive_start = start_dt.replace(tzinfo=None) \
+        if getattr(start_dt, "tzinfo", None) else start_dt
+    naive_end = end_dt.replace(tzinfo=None) \
+        if getattr(end_dt, "tzinfo", None) else end_dt
+    ticks = mt5.copy_ticks_range(symbol, naive_start, naive_end,
+                                 mt5.COPY_TICKS_ALL)
+    if ticks is not None and len(ticks) > 0:
+        return ticks, "naive_server_time"
+    return ticks, "empty"
+
+
 def diagnose_mt5(mt5, symbol: str, start, end) -> dict:
     """Why is MT5 returning nothing? Collect the evidence.
 
@@ -445,10 +471,22 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
         chunks: list[pd.DataFrame] = []
         chunk_start = start_dt
         step = timedelta(days=tick_chunk_days)
+        # Per-chunk log: WHICH chunks returned ticks. The owner's
+        # 2026-10-16 run got ~74k ticks (~1 day) from a 3y request
+        # with no visibility into why. If only the last chunk has
+        # rows, the broker/terminal tick history is depth-limited;
+        # if all chunks are empty, the fetch itself failed. The
+        # log (in the manifest) proves which it is.
+        tick_chunks: list[dict] = []
         while chunk_start < end_dt:
             chunk_end = min(chunk_start + step, end_dt)
-            ticks = mt5.copy_ticks_range(
-                symbol, chunk_start, chunk_end, mt5.COPY_TICKS_ALL)
+            ticks, tick_mode = _copy_ticks_range(
+                mt5, symbol, chunk_start, chunk_end)
+            n_ticks = int(len(ticks)) if ticks is not None else 0
+            tick_chunks.append({
+                "chunk_start": str(chunk_start),
+                "chunk_end": str(chunk_end),
+                "rows": n_ticks, "mode": tick_mode})
             if ticks is not None and len(ticks) > 0:
                 tdf = pd.DataFrame(ticks)
                 tdf["time"] = pd.to_datetime(tdf["time"], unit="s",
@@ -465,6 +503,12 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
         ticks_df = pd.concat(chunks, ignore_index=True)
         ticks_df = ticks_df.sort_values("time").drop_duplicates("time")
         ticks_df.to_csv(cache_dir / _ticks_filename(symbol), index=False)
+        manifest["tick_chunks"] = tick_chunks
+        manifest["tick_fetch"] = {
+            "chunks_requested": len(tick_chunks),
+            "chunks_with_data": sum(1 for c in tick_chunks
+                                    if c["rows"] > 0),
+            "total_rows": int(len(ticks_df))}
         manifest["ticks"] = {
             "rows": int(len(ticks_df)),
             "start": str(ticks_df["time"].min()),

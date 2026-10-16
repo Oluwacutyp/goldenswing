@@ -33,7 +33,6 @@ Two MT5 realities this adapter handles honestly:
 """
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -101,14 +100,6 @@ class MT5FeedConfig:
     login: int | None = None
     password: str | None = None
     server: str | None = None
-    #: Terminal exe to pin ``initialize(path=...)`` to.  Bare
-    #: ``initialize()`` can attach to a DIFFERENT MT5 install/broker
-    #: than the one on screen (several installs) — different data
-    #: path, no history, wrong broker — the exact backtest failure
-    #: of 2026-10-16 (chart showed H1 back to Jun 2023, fetch
-    #: reported "no H1 bars").  None = ``MT5_TERMINAL_PATH`` env,
-    #: else bare initialize().  Set via scripts/run_mt5.py
-    #: --terminal-path / env.
     terminal_path: str | None = None
     #: Server->UTC offset hours. None = auto-calibrate from a fresh tick.
     utc_offset_hours: float | None = None
@@ -180,14 +171,10 @@ class MT5Feed:
         """
         mt5 = self._lib()
         last_err = ""
-        # Pin the terminal: cfg wins, else MT5_TERMINAL_PATH env,
-        # else bare initialize() (can attach to the wrong install).
-        terminal_path = self.cfg.terminal_path \
-            or os.environ.get("MT5_TERMINAL_PATH") or None
         for attempt in range(self.cfg.max_connect_attempts):
             kwargs: dict = {}
-            if terminal_path:
-                kwargs["path"] = terminal_path
+            if self.cfg.terminal_path:
+                kwargs["path"] = self.cfg.terminal_path
             if self.cfg.login is not None:
                 kwargs.update(login=int(self.cfg.login),
                               password=self.cfg.password,
@@ -208,52 +195,7 @@ class MT5Feed:
             mt5.shutdown()
             time.sleep(2 ** attempt)
         self.connected = False
-        diag = self._diagnose(mt5)
-        return False, (
-            f"MT5 connect failed after {self.cfg.max_connect_attempts} "
-            f"attempts: {last_err} | {diag}")
-
-    def _diagnose(self, mt5) -> str:
-        """Which terminal / account did we actually attach to?
-
-        Backtest lesson 2026-10-16: bare initialize() can attach to
-        a different terminal than the one on screen, and a bare
-        "connect failed" hides it.  Best-effort, never raises —
-        every field is guarded because diagnostics must never be
-        the thing that breaks the connect.
-        """
-        try:
-            ti = mt5.terminal_info()
-            term = ("terminal connected="
-                    f"{getattr(ti, 'connected', None)}, "
-                    f"server={getattr(ti, 'server', None)}, "
-                    f"path={getattr(ti, 'path', None)}, "
-                    f"data_path={getattr(ti, 'data_path', None)}, "
-                    f"build={getattr(ti, 'build', None)}") \
-                if ti is not None else "terminal_info=None"
-        except Exception as exc:  # noqa: BLE001 - diagnostics
-            term = f"terminal_info failed: {exc}"
-        try:
-            ai = mt5.account_info()
-            acct = (f"account login={getattr(ai, 'login', None)}, "
-                    f"server={getattr(ai, 'server', None)}, "
-                    f"name={getattr(ai, 'name', None)}") \
-                if ai is not None else "account_info=None (not logged in)"
-        except Exception as exc:  # noqa: BLE001 - diagnostics
-            acct = f"account_info failed: {exc}"
-        try:
-            si = mt5.symbol_info(self.cfg.symbol)
-            sym = (f"symbol {self.cfg.symbol} visible="
-                   f"{getattr(si, 'visible', None)}, "
-                   f"select={getattr(si, 'select', None)}") \
-                if si is not None else f"symbol_info({self.cfg.symbol})=None"
-        except Exception as exc:  # noqa: BLE001 - diagnostics
-            sym = f"symbol_info failed: {exc}"
-        try:
-            err = str(mt5.last_error())
-        except Exception:  # noqa: BLE001 - diagnostics
-            err = "last_error() failed"
-        return f"diagnostics: {term} | {acct} | {sym} | last_error={err}"
+        return False, f"MT5 connect failed after {self.cfg.max_connect_attempts} attempts: {last_err}"
 
     def _select_symbol(self, mt5) -> tuple[bool, str]:
         """Select the configured symbol, auto-detecting the broker's

@@ -216,11 +216,6 @@ class MT5RunnerConfig:
     hierarchy_required: bool = True
     tick_interval: float = 0.25
     allow_live: bool = False  # True ONLY for an explicit real-money run
-    #: Terminal exe to pin initialize(path=...) to (feed + executor).
-    #: None = MT5_TERMINAL_PATH env, else bare initialize() — which
-    #: can attach to a different MT5 install than the one on screen
-    #: (the 2026-10-16 backtest failure).  Set via --terminal-path.
-    terminal_path: str | None = None
     max_positions: int = 1
     reconcile_every_ticks: int = 20
     # Telegram command polling: ON by default — this engine OWNS
@@ -849,12 +844,6 @@ class MT5Runner:
         """Run the tick pump until stopped / capped.  Returns stats."""
         feed = self.feed or MT5Feed()
         executor = self.executor or MT5Executor()
-        # Pin the terminal for both halves: the feed's cfg wins,
-        # else the runner cfg (CLI --terminal-path / env), else the
-        # feed's own MT5_TERMINAL_PATH fallback inside connect().
-        if self.cfg.terminal_path \
-                and getattr(feed.cfg, "terminal_path", None) is None:
-            feed.cfg.terminal_path = self.cfg.terminal_path
         ok, msg = feed.connect()
         if not ok:
             # Feed failure on the FEED_ERROR channel (ERROR), before
@@ -881,7 +870,7 @@ class MT5Runner:
             raise RuntimeError(
                 f"MT5 runner: kill switch present at "
                 f"{self.cfg.kill_switch_path} — refusing to start.")
-        ok, msg = executor.connect(path=self.cfg.terminal_path)
+        ok, msg = executor.connect()
         if not ok:
             raise RuntimeError(f"MT5 runner: executor connect failed: {msg}")
 
