@@ -862,16 +862,28 @@ def _mt5_harvest(ctx: CommandContext, args: list[str]) -> CommandResult:
 # them from its own journal.  Delegates to the shared implementation
 # in goldenswing.alerts.commands — one implementation, two registries.
 
-@mt5_command("/backtest", "build + send backtest report file + summary")
+@mt5_command("/backtest", "run a real whole-engine backtest (async)")
 def _mt5_backtest(ctx: CommandContext, args: list[str]) -> CommandResult:
-    from ..alerts.commands import build_backtest_result
-    return build_backtest_result(ctx, drop_back=False)
+    from ..alerts.commands import start_backtest_from_args
+    return start_backtest_from_args(ctx, args, drop_back=False)
 
 
-@mt5_command("/backtest_send", "send backtest results file to drop back to Muse")
+@mt5_command("/backtest_send", "run a real backtest, send file to drop back")
 def _mt5_backtest_send(ctx: CommandContext, args: list[str]) -> CommandResult:
-    from ..alerts.commands import build_backtest_result
-    return build_backtest_result(ctx, drop_back=True)
+    from ..alerts.commands import start_backtest_from_args
+    return start_backtest_from_args(ctx, args, drop_back=True)
+
+
+@mt5_command("/backtest_export", "export paper-journal trades as a report file")
+def _mt5_backtest_export(ctx: CommandContext, args: list[str]) -> CommandResult:
+    from ..alerts.commands import build_backtest_export_result
+    return build_backtest_export_result(ctx, drop_back=False)
+
+
+@mt5_command("/journal_export", "export paper-journal trades as a report file")
+def _mt5_journal_export(ctx: CommandContext, args: list[str]) -> CommandResult:
+    from ..alerts.commands import build_backtest_export_result
+    return build_backtest_export_result(ctx, drop_back=False)
 
 
 @mt5_command("/journal", "journal head / record count / last record")

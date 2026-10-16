@@ -4008,6 +4008,9 @@ class MT5Runner:
             trim_callback=self.trim_top_layer,
             mt5_control=self,
             pending_orders=self.pending_orders_snapshot(),
+            # Background /backtest delivery: the finished report is
+            # sent through the same reply path as sync commands.
+            deliver=self._reply_command,
         )
 
     def _reply_command(self, result) -> None:

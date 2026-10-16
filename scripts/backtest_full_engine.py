@@ -85,8 +85,18 @@ total_R = sum(partial_R * partial_vol/total_vol) + close_R *
 positions are mark-to-market (not counted in totals).
 
 Usage:
-  cd ~/workspace/goldenswing && .venv/bin/python scripts/backtest_full_engine.py [--max-ticks N] [--out DIR]
+  cd ~/workspace/goldenswing && .venv/bin/python scripts/backtest_full_engine.py [--max-ticks N] [--out DIR] [--days N] [--only-playbook NAME]
 Paper only.  No live trading, no network (news fetcher raises).
+
+--days N: backtest only the most recent N days of the dataset
+  (default: whole window).  Warmup bars before the window are still
+  served, so indicators are not cold-started.  Telegram /backtest
+  defaults to 30 days, capped at 90.
+--only-playbook NAME: run with only that executing playbook enabled
+  (one of sweep_reversal, fvg_midline, trendline_retest, fvg_limit,
+  inversion, killzone_open, judas_swing).  Shadow playbooks
+  (turtle_soup, v_reversal, retracement_trap, order_block, qm_m5,
+  qm_d1) never order, so running one alone is refused.
 """
 from __future__ import annotations
 
@@ -514,6 +524,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-ticks", type=int, default=None)
     ap.add_argument("--out", type=str, default=None,
                     help="output dir (default: fresh temp dir)")
+    ap.add_argument("--days", type=int, default=None,
+                    help="backtest only the most recent N days "
+                         "(warmup bars still served)")
+    ap.add_argument("--only-playbook", type=str, default=None,
+                    help="run with only this executing playbook enabled")
     args = ap.parse_args(argv)
 
     out = Path(args.out) if args.out else Path(
@@ -538,6 +553,23 @@ def main(argv: list[str] | None = None) -> int:
     }
     start = max(f.index[0] for f in frames.values())
     end_open = min(f.index[-1] for f in frames.values())
+    if args.days is not None:
+        if args.days <= 0:
+            print("--days must be positive", file=sys.stderr)
+            return 2
+        # Recent window: warmup bars before `start` are still served
+        # by warm_start_all, so indicators are not cold-started.
+        start = max(start, end_open - pd.Timedelta(days=args.days))
+    only_playbook = args.only_playbook
+    if only_playbook is not None:
+        _executing = ("sweep_reversal", "fvg_midline", "trendline_retest",
+                      "fvg_limit", "inversion", "killzone_open",
+                      "judas_swing")
+        if only_playbook not in _executing:
+            print(f"--only-playbook must be one of {', '.join(_executing)}; "
+                  f"got {only_playbook!r} (shadow playbooks never order)",
+                  file=sys.stderr)
+            return 2
     print(f"window: {start} -> {end_open} "
           f"(production H1 bars: "
           f"{int(((h1.index >= start) & (h1.index <= end_open)).sum())})")
@@ -569,6 +601,8 @@ def main(argv: list[str] | None = None) -> int:
         golden_swing_confirm_enabled=False,  # auto-fire (see docstring)
         news_pause_enabled=False,  # no historical calendar (see docstring)
     )
+    if only_playbook is not None:
+        cfg.execute_playbooks = (only_playbook,)
     news = NewsCalendar(cache_path=out / "news_cache.json",
                         fetcher=_no_network,
                         clock=lambda: clock.now_dt())
@@ -591,7 +625,9 @@ def main(argv: list[str] | None = None) -> int:
     report = analyze(out / "mt5_journal.jsonl", runner, stats,
                      frames, broker, ticks)
     report["window"] = {"start": str(start), "end_open": str(end_open),
-                        "ticks": len(ticks), "elapsed_s": round(elapsed, 1)}
+                        "ticks": len(ticks), "elapsed_s": round(elapsed, 1),
+                        "days_requested": args.days,
+                        "only_playbook": only_playbook}
     report["config"] = {
         "balance": START_BALANCE, "risk_pct": cfg.risk_pct,
         "leverage": LEVERAGE, "spread": SPREAD,

@@ -1440,7 +1440,23 @@ class LiveRunner:
                            else self._last_bar_time),
             measured_oos=self._measured_oos_rows(),
             reports_dir=_Path(self.cfg.journal_path).parent / "reports",
+            # Background /backtest delivery through the sender.
+            deliver=self._deliver_backtest_result,
         )
+
+    def _deliver_backtest_result(self, result) -> None:
+        """Send a finished async /backtest report (background thread)."""
+        sender = self._telegram_sender()
+        if sender is None:
+            return
+        try:
+            if getattr(result, "document", None) is not None:
+                sender.send_document(result.document,
+                                     caption=result.caption)
+            elif getattr(result, "text", None) is not None:
+                sender.send_text(result.text, silent=True)
+        except Exception:
+            pass  # answering never breaks the loop
 
     def _dispatch_command(self, update: dict) -> None:
         """Answer one owner command (a no-op for everyone else)."""

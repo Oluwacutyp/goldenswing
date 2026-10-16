@@ -38,6 +38,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import subprocess
+import sys
+import threading
 import zipfile
 from pathlib import Path
 from typing import Callable
@@ -84,6 +87,12 @@ class CommandContext:
     pending_orders: list = field(default_factory=list)  # MT5 pendings
     reconciler: object = None            # engine Reconciler | None (/reconcile)
     deterministic: object = None        # DeterministicRuntime | None (/health)
+    deliver: object = None               # Callable[[CommandResult], None] | None
+    # ^ Background-job delivery: /backtest runs async and delivers its
+    # report through this when the run finishes.  The MT5 runner sets
+    # it to _reply_command; the OANDA runner to its sender closure.
+    # None = no live delivery (tests / offline); the finished report
+    # is still written under reports_dir and recorded on the job.
 
 
 # ------------------------------------------------- Septorch-style formatting
@@ -639,17 +648,27 @@ def build_harvest_bundle(ctx: CommandContext, scope: str = "all") -> tuple[Path,
 
 
 # ------------------------------------------------------------------ engine /
-# backtest export commands (deterministic engine + Telegram wiring).
+# backtest commands (deterministic engine + Telegram wiring).
 #
-# /backtest      — build a backtest report from the attached journal
-#                  and send it as a FILE + concise summary caption.
-#                  The file is the contract: the owner drops it back
-#                  to Muse for review.  The caption carries trades /
-#                  win% / R / PF / MaxDD / period.  Never silent: no
-#                  journal means an explicit text reply, not nothing.
-# /backtest_send — same file + caption, with the explicit instruction
-#                  to drop the file back to Muse.  (Alias of /backtest
-#                  with the drop-back instruction in the caption.)
+# /backtest [days] [playbook] [sweep]
+#                  — RUN a real whole-engine backtest (the live signal
+#                  path: MT5Runner over historical bars via the sim
+#                  feed/executor in scripts/backtest_full_engine.py),
+#                  NOT an export of the paper journal.  Runs in a
+#                  background thread so Telegram polling never blocks:
+#                  the handler returns a "running…" ack immediately
+#                  and the report file + summary are delivered through
+#                  ctx.deliver when the run finishes (timeout 8h —
+#                  measured engine speed is ~0.25s/tick, so 30 days is
+#                  ~2.4h; a 10-minute timeout could never finish).
+#                  Default 30 days, cap 90 days.  `sweep` = all
+#                  playbooks over 90 days.  A bare playbook name runs
+#                  that playbook alone.
+# /backtest_send — same run, with the explicit instruction to drop the
+#                  file back to Muse for review.
+# /backtest_export — the OLD /backtest behaviour, renamed: export the
+#                  paper journal's closed trades as a report file.
+#                  /backtest must never be an exporter again.
 # /journal       — journal head / record count / last record.
 # /snapshot      — deterministic-engine snapshot manifest (N / N_prev)
 #                  when an engine dir exists, else an honest "none yet".
@@ -657,6 +676,40 @@ def build_harvest_bundle(ctx: CommandContext, scope: str = "all") -> tuple[Path,
 #                  closed); the live Reconciler is reported when the
 #                  runner attaches one on ctx (ctx.reconciler).
 # /health        — feed + journal + open positions in one reply.
+
+#: Executing playbooks (the only ones /backtest can run alone).
+BACKTEST_PLAYBOOKS: tuple[str, ...] = (
+    "sweep_reversal", "fvg_midline", "trendline_retest", "fvg_limit",
+    "inversion", "killzone_open", "judas_swing")
+
+BACKTEST_DEFAULT_DAYS = 30
+BACKTEST_MAX_DAYS = 90
+# Timeout for one backtest run.  MEASURED (2026-10-16), not guessed:
+# two-point fit from real runs (200 ticks = 113s, 1,109 ticks = 341s):
+# ~65s startup (data load + full-history featurization + playbook
+# fast-forward) + ~0.25s/tick, and one day is ~1,152 ticks
+# (288 M5 bars x 4 ticks).  So 1 day is ~6 min, 30 days ~2.4h,
+# 90 days ~7.2h.  A 10-minute timeout can never finish a real run
+# — the job runs in a background subprocess, Telegram polling
+# never blocks, and the ack quotes the measured ETA.
+BACKTEST_TIMEOUT_S = 8 * 3600  # 8 hours: covers 90 days + startup
+BACKTEST_STARTUP_S = 65.0
+BACKTEST_SECONDS_PER_TICK = 0.25
+BACKTEST_TICKS_PER_DAY = 1152
+
+
+def estimate_backtest_eta_s(days: int) -> float:
+    """Estimated wall seconds for a `days`-long backtest run."""
+    return BACKTEST_STARTUP_S + days * BACKTEST_TICKS_PER_DAY \
+        * BACKTEST_SECONDS_PER_TICK
+
+
+def _eta_text(days: int) -> str:
+    mins = estimate_backtest_eta_s(days) / 60.0
+    if mins < 90:
+        return f"~{mins:.0f} min"
+    return f"~{mins / 60.0:.1f} h"
+
 
 def _backtest_rows_from_journal(ctx: CommandContext) -> list[dict]:
     """Trade rows for the backtest exporter, from the paper journal."""
@@ -689,9 +742,14 @@ def _d1_coverage(ctx: CommandContext) -> tuple[int | None, bool]:
     return None, stale
 
 
-def build_backtest_result(ctx: CommandContext, *,
-                          drop_back: bool = False) -> CommandResult:
-    """Shared /backtest + /backtest_send implementation (both loops)."""
+def build_backtest_export_result(ctx: CommandContext, *,
+                                 drop_back: bool = False) -> CommandResult:
+    """The journal exporter: paper-journal closed trades -> report file.
+
+    This is the OLD /backtest behaviour, renamed.  /backtest itself
+    runs a real backtest; this stays for exporting what the paper
+    loop actually traded.
+    """
     from goldenswing.engine.backtest_export import (
         format_summary, write_report)
     if ctx.journal is None:
@@ -720,14 +778,289 @@ def build_backtest_result(ctx: CommandContext, *,
     return CommandResult(document=path, caption=caption)
 
 
-@command("/backtest", "build + send backtest report file + summary")
+# Backwards-compatible alias (old name); new code uses the export name.
+def build_backtest_result(ctx: CommandContext, *,
+                          drop_back: bool = False) -> CommandResult:
+    """Deprecated: the old exporter.  Use build_backtest_export_result."""
+    return build_backtest_export_result(ctx, drop_back=drop_back)
+
+
+# ------------------------------------------------------- real backtest jobs
+
+@dataclass
+class BacktestJob:
+    """One async whole-engine backtest run."""
+    days: int
+    playbook: str | None
+    drop_back: bool
+    out_dir: Path
+    status: str = "running"          # running | done | failed
+    report: dict | None = None       # results.json content on success
+    report_path: Path | None = None  # markdown report on success
+    error: str | None = None
+    thread: threading.Thread | None = None
+
+
+_BACKTEST_JOBS: dict[str, BacktestJob] = {}
+_BACKTEST_LOCK = threading.Lock()
+#: Test hook: when set, jobs call this instead of the subprocess.
+#: Signature: fn(job) -> dict (results.json content).  None = real run.
+_BACKTEST_RUNNER_OVERRIDE: Callable | None = None
+
+
+def set_backtest_runner_for_tests(fn: Callable | None) -> None:
+    """Install / clear the test runner override for backtest jobs."""
+    global _BACKTEST_RUNNER_OVERRIDE
+    _BACKTEST_RUNNER_OVERRIDE = fn
+
+
+def reset_backtest_jobs_for_tests() -> None:
+    """Clear finished/running job state (tests only)."""
+    with _BACKTEST_LOCK:
+        _BACKTEST_JOBS.clear()
+
+
+def parse_backtest_args(args: list[str]) -> tuple[int, str | None, str | None]:
+    """Parse /backtest args -> (days, playbook, error).
+
+    Tokens: an integer = days (clamped to 1..90); a known executing
+    playbook name = run it alone; ``sweep`` = all playbooks, 90 days
+    unless an explicit day count is given.  Anything else is an
+    error naming the valid tokens.
+    """
+    days: int | None = None
+    playbook: str | None = None
+    sweep = False
+    for tok in (args or []):
+        low = tok.lower()
+        if low == "sweep":
+            sweep = True
+        elif low.isdigit():
+            days = int(low)
+        elif low in BACKTEST_PLAYBOOKS:
+            playbook = low
+        else:
+            return (BACKTEST_DEFAULT_DAYS, None,
+                    f"unknown /backtest arg {tok!r} — use a day count "
+                    f"(1–{BACKTEST_MAX_DAYS}), a playbook name "
+                    f"({', '.join(BACKTEST_PLAYBOOKS)}), or `sweep`.")
+    if days is None:
+        days = BACKTEST_MAX_DAYS if sweep else BACKTEST_DEFAULT_DAYS
+    if days > BACKTEST_MAX_DAYS:
+        days = BACKTEST_MAX_DAYS
+    if days < 1:
+        days = 1
+    return days, playbook, None
+
+
+def _backtest_limits_block(d1_stale: bool) -> str:
+    """Honest limits block for every backtest report."""
+    lines = [
+        "⚠️ Limits (read before trusting this):",
+        "• Ticks are simulated: 4 per M5 bar in fixed OHLC order — "
+        "intrabar path is approximated, not real ticks.",
+        "• Fills at tick mid, zero slippage model; spread constant 0.20 "
+        "(Exness demo minimum — real spread varies).",
+        "• H4/D1/W1/MN1 resampled from H1; D1 was H1-resampled. "
+        "W1/MN1 EMA200 insufficient → Golden Swing untestable, "
+        "alignment never reaches Golden Swing on this window.",
+        "• News pause OFF (no historical calendar); Golden Swing "
+        "confirmation auto-fire (timeout default).",
+    ]
+    if d1_stale:
+        lines.append("• ⚠️ D1 feed was STALE at run time — D1 coverage "
+                     "insufficient, treat D1-gated results as suspect.")
+    return "\n".join(lines)
+
+
+def format_backtest_report(report: dict, *, days: int,
+                            playbook: str | None,
+                            d1_stale: bool) -> tuple[str, str]:
+    """Septorch-style (summary, markdown) from a results.json report."""
+    window = report.get("window", {}) or {}
+    trades = report.get("trades", {}) or {}
+    per_pb = report.get("per_playbook", {}) or {}
+    closed = int(trades.get("closed", 0))
+    win_rate = float(trades.get("win_rate", 0.0))
+    total_r = float(trades.get("total_r", 0.0))
+    total_dollar = float(trades.get("total_dollar", 0.0))
+    pf = trades.get("profit_factor", 0.0)
+    max_dd = float(trades.get("max_drawdown_r", 0.0))
+    pf_txt = "∞" if pf == float("inf") else f"{float(pf):.2f}"
+    pb_txt = playbook or "all executing"
+    ticks_txt = f"{int(window.get('ticks', 0)):,}"
+    unrealized_r = float(trades.get("open_at_end_unrealized_r", 0.0))
+    avg_r = float(trades.get("avg_r", 0.0))
+    lines = [
+        fmt_section("📊", "Backtest — Whole Engine"),
+        f"period: last {fmt_code(days)} days · "
+        f"{fmt_code(window.get('start', '?'))} → "
+        f"{fmt_code(window.get('end_open', '?'))}",
+        f"playbooks: {fmt_code(pb_txt)} · "
+        f"ticks: {fmt_code(ticks_txt)}",
+        "",
+        fmt_section("📈", "Trades"),
+        f"closed: {fmt_code(closed)} · "
+        f"open at end: {fmt_code(trades.get('open_at_end', 0))} "
+        f"(unrealized {fmt_code(f'{unrealized_r:+.2f}R')}, not in totals)",
+        f"win rate: {fmt_progress(win_rate)}",
+        f"total: {fmt_r(total_r)} · {fmt_pnl(total_dollar)} · "
+        f"avg {fmt_code(f'{avg_r:+.3f}R')} · "
+        f"PF {fmt_code(pf_txt)} · MaxDD {fmt_code(f'{max_dd:.2f}R')}",
+        "",
+        fmt_section("🎯", "Per-Playbook"),
+    ]
+    if per_pb:
+        for name in sorted(per_pb):
+            d = per_pb[name] or {}
+            lines.append(
+                f"  🎯 {fmt_code(name)}: {d.get('trades', 0)} trades, "
+                f"{fmt_r(float(d.get('total_r', 0.0)))} · "
+                f"{fmt_pnl(float(d.get('total_dollar', 0.0)))}")
+    else:
+        lines.append(f"  {fmt_none()} — no closed trades")
+    lines += ["", _backtest_limits_block(d1_stale)]
+    summary = "\n".join(lines)
+    md = summary + "\n\n```json\n" + json.dumps(report, indent=2,
+                                               default=str) + "\n```\n"
+    return summary, md
+
+
+def _run_backtest_subprocess(job: BacktestJob) -> dict:
+    """Run the real whole-engine backtest; return results.json content."""
+    repo_root = Path(__file__).resolve().parents[2]
+    script = repo_root / "scripts" / "backtest_full_engine.py"
+    cmd = [sys.executable, str(script), "--out", str(job.out_dir),
+           "--days", str(job.days)]
+    if job.playbook:
+        cmd += ["--only-playbook", job.playbook]
+    proc = subprocess.run(cmd, capture_output=True, text=True,
+                          timeout=BACKTEST_TIMEOUT_S)
+    results_path = job.out_dir / "results.json"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-500:]
+        raise RuntimeError(
+            f"backtest subprocess failed (exit {proc.returncode}): {tail}")
+    if not results_path.exists():
+        raise RuntimeError("backtest subprocess finished but no "
+                           "results.json was written")
+    return json.loads(results_path.read_text())
+
+
+def _finish_backtest_job(job: BacktestJob, ctx: CommandContext,
+                         d1_stale: bool) -> None:
+    """Run one job to completion, then deliver its report."""
+    try:
+        if _BACKTEST_RUNNER_OVERRIDE is not None:
+            report = _BACKTEST_RUNNER_OVERRIDE(job)
+        else:
+            report = _run_backtest_subprocess(job)
+        summary, md = format_backtest_report(
+            report, days=job.days, playbook=job.playbook, d1_stale=d1_stale)
+        if job.drop_back:
+            summary += "\nDrop this file back to Muse for review."
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        pb_tag = job.playbook or "all"
+        path = job.out_dir / f"backtest-{job.days}d-{pb_tag}-{stamp}.md"
+        path.write_text(md)
+        job.report = report
+        job.report_path = path
+        job.status = "done"
+        caption = summary if len(summary) <= 1000 else summary[:997] + "…"
+        result = CommandResult(document=path, caption=caption)
+    except Exception as exc:  # noqa: BLE001 — a failed run still reports
+        job.status = "failed"
+        job.error = f"{type(exc).__name__}: {exc}"
+        result = CommandResult(
+            text=f"📊 Backtest failed: {job.error}\n"
+                 f"({job.days} days, playbook "
+                 f"{job.playbook or 'all'}) — the run itself errored, "
+                 f"not the engine. Re-run with /backtest.")
+    finally:
+        with _BACKTEST_LOCK:
+            _BACKTEST_JOBS.pop("global", None)
+    deliver = getattr(ctx, "deliver", None)
+    if callable(deliver):
+        try:
+            deliver(result)
+        except Exception:
+            pass  # delivery failure must not resurrect the job
+
+
+def start_backtest_job(ctx: CommandContext, *, days: int,
+                       playbook: str | None, drop_back: bool,
+                       d1_stale: bool) -> tuple[BacktestJob | None, str | None]:
+    """Start an async backtest job, or (None, reason) if one is running."""
+    with _BACKTEST_LOCK:
+        existing = _BACKTEST_JOBS.get("global")
+        if existing is not None and existing.status == "running":
+            return None, "already running"
+        out_dir = Path(ctx.reports_dir) if ctx.reports_dir else \
+            Path.cwd() / "data" / "reports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        job = BacktestJob(days=days, playbook=playbook,
+                          drop_back=drop_back, out_dir=out_dir)
+        _BACKTEST_JOBS["global"] = job
+    thread = threading.Thread(target=_finish_backtest_job,
+                              args=(job, ctx, d1_stale),
+                              daemon=True, name="goldenswing-backtest")
+    job.thread = thread
+    thread.start()
+    return job, None
+
+
+def start_backtest_from_args(ctx: CommandContext, args: list[str], *,
+                             drop_back: bool) -> CommandResult:
+    """Shared /backtest + /backtest_send: parse, start, ack."""
+    days, playbook, error = parse_backtest_args(args)
+    if error:
+        return CommandResult(text=error)
+    _d1_bars, d1_stale = _d1_coverage(ctx)
+    _job, busy = start_backtest_job(
+        ctx, days=days, playbook=playbook, drop_back=drop_back,
+        d1_stale=d1_stale)
+    if busy:
+        return CommandResult(
+            text="📊 Backtest already running — wait for its report "
+                 "before starting another. One run at a time.")
+    capped = ""
+    if args and any(t.isdigit() and int(t) > BACKTEST_MAX_DAYS
+                    for t in args):
+        capped = f" (requested > {BACKTEST_MAX_DAYS}, capped)"
+    stale = ("\n⚠️ D1 feed is STALE — D1 coverage insufficient, "
+             "results will carry that warning."
+             if d1_stale else "")
+    return CommandResult(
+        text="📊 Backtest running…\n"
+             f"period: last {fmt_code(days)} days{capped} · "
+             f"playbooks: {fmt_code(playbook or 'all executing')}\n"
+             "engine: real MT5Runner over historical bars (sim "
+             "feed/executor) · $10,000 · 1% risk · spread 0.20\n"
+             f"ETA: {fmt_code(_eta_text(days))} (measured ~0.25s/tick + "
+             "~65s startup) — I'll send the report file + summary "
+             "when it finishes. The bot keeps trading meanwhile."
+             f"{stale}"
+             + fmt_next_cta("/backtest_export", "/status", "/health"))
+
+
+@command("/backtest", "run a real whole-engine backtest (async)")
 def _backtest(ctx: CommandContext, args: list[str]) -> CommandResult:
-    return build_backtest_result(ctx, drop_back=False)
+    return start_backtest_from_args(ctx, args, drop_back=False)
 
 
-@command("/backtest_send", "send backtest results file to drop back to Muse")
+@command("/backtest_send", "run a real backtest, send file to drop back")
 def _backtest_send(ctx: CommandContext, args: list[str]) -> CommandResult:
-    return build_backtest_result(ctx, drop_back=True)
+    return start_backtest_from_args(ctx, args, drop_back=True)
+
+
+@command("/backtest_export", "export paper-journal trades as a report file")
+def _backtest_export(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return build_backtest_export_result(ctx, drop_back=False)
+
+
+@command("/journal_export", "export paper-journal trades as a report file")
+def _journal_export(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return build_backtest_export_result(ctx, drop_back=False)
 
 
 @command("/journal", "journal head / record count / last record")
