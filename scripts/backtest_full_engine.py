@@ -85,8 +85,9 @@ total_R = sum(partial_R * partial_vol/total_vol) + close_R *
 positions are mark-to-market (not counted in totals).
 
 Usage:
-  cd ~/workspace/goldenswing && .venv/bin/python scripts/backtest_full_engine.py [--max-ticks N] [--out DIR] [--days N] [--only-playbook NAME]
-Paper only.  No live trading, no network (news fetcher raises).
+  cd ~/workspace/goldenswing && .venv/bin/python scripts/backtest_full_engine.py [--max-ticks N] [--out DIR] [--days N] [--only-playbook NAME] [--notify-telegram]
+Paper only.  No live trading, no network (news fetcher raises) — except
+``--notify-telegram``, which sends the result to Telegram on completion.
 
 --days N: backtest only the most recent N days of the dataset
   (default: whole window).  Warmup bars before the window are still
@@ -103,9 +104,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
 import time
+import traceback
+import urllib.error
+import urllib.request
+import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -131,6 +137,229 @@ START_BALANCE = 10_000.0
 LEVERAGE = 500.0
 SPREAD = 0.20
 CONTRACT = 100.0  # 1 lot = 100 oz
+
+
+# ------------------------------------------------------- telegram notify
+# Second-terminal runs (e.g. a 365-day backtest) finish long after the
+# owner stopped watching the terminal.  ``--notify-telegram`` sends the
+# Septorch-style summary + results.json via the Bot API when the run
+# completes — success or failure.  Stdlib urllib only, no new deps.
+# Credentials come from the same env the live runner uses; the token is
+# never printed, never logged, and never embedded in an error string
+# (Bot API URLs contain the token, so error paths report status +
+# description only).  Notify failure never marks the backtest failed.
+_TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+_TELEGRAM_MESSAGE_LIMIT = 4096
+_TELEGRAM_DOCUMENT_LIMIT_BYTES = 50_000_000  # Bot API sendDocument limit
+_NOTIFY_ENV_MISSING = ("Telegram notify skipped: GS_TELEGRAM_BOT_TOKEN / "
+                       "GS_TELEGRAM_CHAT_ID not set")
+
+#: Last run's notify context, for the main() failure path.
+_LAST_NOTIFY: dict = {}
+
+
+def _progress_bar(rate: float, width: int = 10) -> str:
+    filled = max(0, min(width, round(float(rate) * width)))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def format_notify_message(report: dict | None, out_dir, *, error=None,
+                          error_tail: str = "") -> str:
+    """Septorch-style Telegram summary for a finished backtest."""
+    if error is not None or report is None:
+        lines = ["❌ Backtest failed", "",
+                 f"📁 out: `{out_dir}`"]
+        if error is not None:
+            lines.append(f"error: `{str(error)[:300]}`")
+        if error_tail:
+            lines += ["", "last lines:", error_tail[-1500:]]
+        lines += ["",
+                  "The run itself errored, not the engine. "
+                  "Re-run with /backtest or the script."]
+        return "\n".join(lines)
+    window = report.get("window", {}) or {}
+    trades = report.get("trades", {}) or {}
+    per_pb = report.get("per_playbook", {}) or {}
+    closed = int(trades.get("closed", 0))
+    win_rate = float(trades.get("win_rate", 0.0))
+    total_r = float(trades.get("total_r", 0.0))
+    total_dollar = float(trades.get("total_dollar", 0.0))
+    try:
+        pf_f = float(trades.get("profit_factor", 0.0))
+    except (TypeError, ValueError):
+        pf_f = 0.0
+    pf_txt = "∞" if pf_f == float("inf") else f"{pf_f:.2f}"
+    pb_txt = window.get("only_playbook") or "all executing"
+    lines = [
+        "📊 Backtest done — whole engine",
+        "",
+        f"period: `{window.get('start', '?')}` → "
+        f"`{window.get('end_open', '?')}` · "
+        f"days `{window.get('days_requested', '?')}` · "
+        f"playbooks `{pb_txt}` · "
+        f"ticks `{int(window.get('ticks', 0)):,}`",
+        "",
+        "📈 Trades",
+        f"closed: `{closed}` · "
+        f"open at end: `{trades.get('open_at_end', 0)}` "
+        f"(unrealized `{float(trades.get('open_at_end_unrealized_r', 0.0)):+.2f}R`, "
+        f"not in totals)",
+        f"win rate: {_progress_bar(win_rate)} {win_rate:.1%}",
+        f"total: `{total_r:+.2f}R` · `${total_dollar:+,.2f}` · "
+        f"avg `{float(trades.get('avg_r', 0.0)):+.3f}R` · "
+        f"PF `{pf_txt}` · MaxDD `{float(trades.get('max_drawdown_r', 0.0)):.2f}R`",
+        "",
+        "🎯 Per-Playbook",
+    ]
+    if per_pb:
+        for name in sorted(per_pb):
+            d = per_pb[name] or {}
+            lines.append(
+                f"  🎯 `{name}`: {d.get('trades', 0)} trades, "
+                f"`{float(d.get('total_r', 0.0)):+.2f}R` · "
+                f"`${float(d.get('total_dollar', 0.0)):+,.2f}`")
+    else:
+        lines.append("  ➖ (none) — no closed trades")
+    lines += [
+        "",
+        f"📁 out: `{out_dir}`",
+        "➡️ Next: drop results.json back to Muse for review",
+        "",
+        "⚠️ Limits: sim ticks, zero slippage, spread 0.20 constant, "
+        "resampled HTF, Golden Swing untestable, news pause off.",
+    ]
+    return "\n".join(lines)
+
+
+def _telegram_post(token: str, method: str, *, json_payload: dict | None = None,
+                   raw_body: bytes | None = None,
+                   content_type: str | None = None,
+                   opener=None, timeout: float = 30.0) -> tuple[bool, str]:
+    """One Bot API POST.  Returns (ok, detail) — never includes the
+    token (it lives in the URL) in any error string."""
+    url = _TELEGRAM_API.format(token=token, method=method)
+    if json_payload is not None:
+        body = json.dumps(json_payload).encode("utf-8")
+        ctype = "application/json"
+    else:
+        body = raw_body or b""
+        ctype = content_type or "application/octet-stream"
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": ctype},
+                                 method="POST")
+    opener = opener or urllib.request.build_opener()
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            parsed = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            parsed = json.loads(exc.read().decode("utf-8") or "{}")
+        except Exception:
+            parsed = {}
+        return False, (f"Telegram API {exc.code}: "
+                       f"{str(parsed.get('description', ''))[:200]}")
+    except Exception as exc:  # noqa: BLE001 — network down, timeout, DNS
+        return False, f"{type(exc).__name__}: {exc}"
+    if parsed.get("ok"):
+        mid = (parsed.get("result") or {}).get("message_id")
+        return True, f"ok, message_id={mid}"
+    return False, (f"Telegram API: "
+                   f"{str(parsed.get('description', ''))[:200]}")
+
+
+def send_telegram_text(token: str, chat_id, text: str, *,
+                        opener=None) -> tuple[bool, str]:
+    """sendMessage, truncated to Telegram's 4096-char limit."""
+    if len(text) > _TELEGRAM_MESSAGE_LIMIT:
+        text = text[:_TELEGRAM_MESSAGE_LIMIT - 1] + "…"
+    return _telegram_post(token, "sendMessage",
+                          json_payload={"chat_id": chat_id, "text": text,
+                                        "disable_notification": False},
+                          opener=opener)
+
+
+def send_telegram_document(token: str, chat_id, path, caption: str, *,
+                           opener=None,
+                           limit_bytes: int = _TELEGRAM_DOCUMENT_LIMIT_BYTES
+                           ) -> tuple[bool, str]:
+    """sendDocument via stdlib multipart.  Files over the Bot API limit
+    are refused up front with an honest message, never a doomed upload."""
+    p = Path(path)
+    if not p.exists():
+        return False, f"document not found: {p.name}"
+    size = p.stat().st_size
+    if size > limit_bytes:
+        return False, (f"{p.name} is {size / 1e6:.1f}MB — over Telegram's "
+                       f"50MB bot document limit")
+    boundary = uuid.uuid4().hex
+    parts: list[bytes] = []
+
+    def _field(name: str, value: str) -> None:
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(f'Content-Disposition: form-data; name="{name}"'
+                     f"\r\n\r\n".encode())
+        parts.append(f"{value}\r\n".encode())
+
+    _field("chat_id", str(chat_id))
+    _field("caption", caption[:1023] + "…" if len(caption) > 1024 else caption)
+    _field("disable_notification", "true")
+    parts.append(f"--{boundary}\r\n".encode())
+    parts.append(
+        f'Content-Disposition: form-data; name="document"; '
+        f'filename="{p.name}"\r\n'.encode())
+    parts.append(b"Content-Type: application/json\r\n\r\n")
+    parts.append(p.read_bytes())
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return _telegram_post(
+        token, "sendDocument", raw_body=b"".join(parts),
+        content_type=f"multipart/form-data; boundary={boundary}",
+        opener=opener)
+
+
+def notify_telegram(report: dict | None, out_dir, *, error=None,
+                    error_tail: str = "", opener=None) -> str:
+    """Send the backtest result to Telegram.  Never raises; returns a
+    one-line status.  Notify failure never marks the backtest failed."""
+    try:
+        token = os.environ.get("GS_TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("GS_TELEGRAM_CHAT_ID")
+        if not token or not chat_id:
+            return _NOTIFY_ENV_MISSING
+        text = format_notify_message(report, out_dir, error=error,
+                                     error_tail=error_tail)
+        doc_note = ""
+        results = Path(out_dir) / "results.json"
+        if error is None and report is not None and results.exists():
+            size = results.stat().st_size
+            if size > _TELEGRAM_DOCUMENT_LIMIT_BYTES:
+                doc_note = (
+                    f"\n📁 results.json is {size / 1e6:.1f}MB — over "
+                    f"Telegram's 50MB bot document limit, on EC2 at "
+                    f"`{results}`.")
+        ok, detail = send_telegram_text(token, chat_id, text + doc_note,
+                                      opener=opener)
+        if not ok:
+            return f"Telegram notify failed (sendMessage): {detail}"
+        if error is not None or report is None:
+            return f"Telegram notify sent (failure report): {detail}"
+        if not results.exists():
+            return ("Telegram notify sent (summary only, no "
+                    f"results.json): {detail}")
+        if doc_note:
+            return ("Telegram notify sent (summary only, results.json "
+                    f"too large): {detail}")
+        days = (report.get("window", {}) or {}).get("days_requested", "?")
+        closed = (report.get("trades", {}) or {}).get("closed", 0)
+        caption = (f"📊 Backtest results — {days} days — {closed} closed "
+                   f"trades — drop back to Muse for review")
+        ok2, detail2 = send_telegram_document(token, chat_id, results,
+                                               caption, opener=opener)
+        if not ok2:
+            return f"Telegram notify sent (summary), document failed: {detail2}"
+        return (f"Telegram notify sent (summary + results.json): {detail2}")
+    except Exception as exc:  # noqa: BLE001 — notify must never crash
+        return f"Telegram notify failed: {type(exc).__name__}: {exc}"
+
 
 
 # ------------------------------------------------------------------ clock
@@ -519,7 +748,8 @@ def _no_network(url, timeout):  # noqa: D103 - proves no news fetch
         "backtest must not touch the network (news fetch attempted)")
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main_impl(argv: list[str] | None = None) -> int:
+    _LAST_NOTIFY.clear()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--max-ticks", type=int, default=None)
     ap.add_argument("--out", type=str, default=None,
@@ -529,12 +759,20 @@ def main(argv: list[str] | None = None) -> int:
                          "(warmup bars still served)")
     ap.add_argument("--only-playbook", type=str, default=None,
                     help="run with only this executing playbook enabled")
+    ap.add_argument("--notify-telegram", action="store_true",
+                    help="send the Septorch-style summary + results.json "
+                         "to Telegram on completion (success or failure) "
+                         "via GS_TELEGRAM_BOT_TOKEN / GS_TELEGRAM_CHAT_ID. "
+                         "For second-terminal runs; the /backtest command "
+                         "already delivers via ctx.deliver, so it does not "
+                         "pass this flag.")
     args = ap.parse_args(argv)
 
     out = Path(args.out) if args.out else Path(
         __import__("tempfile").mkdtemp(prefix="full_engine_bt_"))
     out.mkdir(parents=True, exist_ok=True)
     print(f"out: {out}")
+    _LAST_NOTIFY.update({"notify": bool(args.notify_telegram), "out": out})
 
     # ------------------------------------------------------------ data
     h1 = _with_feed_cols(_load_csv(DATA_DIR / "OANDA_XAU_USD_H1_20241001_20261012.csv"))
@@ -639,7 +877,27 @@ def main(argv: list[str] | None = None) -> int:
     (out / "results.json").write_text(json.dumps(report, indent=2,
                                                  default=str))
     print_report(report)
+    if args.notify_telegram:
+        print(notify_telegram(report, out))
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point: run the backtest, Telegram-notifying on failure too.
+
+    Arg-validation failures (return 2) never notify — no run happened.
+    Any other exception notifies with the error + traceback tail, then
+    re-raises so the exit code still reflects the failure.
+    """
+    try:
+        return _main_impl(argv)
+    except Exception as exc:  # noqa: BLE001 — notify, then re-raise
+        ctx = _LAST_NOTIFY
+        if ctx.get("notify"):
+            tail = "\n".join(traceback.format_exc().splitlines()[-15:])
+            print(notify_telegram(None, ctx.get("out", "?"), error=exc,
+                                  error_tail=tail))
+        raise
 
 
 # ---------------------------------------------------------------- analysis
