@@ -235,6 +235,11 @@ def _runner(tmp_path, *, ladder_enabled=True):
         execute_playbooks=("fvg_midline",),
         fixed_lots=0.03,
         ladder_enabled=ladder_enabled,
+        # News pause OFF: the order path's news check reads the
+        # REAL wall-clock calendar — these tests must not fail on
+        # a real news day (e.g. PPI).  The pause itself is covered
+        # by test_news_calendar.py.
+        news_pause_enabled=False,
         score_decay_enabled=False)
     feed = MT5Feed(MT5FeedConfig(), mt5_module=FakeMT5())
     feed.connect()

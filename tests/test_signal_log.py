@@ -92,6 +92,11 @@ def _runner(tmp_path, **cfg_kw):
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
         execute_playbooks=("fvg_midline",),
+        # News pause OFF: the order path's news check reads the
+        # REAL wall-clock calendar — these tests must not fail on
+        # a real news day (e.g. PPI).  The pause itself is covered
+        # by test_news_calendar.py.
+        news_pause_enabled=False,
         **cfg_kw)
     feed = MT5Feed(MT5FeedConfig(), mt5_module=FakeMT5())
     feed.connect()
