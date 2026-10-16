@@ -11,7 +11,8 @@ The iron rule: a playbook keeps the EXACT entry/exit machinery it was
 validated with.  Mixing a trigger from one playbook with exits from
 another is a new experiment, not a refactor.
 """
-from .base import Candidate, EngineContext, Playbook
+from .base import (Candidate, EngineContext, Playbook, PlaybookVerdict,
+                   evaluate_all_playbooks, snapshot_trigger_context)
 from .fvg_limit import FVGLimitPlaybook
 from .fvg_midline import FVGMidlinePlaybook
 from .inversion import InversionPlaybook
@@ -30,6 +31,9 @@ __all__ = [
     "Candidate",
     "EngineContext",
     "Playbook",
+    "PlaybookVerdict",
+    "evaluate_all_playbooks",
+    "snapshot_trigger_context",
     "SweepReversalPlaybook",
     "TurtleSoupPlaybook",
     "FVGMidlinePlaybook",

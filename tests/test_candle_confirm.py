@@ -1,8 +1,11 @@
 """Tests for the POI confirmation check (full confirmation family
-at the POI) and its shadow wiring.
+at the POI) and its wiring.
 
-The check is SHADOW / log-only: it must annotate the pending entry
-and the backtest trade book without changing any live decision.
+Two wirings (since the 2026-10-15 trigger redesign):
+- Hierarchy backtest: SHADOW / log-only — it annotates the trade
+  book (``candle_confirmed`` stats) without changing decisions.
+- Live runner: the family IS the trigger — a confirming shape at
+  the POI FIRES (the pending is consumed, the signal path runs).
 """
 import math
 
@@ -209,7 +212,11 @@ def test_backtest_trades_carry_candle_annotation():
         1 for t in result["trades"] if t["candle_confirmed"])
 
 
-def test_runner_annotates_pending_without_changing_decision(tmp_path):
+def test_runner_pending_fires_on_rejection_confirm(tmp_path):
+    # Trigger redesign (2026-10-15): the confirmation family IS
+    # the trigger — a confirming shape at the POI FIRES (the
+    # pending is consumed and the signal path runs).  The old
+    # annotate-without-deciding machinery is gone.
     runner = _runner(tmp_path)
     # M15 bars: gentle bars, then a long rejection bar at the POI.
     rows = [(100.5, 101.0, 100.0, 100.6),
@@ -222,33 +229,35 @@ def test_runner_annotates_pending_without_changing_decision(tmp_path):
     frame = _bars(rows, start="2026-01-01 00:00")
     h1_open = frame.index[0]
     runner._stack = TimeframeStack.from_frames({"M15": frame})
-    pend = {"direction": 1, "zone": {"bottom": 100.0, "top": 102.0},
-            "h1_open": h1_open, "entry_clock": "M15",
-            "level": 99.0, "trigger": "test"}
+    setup = {"direction": 1,
+             "zone": {"bottom": 100.0, "top": 102.0, "kind": "support",
+                      "level": 101.0},
+             "buf": 0.1, "h4_highs": [103.0], "h4_lows": [99.0]}
+    pend = {"armed": True, "trigger": "zone_touch", "direction": 1,
+            "entry": 101.0, "zone": setup["zone"],
+            "entry_clock": "M15", "h1_open": h1_open,
+            "invalidation_level": 99.9, "setup": setup,
+            "armed_bars": 0}
     runner._pending = pend
-    # No structural entry event on these gentle bars: the pending
-    # must survive _evaluate_pending_entry unconsumed.
-    from goldenswing.live.hierarchy import check_live_entry
-    assert check_live_entry(frame, 1, swing_n=3, since=h1_open,
-                            entry_clock="M15") is None
-    runner._evaluate_pending_entry({}, {})
-    assert runner._pending is pend  # decision unchanged: still pending
-    ann = pend.get("candle_confirm")
-    assert ann is not None and ann["confirmed"] is True
-    assert ann["shape"] == "rejection"
-    assert "rejection" in ann["shapes"]
-    assert pend.get("candle_confirm_logged") is True
+    fired = []
+    runner._run_live_signal = lambda trig, tick, st: fired.append(trig)
+    runner._evaluate_pending_entry(
+        {"time": h1_open.to_pydatetime(), "mid": 101.0}, {})
+    assert [f["trigger"] for f in fired] == ["rejection"]
+    assert "rejection" in fired[0]["confirm_shapes"]
+    assert runner._pending is None  # consumed by the confirmation
 
 
-def test_runner_skips_annotation_when_zone_missing(tmp_path):
+def test_runner_ignores_unarmed_pending(tmp_path):
+    # Only ARMED touches await confirmation: a pending that is
+    # not armed is ignored by the confirm shot, untouched.
     runner = _runner(tmp_path)
     frame = _bars([(101.0, 102.0, 99.0, 101.5)])
     runner._stack = TimeframeStack.from_frames({"M15": frame})
     pend = {"direction": 1, "h1_open": frame.index[0],
-            "entry_clock": "M15", "level": 99.0, "trigger": "test"}
+            "entry_clock": "M15", "trigger": "test"}
     runner._pending = pend
     runner._evaluate_pending_entry({}, {})
-    assert "candle_confirm" not in pend
     assert runner._pending is pend
 
 

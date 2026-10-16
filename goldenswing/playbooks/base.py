@@ -9,6 +9,7 @@ pre-simulated candidates and decides which (if any) enters the book.
 from __future__ import annotations
 
 import abc
+import copy
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -186,3 +187,153 @@ class Playbook(abc.ABC):
     def import_state(self, state: dict) -> None:
         """Restore working state after a restart.  Default: no-op."""
         return
+
+    # --------------------------------------------- trigger-aware boundary
+    # Trigger direction is IMMUTABLE authority.  A playbook never
+    # re-decides direction: it inherits the trigger direction and
+    # validates only its own tactical pattern, location, score,
+    # invalidation and costs at that direction.  A tactical pattern
+    # that fires the other way is ``pattern_absent`` for this trigger
+    # (the trigger did not fire that way), NEVER a
+    # ``direction_mismatch`` rejection — that string must not appear
+    # on this path.  TTL / invalidation / zone-exit stay with the
+    # trigger; the playbook never extends them.
+    def _tactical_pattern(self, bars, direction: int,
+                          trigger_ctx: dict) -> dict | None:
+        """Playbook-specific tactical pattern at ``direction``.
+
+        Return a dict with at least ``score``, ``invalidation`` and
+        ``costs`` when the playbook's own pattern is present at this
+        direction, else None.  Default None: the base playbook has no
+        tactical pattern of its own, so ``evaluate`` reports
+        ``pattern_absent``.  Subclasses override this hook; they must
+        NOT return a direction field that contradicts the trigger —
+        ``evaluate`` treats any such result as absent.
+        """
+        return None
+
+    def evaluate(self, bars, ctx) -> "PlaybookVerdict":
+        """Evaluate this playbook for ONE trigger fire.
+
+        ``bars`` is the bar frame (DataFrame or dict of frames);
+        ``ctx`` is the trigger context (dict or object carrying
+        ``direction`` / ``trigger_direction``, ``zone``,
+        ``invalidation``, ``ttl`` / ``ttl_bars``, ``zone_exit``).
+        The trigger context is deep-copied per playbook, so one
+        playbook can never mutate another's snapshot.
+        """
+        trigger_ctx = snapshot_trigger_context(ctx)
+        direction = int(trigger_ctx.get("direction", 0) or 0)
+        if direction not in (1, -1):
+            return PlaybookVerdict(
+                playbook=self.name, status="pattern_absent",
+                direction=direction, score=0.0,
+                reason="pattern_absent: no trigger direction",
+                trigger_context=trigger_ctx)
+        try:
+            found = self._tactical_pattern(bars, direction, trigger_ctx)
+        except Exception as exc:  # a playbook never breaks the trigger
+            return PlaybookVerdict(
+                playbook=self.name, status="invalid",
+                direction=direction, score=0.0,
+                reason=f"invalid: tactical pattern error: {exc}",
+                trigger_context=trigger_ctx)
+        if not found:
+            return PlaybookVerdict(
+                playbook=self.name, status="pattern_absent",
+                direction=direction, score=0.0,
+                reason="pattern_absent",
+                trigger_context=trigger_ctx)
+        # A tactical result pointing the other way is absent for
+        # this trigger, never a direction_mismatch rejection.
+        if int(found.get("direction", direction) or direction) != direction:
+            return PlaybookVerdict(
+                playbook=self.name, status="pattern_absent",
+                direction=direction, score=0.0,
+                reason="pattern_absent: tactical pattern not at trigger direction",
+                trigger_context=trigger_ctx)
+        score = float(found.get("score", 0.0) or 0.0)
+        invalidation = found.get("invalidation")
+        costs = found.get("costs")
+        if invalidation is None or costs is None:
+            return PlaybookVerdict(
+                playbook=self.name, status="invalid",
+                direction=direction, score=score,
+                reason="invalid: missing invalidation or costs",
+                trigger_context=trigger_ctx)
+        return PlaybookVerdict(
+            playbook=self.name, status="valid",
+            direction=direction, score=score,
+            invalidation=invalidation, costs=costs,
+            entry=found.get("entry"), stop=found.get("stop"),
+            target=found.get("target"),
+            pattern=found.get("pattern", self.name),
+            location=found.get("location"),
+            reason=found.get("reason", "valid"),
+            trigger_context=trigger_ctx)
+
+
+@dataclass(frozen=True)
+class PlaybookVerdict:
+    """Result of :meth:`Playbook.evaluate` for one trigger fire.
+
+    ``status`` is ``pattern_absent`` (normal — most triggers have no
+    pattern for this playbook), ``valid`` or ``invalid``.  There is
+    no ``direction_mismatch`` status on this path by design.
+    ``direction`` is always the trigger direction, never re-decided.
+    """
+
+    playbook: str
+    status: str = "pattern_absent"
+    direction: int = 0
+    score: float = 0.0
+    invalidation: object = None
+    costs: object = None
+    entry: object = None
+    stop: object = None
+    target: object = None
+    pattern: str = ""
+    location: object = None
+    reason: str = "pattern_absent"
+    trigger_context: dict = field(default_factory=dict)
+
+
+def snapshot_trigger_context(ctx) -> dict:
+    """Deep-copy a trigger context so one playbook cannot mutate
+    another's snapshot.  Accepts a dict or an object with attributes.
+    Normalised keys: ``direction``, ``zone``, ``invalidation``,
+    ``ttl_bars``, ``zone_exit``, plus any other trigger fields,
+    preserved verbatim.
+    """
+    if ctx is None:
+        return {"direction": 0}
+    if isinstance(ctx, dict):
+        raw = copy.deepcopy(ctx)
+    else:
+        raw = {}
+        for key in ("direction", "trigger_direction", "zone",
+                    "invalidation", "ttl", "ttl_bars", "zone_exit",
+                    "timestamp", "bar_index", "session", "killzone",
+                    "amd_phase", "trigger_tf", "zone_tf", "bias_tf"):
+            if hasattr(ctx, key):
+                raw[key] = copy.deepcopy(getattr(ctx, key))
+        # EngineContext-style objects carry no trigger fields; the
+        # caller passes the trigger dict separately in that case.
+    out = copy.deepcopy(raw)
+    if "direction" not in out and "trigger_direction" in out:
+        out["direction"] = out.pop("trigger_direction")
+    out["direction"] = int(out.get("direction", 0) or 0)
+    if "ttl_bars" not in out and "ttl" in out:
+        out["ttl_bars"] = out["ttl"]
+    return out
+
+
+def evaluate_all_playbooks(playbooks, bars, ctx) -> list[PlaybookVerdict]:
+    """Evaluate EVERY playbook exactly once per trigger fire.
+
+    Each playbook gets its own deep-copied trigger snapshot, so
+    evaluation order cannot leak state between playbooks.  A
+    playbook that raises is reported ``invalid`` by ``evaluate``,
+    never allowed to abort the remaining playbooks.
+    """
+    return [pb.evaluate(bars, ctx) for pb in playbooks]

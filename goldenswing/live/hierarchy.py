@@ -84,6 +84,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from ..entry.validator import SHAPE_PRIORITY, confirm_at_poi
 from ..reader.session_timeframes import compose as _compose_session
 from .multitf import (SWING, TimeframeConfig, atr14, detect_bos_msch_choch,
                       evaluate as _mtf_evaluate, evaluate_bias, find_swings,
@@ -544,16 +545,28 @@ def zones_for_direction(zone_bars: pd.DataFrame, direction: int, *,
 # ------------------------------------------------------- live evaluation clock
 # The closed-bar hierarchy above (evaluate_hierarchy) is the shared
 # implementation behind the backtest and the legacy paper loop.  The
-# MT5 engine must NOT wait for an H1 bar to close before acting: a
-# real trader acts when the level breaks.  These helpers implement
-# the SAME legs with a LIVE clock — trigger on tick-cross, entry on
-# entry-TF closes, TF closes only refresh levels — reusing the same
-# primitives (evaluate_bias, zones_by_side, find_swings, atr14,
-# detect_bos_msch_choch) and the same gate formulas as _evaluate.
-# Levels come from CLOSED bars only; the forming bar never confirms
-# its own swing and never feeds a level.  The live verdict the runner
-# builds from these helpers has the same shape as evaluate_hierarchy's
-# output, so confluence.gate_live_signal needs no special case.
+# MT5 engine must NOT wait for an H1 bar to close before acting.
+# These helpers implement the LIVE clock — touch arms on tick-cross,
+# the confirmation family fires on entry-TF closes, TF closes only
+# refresh levels — reusing the same primitives (evaluate_bias,
+# zones_by_side, find_swings, atr14) and the same gate formulas as
+# _evaluate.  Levels come from CLOSED bars only; the forming bar
+# never confirms its own swing and never feeds a level.  The live
+# verdict the runner builds from these helpers has the same shape
+# as evaluate_hierarchy's output, so confluence.gate_live_signal
+# needs no special case.
+#
+# TRIGGER, REDESIGNED (2026-10-15).  The old trigger demanded price
+# PAST the H1 swing level AND inside the H4 POI zone at the same
+# tick — geometrically near-impossible (full-engine backtest:
+# 0/573 armed windows).  The new trigger is the owner's doctrine:
+# entries AT the marked POI, never above it.  A tick whose price
+# sits AT the H4 POI band arms the pending; the POI confirmation
+# family (entry/validator.confirm_at_poi, all 19 shapes) decides
+# whether it fires, on the entry-clock bars composing the forming
+# H1 bar.  BOS/ChoCH survive as confirmation shapes inside the
+# family — they are NOT a separate gate, and "past the swing level"
+# is no longer a condition anywhere in the live trigger.
 
 
 def live_setup(stack: TimeframeStack | dict, *,
@@ -561,13 +574,15 @@ def live_setup(stack: TimeframeStack | dict, *,
     """Trigger levels from CLOSED bars only (refreshed on TF closes).
 
     Returns None when legs 1-2 (D1 bias / H4 agreement) fail or no
-    H4 POI / H1 trigger levels exist — the setup is not armed.
+    H4 POI / H1 swing levels exist — the setup is not armed.
     Otherwise returns the levels the tick clock checks every tick:
     ``bias_d1`` / ``bias_h4`` / ``direction``, ``zone`` (the H4 POI
-    band for the bias direction), H1 reference/minor swing levels,
-    ``atr_h1``, ``buf`` (the breakout buffer), and the H4 swing price
-    lists used for the target.  The stack frames must hold CLOSED
-    bars only (the live invariant); the forming bar is never here.
+    band for the bias direction), H1 reference/minor swing levels
+    (retained for diagnostics; the trigger no longer requires a
+    break past them), ``atr_h1``, ``buf`` (the stop buffer beyond
+    the zone edge), and the H4 swing price lists used for the
+    target.  The stack frames must hold CLOSED bars only (the live
+    invariant); the forming bar is never here.
     """
     if isinstance(stack, dict):
         stack = TimeframeStack.from_frames(stack)
@@ -596,6 +611,21 @@ def live_setup(stack: TimeframeStack | dict, *,
     atr_h1 = atr14(h1)
     if atr_h1 <= 0:
         return None
+    buf = float(SWING.breakout_atr * atr_h1)
+    # CONTAINMENT FIRST: the H1 reference level on the zone side
+    # (swing low for longs, swing high for shorts) must NEST
+    # inside the H4 zone (± buf, the codebase's existing level
+    # tolerance — the same buf the stop sits beyond the zone
+    # edge).  If the levels live at different coordinates, no
+    # tick can ever satisfy both — the setup is invalid, skip it
+    # instead of waiting forever on an impossible tick.  This
+    # replaces the old simultaneous-cross requirement: nesting is
+    # checked once here, at arming, not per tick.
+    ref_level = float(trig_lows[-1][1]) if bias_d1 > 0 \
+        else float(trig_highs[-1][1])
+    if not (zone["bottom"] - buf <= ref_level
+            <= zone["top"] + buf):
+        return None
     h4_highs, h4_lows = find_swings(
         h4["high"].to_numpy(), h4["low"].to_numpy(), swing_n)
     return {
@@ -607,103 +637,104 @@ def live_setup(stack: TimeframeStack | dict, *,
         "ref_low": float(trig_lows[-1][1]),
         "minor_low": float(trig_lows[-2][1])
         if len(trig_lows) >= 2 else None,
+        "ref_level": ref_level,
         "atr_h1": float(atr_h1),
-        "buf": float(SWING.breakout_atr * atr_h1),
+        "buf": buf,
         "h4_highs": [float(p) for _, p in h4_highs],
         "h4_lows": [float(p) for _, p in h4_lows],
         "swing_n": int(swing_n),
     }
 
 
-def check_live_trigger(setup: dict, *, open_: float, high: float,
-                       low: float, close: float,
-                       closed_h1: pd.DataFrame) -> dict | None:
-    """Check one live (forming) H1 bar against the setup levels.
+def check_zone_touch(setup: dict, *, mid: float) -> bool:
+    """Arm condition: the live price sits AT the H4 POI band.
 
-    Same gates as ``_evaluate``'s legs 3-4, with the forming bar in
-    the trigger-bar seat: the live price must sit AT the H4 POI band,
-    and :func:`detect_bos_msch_choch` (same function, same config,
-    same displacement gate) must fire on the forming bar against
-    swing levels taken from CLOSED bars only.  Returns None when
-    nothing fires, else ``{trigger, direction, entry, stop, target,
-    risk, level, zone}`` where ``level`` is the crossed level the
-    runner watches for a reversal (price back across it = the break
-    failed).
+    This is the trigger's first half: a touch, not a breakout.  A
+    touch arms the pending; the confirmation family decides
+    whether it fires (see :func:`check_live_trigger`).
     """
     zone = setup["zone"]
-    if not (zone["bottom"] <= close <= zone["top"]):
+    return zone["bottom"] <= mid <= zone["top"]
+
+
+def check_live_trigger(setup: dict, *, entry_frame: pd.DataFrame,
+                       h1_open, close: float) -> dict | None:
+    """Confirm an armed zone touch with the POI confirmation family.
+
+    Runs :func:`confirm_at_poi` on the entry-clock bars composing
+    the forming H1 bar (index >= ``h1_open``) against the setup's
+    zone band, with the full entry frame as lookback context.  The
+    confirmation window is therefore the entry bars composing the
+    forming H1 bar — up to 4 for M15, 2 for M30, 12 for M5 — the
+    same window the old entry leg used; the pending expires at the
+    H1 close, so a touch-to-confirm span is bounded by one H1 bar.
+
+    AT-POI: the confirming bar must overlap the POI band.  The
+    family itself does NOT require this for bos / choch /
+    sweep_reclaim / hh_hl (their detectors only need a bar inside
+    the frame), so the trigger enforces it here: a reaction far
+    from the zone is not a POI reaction, and a BOS above the zone
+    must never fire the trigger (that was the old failure mode in
+    reverse).  When several shapes confirm, the trigger is the
+    first (earliest bar, then SHAPE_PRIORITY) whose bar overlaps.
+
+    Returns None when nothing confirms at the POI, else
+    ``{trigger, confirm_shapes, direction, entry, stop, target,
+    risk, level, zone}``.  ``stop`` sits just beyond the defended
+    zone edge plus the breakout buffer (long: zone bottom - buf;
+    short: zone top + buf); ``level`` is the same stop level — a
+    price through it invalidates the touch.  ``target`` is 2R,
+    capped at the nearest H4 swing level beyond the entry when that
+    level is at least 2R away (same rule as the old trigger).
+    """
+    zone = setup["zone"]
+    direction = int(setup["direction"])
+    if entry_frame is None or len(entry_frame) == 0:
         return None
-    tail = closed_h1.tail(30)[["open", "high", "low", "close"]]
-    forming = pd.DataFrame(
-        [{"open": float(open_), "high": float(high),
-          "low": float(low), "close": float(close)}],
-        index=[closed_h1.index[-1] + pd.Timedelta(minutes=60)])
-    frame = pd.concat([tail, forming])
-    bias = int(setup["direction"])
-    event = detect_bos_msch_choch(
-        frame, setup["ref_high"], setup["ref_low"], setup["atr_h1"],
-        trend=bias, minor_high=setup["minor_high"],
-        minor_low=setup["minor_low"], config=SWING)
-    if event is None:
+    composing = entry_frame[entry_frame.index >= pd.Timestamp(h1_open)]
+    if len(composing) == 0:
         return None
-    direction = 1 if event.endswith("bull") else -1
-    if direction != bias:
+    ann = confirm_at_poi(composing, direction, zone["bottom"],
+                         zone["top"], context=entry_frame)
+    if not ann.confirmed:
         return None
-    buf = setup["buf"]
+    prio = {s: i for i, s in enumerate(SHAPE_PRIORITY)}
+    trigger = None
+    for shape in sorted(ann.shapes,
+                        key=lambda s: (ann.bar_indices[s],
+                                       prio.get(s, 99))):
+        label = ann.bar_indices[shape]
+        if label not in entry_frame.index:
+            continue
+        bar = entry_frame.loc[[label]].iloc[0]
+        if bar["low"] <= zone["top"] and bar["high"] >= zone["bottom"]:
+            trigger = shape
+            break
+    if trigger is None:
+        return None
+    buf = float(setup["buf"])
     if direction > 0:
-        stop = setup["ref_low"] - buf
+        stop = zone["bottom"] - buf
         if not stop < close:
             return None
-        level = setup["ref_high"] if event.startswith("MSCH") else max(
-            setup["ref_high"],
-            setup["minor_high"] if setup["minor_high"] is not None
-            else setup["ref_high"])
         cands = [p for p in setup["h4_highs"] if p > close]
     else:
-        stop = setup["ref_high"] + buf
+        stop = zone["top"] + buf
         if not stop > close:
             return None
-        level = setup["ref_low"] if event.startswith("MSCH") else min(
-            setup["ref_low"],
-            setup["minor_low"] if setup["minor_low"] is not None
-            else setup["ref_low"])
         cands = [p for p in setup["h4_lows"] if p < close]
     risk = abs(close - stop)
+    if risk <= 0:
+        return None
     target = close + direction * 2.0 * risk
     if cands:
         nearest = min(cands, key=lambda p: abs(p - close))
         if abs(nearest - close) >= 2.0 * risk:
             target = nearest
-    return {"trigger": event, "direction": direction,
-            "entry": float(close), "stop": float(stop),
-            "target": float(target), "risk": float(risk),
-            "level": float(level), "zone": zone}
-
-
-def check_live_entry(entry_frame: pd.DataFrame, bias: int, swing_n: int,
-                     *, since, entry_clock: str) -> int | None:
-    """Entry-TF confirmation on CLOSED entry bars composing the forming
-    H1 bar (index >= ``since``).
-
-    Mirrors the closed-bar leg 5 exactly: the FULL entry frame is
-    passed to :func:`_entry_event_window` (the event at bar ``j``
-    needs swing history from bars strictly before ``j``), with
-    ``window`` = the number of composing bars closed so far, capped
-    at ``60 // TF_MINUTES[entry_clock]`` (4 for M15, 2 for M30).
-    Returns the most recent event's direction (either sign — the
-    caller compares it to the bias) or None when no composing bar
-    fires.  A closed entry bar is the unit here, never a tick.
-    """
-    if entry_frame is None or len(entry_frame) == 0:
-        return None
-    entry_window = max(1, int(60 // TF_MINUTES[entry_clock]))
-    n_composing = int((entry_frame.index >= pd.Timestamp(since)).sum())
-    window = min(n_composing, entry_window)
-    if window <= 0:
-        return None
-    direction, _idx = _entry_event_window(
-        entry_frame, bias, swing_n, window)
-    return direction
+    return {"trigger": trigger, "confirm_shapes": list(ann.shapes),
+            "direction": direction, "entry": float(close),
+            "stop": float(stop), "target": float(target),
+            "risk": float(risk), "level": float(stop), "zone": zone}
 
 
 def qm_annotation(qm_touch: dict | None, bias: int, asof) -> dict:
