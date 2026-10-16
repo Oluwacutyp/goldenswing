@@ -140,3 +140,25 @@ def test_cache_covers_rejects_short_window(tmp_path):
     # Ask for a WIDER window than the cache holds -> must not claim cover.
     wider_end = pd.Timestamp("2026-02-01", tz="UTC")
     assert mf._cache_covers(tmp_path, "XAUUSD", start, wider_end) is False
+
+
+def test_default_symbol_is_xauusdm():
+    # Owner's terminal is Exness: gold is XAUUSDm, plain XAUUSD
+    # does not exist there.
+    assert mf.DEFAULT_SYMBOL == "XAUUSDm"
+
+
+def test_fetch_filenames_carry_symbol(tmp_path):
+    # Cache filenames must use the symbol: MT5_XAUUSDm_* for the
+    # default Exness symbol, and a different symbol gets its own
+    # files (caches never mix across broker symbols).
+    start, end = _window()
+    fake = _FakeMT5()
+    mf.fetch_mt5_native("XAUUSDm", start, end, tmp_path,
+                        mt5_module=fake)
+    for tf in mf.REQUIRED_TFS:
+        assert (tmp_path / f"MT5_XAUUSDm_{tf}_native.csv").exists()
+    assert (tmp_path / "MT5_XAUUSDm_ticks.csv").exists()
+    assert mf._cache_covers(tmp_path, "XAUUSDm", start, end) is True
+    # Same bars do NOT satisfy a different symbol's cache.
+    assert mf._cache_covers(tmp_path, "XAUUSD", start, end) is False

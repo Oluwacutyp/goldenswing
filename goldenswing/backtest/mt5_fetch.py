@@ -13,8 +13,9 @@ On start the backtest calls :func:`ensure_mt5_native`, which:
    and fetches ``copy_rates_range`` for EVERY timeframe (MN1, W1,
    D1, H4, H1, M30, M15, M5, M1) plus ``copy_ticks_range`` (one
    single tick stream, NOT per-TF) for the same window, and writes
-   them to the cache in the ``MT5_XAUUSD_{TF}_native.csv`` /
-   ``MT5_XAUUSD_ticks.csv`` format the native loader reads.
+   them to the cache in the ``MT5_{SYMBOL}_{TF}_native.csv`` /
+   ``MT5_{SYMBOL}_ticks.csv`` format the native loader reads, where
+   SYMBOL is the broker symbol on the terminal (Exness: ``XAUUSDm``).
 
 If MT5 is not available — package missing, ``initialize()`` fails,
 terminal not running — this FAILS with a clear message telling the
@@ -47,6 +48,12 @@ TF_ATTRS = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5",
             "MN1": "TIMEFRAME_MN1"}
 REQUIRED_TFS = tuple(TF_ATTRS)
 
+#: Default broker symbol for the backtest fetch. The owner's
+#: terminal is Exness, where gold is listed as ``XAUUSDm`` — plain
+#: ``XAUUSD`` does not exist there, so ``symbol_select("XAUUSD")``
+#: fails and the fetch returns nothing. ``--symbol`` overrides.
+DEFAULT_SYMBOL = "XAUUSDm"
+
 MT5_NOT_RUNNING_MSG = (
     "MT5 terminal not running on this machine - start MT5 and log "
     "in, then rerun. The backtest fetches its own data from the "
@@ -58,8 +65,12 @@ class MT5Unavailable(RuntimeError):
     """MT5 is not reachable — terminal not running / not logged in."""
 
 
-def _rates_filename(tf: str) -> str:
-    return f"MT5_XAUUSD_{tf}_native.csv"
+def _rates_filename(tf: str, symbol: str) -> str:
+    return f"MT5_{symbol}_{tf}_native.csv"
+
+
+def _ticks_filename(symbol: str) -> str:
+    return f"MT5_{symbol}_ticks.csv"
 
 
 def _cache_covers(cache_dir: Path, symbol: str, start: pd.Timestamp,
@@ -68,10 +79,11 @@ def _cache_covers(cache_dir: Path, symbol: str, start: pd.Timestamp,
 
     Reads only the ``time`` column. A missing or short file means
     the cache does NOT cover the window — fetch (or re-fetch) it.
+    Filenames carry the symbol (``MT5_{symbol}_...``) so caches
+    for different broker symbols never get mixed up.
     """
-    del symbol  # one symbol per cache dir; filename carries no symbol
     for tf in REQUIRED_TFS:
-        path = cache_dir / _rates_filename(tf)
+        path = cache_dir / _rates_filename(tf, symbol)
         if not path.exists():
             return False
         try:
@@ -83,7 +95,7 @@ def _cache_covers(cache_dir: Path, symbol: str, start: pd.Timestamp,
         ts = pd.to_datetime(times["time"], utc=True)
         if ts.min() > start or ts.max() < end:
             return False
-    ticks = cache_dir / "MT5_XAUUSD_ticks.csv"
+    ticks = cache_dir / _ticks_filename(symbol)
     if not ticks.exists():
         return False
     try:
@@ -126,7 +138,7 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                     f"in the terminal (F2) and rerun.")
             df = pd.DataFrame(rates)
             df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-            df.to_csv(cache_dir / _rates_filename(tf), index=False)
+            df.to_csv(cache_dir / _rates_filename(tf, symbol), index=False)
             manifest["tfs"][tf] = {
                 "rows": int(len(df)),
                 "start": str(df["time"].min()),
@@ -153,7 +165,7 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                 f"in the terminal (F2) and rerun.")
         ticks_df = pd.concat(chunks, ignore_index=True)
         ticks_df = ticks_df.sort_values("time").drop_duplicates("time")
-        ticks_df.to_csv(cache_dir / "MT5_XAUUSD_ticks.csv", index=False)
+        ticks_df.to_csv(cache_dir / _ticks_filename(symbol), index=False)
         manifest["ticks"] = {
             "rows": int(len(ticks_df)),
             "start": str(ticks_df["time"].min()),

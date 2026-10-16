@@ -20,7 +20,7 @@ On the EC2 MT5 terminal (or any terminal with full history):
 import MetaTrader5 as mt5
 import pandas as pd
 mt5.initialize()
-SYMBOL = "XAUUSD"  # broker symbol on that terminal
+SYMBOL = "XAUUSDm"  # broker symbol on that terminal (Exness)
 FROM = pd.Timestamp("2024-10-01", tz="UTC")
 TO = pd.Timestamp("2026-10-12", tz="UTC")
 TFS = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
@@ -33,13 +33,13 @@ for name, tf in TFS.items():
                                  TO.to_pydatetime())
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df.to_csv(f"MT5_XAUUSD_{name}_native.csv", index=False)
+    df.to_csv(f"MT5_XAUUSDm_{name}_native.csv", index=False)
 # Ticks — a SINGLE stream, not one per TF:
 ticks = mt5.copy_ticks_range(SYMBOL, FROM.to_pydatetime(),
                              TO.to_pydatetime(), mt5.COPY_TICKS_ALL)
 tdf = pd.DataFrame(ticks)
 tdf["time"] = pd.to_datetime(tdf["time"], unit="s", utc=True)
-tdf.to_csv("MT5_XAUUSD_ticks.csv", index=False)
+tdf.to_csv("MT5_XAUUSDm_ticks.csv", index=False)
 ```
 
 Copy the 10 CSVs to `goldenswing/data/` and re-run.

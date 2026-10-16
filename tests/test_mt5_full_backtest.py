@@ -52,8 +52,7 @@ def test_analyze_tp_hit_rates_and_regime(tmp_path):
 
 
 def test_script_has_no_shortcut_flags():
-    src = pathlib.Path(mt5full.__file__).read_text()
-    # No argparse flag defines them (docstring may name them as
+    src = pathlib.Path(mt5full.__file__).read_text()    # No argparse flag defines them (docstring may name them as
     # removed), and nothing assigns a playbook subset.
     assert 'add_argument("--days"' not in src
     assert 'add_argument("--only-playbook"' not in src
@@ -128,3 +127,16 @@ def test_telegram_send_failure_reported_not_skipped(monkeypatch):
                                         tg_call="/fake/tg-call")
     assert res["sent"] is False
     assert "boom" in res["error"]
+
+
+def test_script_symbol_defaults_to_xauusdm():
+    # Owner's Exness terminal lists gold as XAUUSDm. The script's
+    # --symbol default (the broker symbol data is fetched under)
+    # must be XAUUSDm, not XAUUSD.
+    import pathlib as _pl
+
+    src = _pl.Path(mt5full.__file__).read_text()
+    assert 'default=DEFAULT_SYMBOL' in src
+    assert mt5full.DEFAULT_SYMBOL == "XAUUSDm"
+    # And the fetch path actually receives the CLI symbol.
+    assert "ensure_mt5_native(args.symbol" in src

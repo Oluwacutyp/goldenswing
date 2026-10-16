@@ -42,7 +42,7 @@ def test_per_tf_files_loaded_not_resampled(tmp_path):
             {"ts": idx, "open": 100.0, "high": 110.0, "low": 90.0,
              "close": 100.0 + np.arange(40) * 0.01 + i * 0.5,
              "volume": 10.0})
-        df.to_csv(tmp_path / f"MT5_XAUUSD_{tf}_native.csv", index=False)
+        df.to_csv(tmp_path / f"MT5_XAUUSDm_{tf}_native.csv", index=False)
     frames, prov = load_native_frames(tmp_path)
     assert set(frames) == {"MN1", "W1", "D1", "H4", "H1", "M30",
                            "M15", "M5", "M1"}
@@ -57,7 +57,7 @@ def test_d1_gap_segments_reported(tmp_path):
     idx = idx1.append(idx2)
     df = pd.DataFrame({"ts": idx, "open": 100.0, "high": 101.0,
                        "low": 99.0, "close": 100.0, "volume": 10.0})
-    df.to_csv(tmp_path / "MT5_XAUUSD_D1_native.csv", index=False)
+    df.to_csv(tmp_path / "MT5_XAUUSDm_D1_native.csv", index=False)
     cov = coverage_report(tmp_path)
     assert len(cov["D1"].segments) == 2
     assert cov["D1"].gap_days > 100
@@ -69,7 +69,7 @@ def test_ticks_mt5_format(tmp_path):
                        "ask": [100.2, 100.3, 100.4],
                        "last": [100.1, 100.2, 100.3],
                        "volume": [1, 1, 1], "flags": [0, 0, 0]})
-    df.to_csv(tmp_path / "MT5_XAUUSD_ticks.csv", index=False)
+    df.to_csv(tmp_path / "MT5_XAUUSDm_ticks.csv", index=False)
     ticks = load_native_ticks(tmp_path)
     assert len(ticks) == 3
     assert ticks[0]["mid"] == pytest.approx(100.1)
@@ -86,3 +86,21 @@ def test_m1_proxy_labelled_approximation():
     ticks = ticks_from_m1(m1)
     assert len(ticks) == 8  # 4 ticks per M1 bar
     assert ticks[0]["time"] == m1.index[0]
+
+
+def test_symbol_override_loads_that_symbols_files(tmp_path):
+    # --symbol override: loader reads MT5_{symbol}_* files, and the
+    # default (XAUUSDm) files do NOT satisfy a different symbol.
+    idx = pd.date_range("2024-10-01", "2024-11-10", periods=40, tz="UTC")
+    for tf in ("M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"):
+        df = pd.DataFrame(
+            {"ts": idx, "open": 100.0, "high": 110.0, "low": 90.0,
+             "close": 100.0, "volume": 10.0})
+        df.to_csv(tmp_path / f"MT5_XAUUSD_{tf}_native.csv", index=False)
+    frames, _prov = load_native_frames(tmp_path, symbol="XAUUSD")
+    assert set(frames) == {"MN1", "W1", "D1", "H4", "H1", "M30",
+                           "M15", "M5", "M1"}
+    # Default symbol looks for XAUUSDm files — plain-XAUUSD files
+    # do not satisfy it.
+    with pytest.raises(MissingNativeData):
+        load_native_frames(tmp_path)  # default symbol XAUUSDm

@@ -45,28 +45,41 @@ GAP_MULTIPLE = 3.0
 TF_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60,
               "H4": 240, "D1": 1440, "W1": 10080, "MN1": 43200}
 
-#: Candidate files per TF, best first. MT5 native first, then the
-#: vendor's own per-TF file. NEVER a file of another TF.
-#: W1 / MN1 / M30 have no candidate: no file exists in the repo.
-TF_CANDIDATES: dict[str, tuple[str, ...]] = {
-    "D1": ("MT5_XAUUSD_D1_native*.csv",),
-    "H4": ("MT5_XAUUSD_H4_native*.csv",
-           "OANDA_XAU_USD_H4_*.csv"),
-    "H1": ("MT5_XAUUSD_H1_native*.csv",
-           "OANDA_XAU_USD_H1_*.csv"),
-    "M15": ("MT5_XAUUSD_M15_native*.csv",
-            "OANDA_XAU_USD_M15_*.csv"),
-    "M5": ("MT5_XAUUSD_M5_native*.csv",
-           "OANDA_XAU_USD_M5_*.csv"),
-    "M1": ("MT5_XAUUSD_M1_native*.csv",
-           "OANDA_XAU_USD_M1_*.csv"),
-    "W1": ("MT5_XAUUSD_W1_native*.csv",),
-    "MN1": ("MT5_XAUUSD_MN1_native*.csv",),
-    "M30": ("MT5_XAUUSD_M30_native*.csv",),
-}
+#: Default broker symbol for native files. The owner's terminal
+#: is Exness, where gold is listed as ``XAUUSDm`` — plain ``XAUUSD``
+#: does not exist there. ``--symbol`` overrides; the loader takes
+#: the same symbol so fetch cache and loader never disagree.
+DEFAULT_SYMBOL = "XAUUSDm"
 
-#: MT5 tick export candidates (copy_ticks_range CSV).
-TICK_CANDIDATES = ("MT5_XAUUSD_ticks*.csv",)
+
+def _tf_candidates(symbol: str) -> dict[str, tuple[str, ...]]:
+    """Candidate files per TF for ``symbol``, best first.
+
+    MT5 native first, then the vendor's own per-TF file. NEVER a
+    file of another TF. W1 / MN1 / M30 have no vendor file: no
+    file exists in the repo.
+    """
+    return {
+        "D1": (f"MT5_{symbol}_D1_native*.csv",),
+        "H4": (f"MT5_{symbol}_H4_native*.csv",
+               "OANDA_XAU_USD_H4_*.csv"),
+        "H1": (f"MT5_{symbol}_H1_native*.csv",
+               "OANDA_XAU_USD_H1_*.csv"),
+        "M15": (f"MT5_{symbol}_M15_native*.csv",
+                "OANDA_XAU_USD_M15_*.csv"),
+        "M5": (f"MT5_{symbol}_M5_native*.csv",
+               "OANDA_XAU_USD_M5_*.csv"),
+        "M1": (f"MT5_{symbol}_M1_native*.csv",
+               "OANDA_XAU_USD_M1_*.csv"),
+        "W1": (f"MT5_{symbol}_W1_native*.csv",),
+        "MN1": (f"MT5_{symbol}_MN1_native*.csv",),
+        "M30": (f"MT5_{symbol}_M30_native*.csv",),
+    }
+
+
+def _tick_candidates(symbol: str) -> tuple[str, ...]:
+    """MT5 tick export candidates (copy_ticks_range CSV)."""
+    return (f"MT5_{symbol}_ticks*.csv",)
 
 MT5_EXPORT_SPEC = """\
 MT5 EXPORT NEEDED — one common window, every timeframe native.
@@ -77,7 +90,7 @@ MetaTrader5 Python (pip install MetaTrader5) with this script:
     import MetaTrader5 as mt5
     import pandas as pd
     mt5.initialize()
-    SYMBOL = "XAUUSD"  # broker symbol on that terminal
+    SYMBOL = "XAUUSDm"  # broker symbol on that terminal (Exness)
     FROM = pd.Timestamp("2024-10-01", tz="UTC")
     TO = pd.Timestamp("2026-10-12", tz="UTC")
     TFS = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
@@ -90,13 +103,13 @@ MetaTrader5 Python (pip install MetaTrader5) with this script:
                                      TO.to_pydatetime())
         df = pd.DataFrame(rates)
         df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-        df.to_csv(f"MT5_XAUUSD_{name}_native.csv", index=False)
+        df.to_csv(f"MT5_XAUUSDm_{name}_native.csv", index=False)
     # Ticks (single stream, NOT per-TF):
     ticks = mt5.copy_ticks_range(SYMBOL, FROM.to_pydatetime(),
                                  TO.to_pydatetime(), mt5.COPY_TICKS_ALL)
     tdf = pd.DataFrame(ticks)
     tdf["time"] = pd.to_datetime(tdf["time"], unit="s", utc=True)
-    tdf.to_csv("MT5_XAUUSD_ticks.csv", index=False)
+    tdf.to_csv("MT5_XAUUSDm_ticks.csv", index=False)
 
 Copy the 10 CSVs to goldenswing/data/ and re-run. Requirements:
 - Same window for every TF (common intersection must be non-empty).
@@ -176,13 +189,15 @@ def _segments(index: pd.DatetimeIndex, tf: str) -> list[tuple[str, str, int]]:
             for s, e in zip(starts, ends)]
 
 
-def coverage_report(data_dir: Path | None = None) -> dict[str, TFCoverage]:
+def coverage_report(data_dir: Path | None = None,
+                    symbol: str = DEFAULT_SYMBOL) -> dict[str, TFCoverage]:
     """Per-TF coverage from native files only. Never loads a fallback."""
     base = Path(data_dir) if data_dir is not None else DATA_DIR
+    candidates = _tf_candidates(symbol)
     out: dict[str, TFCoverage] = {}
     for tf in REQUIRED_TFS:
         cov = TFCoverage(tf=tf, missing=True)
-        for pattern in TF_CANDIDATES.get(tf, ()):  # pragma: no branch
+        for pattern in candidates.get(tf, ()):  # pragma: no branch
             matches = sorted(base.glob(pattern))
             if not matches:
                 continue
@@ -207,13 +222,14 @@ def coverage_report(data_dir: Path | None = None) -> dict[str, TFCoverage]:
 
 
 def load_native_frames(data_dir: Path | None = None,
+                       symbol: str = DEFAULT_SYMBOL,
                        ) -> tuple[dict[str, pd.DataFrame], dict]:
     """Load every required TF from its own native file.
 
     Returns (frames, provenance). Raises MissingNativeData if ANY
     required TF has no file — no resampling, no partial run.
     """
-    cov = coverage_report(data_dir)
+    cov = coverage_report(data_dir, symbol)
     missing = [tf for tf, c in cov.items() if c.missing]
     provenance = {tf: {"source": c.source, "rows": c.rows,
                        "start": c.start, "end": c.end,
@@ -237,10 +253,11 @@ def load_native_frames(data_dir: Path | None = None,
     return frames, provenance
 
 
-def load_native_ticks(data_dir: Path | None = None) -> list[dict]:
+def load_native_ticks(data_dir: Path | None = None,
+                      symbol: str = DEFAULT_SYMBOL) -> list[dict]:
     """Load real MT5 ticks (copy_ticks_range CSV). Raises if absent."""
     base = Path(data_dir) if data_dir is not None else DATA_DIR
-    for pattern in TICK_CANDIDATES:
+    for pattern in _tick_candidates(symbol):
         matches = sorted(base.glob(pattern))
         if not matches:
             continue
@@ -257,7 +274,7 @@ def load_native_ticks(data_dir: Path | None = None) -> list[dict]:
                           "tick_volume": float(d.get("volume", 1.0)),
                           "real_volume": float(d.get("volume", 0.0))})
         return ticks
-    raise MissingNativeData(["ticks (MT5_XAUUSD_ticks_*.csv)"])
+    raise MissingNativeData([f"ticks (MT5_{symbol}_ticks_*.csv)"])
 
 
 def ticks_from_m1(m1: pd.DataFrame) -> list[dict]:

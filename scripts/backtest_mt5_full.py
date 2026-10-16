@@ -72,7 +72,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from goldenswing.backtest.mt5_fetch import (  # noqa: E402
-    DEFAULT_CACHE_DIR, MT5Unavailable, default_window,
+    DEFAULT_CACHE_DIR, DEFAULT_SYMBOL, MT5Unavailable, default_window,
     ensure_mt5_native)
 from goldenswing.backtest.mt5_native_data import (  # noqa: E402
     MissingNativeData, coverage_report,
@@ -117,7 +117,7 @@ def _ensure_data(args) -> tuple[pd.Timestamp, pd.Timestamp, dict]:
 def _print_coverage(args) -> int:
     _start, _end, _manifest = _ensure_data(args)
     cache = Path(args.cache_dir) if args.cache_dir else DEFAULT_CACHE_DIR
-    cov = coverage_report(cache)
+    cov = coverage_report(cache, args.symbol)
     print("Native per-TF coverage (NO resampling — missing = missing):")
     for tf, c in cov.items():
         if c.missing:
@@ -129,18 +129,18 @@ def _print_coverage(args) -> int:
                   f"maxgap {c.gap_days:.0f}d  [{c.source}]")
             print(f"       segments: {segs}")
     try:
-        frames, prov = load_native_frames(cache)
+        frames, prov = load_native_frames(cache, args.symbol)
         w = prov["window"]
         print(f"\nCommon window: {w['start']} -> {w['end']}")
     except MissingNativeData as exc:
         print(f"\nBLOCKED: {exc.missing}")
         return 3
     try:
-        ticks = load_native_ticks(cache)
+        ticks = load_native_ticks(cache, args.symbol)
         print(f"Ticks: {len(ticks):,} real MT5 ticks")
     except MissingNativeData:
         print("Ticks: MISSING — real tick backtest needs "
-              "MT5_XAUUSD_ticks.csv (copy_ticks_range)")
+              f"MT5_{args.symbol}_ticks.csv (copy_ticks_range)")
     return 0
 
 
@@ -257,8 +257,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--allow-m1-proxy", action="store_true",
                     help="smoke-run on labelled M1 tick approximation "
                          "when no real MT5 tick file exists")
-    ap.add_argument("--symbol", type=str, default="XAUUSD",
-                    help="MT5 symbol (terminal's logged-in account)")
+    ap.add_argument("--symbol", type=str, default=DEFAULT_SYMBOL,
+                    help="MT5 broker symbol to fetch data for "
+                         "(default: XAUUSDm — the owner's Exness "
+                         "terminal lists gold as XAUUSDm, not XAUUSD)")
     ap.add_argument("--start", type=str, default=None,
                     help="fetch window start (ISO, with --end)")
     ap.add_argument("--end", type=str, default=None,
@@ -297,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     _start, _end, manifest = _ensure_data(args)
     cache = Path(args.cache_dir) if args.cache_dir else DEFAULT_CACHE_DIR
     try:
-        frames, provenance = load_native_frames(cache)
+        frames, provenance = load_native_frames(cache, args.symbol)
     except MissingNativeData as exc:
         print(f"BLOCKED — {exc}", file=sys.stderr)
         return 3
@@ -317,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"window: {start} -> {end_open}")
 
     try:
-        ticks = load_native_ticks(cache)
+        ticks = load_native_ticks(cache, args.symbol)
         tick_provenance = "real_mt5_ticks"
         print(f"ticks: {len(ticks):,} real MT5 ticks")
     except MissingNativeData:
@@ -345,6 +347,13 @@ def main(argv: list[str] | None = None) -> int:
     feed = bfe.SimFeed(broker, frames, dxy, start, ticks)
     executor = bfe.SimExecutor(broker)
     cfg = MT5RunnerConfig(
+        # NOTE: the engine's instrument label stays the engine
+        # default (XAUUSD). --symbol is the BROKER symbol the data
+        # was fetched under (XAUUSDm on Exness) — the same gold,
+        # different broker suffix. Playbook validation is on the
+        # instrument (XAUUSD), not the broker suffix, so the runner
+        # label must not become XAUUSDm. Live runner config is
+        # untouched.
         journal_path=out / "mt5_journal.jsonl",
         risk_state_path=out / "mt5_risk.json",
         kill_switch_path=out / "mt5_KILL",
