@@ -341,7 +341,24 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
     # Feed
     lines.append(fmt_section("📡", "Feed"))
     lines.append(fmt_feed_line(fs, ctx.last_bar_time, ctx.last_price))
+    if ctrl is not None:
+        # Per-TF last closed bars (guarded — old runners lack it).
+        # The old /status showed only the H1 last bar, which read
+        # as "feed is H1-only": the stack carries all six TFs.
+        stack_line = getattr(ctrl, "stack_line", None)
+        if callable(stack_line):
+            lines.append(stack_line())
     lines.append("")
+    # Live setup: armed / not-armed + why.  Guarded — old runners
+    # lack it.  This is the answer to "why no trades" when no
+    # playbook has been reached yet (blocked legs stay empty
+    # until a trigger fires, so they cannot answer it alone).
+    if ctrl is not None:
+        setup_line = getattr(ctrl, "setup_line", None)
+        if callable(setup_line):
+            lines.append(fmt_section("🎯", "Live Setup"))
+            lines.append(setup_line())
+            lines.append("")
     # Engine state
     lines.append(fmt_section("⚙️", "Engine"))
     if cfg is not None and cfg.get("paused"):
@@ -414,7 +431,9 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
         lines.append(fmt_section("🚫", "why no trades — blocked legs:"))
         legs = stats.get("legs") or {}
         if not legs and not stats.get("manipulation_blocked"):
-            lines.append(f"  {fmt_none()} (nothing blocked yet)")
+            lines.append(f"  {fmt_none()} (nothing blocked yet — "
+                         f"see Live Setup above for why no trigger "
+                         f"has fired)")
         for leg, count in sorted(legs.items(), key=lambda kv: -kv[1]):
             lines.append(f"  ⛔ `{leg}`: {count}")
         if stats.get("manipulation_blocked"):

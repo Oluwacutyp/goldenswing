@@ -12,11 +12,18 @@ HIERARCHY, NEVER DEMOCRACY
 --------------------------
 A signal fires only when every leg passes, in order.  Higher
 timeframes grant permission downward; a lower timeframe can NEVER
-override or outvote a higher one:
+override or outvote a higher one.  H4 does NOT get a second vote:
+it supplies the POI zone; D1 supplies the direction.
 
 1. ``d1_bias`` — D1 bias != 0 (last closed swing structure).
-2. ``h4_agree`` — H4 bias agrees with D1 (flat H4 = no permission;
-   H4 against D1 blocks, it is never averaged in).
+2. ``h4_agree`` — H4 context, recorded never a vote: ``aligned``
+   (H4 trends with D1), ``pullback`` (H4 trends against D1 — the
+   pullback INTO the D1-side POI, the lecture setup), ``flat`` (no
+   H4 opinion — not a veto).  This leg always passes once D1 has
+   a bias; the zone / trigger / entry legs below decide.  (Before
+   2026-10-16 this leg required H4 == D1 and was the zero-signal
+   root cause: it armed 21% of H1 bars on real gold and, because
+   playbooks never ran, ``/status`` showed ``blocked legs: none``.)
 3. ``h4_zone`` — the H1 trigger bar closes AT the H4 POI (inside the
    zone band, never beyond it).  No chasing.
 4. ``h1_trigger`` — a structural event (BOS / MSCH / CHoCH) fires on
@@ -41,9 +48,8 @@ is explicit, never inferred.
 
 Legs 3-4 reuse :func:`goldenswing.live.multitf.evaluate` (SWING
 preset: D1 bias / H4 zones / H1 trigger) with the hard veto OFF;
-leg 2 (H4 agreement) is evaluated independently here because the
-preset does not check it.  Leg 5 is the session-clock entry leg
-(``reader/session_timeframes.py``).
+leg 2 records H4 context only (see above).  Leg 5 is the
+session-clock entry leg (``reader/session_timeframes.py``).
 
 HARD VETO IS OFF — ALWAYS.  This module never enables it: every call
 into ``multitf`` passes ``enable_veto=False``, and the verdict
@@ -282,7 +288,7 @@ def evaluate_hierarchy(stack: TimeframeStack | dict,
                              for leg in LEG_ORDER}
     verdict: dict = {
         "allowed": False, "blocked_leg": "data", "legs": legs,
-        "bias_d1": 0, "bias_h4": 0, "direction": 0,
+        "bias_d1": 0, "bias_h4": 0, "h4_context": "", "direction": 0,
         "zone": None, "trigger": None, "entry": None, "stop": None,
         "target": None, "risk": None, "session": None,
         "amd_phase": amd_phase or "unknown",
@@ -325,18 +331,29 @@ def evaluate_hierarchy(stack: TimeframeStack | dict,
         return _finish(verdict, legs)
     legs["d1_bias"] = _leg(True, "")
 
-    # --- leg 2: H4 agrees with D1 (flat / against both block).
+    # --- leg 2: H4 context (recorded, never a vote).
+    # H4 supplies the POI zone; D1 supplies the direction.  An H4
+    # bias against D1 is the pullback INTO the D1-side POI — the
+    # lecture setup — and a flat H4 is a missing second opinion,
+    # not a veto.  Requiring H4 == D1 here was the 2026-10-16
+    # zero-signal root cause (it armed 21% of H1 bars on real
+    # gold; without it 46% arm, the rest gated by zone /
+    # containment / trigger / score downstream).  The leg stays
+    # in LEG_ORDER as the recorded context so verdict shape and
+    # /status leg reporting do not change.
     bias_h4 = evaluate_bias(sliced["H4"], swing_n=swing_n)
     verdict["bias_h4"] = int(bias_h4)
+    verdict["h4_context"] = _h4_context(bias_d1, bias_h4)
     if bias_h4 == 0:
-        legs["h4_agree"] = _leg(False, "h4_flat: no H4 permission")
-        return _finish(verdict, legs, qm_touch=qm_touch, bias=bias_d1)
-    if bias_h4 != bias_d1:
         legs["h4_agree"] = _leg(
-            False, f"h4_against_d1: H4 bias {bias_h4:+d} vs "
-                    f"D1 bias {bias_d1:+d}")
-        return _finish(verdict, legs, qm_touch=qm_touch, bias=bias_d1)
-    legs["h4_agree"] = _leg(True, "")
+            True, "h4_flat: no H4 bias — H4 supplies the POI only")
+    elif bias_h4 != bias_d1:
+        legs["h4_agree"] = _leg(
+            True, f"h4_pullback: H4 bias {bias_h4:+d} vs D1 "
+                   f"{bias_d1:+d} — pullback into the D1-side POI; "
+                   f"direction stays D1")
+    else:
+        legs["h4_agree"] = _leg(True, "h4_aligned")
 
     # --- legs 3-4: H4 zone + H1 trigger via the shared structural
     # engine (SWING preset, hard veto OFF — always).
@@ -569,20 +586,35 @@ def zones_for_direction(zone_bars: pd.DataFrame, direction: int, *,
 # is no longer a condition anywhere in the live trigger.
 
 
-def live_setup(stack: TimeframeStack | dict, *,
-               swing_n: int = 3) -> dict | None:
-    """Trigger levels from CLOSED bars only (refreshed on TF closes).
+def _h4_context(bias_d1: int, bias_h4: int) -> str:
+    """H4's role is context, never a second vote.
 
-    Returns None when legs 1-2 (D1 bias / H4 agreement) fail or no
-    H4 POI / H1 swing levels exist — the setup is not armed.
-    Otherwise returns the levels the tick clock checks every tick:
-    ``bias_d1`` / ``bias_h4`` / ``direction``, ``zone`` (the H4 POI
-    band for the bias direction), H1 reference/minor swing levels
-    (retained for diagnostics; the trigger no longer requires a
-    break past them), ``atr_h1``, ``buf`` (the stop buffer beyond
-    the zone edge), and the H4 swing price lists used for the
-    target.  The stack frames must hold CLOSED bars only (the live
-    invariant); the forming bar is never here.
+    The hierarchy is D1 decides direction, H4 supplies the POI zone.
+    ``aligned`` = H4 trends with D1.  ``pullback`` = H4 trends
+    against D1 — the canonical pullback INTO the D1 POI, the setup
+    the lecture specifies (D1 bias + pullback into H4 zone + H1
+    trigger).  ``flat`` = H4 has no bias; a missing H4 opinion is
+    not a veto.  None of the three blocks; the zone, containment,
+    trigger, score, confluence, manipulation, cost and margin gates
+    below still decide whether anything fires.
+    """
+    if bias_h4 == 0:
+        return "flat"
+    if bias_h4 == bias_d1:
+        return "aligned"
+    return "pullback"
+
+
+def _live_setup_impl(stack: TimeframeStack | dict, *,
+                     swing_n: int = 3) -> tuple[dict | None, str]:
+    """``live_setup`` + the reason it is / is not armed.
+
+    Reason strings (``armed``, ``d1_flat``, ``no_h4_poi``,
+    ``no_h1_swings``, ``no_atr``, ``containment``,
+    ``insufficient_bars``) exist so ``/status`` can tell the owner
+    WHY no setup is armed instead of showing ``blocked legs: none``
+    for a runner that is merely waiting — the 2026-10-16
+    ``last signal: none journaled yet`` screenshot.
     """
     if isinstance(stack, dict):
         stack = TimeframeStack.from_frames(stack)
@@ -592,25 +624,32 @@ def live_setup(stack: TimeframeStack | dict, *,
     need = 2 * swing_n + 5
     if d1 is None or len(d1) < need or h4 is None or len(h4) < need \
             or h1 is None or len(h1) < need:
-        return None
+        return None, "insufficient_bars"
     bias_d1 = evaluate_bias(d1, swing_n=swing_n)
     if bias_d1 == 0:
-        return None
+        return None, "d1_flat: D1 bias is flat — no direction, no setup"
     bias_h4 = evaluate_bias(h4, swing_n=swing_n)
-    if bias_h4 != bias_d1:
-        return None
+    # NO H4-agreement requirement here — that was the 2026-10-16
+    # zero-signal root cause.  Requiring H4 bias == D1 bias is
+    # democracy (two votes), not hierarchy: during a pullback H4
+    # NECESSARILY trends against D1 while price retraces into the
+    # D1-side H4 POI.  Measured on real gold bars (last 200 H1
+    # bars, causal): the agreement vote armed 21% of bars; without
+    # it 46% arm, and the newly armed bars are H4-flat (no H4
+    # opinion — not a veto) plus genuine pullbacks.  Direction
+    # stays D1, always; H4's bias is recorded as context.
     zones = zones_by_side(h4, swing_n=swing_n)
     zone = zones.get("support") if bias_d1 > 0 \
         else zones.get("resistance")
     if zone is None:
-        return None
+        return None, "no_h4_poi: no H4 POI on the D1 side"
     trig_highs, trig_lows = find_swings(
         h1["high"].to_numpy(), h1["low"].to_numpy(), swing_n)
     if not trig_highs or not trig_lows:
-        return None
+        return None, "no_h1_swings: no confirmed H1 swings"
     atr_h1 = atr14(h1)
     if atr_h1 <= 0:
-        return None
+        return None, "no_atr: H1 ATR unmeasurable"
     buf = float(SWING.breakout_atr * atr_h1)
     # CONTAINMENT FIRST: the H1 reference level on the zone side
     # (swing low for longs, swing high for shorts) must NEST
@@ -625,11 +664,17 @@ def live_setup(stack: TimeframeStack | dict, *,
         else float(trig_highs[-1][1])
     if not (zone["bottom"] - buf <= ref_level
             <= zone["top"] + buf):
-        return None
+        return None, (
+            "containment: H1 ref level "
+            f"{ref_level:.1f} outside H4 POI "
+            f"{zone['bottom']:.1f}–{zone['top']:.1f} "
+            "(structure not at the zone yet)")
     h4_highs, h4_lows = find_swings(
         h4["high"].to_numpy(), h4["low"].to_numpy(), swing_n)
+    context = _h4_context(bias_d1, bias_h4)
     return {
         "bias_d1": int(bias_d1), "bias_h4": int(bias_h4),
+        "h4_context": context,
         "direction": int(bias_d1), "zone": zone,
         "ref_high": float(trig_highs[-1][1]),
         "minor_high": float(trig_highs[-2][1])
@@ -643,7 +688,36 @@ def live_setup(stack: TimeframeStack | dict, *,
         "h4_highs": [float(p) for _, p in h4_highs],
         "h4_lows": [float(p) for _, p in h4_lows],
         "swing_n": int(swing_n),
-    }
+    }, "armed"
+
+
+def live_setup(stack: TimeframeStack | dict, *,
+               swing_n: int = 3) -> dict | None:
+    """Trigger levels from CLOSED bars only (refreshed on TF closes).
+
+    Returns None when D1 bias is flat or no H4 POI / H1 swing
+    levels exist — the setup is not armed.  H4 bias agreement is
+    deliberately NOT required: H4 supplies the POI zone, D1
+    supplies the direction (see ``_live_setup_impl``).  Otherwise
+    returns the levels the tick clock checks every tick:
+    ``bias_d1`` / ``bias_h4`` / ``h4_context`` / ``direction``,
+    ``zone`` (the H4 POI band for the bias direction), H1
+    reference/minor swing levels (retained for diagnostics; the
+    trigger no longer requires a break past them), ``atr_h1``,
+    ``buf`` (the stop buffer beyond the zone edge), and the H4
+    swing price lists used for the target.  The stack frames must
+    hold CLOSED bars only (the live invariant); the forming bar is
+    never here.
+    """
+    setup, _reason = _live_setup_impl(stack, swing_n=swing_n)
+    return setup
+
+
+def live_setup_reason(stack: TimeframeStack | dict, *,
+                      swing_n: int = 3) -> str:
+    """Why :func:`live_setup` would / would not arm (``/status``)."""
+    _setup, reason = _live_setup_impl(stack, swing_n=swing_n)
+    return reason
 
 
 def check_zone_touch(setup: dict, *, mid: float) -> bool:

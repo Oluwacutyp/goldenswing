@@ -1,10 +1,11 @@
 """Tests for the all-timeframe hierarchy (live + backtest, shared code).
 
-The hierarchy: D1 bias -> H4 agreement -> H4 zone -> H1 trigger ->
-session entry-clock confirmation.  Hard veto is OFF everywhere.
-QM M5 is an annotation leg, never a gate.  Per-TF cursors never
-rewind.  Live and backtest share ``evaluate_hierarchy`` — the parity
-test proves both paths read the same verdict at the same bar.
+The hierarchy: D1 bias -> H4 context (POI supplier, never a second
+vote) -> H4 zone -> H1 trigger -> session entry-clock confirmation.
+Hard veto is OFF everywhere.  QM M5 is an annotation leg, never a
+gate.  Per-TF cursors never rewind.  Live and backtest share
+``evaluate_hierarchy`` — the parity test proves both paths read the
+same verdict at the same bar.
 """
 import math
 
@@ -140,26 +141,36 @@ def test_session_clock_selection():
 
 
 # ------------------------------------------------------------- hierarchy legs
-def test_h4_against_d1_blocks():
+def test_h4_against_d1_is_pullback_context_not_a_block():
+    # Doctrine (2026-10-16 fix): H4 supplies the POI, D1 supplies
+    # the direction.  H4 against D1 is the pullback INTO the
+    # D1-side POI — it must NOT block at the h4_agree leg.  This
+    # stack's H4 POI sits far from price, so the verdict still
+    # blocks — but at h4_zone (entry not at POI), never h4_agree.
     stack = passing_stack()
     stack.frames["H4"] = zigzag(-1, 40, start=110.0, slope=0.3, amp=1.5)
     v = evaluate_hierarchy(stack, asof=KILLZONE_ASOF, swing_n=1)
-    assert v["allowed"] is False
-    assert v["blocked_leg"] == "h4_agree"
-    assert "h4_against_d1" in v["legs"]["h4_agree"]["reason"]
+    assert v["legs"]["h4_agree"]["passed"] is True
+    assert v["h4_context"] == "pullback"
+    assert "h4_pullback" in v["legs"]["h4_agree"]["reason"]
+    assert v["blocked_leg"] == "h4_zone"
     assert v["veto_enabled"] is False
 
 
-def test_h4_flat_blocks_no_permission():
+def test_h4_flat_is_poi_only_not_a_block():
+    # H4 flat = no H4 opinion, not a veto.  This flat H4 has no
+    # swings at all, so there is no POI: the verdict blocks at
+    # h4_zone (no_poi) — the zone leg decides, never h4_agree.
     stack = passing_stack()
     flat = pd.DataFrame(
         [(100.0, 100.5, 99.5, 100.0)] * 40,
         columns=["open", "high", "low", "close"], index=_idx(40))
     stack.frames["H4"] = flat
     v = evaluate_hierarchy(stack, asof=KILLZONE_ASOF, swing_n=1)
-    assert v["allowed"] is False
-    assert v["blocked_leg"] == "h4_agree"
-    assert "h4_flat" in v["legs"]["h4_agree"]["reason"]
+    assert v["legs"]["h4_agree"]["passed"] is True
+    assert v["h4_context"] == "flat"
+    assert v["blocked_leg"] == "h4_zone"
+    assert v["legs"]["h4_zone"]["reason"] == "no_poi"
 
 
 def test_h1_trigger_without_h4_zone_never_fires():

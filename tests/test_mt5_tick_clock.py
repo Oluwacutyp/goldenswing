@@ -21,7 +21,8 @@ from goldenswing.execution.executor import OrderResult, Position
 from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
 from goldenswing.live.hierarchy import (TF_MINUTES, TimeframeStack,
                                         check_live_trigger,
-                                        check_zone_touch, live_setup)
+                                        check_zone_touch, live_setup,
+                                        live_setup_reason)
 
 H1_HIGH = [1992, 1993, 1994, 1995, 1996, 1996, 1996, 1997, 1997, 1997,
            1997, 1997, 1998, 1997, 1997, 1996, 1996, 1996, 1997, 1997,
@@ -215,7 +216,11 @@ def test_live_setup_not_armed_when_level_does_not_nest():
         H1_LOW[:] = saved
 
 
-def test_live_setup_not_armed_when_h4_disagrees():
+def test_live_setup_not_armed_when_h4_disagrees_but_levels_do_not_nest():
+    # H4 disagreement alone must NOT disarm (pullback context —
+    # see test_live_pullback_signal).  This mirrored H4 still
+    # yields None, but via CONTAINMENT: the H1 ref level sits far
+    # from the mirrored H4 POI, so no tick could satisfy both.
     frames = _frames()
     # Mirror H4 around 2000: uptrend becomes downtrend (bias -1).
     h4 = frames["H4"]
@@ -225,6 +230,7 @@ def test_live_setup_not_armed_when_h4_disagrees():
          "volume": h4["volume"], "real_volume": h4["real_volume"],
          "spread": h4["spread"]}, index=h4.index)
     assert live_setup(frames) is None
+    assert live_setup_reason(frames).startswith("containment")
 
 
 # ------------------------------------------------------- check_zone_touch

@@ -75,7 +75,7 @@ from ..live.volume_profile import volume_profile
 from ..live.hierarchy import (LEG_ORDER, TimeframeStack, TF_MINUTES,
                               check_live_trigger, check_zone_touch,
                               evaluate_hierarchy, live_setup,
-                              qm_annotation)
+                              live_setup_reason, qm_annotation)
 from ..live.macrotrend import (MacroTrendResult, compute_macrotrend)
 from ..live.manipulation import chase_blocked
 from ..live.news import NewsCalendar
@@ -523,6 +523,11 @@ class MT5Runner:
         # still unconfirmed) awaiting POI confirmation.
         self._forming: dict | None = None
         self._live_setup: dict | None = None
+        # Why the live setup is / is not armed (live_setup_reason):
+        # /status must be able to say WHY no setup is armed instead
+        # of showing "blocked legs: none" for a runner that is
+        # merely waiting (2026-10-16 screenshot).
+        self._live_setup_reason: str = "not evaluated yet"
         self._pending: dict | None = None
         # Fired-window guard (trigger redesign): the H1 bar open
         # time in which a trigger last fired.  The H1 bar IS the
@@ -781,7 +786,7 @@ class MT5Runner:
         # Trigger levels from the closed warm-start bars.  The H1
         # close is NOT the signal clock anymore — this setup is what
         # the tick clock checks every tick (see _evaluate_live_tick).
-        self._live_setup = live_setup(self._stack)
+        self._refresh_live_setup()
         # MacroTrend alignment from the warm-start frames (D1/W1/MN1
         # closed bars).  Sizing + Golden Swing confirmation read this.
         self._refresh_alignment()
@@ -1407,7 +1412,7 @@ class MT5Runner:
         if "H1" in appended:
             self._refresh_dxy()
         if any(tf in ("D1", "H4", "H1") for tf in appended):
-            self._live_setup = live_setup(self._stack)
+            self._refresh_live_setup()
         # Phase 3: entry-TF closes — the Close Rule FIRST (a bar
         # closing beyond the invalidation level kills the setup
         # instantly, before any confirmation on the same close),
@@ -1493,6 +1498,67 @@ class MT5Runner:
     def dxy_line(self) -> str:
         """One-line DXY state for /status (see mt5_commands)."""
         return self._dxy.state.describe()
+
+    def _refresh_live_setup(self) -> None:
+        """Recompute the cached trigger levels + the reason string.
+
+        Single place both call sites (warm start, TF-close refresh)
+        go through, so ``_live_setup`` and ``_live_setup_reason``
+        can never disagree.
+        """
+        if self._stack is None:
+            self._live_setup = None
+            self._live_setup_reason = "no stack"
+            return
+        self._live_setup = live_setup(self._stack)
+        self._live_setup_reason = live_setup_reason(self._stack)
+
+    def setup_line(self) -> str:
+        """One-line live-setup state for /status (see mt5_commands).
+
+        Armed: direction + H4 POI band + H4 context + distance
+        from the last tick to the zone.  Not armed: the reason
+        (d1_flat / no_h4_poi / containment / …) — the answer to
+        \"why no trades\" when no playbook has been reached yet.
+        """
+        setup = self._live_setup
+        if setup is None:
+            return f"setup: none — {self._live_setup_reason}"
+        zone = setup["zone"]
+        direction = "LONG" if setup["direction"] > 0 else "SHORT"
+        context = setup.get("h4_context", "")
+        line = (f"setup: ARMED {direction} · H4 POI "
+                f"{zone['bottom']:.1f}–{zone['top']:.1f} "
+                f"(H4 {context}) · H1 ref {setup['ref_level']:.1f}")
+        last = self._last_tick or {}
+        mid = last.get("mid")
+        if mid:
+            if mid < zone["bottom"]:
+                line += f" · last price {mid:.1f} (${zone['bottom'] - mid:.1f} below zone)"
+            elif mid > zone["top"]:
+                line += f" · last price {mid:.1f} (${mid - zone['top']:.1f} above zone)"
+            else:
+                line += f" · last price {mid:.1f} INSIDE zone (armed, awaiting POI confirm)"
+        return line
+
+    def stack_line(self) -> str:
+        """One-line per-TF last closed bar for /status.
+
+        The old /status showed only the H1 last bar, which read as
+        \"feed is H1-only\" — the stack carries D1/H4/H1/M15/M30/M5
+        (+ W1/MN1 macro).  This line proves it per TF.
+        """
+        if self._stack is None:
+            return "bars: no stack"
+        parts = []
+        for tf in ("D1", "H4", "H1", "M15", "M30", "M5"):
+            frame = self._stack.frames.get(tf)
+            if frame is None or len(frame) == 0:
+                parts.append(f"{tf}: —")
+            else:
+                parts.append(f"{tf}: {frame.index[-1]:%m-%d %H:%M} "
+                             f"×{len(frame)}")
+        return "bars (last closed, UTC): " + " · ".join(parts)
 
     def alignment_line(self) -> str:
         """One-line alignment for /status (see mt5_commands)."""
@@ -2006,7 +2072,11 @@ class MT5Runner:
         self._fired_h1_bar = pend["h1_open"]
         fired = {**trig, "fired_ts": pd.Timestamp(tick["time"]),
                  "h1_open": pend["h1_open"],
-                 "entry_clock": pend["entry_clock"]}
+                 "entry_clock": pend["entry_clock"],
+                 # The arming setup rides along so _live_verdict can
+                 # report the MEASURED H4 bias / context (a pullback
+                 # verdict must not claim "H4 agrees" — see below).
+                 "setup": pend["setup"]}
         stats["triggers"] = stats.get("triggers", 0) + 1
         self.journal.log_note(
             f"mt5: trigger fired {trig['trigger']} "
@@ -2063,6 +2133,16 @@ class MT5Runner:
         annotations as in :meth:`_verdict_for_bar`.
         """
         direction = int(pend["direction"])
+        # Measured H4 bias from the arming setup — NEVER assumed
+        # equal to the direction.  The old code hardcoded
+        # ``bias_h4 = direction`` and logged "H4 agrees", which was
+        # false on every pullback verdict (H4 +1, direction -1)
+        # and hid the 2026-10-16 root cause in the journal.
+        # Missing setup (legacy callers) falls back to the
+        # direction, exactly as before.
+        setup = pend.get("setup") or {}
+        bias_h4 = int(setup.get("bias_h4", direction))
+        h4_context = str(setup.get("h4_context", "") or "")
         state = states[t] if 0 <= t < len(states) else None
         feats = getattr(state, "features", None) \
             if state is not None else None
@@ -2079,7 +2159,9 @@ class MT5Runner:
         stop = float(pend["stop"])
         legs = {leg: {"passed": True, "reason": ""} for leg in LEG_ORDER}
         legs["d1_bias"]["reason"] = f"D1 bias {direction:+d} (closed bars)"
-        legs["h4_agree"]["reason"] = f"H4 agrees {direction:+d} (closed)"
+        legs["h4_agree"]["reason"] = (
+            f"H4 {h4_context or 'context'} {bias_h4:+d} (closed) — "
+            f"POI supplier, direction stays D1 {direction:+d}")
         legs["h4_zone"]["reason"] = "live price at H4 POI (zone touch)"
         legs["h1_trigger"]["reason"] = \
             f"zone touch + {pend['trigger']} confirm"
@@ -2087,7 +2169,8 @@ class MT5Runner:
             f"{pend['entry_clock']} POI confirm"
         return {
             "allowed": True, "blocked_leg": "", "legs": legs,
-            "bias_d1": direction, "bias_h4": direction,
+            "bias_d1": direction, "bias_h4": bias_h4,
+            "h4_context": h4_context,
             "direction": direction, "zone": pend["zone"],
             "trigger": pend["trigger"], "entry": mid,
             "stop": stop, "target": float(pend["target"]),
