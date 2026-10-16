@@ -87,10 +87,6 @@ from ..live.regime_state import (RegimeState, load_regime_state,
 from ..live.zones import (TF_ORDER as _TF_ORDER, ZoneCache,
                           ZoneStore, find_clusters)
 from ..live.macrotrend import (MacroTrendResult, compute_macrotrend)
-from ..live.narrative import (ENTRY as _NARR_ENTRY,
-                              NarrativeState, advance as advance_narrative,
-                              amd_for_state, load_narrative_state,
-                              save_narrative_state)
 from ..live.manipulation import chase_blocked
 from ..live.news import NewsCalendar
 from ..live.reasoning import build_reasoning, build_study
@@ -100,7 +96,7 @@ from ..reader.session_timeframes import (
     compose as _compose_session, session_of)
 from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
                          InversionPlaybook, JudasSwingPlaybook,
-                         KillzoneOpenPlaybook, NarrativePlaybook,
+                         KillzoneOpenPlaybook,
                          OrderBlockPlaybook, QMD1Playbook, QMM5Playbook,
                          RangeCompressionBreakoutPlaybook,
                          RangeMeanReversionPlaybook, RangeQMPlaybook,
@@ -747,8 +743,7 @@ class MT5Runner:
                                RangeSweepReclaimPlaybook(),
                                RangeQMPlaybook(),
                                RangeMeanReversionPlaybook(),
-                               RangeCompressionBreakoutPlaybook(),
-                               NarrativePlaybook()]
+                               RangeCompressionBreakoutPlaybook()]
         return self._playbooks
 
     # ------------------------------------------------- blocked-leg stats

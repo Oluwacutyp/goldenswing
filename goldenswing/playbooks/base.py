@@ -114,14 +114,6 @@ class Playbook(abc.ABC):
     #: verdict's ``sweep_confirmed_edges``.  Default False; only the
     #: range edge sweep playbook opts in.
     requires_sweep_confirmation: bool = False
-    #: True -> this playbook fires only with a COMPLETE narrative
-    #: chain (``live/narrative.py`` ENTRY state at the signal's
-    #: direction: HTF zone -> sweep -> displacement -> CHoCH/BOS +
-    #: FVG).  A single pattern alone never trades.  Enforced by
-    #: ``confluence.ConfluenceEngine.gate_live_signal`` (gate 0e)
-    #: against the verdict's ``narrative`` state.  Default False;
-    #: only the narrative playbook opts in.
-    requires_narrative_chain: bool = False
     #: minimum base_score for live-book membership (anchor: 60.0).
     live_threshold: float = 60.0
     #: Where this playbook is genuinely good, in the words of its

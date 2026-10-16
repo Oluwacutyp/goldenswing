@@ -32,7 +32,7 @@ EXECUTE_PLAYBOOK_NAMES: tuple[str, ...] = (
 #: Shadow playbooks: evaluated + logged, never ordered.
 SHADOW_PLAYBOOK_NAMES: tuple[str, ...] = (
     "turtle_soup", "v_reversal", "retracement_trap", "order_block",
-    "qm_m5", "qm_d1", "narrative")
+    "qm_m5", "qm_d1")
 ALL_PLAYBOOK_NAMES: tuple[str, ...] = (
     EXECUTE_PLAYBOOK_NAMES + SHADOW_PLAYBOOK_NAMES)
 
