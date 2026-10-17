@@ -499,6 +499,14 @@ class MT5Runner:
         self.feed = feed
         self.executor = executor
         self.senders = senders or []
+        # Telegram failure visibility: a stuck sender must never be
+        # silent (journal-only) and must never flood the console —
+        # _note_tg_failure prints each distinct failure at most once
+        # per 600s (same key window as alerts.telegram.ErrorDeduper).
+        self._tg_fail_last: dict[str, float] = {}
+        # Telegram-unavailable warning (no token, no CLI): logged +
+        # printed once per process start, never every 30s poll.
+        self._tg_unavailable_logged = False
         self.journal = TradeJournal(self.cfg.journal_path)
         # Deterministic engine runtime (bridge).  Best-effort: if it
         # fails to initialise, the legacy journal path continues and
@@ -858,6 +866,24 @@ class MT5Runner:
         self._send_startup_progress(
             "MT5 engine starting…\n"
             f"symbol: {self.cfg.symbol}")
+        if not self.senders:
+            # LOUD, not journal-only: with no sender configured every
+            # TG ping + command reply is silently dropped.  The usual
+            # cause is a fresh PowerShell that never got the
+            # $env:GS_TELEGRAM_* exports (run_mt5.py also loads a
+            # repo-root .env when one exists).  The engine still
+            # starts — market work does not depend on Telegram — but
+            # the owner must know at a glance why the bot is quiet.
+            print(
+                "MT5 startup: WARNING: no Telegram sender configured "
+                "— startup pings + command replies will NOT reach "
+                "Telegram. Set GS_TELEGRAM_BOT_TOKEN and "
+                "GS_TELEGRAM_CHAT_ID in the environment (or a "
+                "repo-root .env) and restart.",
+                flush=True)
+            self.journal.log_note(
+                "mt5: startup with no Telegram sender configured "
+                "(GS_TELEGRAM_BOT_TOKEN / GS_TELEGRAM_CHAT_ID unset)")
         try:
             ok, msg = feed.connect()
             if not ok:
@@ -977,6 +1003,17 @@ class MT5Runner:
             # feed connect + runner start, independent of command polling
             # (it fires even with --no-poll-commands).  Never raises.
             self._send_startup_ping(acct)
+            # Console confirmation that startup COMPLETED: without it
+            # the console goes blank after "playbooks warmed" and the
+            # owner cannot tell a started engine from a stalled one.
+            # (The TG ping above is Telegram-only; this is console-only.)
+            print(
+                "MT5 startup: engine started — tick pump running; "
+                "commands polled every "
+                f"{self.cfg.poll_interval_seconds:.0f}s even with no "
+                "ticks (market closed => no new ticks, polling still "
+                "runs)",
+                flush=True)
         except Exception as _startup_exc:
             self._send_startup_progress(
                 f"MT5 engine FAILED to start: {_startup_exc}")
@@ -995,7 +1032,16 @@ class MT5Runner:
         self._scan_qm_d1(self._stack.frames.get("D1"), stats)
         pump = TickPump(feed, interval=self.cfg.tick_interval)
         try:
-            pump.run(self._on_tick(stats), max_ticks=max_ticks)
+            # on_idle: command polling MUST NOT depend on new ticks.
+            # With the market closed the terminal returns the same
+            # stale tick forever, TickPump dedupes it, and _on_tick
+            # never fires — so a poller that only runs inside
+            # _on_tick never fires either and the engine goes deaf
+            # to /status.  The idle hook runs the poller on every
+            # spin; _poll_telegram_commands' own _last_poll gate
+            # keeps it to once per poll_interval_seconds.
+            pump.run(self._on_tick(stats), max_ticks=max_ticks,
+                     on_idle=lambda: self._poll_telegram_commands(stats))
         finally:
             # Engine stop: cancel every pending order.  A resting
             # limit/stop left on the broker would fill later with no
@@ -1613,6 +1659,15 @@ class MT5Runner:
                 closed_tfs.append(tf)
         if not closed_tfs:
             return
+        # Logged (info): this fetch is the live engine's normal
+        # refresh path, NOT a second warm start.  fetch_new_all only
+        # fetches bars since the cursor and appends nothing new when
+        # the tick was stale — a routine refresh, not a re-fetch of
+        # history.  (Before this log, a refresh's W1/MN1 short-history
+        # warnings looked like a duplicate warm start; those
+        # warnings are now warm-start-only via warn_short=False.)
+        _log.info("mt5 refresh: TFs closed: %s — fetching new bars",
+                  closed_tfs)
         fresh = self.feed.fetch_new_all(cursors)
         # Phase 2: append every newly closed bar; refresh legs.
         appended: list[str] = []
@@ -5704,8 +5759,8 @@ class MT5Runner:
         try:
             self._send_alert(text)
         except Exception as exc:  # noqa: BLE001 - never break start
-            self.journal.log_note(
-                f"mt5: startup progress send failed: {exc}")
+            self._note_tg_failure(
+                f"startup progress send failed: {exc}")
 
     def _send_startup_ping(self, acct: dict) -> None:
         """One Telegram 'engine started' ping per process start.
@@ -5715,13 +5770,19 @@ class MT5Runner:
         command polling (getUpdates): the ping goes out even with
         --no-poll-commands — the owner must be able to tell the
         engine is alive while the OANDA loop still owns getUpdates.
-        Never raises: no senders configured -> journal note only;
-        a send failure is journaled and start continues.
+        Never raises: no senders configured -> console warning +
+        journal note; a send failure is journaled + console-printed
+        (via _send_alert / _note_tg_failure) and start continues.
         """
         if self._startup_ping_sent:
             return
         self._startup_ping_sent = True
         if not self.senders:
+            print(
+                "MT5 startup: WARNING: startup ping NOT sent — no "
+                "Telegram sender configured (set "
+                "GS_TELEGRAM_BOT_TOKEN and GS_TELEGRAM_CHAT_ID).",
+                flush=True)
             self.journal.log_note(
                 "mt5: startup ping skipped (no Telegram sender "
                 "configured)")
@@ -5746,7 +5807,25 @@ class MT5Runner:
             )
             self._send_alert(text)
         except Exception as exc:
-            self.journal.log_note(f"mt5: startup ping failed: {exc}")
+            self._note_tg_failure(f"startup ping failed: {exc}")
+
+    def _note_tg_failure(self, detail: str) -> None:
+        """Journal + deduped console error for a Telegram send failure.
+
+        A send failure must never be silent (journal-only) — the
+        owner watches the console and would otherwise never know
+        the bot is mute.  It must also never flood the console: the
+        same failure prints at most once per 600s (same key window
+        as alerts.telegram.ErrorDeduper).  Always journaled.
+        """
+        self.journal.log_note(f"mt5: alert send failed: {detail}")
+        key = (detail or "")[:80]
+        now = time.monotonic()
+        last = self._tg_fail_last.get(key)
+        if last is not None and now - last < 600:
+            return
+        self._tg_fail_last[key] = now
+        print(f"MT5 Telegram send FAILED: {detail}", flush=True)
 
     def _send_alert(self, text: str, *,
                     chart_png: bytes | None = None,
@@ -5755,9 +5834,10 @@ class MT5Runner:
 
         Sender contract (in preference order): ``send_photo(png,
         caption)`` (TelegramSender), ``send_text(text)``, legacy
-        ``send(text)`` duck-type.  A sender failure is journaled,
-        never raised into the tick loop.  ``reply_markup`` (inline
-        keyboard) is passed through when the sender supports it —
+        ``send(text)`` duck-type.  A sender failure is journaled +
+        deduped-console-printed (see _note_tg_failure), never raised
+        into the tick loop.  ``reply_markup`` (inline keyboard) is
+        passed through when the sender supports it —
         used by the Golden Swing Confirm request.
         """
         for sender in self.senders:
@@ -5765,8 +5845,8 @@ class MT5Runner:
                 if chart_png and hasattr(sender, "send_photo"):
                     res = sender.send_photo(chart_png, text)
                     if not getattr(res, "delivered", False):
-                        self.journal.log_note(
-                            f"mt5: alert photo send failed: {res.detail}")
+                        self._note_tg_failure(
+                            f"alert photo send failed: {res.detail}")
                 elif hasattr(sender, "send_text"):
                     try:
                         res = sender.send_text(
@@ -5775,12 +5855,12 @@ class MT5Runner:
                         # Legacy sender without reply_markup support.
                         res = sender.send_text(text)
                     if not getattr(res, "delivered", False):
-                        self.journal.log_note(
-                            f"mt5: alert send failed: {res.detail}")
+                        self._note_tg_failure(
+                            f"alert send failed: {res.detail}")
                 else:
                     sender.send(text)
             except Exception as exc:
-                self.journal.log_note(f"mt5: alert send failed: {exc}")
+                self._note_tg_failure(f"alert send failed: {exc}")
 
     # ------------------------------------------------- telegram commands
     def _get_command_router(self):
@@ -5911,6 +5991,27 @@ class MT5Runner:
         except Exception:
             return {}
 
+    def _telegram_available(self) -> bool:
+        """Can we call the Telegram Bot API at all?
+
+        Polling uses the env token / skill CLI (see _tg_api), NOT
+        the alert senders: a missing GS_TELEGRAM_CHAT_ID disables
+        alert sends (send_text needs a chat id) but must NOT
+        disable command polling when a token is present — replies
+        go to the chat id from the incoming update.  Mirrors
+        _tg_api's transport check: env token, else tg-call CLI.
+        """
+        if self.senders:
+            return True
+        if os.environ.get("GS_TELEGRAM_BOT_TOKEN"):
+            return True
+        for cand in ("~/workspace/custom-connectors/"
+                     "custom.legacy-telegram/bin/tg-call",
+                     "~/workspace/skills/telegram/bin/tg-call"):
+            if os.path.isfile(os.path.expanduser(cand)):
+                return True
+        return False
+
     def _poll_telegram_commands(self, stats: dict | None = None) -> None:
         """Poll getUpdates and answer owner commands (MT5 registry).
 
@@ -5918,10 +6019,12 @@ class MT5Runner:
         poller must be OFF at cutover (GS_TELEGRAM_POLL=0) — one
         consumer only.  First poll only syncs the offset (drains the
         backlog without answering stale commands); later polls answer.
-        A poll failure is silent — the tick loop never stops for it.
-        ``stats`` (this tick's counters) is threaded to Confirm taps
-        so a deferred Golden Swing order's execution counts on the
-        tick that confirmed it.
+        A poll failure is silent — the tick loop never stops for it —
+        EXCEPT a missing transport (no token, no CLI), which is
+        logged + printed once per process start.  ``stats`` (this
+        tick's counters) is threaded to Confirm taps so a deferred
+        Golden Swing order's execution counts on the tick that
+        confirmed it.
         """
         if not self.cfg.poll_commands:
             return
@@ -5929,8 +6032,22 @@ class MT5Runner:
         if now - self._last_poll < self.cfg.poll_interval_seconds:
             return
         self._last_poll = now
-        if not self.senders:
-            return  # nowhere to answer; stay quiet
+        if not self._telegram_available():
+            # No transport at all (no token, no CLI): polling cannot
+            # work.  Logged + printed ONCE per process start, never
+            # every 30s poll — a missing token must be visible, not
+            # silent, and not spam.
+            if not self._tg_unavailable_logged:
+                self._tg_unavailable_logged = True
+                print(
+                    "MT5 startup: WARNING: Telegram polling "
+                    "disabled — no bot token "
+                    "(GS_TELEGRAM_BOT_TOKEN) and no tg-call CLI.",
+                    flush=True)
+                self.journal.log_note(
+                    "mt5: Telegram polling disabled (no token, "
+                    "no tg-call CLI)")
+            return
         try:
             updates = self._tg_api(
                 "getUpdates",

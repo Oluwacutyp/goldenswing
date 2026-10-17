@@ -382,7 +382,8 @@ class MT5Feed:
         return df[["open", "high", "low", "close", "volume",
                    "real_volume", "spread"]]
 
-    def bars_for(self, symbol: str, tf: str, count: int) -> pd.DataFrame:
+    def bars_for(self, symbol: str, tf: str, count: int, *,
+                 warn_short: bool = True) -> pd.DataFrame:
         """Latest ``count`` bars for an arbitrary symbol (e.g. DXY)
         — same contract as :meth:`bars` (forming bar included).
 
@@ -390,6 +391,13 @@ class MT5Feed:
         terminal has never selected cannot be fetched.  A failed
         select raises MT5Unavailable with a clear message instead
         of returning a frame for the wrong symbol.
+
+        ``warn_short``: the "terminal returned fewer bars" warning
+        belongs to WARM START (a thin zone book is a data outage).
+        Routine refreshes (``fetch_new_all``) only need bars since
+        the cursor — a short fetch there is expected and harmless,
+        so they pass ``warn_short=False`` instead of logging a
+        scary warning on every refresh.
         """
         mt5 = self._lib()
         if not mt5.symbol_select(symbol, True):
@@ -406,7 +414,7 @@ class MT5Feed:
                 # never silently use a short history.  (The zone
                 # book + hierarchy need 3+ years; a short fetch
                 # is a data outage, not a normal state.)
-                if len(rates) < int(count):
+                if len(rates) < int(count) and warn_short:
                     _log.warning(
                         "MT5 %s %s: terminal returned %d bars, "
                         "requested %d — short history, zone book "
@@ -419,14 +427,18 @@ class MT5Feed:
         raise MT5Unavailable(
             f"copy_rates_from_pos({symbol} {tf}) failed: {last_err}")
 
-    def bars(self, tf: str, count: int) -> pd.DataFrame:
+    def bars(self, tf: str, count: int, *, warn_short: bool = True
+             ) -> pd.DataFrame:
         """Latest ``count`` closed+forming bars for ``tf`` (UTC index).
 
         Retries with the old bots' backoff (0.5 * 2**(attempt-1)).
         Callers trade on closed bars only — the last row is the
         still-forming bar, exactly like the OANDA feed's contract.
+        ``warn_short``: see :meth:`bars_for` — warm start warns,
+        routine refresh does not.
         """
-        return self.bars_for(self.cfg.symbol, tf, count)
+        return self.bars_for(self.cfg.symbol, tf, count,
+                             warn_short=warn_short)
 
     def warm_start_all(self) -> dict[str, pd.DataFrame]:
         """Full CLOSED history per TF (forming bar dropped).
@@ -446,13 +458,19 @@ class MT5Feed:
 
     def fetch_new_all(self, since_by_tf: dict | None = None
                       ) -> dict[str, pd.DataFrame]:
-        """New CLOSED bars per TF (forming bar dropped — see above)."""
+        """New CLOSED bars per TF (forming bar dropped — see above).
+
+        Routine refresh: only bars since the cursor are needed, so
+        a short fetch is expected and harmless — no short-history
+        warning here (that warning belongs to warm start, where a
+        thin history means a thin zone book).
+        """
         since_by_tf = since_by_tf or {}
         now = datetime.now(timezone.utc)
         out: dict[str, pd.DataFrame] = {}
         tfs = tuple(self.cfg.granularities) + tuple(self.cfg.macro_tfs)
         for tf in tfs:
-            frame = self.bars(tf, 500)
+            frame = self.bars(tf, 500, warn_short=False)
             since = since_by_tf.get(tf)
             if since is not None:
                 frame = frame[frame.index > since]
@@ -684,13 +702,32 @@ class TickPump:
     def stop(self) -> None:
         self._stopped = True
 
-    def run(self, on_tick, *, max_ticks: int | None = None) -> int:
+    @staticmethod
+    def _idle(on_idle) -> None:
+        """Run the idle hook; an idle failure never kills the pump."""
+        if on_idle is None:
+            return
+        try:
+            on_idle()
+        except Exception:
+            pass
+
+    def run(self, on_tick, *, max_ticks: int | None = None,
+            on_idle=None) -> int:
         """Pump ticks into ``on_tick(tick)`` until stopped / capped.
 
         Returns the number of ticks delivered.  A tick that is
         identical to the previous one (same time, same bid/ask) is
         not delivered twice.  ``on_tick`` raising :class:`StopIteration`
         stops the pump cleanly.
+
+        ``on_idle`` (optional): called whenever the loop spins
+        without a new tick (no tick at all, or a duplicate of the
+        previous one).  Command polling lives here: with the
+        market closed the terminal returns the same stale tick
+        forever, so a poller that only runs inside ``on_tick``
+        never fires and the engine goes deaf to /status.  An
+        idle failure never kills the pump.
         """
         last: dict | None = None
         while not self._stopped:
@@ -698,11 +735,13 @@ class TickPump:
                 break
             tick = self.feed.tick()
             if tick is None:
+                self._idle(on_idle)
                 time.sleep(self.interval)
                 continue
             if last is not None and tick["time"] == last["time"] \
                     and tick["bid"] == last["bid"] \
                     and tick["ask"] == last["ask"]:
+                self._idle(on_idle)
                 time.sleep(self.interval)
                 continue
             last = tick

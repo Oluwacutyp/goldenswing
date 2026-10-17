@@ -50,6 +50,47 @@ def _resolve_symbol(args_symbol: str | None, environ) -> tuple[str, bool]:
     return symbol, explicit
 
 
+def _load_dotenv() -> int:
+    """Load GoldenSwing env vars from a repo-root .env (if present).
+
+    Fresh PowerShell sessions lose $env:GS_* exports — without them
+    the engine starts with NO Telegram sender and every ping +
+    command reply is silently dropped.  A .env next to the repo
+    restores them.  Never overrides vars already in the environment
+    (explicit env wins); only GS_*/MT5_* keys are loaded, nothing
+    else from the file is trusted.  Returns the number loaded.
+    """
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.is_file():
+        return 0
+    loaded = 0
+    try:
+        text = env_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, _, val = line.partition("=")
+        key = key.strip()
+        if not (key.startswith("GS_") or key.startswith("MT5_")):
+            continue
+        if key in os.environ:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        os.environ[key] = val
+        loaded += 1
+    if loaded:
+        print(f"MT5 startup: loaded {loaded} var(s) from {env_path} "
+              "(explicit env wins)", flush=True)
+    return loaded
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--symbol", default=None,
@@ -83,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="do NOT log per-day tick CSVs")
     args = ap.parse_args(argv)
 
+    _load_dotenv()
     login = os.environ.get("GS_MT5_LOGIN")
     # Explicit symbol = passed on the command line OR set via GS_SYMBOL.
     # Only a non-explicit (default) symbol gets auto-detect fallback.
@@ -114,6 +156,17 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ.get("GS_TELEGRAM_CHAT_ID"):
         from goldenswing.alerts.telegram import TelegramSender
         senders = [TelegramSender.from_env()]
+    if not senders:
+        # LOUD, not journal-only: without a sender every startup
+        # ping + command reply is silently dropped, and the owner
+        # stares at a quiet bot.  (The runner prints the same
+        # warning again at startup — belt + suspenders, one line.)
+        print(
+            "MT5 startup: WARNING: GS_TELEGRAM_CHAT_ID not set — "
+            "Telegram pings + command replies DISABLED. Set "
+            "GS_TELEGRAM_BOT_TOKEN and GS_TELEGRAM_CHAT_ID in the "
+            "environment (or a repo-root .env) and restart.",
+            flush=True)
     runner = MT5Runner(cfg, feed=MT5Feed(feed_cfg), senders=senders)
     # An explicit --fixed-lots wins over the persisted Telegram
     # config (data/mt5_config.json) the runner just loaded, and is
