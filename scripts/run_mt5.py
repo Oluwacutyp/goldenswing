@@ -50,6 +50,12 @@ def _resolve_symbol(args_symbol: str | None, environ) -> tuple[str, bool]:
     return symbol, explicit
 
 
+def _dotenv_path() -> Path:
+    """Repo-root .env path (computed from __file__ at call time so
+    tests can monkeypatch __file__)."""
+    return Path(__file__).resolve().parent.parent / ".env"
+
+
 def _load_dotenv() -> int:
     """Load GoldenSwing env vars from a repo-root .env (if present).
 
@@ -60,12 +66,20 @@ def _load_dotenv() -> int:
     (explicit env wins); only GS_*/MT5_* keys are loaded, nothing
     else from the file is trusted.  Returns the number loaded.
     """
-    env_path = Path(__file__).resolve().parent.parent / ".env"
+    env_path = _dotenv_path()
     if not env_path.is_file():
         return 0
     loaded = 0
     try:
-        text = env_path.read_text(encoding="utf-8", errors="replace")
+        # utf-8-sig: Windows Notepad saves .env as UTF-8 WITH BOM by
+        # default — a bare utf-8 read leaves "\ufeff" on the first
+        # line's key, which then fails the GS_/MT5_ prefix check and
+        # is silently skipped.  The BOM bug meant a .env whose FIRST
+        # line held a Telegram key loaded nothing for that key, and
+        # the engine reported "not configured" even though .env had
+        # it.  utf-8-sig strips the BOM when present and behaves
+        # like utf-8 otherwise.
+        text = env_path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return 0
     for raw in text.splitlines():
@@ -89,6 +103,69 @@ def _load_dotenv() -> int:
         print(f"MT5 startup: loaded {loaded} var(s) from {env_path} "
               "(explicit env wins)", flush=True)
     return loaded
+
+
+def _missing_telegram_vars(environ=None) -> list[str]:
+    """Which Telegram vars are absent from the process environment."""
+    env = os.environ if environ is None else environ
+    return [v for v in ("GS_TELEGRAM_BOT_TOKEN", "GS_TELEGRAM_CHAT_ID")
+            if not env.get(v)]
+
+
+def _telegram_not_configured_text(*, dotenv_path: Path,
+                                  dotenv_existed: bool,
+                                  dotenv_loaded: int,
+                                  missing: list[str]) -> str:
+    """Accurate 'not configured' warning.
+
+    The old message stated a flat persistent fact ("not configured")
+    which contradicted the owner's evidence: notifications + commands
+    worked yesterday.  The truth is session-scoped — $env: exports
+    live only in the PowerShell session that set them — so the
+    message must say WHERE it looked, WHAT is missing, and WHY
+    yesterday worked while today does not.  Never used when a
+    sender exists (callers check that first).
+    """
+    if dotenv_existed:
+        dotenv_status = (
+            f"found, loaded {dotenv_loaded} var(s), but the Telegram "
+            "keys are still missing"
+            if dotenv_loaded else
+            "found, but it holds no loadable GS_TELEGRAM_* keys")
+    else:
+        dotenv_status = "not found"
+    return (
+        "MT5 startup: WARNING: Telegram sender NOT configured in "
+        "THIS session — startup pings + command replies will NOT "
+        "reach Telegram.\n"
+        "MT5 startup: checked process environment + repo-root .env "
+        f"at {dotenv_path} ({dotenv_status}).\n"
+        "MT5 startup: missing: " + ", ".join(missing) + ".\n"
+        "MT5 startup: why yesterday worked: $env:GS_TELEGRAM_* "
+        "exports live only in the PowerShell session that set "
+        "them — a fresh PowerShell starts without them. "
+        "Yesterday's session had them exported; this session "
+        "does not.\n"
+        "MT5 startup: fix: put GS_TELEGRAM_BOT_TOKEN and "
+        f"GS_TELEGRAM_CHAT_ID in {dotenv_path} and restart — "
+        ".env persists across sessions.")
+
+
+def _telegram_outbox_text() -> str:
+    """Sender exists but cannot reach Telegram (outbox-only).
+
+    Happens when GS_TELEGRAM_CHAT_ID is set but the bot token is
+    missing: a sender IS built, so no 'not configured' warning
+    fires, yet every send reports delivered=False.  Without this
+    the engine looks configured while staying mute — the opposite
+    false claim to the not-configured one.
+    """
+    return (
+        "MT5 startup: WARNING: Telegram sender is outbox-only "
+        "(GS_TELEGRAM_CHAT_ID is set but GS_TELEGRAM_BOT_TOKEN "
+        "is missing) — pings will NOT reach Telegram. Set "
+        "GS_TELEGRAM_BOT_TOKEN in the environment (or a "
+        "repo-root .env) and restart.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -124,7 +201,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="do NOT log per-day tick CSVs")
     args = ap.parse_args(argv)
 
-    _load_dotenv()
+    dotenv_path = _dotenv_path()
+    dotenv_existed = dotenv_path.is_file()
+    dotenv_loaded = _load_dotenv()
     login = os.environ.get("GS_MT5_LOGIN")
     # Explicit symbol = passed on the command line OR set via GS_SYMBOL.
     # Only a non-explicit (default) symbol gets auto-detect fallback.
@@ -157,16 +236,22 @@ def main(argv: list[str] | None = None) -> int:
         from goldenswing.alerts.telegram import TelegramSender
         senders = [TelegramSender.from_env()]
     if not senders:
-        # LOUD, not journal-only: without a sender every startup
-        # ping + command reply is silently dropped, and the owner
-        # stares at a quiet bot.  (The runner prints the same
-        # warning again at startup — belt + suspenders, one line.)
-        print(
-            "MT5 startup: WARNING: GS_TELEGRAM_CHAT_ID not set — "
-            "Telegram pings + command replies DISABLED. Set "
-            "GS_TELEGRAM_BOT_TOKEN and GS_TELEGRAM_CHAT_ID in the "
-            "environment (or a repo-root .env) and restart.",
-            flush=True)
+        # LOUD, not journal-only — and ACCURATE: the message must
+        # name where it looked, what is missing, and why yesterday
+        # worked while today does not (session-scoped $env:
+        # exports).  A flat "not configured" contradicts the
+        # owner's evidence that notifications + commands worked
+        # yesterday.  (The runner prints the same warning again
+        # at startup — belt + suspenders, one line each.)
+        print(_telegram_not_configured_text(
+            dotenv_path=dotenv_path,
+            dotenv_existed=dotenv_existed,
+            dotenv_loaded=dotenv_loaded,
+            missing=_missing_telegram_vars()), flush=True)
+    elif all(getattr(s, "mode", "live") == "outbox" for s in senders):
+        # Sender exists but cannot reach Telegram (no token) —
+        # never claim "configured" while staying mute.
+        print(_telegram_outbox_text(), flush=True)
     runner = MT5Runner(cfg, feed=MT5Feed(feed_cfg), senders=senders)
     # An explicit --fixed-lots wins over the persisted Telegram
     # config (data/mt5_config.json) the runner just loaded, and is

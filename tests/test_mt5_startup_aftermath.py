@@ -38,6 +38,7 @@ from goldenswing.execution.mt5_runner import (
     MT5Runner,
     MT5RunnerConfig,
     TickPump,
+    _telegram_startup_warnings,
 )
 from goldenswing.feed.mt5 import MT5Feed, MT5FeedConfig
 from goldenswing.live.hierarchy import TimeframeStack
@@ -151,8 +152,14 @@ def test_startup_ping_no_senders_warns(tmp_path, capsys):
     runner = _runner(tmp_path, senders=[])
     runner._send_startup_ping(SimpleNamespace())
     out = capsys.readouterr().out
-    assert "startup ping NOT sent" in out
+    # Accurate, not flat: the warning must name the missing vars,
+    # where it looked, and why yesterday worked (session-scoped
+    # $env: exports) — a bare "not configured" contradicts the
+    # owner's evidence that notifications + commands worked
+    # yesterday.
+    assert "no Telegram sender configured in THIS session" in out
     assert "GS_TELEGRAM_BOT_TOKEN" in out
+    assert "yesterday's session" in out
 
 
 # ---------------------------------------------------------------- .env loading
@@ -393,3 +400,174 @@ def test_refresh_logs_closed_tfs(tmp_path, caplog, monkeypatch):
         runner._refresh_bars(tick, {})
     assert [r for r in caplog.records
             if "mt5 refresh" in r.getMessage()]
+
+
+# ---------------------------------------------------------------- "not
+# configured" must fit the evidence (owner challenge 2026-10-17):
+# notifications + commands worked YESTERDAY, so a flat "not
+# configured" today contradicts lived evidence.  The truth is
+# session-scoped: $env: exports live only in the PowerShell
+# session that set them.  The warning must name where it looked,
+# what is missing, and why yesterday worked — and must NEVER
+# print when a sender exists and can deliver.
+
+
+class _LiveSender:
+    """Delivers (mode live)."""
+
+    mode = "live"
+
+    def __init__(self):
+        self.calls = []
+
+    def send_text(self, text, reply_markup=None):
+        self.calls.append(text)
+        return SimpleNamespace(delivered=True, detail="ok")
+
+
+class _OutboxSender:
+    """Chat id set, no token — exists but cannot reach Telegram."""
+
+    mode = "outbox"
+
+    def send_text(self, text, reply_markup=None):
+        return SimpleNamespace(
+            delivered=False,
+            detail="no GS_TELEGRAM_BOT_TOKEN/GS_TELEGRAM_CHAT_ID")
+
+
+def test_warnings_never_when_sender_delivers(monkeypatch):
+    """No false negative: a live sender -> no warnings at all."""
+    assert _telegram_startup_warnings([_LiveSender()]) == []
+    # A duck-type sender with no .mode is assumed deliverable.
+    assert _telegram_startup_warnings([_FailingSender()]) == []
+
+
+def test_warnings_no_senders_names_missing_and_session(monkeypatch):
+    monkeypatch.delenv("GS_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("GS_TELEGRAM_CHAT_ID", raising=False)
+    warnings = _telegram_startup_warnings([])
+    assert len(warnings) == 1
+    text = warnings[0]
+    assert "in THIS session" in text
+    assert "Missing: GS_TELEGRAM_BOT_TOKEN, GS_TELEGRAM_CHAT_ID" in text
+    assert "yesterday's session" in text
+    assert "fresh" in text
+    assert ".env" in text
+    assert "process environment" in text
+
+
+def test_warnings_no_senders_names_only_the_missing_one(monkeypatch):
+    monkeypatch.setenv("GS_TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.delenv("GS_TELEGRAM_CHAT_ID", raising=False)
+    text = _telegram_startup_warnings([])[0]
+    assert "Missing: GS_TELEGRAM_CHAT_ID" in text
+    assert "GS_TELEGRAM_BOT_TOKEN," not in text
+
+
+def test_warnings_outbox_only_sender(tmp_path):
+    warnings = _telegram_startup_warnings([_OutboxSender()])
+    assert len(warnings) == 1
+    assert "outbox-only" in warnings[0]
+    assert "GS_TELEGRAM_BOT_TOKEN" in warnings[0]
+    # The opposite false claim: never "not configured" when a
+    # sender exists, even an outbox one.
+    assert "no Telegram sender configured" not in warnings[0]
+
+
+def test_startup_ping_with_sender_never_says_not_configured(tmp_path,
+                                                            capsys):
+    sender = _LiveSender()
+    runner = _runner(tmp_path, senders=[sender])
+    runner._send_startup_ping({})
+    out = capsys.readouterr().out
+    assert "not configured" not in out
+    assert sender.calls, "ping should have been attempted"
+
+
+def test_telegram_available_all_outbox_is_not_available(tmp_path,
+                                                         monkeypatch):
+    """Outbox sender + no token + no CLI -> polling honestly
+    unavailable (else the poller silently returns nothing)."""
+    monkeypatch.delenv("GS_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setattr(os.path, "isfile", lambda p: False)
+    runner = _runner(tmp_path, senders=[_OutboxSender()])
+    assert runner._telegram_available() is False
+    # ...but a token present means polling works even though
+    # sends cannot (replies go to the update's chat id).
+    monkeypatch.setenv("GS_TELEGRAM_BOT_TOKEN", "tok")
+    assert runner._telegram_available() is True
+
+
+def test_telegram_available_live_sender(tmp_path, monkeypatch):
+    runner = _runner(tmp_path, senders=[_LiveSender()])
+    assert runner._telegram_available() is True
+
+
+def test_load_dotenv_bom_first_line(tmp_path, monkeypatch):
+    """Windows Notepad saves .env as UTF-8 WITH BOM — the BOM used
+    to poison the first line's key so it was silently skipped.
+    A .env whose FIRST line holds the chat id must still load."""
+    run_mt5 = _load_run_mt5()
+    # NOTE: the token line is built by concatenation (not one
+    # literal) so no "BOT_TOKEN=<value>" pattern ever appears in
+    # this file — a redactor would otherwise rewrite the value.
+    tok_key = "GS_TELEGRAM_" + "BOT_TOKEN"
+    tok_val = "tok" + "123"
+    (tmp_path / ".env").write_bytes(
+        b"\xef\xbb\xbfGS_TELEGRAM_CHAT_ID=12345\n"
+        + tok_key.encode() + b"=" + tok_val.encode())
+    monkeypatch.setattr(run_mt5, "__file__",
+                        str(tmp_path / "scripts" / "run_mt5.py"))
+    monkeypatch.delenv("GS_TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.delenv("GS_TELEGRAM_BOT_TOKEN", raising=False)
+    assert run_mt5._load_dotenv() == 2
+    assert os.environ["GS_TELEGRAM_CHAT_ID"] == "12345"
+    assert os.environ["GS_TELEGRAM_BOT_TOKEN"] == tok_val
+
+
+def test_run_mt5_not_configured_text_names_session_gap(tmp_path,
+                                                       monkeypatch):
+    """run_mt5's warning: where it looked, what is missing, why
+    yesterday worked, and the .env fix — for each .env state."""
+    run_mt5 = _load_run_mt5()
+    monkeypatch.delenv("GS_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("GS_TELEGRAM_CHAT_ID", raising=False)
+    missing = run_mt5._missing_telegram_vars()
+    assert missing == ["GS_TELEGRAM_BOT_TOKEN", "GS_TELEGRAM_CHAT_ID"]
+    text = run_mt5._telegram_not_configured_text(
+        dotenv_path=tmp_path / ".env",
+        dotenv_existed=False,
+        dotenv_loaded=0,
+        missing=missing)
+    assert "in THIS session" in text
+    assert "process environment" in text
+    assert str(tmp_path / ".env") in text
+    assert ".env" in text and "not found" in text
+    assert "missing: GS_TELEGRAM_BOT_TOKEN, GS_TELEGRAM_CHAT_ID" in text
+    assert "Yesterday's session" in text
+    assert "fresh PowerShell" in text
+    assert ".env persists across sessions" in text
+    # .env found but holding no Telegram keys.
+    text2 = run_mt5._telegram_not_configured_text(
+        dotenv_path=tmp_path / ".env",
+        dotenv_existed=True,
+        dotenv_loaded=0,
+        missing=missing)
+    assert "no loadable GS_TELEGRAM_* keys" in text2
+    # .env found and loaded other vars, Telegram keys still missing.
+    text3 = run_mt5._telegram_not_configured_text(
+        dotenv_path=tmp_path / ".env",
+        dotenv_existed=True,
+        dotenv_loaded=3,
+        missing=missing)
+    assert "loaded 3 var(s)" in text3
+    assert "Telegram keys are still missing" in text3
+
+
+def test_run_mt5_outbox_text():
+    run_mt5 = _load_run_mt5()
+    text = run_mt5._telegram_outbox_text()
+    assert "outbox-only" in text
+    assert "GS_TELEGRAM_BOT_TOKEN" in text
+    assert "will NOT reach Telegram" in text

@@ -485,6 +485,61 @@ class PendingOrderState:
     ladder_lots: list = field(default_factory=list)
 
 
+def _telegram_missing_vars(environ=None) -> list[str]:
+    """Which Telegram vars are absent from the process environment."""
+    env = os.environ if environ is None else environ
+    return [v for v in ("GS_TELEGRAM_BOT_TOKEN", "GS_TELEGRAM_CHAT_ID")
+            if not env.get(v)]
+
+
+def _repo_dotenv_path() -> Path:
+    """Repo-root .env path (goldenswing/execution/ -> repo root)."""
+    return Path(__file__).resolve().parent.parent.parent / ".env"
+
+
+def _telegram_startup_warnings(senders: list) -> list[str]:
+    """Accurate Telegram startup warnings for this session.
+
+    Returns [] when at least one sender can actually deliver
+    (live/skill mode, or an unknown duck-type sender assumed
+    deliverable) — 'not configured' must NEVER print when a
+    sender exists.  Two warning cases:
+
+    * no senders: name what is missing, where it was looked for,
+      and why yesterday worked while today does not ($env:
+      exports are per-PowerShell-session; yesterday's session
+      had them exported, a fresh one does not).  A flat
+      'not configured' contradicts the owner's evidence that
+      notifications + commands worked yesterday.
+    * senders exist but all outbox-only (chat id set, no token):
+      the engine would look configured while staying mute —
+      the opposite false claim.
+    """
+    if not senders:
+        missing = _telegram_missing_vars()
+        dotenv_path = _repo_dotenv_path()
+        return [(
+            "MT5 startup: WARNING: no Telegram sender configured "
+            "in THIS session — startup pings + command replies "
+            "will NOT reach Telegram. Missing: "
+            + ", ".join(missing) + ". Checked process environment "
+            "(scripts/run_mt5.py also loads a repo-root .env at "
+            f"{dotenv_path} before this point). $env:GS_TELEGRAM_* "
+            "exports live only in the PowerShell session that set "
+            "them — yesterday's session had them exported, a "
+            "fresh one does not. Put GS_TELEGRAM_BOT_TOKEN and "
+            f"GS_TELEGRAM_CHAT_ID in {dotenv_path} and restart — "
+            ".env persists across sessions.")]
+    if all(getattr(s, "mode", "live") == "outbox" for s in senders):
+        return [(
+            "MT5 startup: WARNING: Telegram sender is outbox-only "
+            "(GS_TELEGRAM_CHAT_ID is set but GS_TELEGRAM_BOT_TOKEN "
+            "is missing) — pings will NOT reach Telegram. Set "
+            "GS_TELEGRAM_BOT_TOKEN in the environment (or a "
+            "repo-root .env) and restart.")]
+    return []
+
+
 class MT5Runner:
     """Tick-driven live loop on MT5 feed + MT5 executor."""
 
@@ -866,24 +921,24 @@ class MT5Runner:
         self._send_startup_progress(
             "MT5 engine starting…\n"
             f"symbol: {self.cfg.symbol}")
-        if not self.senders:
-            # LOUD, not journal-only: with no sender configured every
-            # TG ping + command reply is silently dropped.  The usual
-            # cause is a fresh PowerShell that never got the
-            # $env:GS_TELEGRAM_* exports (run_mt5.py also loads a
-            # repo-root .env when one exists).  The engine still
-            # starts — market work does not depend on Telegram — but
-            # the owner must know at a glance why the bot is quiet.
-            print(
-                "MT5 startup: WARNING: no Telegram sender configured "
-                "— startup pings + command replies will NOT reach "
-                "Telegram. Set GS_TELEGRAM_BOT_TOKEN and "
-                "GS_TELEGRAM_CHAT_ID in the environment (or a "
-                "repo-root .env) and restart.",
-                flush=True)
-            self.journal.log_note(
-                "mt5: startup with no Telegram sender configured "
-                "(GS_TELEGRAM_BOT_TOKEN / GS_TELEGRAM_CHAT_ID unset)")
+        _tg_warnings = _telegram_startup_warnings(self.senders)
+        if _tg_warnings:
+            # LOUD, not journal-only: with no sender configured (or
+            # an outbox-only sender) every TG ping + command reply
+            # is silently dropped.  The warning must be ACCURATE
+            # (where it looked, what is missing, why yesterday
+            # worked) — a flat "not configured" contradicts the
+            # owner's evidence that notifications + commands worked
+            # yesterday.  The engine still starts — market work
+            # does not depend on Telegram — but the owner must know
+            # at a glance why the bot is quiet.
+            for line in _tg_warnings:
+                print(line, flush=True)
+            if not self.senders:
+                self.journal.log_note(
+                    "mt5: startup with no Telegram sender configured "
+                    "(GS_TELEGRAM_BOT_TOKEN / GS_TELEGRAM_CHAT_ID "
+                    "unset)")
         try:
             ok, msg = feed.connect()
             if not ok:
@@ -5778,11 +5833,12 @@ class MT5Runner:
             return
         self._startup_ping_sent = True
         if not self.senders:
-            print(
-                "MT5 startup: WARNING: startup ping NOT sent — no "
-                "Telegram sender configured (set "
-                "GS_TELEGRAM_BOT_TOKEN and GS_TELEGRAM_CHAT_ID).",
-                flush=True)
+            # Accurate, not flat: name the missing vars + why
+            # yesterday worked (session-scoped $env: exports).
+            # _telegram_startup_warnings([]) returns exactly this
+            # one line; never printed when a sender exists.
+            for line in _telegram_startup_warnings([]):
+                print(line, flush=True)
             self.journal.log_note(
                 "mt5: startup ping skipped (no Telegram sender "
                 "configured)")
@@ -6000,9 +6056,18 @@ class MT5Runner:
         disable command polling when a token is present — replies
         go to the chat id from the incoming update.  Mirrors
         _tg_api's transport check: env token, else tg-call CLI.
+
+        An all-outbox sender list does NOT count as available:
+        outbox mode means chat id set but no token (and no skill
+        CLI) — polling would silently return nothing.  In that
+        case fall through to the token/CLI check so the caller
+        gets the honest 'polling disabled' warning instead of a
+        silent dead poller.
         """
         if self.senders:
-            return True
+            if any(getattr(s, "mode", "live") != "outbox"
+                   for s in self.senders):
+                return True
         if os.environ.get("GS_TELEGRAM_BOT_TOKEN"):
             return True
         for cand in ("~/workspace/custom-connectors/"
