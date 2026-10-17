@@ -334,6 +334,9 @@ def _check_tick_window(provenance: dict, manifest: dict,
     chunk_lines = "\n".join(
         f"    {c.get('chunk_start')}..{c.get('chunk_end')}: "
         f"{c.get('rows', '?')} ticks ({c.get('mode', '?')})"
+        + (f", returned {c.get('returned_start')}.."
+           f"{c.get('returned_end')}"
+           if c.get("returned_start") else "")
         for c in chunks) or "    (no per-chunk log — cache hit)"
     return (
         f"BLOCKED — tick window is only {days:.1f} days "

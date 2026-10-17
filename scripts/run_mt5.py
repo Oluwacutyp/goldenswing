@@ -56,6 +56,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="broker gold symbol (default: XAUUSD with "
                          "auto-detect fallback; explicit --symbol / "
                          "GS_SYMBOL always wins, never auto-detected)")
+    ap.add_argument("--terminal-path", default=None,
+                    help="pin initialize(path=...) to the running "
+                         "terminal's terminal64.exe (default: "
+                         "MT5_TERMINAL_PATH env, else bare "
+                         "initialize() — which can attach to a "
+                         "different MT5 install than the one on "
+                         "screen)")
     ap.add_argument("--max-ticks", type=int, default=None)
     ap.add_argument("--fixed-lots", type=float, default=None)
     ap.add_argument("--risk-pct", type=float, default=None)
@@ -80,18 +87,22 @@ def main(argv: list[str] | None = None) -> int:
     # Explicit symbol = passed on the command line OR set via GS_SYMBOL.
     # Only a non-explicit (default) symbol gets auto-detect fallback.
     symbol, symbol_explicit = _resolve_symbol(args.symbol, os.environ)
+    terminal_path = args.terminal_path \
+        or os.environ.get("MT5_TERMINAL_PATH") or None
     feed_cfg = MT5FeedConfig(
         symbol=symbol,
         symbol_explicit=symbol_explicit,
         login=int(login) if login else None,
         password=os.environ.get("GS_MT5_PASSWORD"),
         server=os.environ.get("GS_MT5_SERVER"),
+        terminal_path=terminal_path,
         tick_interval=args.tick_interval)
     cfg = MT5RunnerConfig.from_env(
         symbol=symbol,
         fixed_lots=args.fixed_lots,
         allow_live=args.allow_live,
         tick_interval=args.tick_interval)
+    cfg.terminal_path = terminal_path
     if args.risk_pct is not None:
         cfg.risk_pct = args.risk_pct
     if args.journal:

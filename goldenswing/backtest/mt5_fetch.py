@@ -54,7 +54,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .mt5_native_data import TF_MINUTES, build_bars_from_ticks
+from .mt5_native_data import TF_MINUTES, _holes, build_bars_from_ticks, dedupe_ticks
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "mt5_native"
@@ -483,10 +483,26 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
             ticks, tick_mode = _copy_ticks_range(
                 mt5, symbol, chunk_start, chunk_end)
             n_ticks = int(len(ticks)) if ticks is not None else 0
+            # Returned span, NOT just the requested window: the
+            # terminal may return ticks only for a small slice of
+            # the requested chunk (2026-10-16: chunk requested
+            # 2025-10-07..2026-01-05 returned 495,711 ticks that
+            # actually spanned only 2026-01-01..2026-01-05).
+            # Logging only the requested window made the chunk log
+            # and the tick window disagree by 410k ticks.
+            ret_start = ret_end = None
+            if ticks is not None and len(ticks) > 0:
+                _tdf = pd.DataFrame(ticks)
+                _times = pd.to_datetime(_tdf["time"], unit="s",
+                                        utc=True)
+                ret_start = str(_times.min())
+                ret_end = str(_times.max())
             tick_chunks.append({
                 "chunk_start": str(chunk_start),
                 "chunk_end": str(chunk_end),
-                "rows": n_ticks, "mode": tick_mode})
+                "rows": n_ticks, "mode": tick_mode,
+                "returned_start": ret_start,
+                "returned_end": ret_end})
             if ticks is not None and len(ticks) > 0:
                 tdf = pd.DataFrame(ticks)
                 tdf["time"] = pd.to_datetime(tdf["time"], unit="s",
@@ -501,14 +517,21 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                 f"{start.date()}..{end.date()}. "
                 f"{_diag_summary(diag)}")
         ticks_df = pd.concat(chunks, ignore_index=True)
-        ticks_df = ticks_df.sort_values("time").drop_duplicates("time")
+        # Exact-duplicate dedupe ONLY (see dedupe_ticks): MT5
+        # stamps time in whole seconds and gold prints several
+        # real ticks per second. Deduping by time destroyed ~83%
+        # of a real fetch (495,711 -> 85,118 on 2026-10-16).
+        rows_raw = int(len(ticks_df))
+        ticks_df = dedupe_ticks(ticks_df)
         ticks_df.to_csv(cache_dir / _ticks_filename(symbol), index=False)
         manifest["tick_chunks"] = tick_chunks
         manifest["tick_fetch"] = {
             "chunks_requested": len(tick_chunks),
             "chunks_with_data": sum(1 for c in tick_chunks
                                     if c["rows"] > 0),
-            "total_rows": int(len(ticks_df))}
+            "rows_raw": rows_raw,
+            "total_rows": int(len(ticks_df)),
+            "exact_dupes_dropped": rows_raw - int(len(ticks_df))}
         manifest["ticks"] = {
             "rows": int(len(ticks_df)),
             "start": str(ticks_df["time"].min()),
@@ -525,6 +548,11 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
             ticks_df["time"].min() > start)
         manifest["requested_window"] = {"start": str(start),
                                         "end": str(end)}
+        # History HOLES (owner evidence 2026-10-16: the broker's
+        # own D1 history is missing Jul 2023 – Mar 2024). Report
+        # them in the manifest; the loader never stitches across
+        # one (it runs the longest hole-free common segment).
+        manifest["tick_holes"] = _holes(ticks_df["time"], "M1")
         offset = _server_utc_offset_hours(mt5)
         manifest["server_utc_offset_hours"] = offset
         built_from_ticks: list[str] = []
@@ -546,6 +574,7 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                     "end": str(df["time"].max()),
                     "source": "mt5_copy_rates_native",
                     "datetime_mode": mode,
+                    "holes": _holes(df["time"], tf),
                     "requested": f"{start.date()}..{end.date()}",
                     "returned": f"{df['time'].min()}..{df['time'].max()}"}
                 continue
@@ -572,6 +601,7 @@ def _fetch_with_module(mt5, symbol: str, start: pd.Timestamp,
                     "source": "built_from_ticks",
                     "note": "aggregated from the MT5 tick stream; "
                             f"terminal had no cached {tf} bars",
+                    "holes": _holes(bars.index, tf),
                     "requested": f"{start.date()}..{end.date()}",
                     "returned": f"{bars.index[0]}..{bars.index[-1]}"}
                 built_from_ticks.append(tf)

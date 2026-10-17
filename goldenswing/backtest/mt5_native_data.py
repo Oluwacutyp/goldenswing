@@ -105,6 +105,26 @@ def _bucket_times(times: pd.Series, tf: str,
     return bucket - pd.Timedelta(hours=float(offset_hours))
 
 
+def dedupe_ticks(ticks_df: pd.DataFrame) -> pd.DataFrame:
+    """Drop only EXACT duplicate tick rows, never same-second ticks.
+
+    MT5 ``copy_ticks_range`` stamps ``time`` in whole seconds, and
+    gold routinely prints several real ticks per second (different
+    bid/ask/volume/flags). An earlier version did
+    ``drop_duplicates("time")`` here, which kept only the FIRST tick
+    per second and silently destroyed ~83% of a real fetch
+    (2026-10-16: 495,711 raw ticks -> 85,118 kept) plus most of
+    the summed bar volume. Exact-row dedupe only removes true
+    duplicates (e.g. a tick returned twice at a chunk boundary).
+    """
+    if ticks_df is None or len(ticks_df) == 0:
+        return ticks_df
+    df = ticks_df
+    if "time" in df.columns:
+        df = df.sort_values("time")
+    return df.drop_duplicates().reset_index(drop=True)
+
+
 def build_bars_from_ticks(ticks_df: pd.DataFrame, tf: str,
                           server_utc_offset_hours: float = 0.0
                           ) -> pd.DataFrame:
@@ -243,6 +263,7 @@ class TFCoverage:
     end: str = ""
     segments: list[tuple[str, str, int]] = field(default_factory=list)
     gap_days: float = 0.0
+    holes: list[dict] = field(default_factory=list)
     missing: bool = False
     built_from_ticks: bool = False
 
@@ -289,6 +310,60 @@ def _segments(index: pd.DatetimeIndex, tf: str) -> list[tuple[str, str, int]]:
             for s, e in zip(starts, ends)]
 
 
+#: A gap longer than this is a DATA HOLE, not calendar. Weekends
+#: are <= ~4 days even with a holiday Monday, and the Christmas /
+#: New Year stretch is <= ~10 days, so 14 days never flags
+#: calendar. Per-TF floor: 3x the TF length (MN1 bars are ~30d
+#: apart, so a 90d floor keeps normal MN1 spacing hole-free).
+#: Owner evidence (2026-10-16): the broker's own MT5 D1 history
+#: has a 9-MONTH hole (2023-06-30 -> 2024-03-31). The backtest
+#: must never silently stitch across a hole — indicators and
+#: swings computed across it would mix pre-hole and post-hole
+#: regimes as if continuous.
+HOLE_DAYS = 14.0
+
+
+def _hole_threshold(tf: str) -> pd.Timedelta:
+    """Gap length above which a TF's data has a hole."""
+    return max(pd.Timedelta(days=HOLE_DAYS),
+               pd.Timedelta(minutes=TF_MINUTES[tf] * GAP_MULTIPLE))
+
+
+def _holes(times, tf: str) -> list[dict]:
+    """Data holes in a time series: [{start, end, gap_days}].
+
+    ``times`` is a DatetimeIndex / Series of bar opens (or tick
+    times). A hole is a gap > ``_hole_threshold(tf)`` — weekends,
+    holidays and normal TF spacing never qualify.
+    """
+    idx = pd.DatetimeIndex(times).sort_values()
+    out: list[dict] = []
+    if len(idx) < 2:
+        return out
+    thresh = _hole_threshold(tf)
+    diffs = idx[1:] - idx[:-1]
+    for i, d in enumerate(diffs):
+        if d > thresh:
+            out.append({"start": str(idx[i]),
+                        "end": str(idx[i + 1]),
+                        "gap_days": round(float(d.total_seconds()
+                                                / 86400), 1)})
+    return out
+
+
+def _hole_free_segments(times, tf: str
+                        ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Hole-free segments as (first, last) timestamp pairs."""
+    idx = pd.DatetimeIndex(times).sort_values()
+    if len(idx) == 0:
+        return []
+    thresh = _hole_threshold(tf)
+    breaks = idx[1:] - idx[:-1] > thresh
+    starts = [0] + [i + 1 for i, b in enumerate(breaks) if b]
+    ends = [i for i, b in enumerate(breaks) if b] + [len(idx) - 1]
+    return [(idx[s], idx[e]) for s, e in zip(starts, ends)]
+
+
 def coverage_report(data_dir: Path | None = None,
                     symbol: str = DEFAULT_SYMBOL) -> dict[str, TFCoverage]:
     """Per-TF coverage from native files only. Never loads a fallback."""
@@ -312,6 +387,7 @@ def coverage_report(data_dir: Path | None = None,
             cov.start = str(frame.index[0])
             cov.end = str(frame.index[-1])
             cov.segments = _segments(frame.index, tf)
+            cov.holes = _holes(frame.index, tf)
             if len(frame) > 1:
                 diffs = (frame.index[1:] - frame.index[:-1])
                 cov.gap_days = float(diffs.max().total_seconds() / 86400)
@@ -365,6 +441,74 @@ def _tick_window_coverage(frames: dict[str, pd.DataFrame],
     return (tick_start, tick_end)
 
 
+def _select_run_segment(frames: dict[str, pd.DataFrame],
+                        provenance: dict,
+                        window_start: pd.Timestamp,
+                        window_end: pd.Timestamp) -> tuple[
+                            dict[str, pd.DataFrame],
+                            tuple[pd.Timestamp, pd.Timestamp]]:
+    """Enforce no-stitch: pick the longest hole-free sub-window.
+
+    ``window_start``/``window_end`` are the candidate run window
+    (tick window, or the native-only intersection). Every hole of
+    every TF that overlaps it splits the window; the longest
+    remaining piece is the run window. The piece that falls INSIDE
+    a hole (no data for the holed TF) is never a candidate. Each
+    frame keeps warm-up bars back to the start of its own
+    hole-free segment containing the piece start — bars before
+    that segment (pre-hole) are dropped, so no indicator or swing
+    is ever computed across a hole — and bars after the piece
+    end are dropped. Records per-TF holes + excluded segments
+    in ``provenance`` (which flows into the report JSON).
+    """
+    holes = {tf: _holes(frame.index, tf)
+             for tf, frame in frames.items()}
+    provenance["holes"] = holes
+    cuts = {window_start, window_end}
+    for tf_holes in holes.values():
+        for h in tf_holes:
+            hs, he = pd.Timestamp(h["start"]), pd.Timestamp(h["end"])
+            if window_start < hs < window_end:
+                cuts.add(hs)
+            if window_start < he < window_end:
+                cuts.add(he)
+    pts = sorted(cuts)
+    pieces = []
+    for a, b in zip(pts, pts[1:]):
+        if a >= b:
+            continue
+        # A piece inside a hole has no data for the holed TF —
+        # never a run candidate.
+        inside_hole = any(
+            pd.Timestamp(h["start"]) <= a
+            and b <= pd.Timestamp(h["end"])
+            for tf_holes in holes.values() for h in tf_holes)
+        if not inside_hole:
+            pieces.append((a, b))
+    if not pieces:
+        raise MissingNativeData(
+            ["candidate run window lies inside a data hole for "
+             "some TF (no hole-free piece) — see "
+             "provenance['holes']"], provenance)
+    pieces.sort(key=lambda p: p[1] - p[0], reverse=True)
+    chosen = pieces[0]
+    provenance["run_window"] = {"start": str(chosen[0]),
+                                "end": str(chosen[1])}
+    provenance["excluded_segments"] = [
+        {"start": str(s), "end": str(e)} for s, e in pieces[1:]]
+    sliced: dict[str, pd.DataFrame] = {}
+    for tf, frame in frames.items():
+        # Warm-up: back to the start of this TF's own hole-free
+        # segment containing the piece start (pre-hole bars out).
+        seg_start = chosen[0]
+        for s0, s1 in _hole_free_segments(frame.index, tf):
+            if s0 <= chosen[0] <= s1:
+                seg_start = s0
+                break
+        sliced[tf] = frame.loc[seg_start:chosen[1]]
+    return sliced, chosen
+
+
 def load_native_frames(data_dir: Path | None = None,
                        symbol: str = DEFAULT_SYMBOL,
                        ) -> tuple[dict[str, pd.DataFrame], dict]:
@@ -380,6 +524,10 @@ def load_native_frames(data_dir: Path | None = None,
     not cover the tick window (e.g. a stale file ending Dec 2025
     while ticks run to Oct 2026). No TF is ever aggregated from
     H1 bars; tick-built TFs aggregate the tick stream itself.
+    Within the tick window the run uses the longest HOLE-FREE
+    segment common to all TFs — the broker's own history has
+    holes (owner evidence: D1 missing Jul 2023 – Mar 2024), and
+    the run must never stitch across one.
     Raises MissingNativeData if ticks are missing AND any TF has
     no file — with auto-fetch diagnostics, never a manual
     export instruction.
@@ -390,6 +538,7 @@ def load_native_frames(data_dir: Path | None = None,
                        "start": c.start, "end": c.end,
                        "segments": c.segments,
                        "gap_days": round(c.gap_days, 1),
+                       "holes": c.holes,
                        "built_from_ticks": bool(c.built_from_ticks)}
                   for tf, c in cov.items()}
     # Ticks once: they define the run window when present.
@@ -404,7 +553,7 @@ def load_native_frames(data_dir: Path | None = None,
         ticks_df = pd.DataFrame(tick_list).rename(
             columns={"tick_volume": "volume"})
         ticks_df["time"] = pd.to_datetime(ticks_df["time"], utc=True)
-        ticks_df = ticks_df.sort_values("time").drop_duplicates("time")
+        ticks_df = dedupe_ticks(ticks_df)
         if len(ticks_df) >= 2:
             tick_start = ticks_df["time"].min()
             tick_end = ticks_df["time"].max()
@@ -416,8 +565,17 @@ def load_native_frames(data_dir: Path | None = None,
         for tf in REQUIRED_TFS:
             native = None if cov[tf].missing else \
                 cov[tf]._frame.copy()  # type: ignore[attr-defined]
+            # Native must cover the tick window AND have at least
+            # one bar inside it: a file can "cover" by endpoints
+            # while a hole spans the whole tick window (no bars
+            # in-window at all) — then it is rebuilt from ticks.
+            native_in_window = (
+                None if native is None
+                else native.loc[tick_start:tick_end])
             if native is not None and _bar_window_covers(
-                    native, tf, tick_start, tick_end):
+                    native, tf, tick_start, tick_end) \
+                    and native_in_window is not None \
+                    and len(native_in_window) > 0:
                 frames[tf] = native
                 continue
             # Native missing OR native does not cover the tick
@@ -445,21 +603,37 @@ def load_native_frames(data_dir: Path | None = None,
                 "end": str(bars.index[-1]),
                 "segments": _segments(bars.index, tf),
                 "gap_days": round(gap, 1),
+                "holes": _holes(bars.index, tf),
                 "built_from_ticks": True,
             }
         if still_missing:
             raise MissingNativeData(still_missing, provenance)
-        provenance["window"] = {"start": str(tick_start),
-                                "end": str(tick_end)}
+        # NEVER stitch across a hole: clip every frame to the
+        # tick window (native bars from 2023 must not stretch the
+        # run past the ticks), then slice to the longest hole-free
+        # segment common to all TFs. Tick holes (e.g. a 30-day gap
+        # in the tick stream) exclude the other segments from the
+        # run; they are reported in provenance, not silently jumped.
+        tick_holes = _holes(ticks_df["time"], "M1")
+        provenance["tick_holes"] = tick_holes
+        frames = {tf: frame.loc[tick_start:tick_end]
+                  for tf, frame in frames.items()}
+        frames, (run_start, run_end) = _select_run_segment(
+            frames, provenance, tick_start, tick_end)
+        ticks_in_run = int(((ticks_df["time"] >= run_start)
+                            & (ticks_df["time"] <= run_end)).sum())
+        provenance["window"] = {"start": str(run_start),
+                                "end": str(run_end)}
         provenance["tick_window"] = {
-            "start": str(tick_start), "end": str(tick_end),
-            "rows": int(len(ticks_df)),
+            "start": str(run_start), "end": str(run_end),
+            "rows": ticks_in_run,
             "source": f"MT5_{symbol}_ticks.csv (copy_ticks_range — "
                       "broker tick history is limited; bars run "
                       "on the tick window)"}
         provenance["tick_coverage"] = (
             f"ticks available {tick_start}..{tick_end}; "
-            f"full-engine tick run on the tick window")
+            f"full-engine tick run on the hole-free run window "
+            f"{run_start}..{run_end} ({ticks_in_run} ticks in run)")
         provenance["built_from_ticks"] = sorted(
             tf for tf in REQUIRED_TFS
             if provenance.get(tf, {}).get("built_from_ticks"))
@@ -474,15 +648,21 @@ def load_native_frames(data_dir: Path | None = None,
         raise MissingNativeData(missing, provenance)
     frames = {tf: cov[tf]._frame.copy()  # type: ignore[attr-defined]
               for tf in REQUIRED_TFS}
-    # Native-only intersection: the run window when no ticks exist.
-    start = max(f.index[0] for f in frames.values())
-    end = min(f.index[-1] for f in frames.values())
-    if start >= end:
+    # NEVER stitch across a hole: the run window is the longest
+    # hole-free piece of the native-only intersection (owner
+    # evidence: D1 history has a 9-month hole, 2023-06-30 ->
+    # 2024-03-31 — the old max(first)..min(last) intersection
+    # spanned it).
+    start0 = max(f.index[0] for f in frames.values())
+    end0 = min(f.index[-1] for f in frames.values())
+    if start0 >= end0:
         raise MissingNativeData(
             [f"native TF files do not share a run window "
-             f"(latest first bar {start} >= earliest last bar "
-             f"{end})"],
+             f"(latest first bar {start0} >= earliest last bar "
+             f"{end0})"],
             provenance)
+    frames, (start, end) = _select_run_segment(
+        frames, provenance, start0, end0)
     provenance["window"] = {"start": str(start), "end": str(end)}
     provenance["built_from_ticks"] = sorted(
         tf for tf in REQUIRED_TFS
@@ -504,7 +684,7 @@ def load_native_ticks(data_dir: Path | None = None,
         df = pd.concat([pd.read_csv(p) for p in matches],
                        ignore_index=True)
         df["time"] = pd.to_datetime(df["time"], utc=True)
-        df = df.sort_values("time").drop_duplicates("time")
+        df = dedupe_ticks(df)
         ticks = []
         for row in df.itertuples(index=False):
             d = row._asdict()
