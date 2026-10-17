@@ -855,106 +855,132 @@ class MT5Runner:
         if self.cfg.terminal_path \
                 and getattr(feed.cfg, "terminal_path", None) is None:
             feed.cfg.terminal_path = self.cfg.terminal_path
-        ok, msg = feed.connect()
-        if not ok:
-            # Feed failure on the FEED_ERROR channel (ERROR), before
-            # raising — a connect failure is a feed problem, and it
-            # must never be mistaken for a flat-bias HOLD.
-            log_feed_error(_log, symbol=self.cfg.symbol, reason=msg)
-            raise RuntimeError(f"MT5 runner: feed connect failed: {msg}")
-        feed_msg = msg  # executor.connect() below reuses `msg`
-        # The feed is the source of truth for the broker's gold symbol:
-        # auto-detect may have resolved XAUUSD -> XAUUSDm.  Orders,
-        # positions, and specs below must use the resolved symbol, so
-        # adopt it when the feed was not explicitly configured (an
-        # explicit feed symbol already matches the runner's).
-        if not feed.cfg.symbol_explicit \
-                and feed.cfg.symbol != self.cfg.symbol:
-            self.cfg.symbol = feed.cfg.symbol
-        acct = feed.account_state()
-        if acct.get("trade_mode") == TRADE_MODE_REAL \
-                and not self.cfg.allow_live:
-            raise RuntimeError(
-                "MT5 runner: refusing to trade a REAL MT5 account "
-                "(trade_mode=2) without allow_live=True — demo only.")
-        if Path(self.cfg.kill_switch_path).exists():
-            raise RuntimeError(
-                f"MT5 runner: kill switch present at "
-                f"{self.cfg.kill_switch_path} — refusing to start.")
-        ok, msg = executor.connect(path=self.cfg.terminal_path)
-        if not ok:
-            raise RuntimeError(f"MT5 runner: executor connect failed: {msg}")
+        self._send_startup_progress(
+            "MT5 engine starting…\n"
+            f"symbol: {self.cfg.symbol}")
+        try:
+            ok, msg = feed.connect()
+            if not ok:
+                # Feed failure on the FEED_ERROR channel (ERROR), before
+                # raising — a connect failure is a feed problem, and it
+                # must never be mistaken for a flat-bias HOLD.
+                log_feed_error(_log, symbol=self.cfg.symbol, reason=msg)
+                raise RuntimeError(f"MT5 runner: feed connect failed: {msg}")
+            feed_msg = msg  # executor.connect() below reuses `msg`
+            # The feed is the source of truth for the broker's gold symbol:
+            # auto-detect may have resolved XAUUSD -> XAUUSDm.  Orders,
+            # positions, and specs below must use the resolved symbol, so
+            # adopt it when the feed was not explicitly configured (an
+            # explicit feed symbol already matches the runner's).
+            if not feed.cfg.symbol_explicit \
+                    and feed.cfg.symbol != self.cfg.symbol:
+                self.cfg.symbol = feed.cfg.symbol
+            acct = feed.account_state()
+            if acct.get("trade_mode") == TRADE_MODE_REAL \
+                    and not self.cfg.allow_live:
+                raise RuntimeError(
+                    "MT5 runner: refusing to trade a REAL MT5 account "
+                    "(trade_mode=2) without allow_live=True — demo only.")
+            if Path(self.cfg.kill_switch_path).exists():
+                raise RuntimeError(
+                    f"MT5 runner: kill switch present at "
+                    f"{self.cfg.kill_switch_path} — refusing to start.")
+            ok, msg = executor.connect(path=self.cfg.terminal_path)
+            if not ok:
+                raise RuntimeError(f"MT5 runner: executor connect failed: {msg}")
 
-        # Warm start: full closed history per TF -> forward-only stack.
-        # Feed health is reported on the FEED_ERROR channel (ERROR)
-        # when poll_status says not-ok — a stale / disconnected
-        # feed is a feed problem, distinct from a flat-bias HOLD.
-        self.report_feed_status(feed.poll_status())
-        self._stack = TimeframeStack.from_frames(feed.warm_start_all())
-        h1 = self._stack.frames.get("H1")
-        if h1 is None or len(h1) == 0:
-            raise RuntimeError("MT5 runner: warm start returned no H1 bars")
-        for tf, frame in self._stack.frames.items():
-            if len(frame):
-                # Last-processed CLOSE (= last closed bar's open + TF).
-                # Comparing closes to closes: a close-to-open mixup
-                # would refresh on every tick.
-                self._last_processed[tf] = (
-                    frame.index[-1] + pd.Timedelta(minutes=TF_MINUTES[tf]))
-        self._qm_touch = self._advance_qm(self._stack.frames.get("M5"))
-        # Trigger levels from the closed warm-start bars.  The H1
-        # close is NOT the signal clock anymore — this setup is what
-        # the tick clock checks every tick (see _evaluate_live_tick).
-        self._refresh_live_setup()
-        # MacroTrend alignment from the warm-start frames (D1/W1/MN1
-        # closed bars).  Sizing + Golden Swing confirmation read this.
-        self._refresh_alignment()
-        self.feed = feed
-        self.executor = executor
-        # Deterministic lifecycle: REPLAY -> RECONCILING -> LIVE.
-        # Replay re-reads committed frames with effects suppressed;
-        # reconcile with no unresolved outbox flips to LIVE.  Failure
-        # here never blocks the legacy loop — it is noted, not fatal.
-        if self.deterministic is not None:
-            try:
-                self.deterministic.begin_live()
-            except Exception as exc:  # noqa: BLE001 - fallback is legacy
-                self.journal.log_note(
-                    f"mt5: deterministic begin_live failed: {exc}")
-        self._det_journal("runner_started", {
-            "symbol": self.cfg.symbol,
-            "login": acct.get("login"),
-            "trade_mode": acct.get("trade_mode")})
-        self.journal.log_note(
-            "mt5 runner: started "
-            f"(symbol={self.cfg.symbol}) "
-            f"({', '.join(f'{tf}:{len(self._stack.frames.get(tf, []))}' for tf in self._stack.frames)}) "
-            f"account login={acct.get('login')} equity={acct.get('equity')} "
-            f"trade_mode={acct.get('trade_mode')} "
-            f"macro: {self._alignment.describe()}"
-            + (f" connect: {feed_msg}" if feed_msg != "MT5 connected" else ""))
+            # Warm start: full closed history per TF -> forward-only stack.
+            # Feed health is reported on the FEED_ERROR channel (ERROR)
+            # when poll_status says not-ok — a stale / disconnected
+            # feed is a feed problem, distinct from a flat-bias HOLD.
+            self.report_feed_status(feed.poll_status())
+            self._stack = TimeframeStack.from_frames(feed.warm_start_all())
+            h1 = self._stack.frames.get("H1")
+            if h1 is None or len(h1) == 0:
+                raise RuntimeError("MT5 runner: warm start returned no H1 bars")
+            for tf, frame in self._stack.frames.items():
+                if len(frame):
+                    # Last-processed CLOSE (= last closed bar's open + TF).
+                    # Comparing closes to closes: a close-to-open mixup
+                    # would refresh on every tick.
+                    self._last_processed[tf] = (
+                        frame.index[-1] + pd.Timedelta(minutes=TF_MINUTES[tf]))
+            self._send_startup_progress(
+                "MT5 engine: history fetched ("
+                + ", ".join(f"{tf}:{len(self._stack.frames.get(tf, []))}"
+                            for tf in self._stack.frames)
+                + ")")
+            self._qm_touch = self._advance_qm(self._stack.frames.get("M5"))
+            # Trigger levels from the closed warm-start bars.  The H1
+            # close is NOT the signal clock anymore — this setup is what
+            # the tick clock checks every tick (see _evaluate_live_tick).
+            print("MT5 startup: building zones…", flush=True)
+            self._refresh_live_setup()
+            # MacroTrend alignment from the warm-start frames (D1/W1/MN1
+            # closed bars).  Sizing + Golden Swing confirmation read this.
+            self._refresh_alignment()
+            self._send_startup_progress(
+                "MT5 engine: zones built "
+                f"({len(self._structural_zones)} zones)")
+            self.feed = feed
+            self.executor = executor
+            # Deterministic lifecycle: REPLAY -> RECONCILING -> LIVE.
+            # Replay re-reads committed frames with effects suppressed;
+            # reconcile with no unresolved outbox flips to LIVE.  Failure
+            # here never blocks the legacy loop — it is noted, not fatal.
+            if self.deterministic is not None:
+                try:
+                    self.deterministic.begin_live()
+                except Exception as exc:  # noqa: BLE001 - fallback is legacy
+                    self.journal.log_note(
+                        f"mt5: deterministic begin_live failed: {exc}")
+            self._det_journal("runner_started", {
+                "symbol": self.cfg.symbol,
+                "login": acct.get("login"),
+                "trade_mode": acct.get("trade_mode")})
+            self.journal.log_note(
+                "mt5 runner: started "
+                f"(symbol={self.cfg.symbol}) "
+                f"({', '.join(f'{tf}:{len(self._stack.frames.get(tf, []))}' for tf in self._stack.frames)}) "
+                f"account login={acct.get('login')} equity={acct.get('equity')} "
+                f"trade_mode={acct.get('trade_mode')} "
+                f"macro: {self._alignment.describe()}"
+                + (f" connect: {feed_msg}" if feed_msg != "MT5 connected" else ""))
 
-        # Fast-forward playbook streaming state over history; past
-        # signals are discarded — only the latest close trades.
-        # Range playbooks get the native H4 frame (no resample).
-        states = read_and_featurize(h1, None)
-        for pb in self._get_playbooks():
-            if hasattr(pb, "set_h4_frame"):
-                pb.set_h4_frame(
-                    self._stack.frames.get("H4"))
-            for t2 in range(len(h1)):
-                pb.live_signal(states, t2, h1)
-        # Adopt positions the broker already holds with our magic
-        # (restart sync — MT5 is the source of truth for open trades).
-        self._adopt_existing(executor)
-        # Adopt pending orders the broker still holds with our magic:
-        # a restart must not orphan a resting limit/stop.
-        self._adopt_existing_pending(executor)
+            # Fast-forward playbook streaming state over history; past
+            # signals are discarded — only the latest close trades.
+            # Range playbooks get the native H4 frame (no resample).
+            states = read_and_featurize(h1, None)
+            _playbooks = self._get_playbooks()
+            print(f"MT5 startup: warming {len(_playbooks)} "
+                  "playbooks over history…", flush=True)
+            for pb in _playbooks:
+                if hasattr(pb, "set_h4_frame"):
+                    pb.set_h4_frame(
+                        self._stack.frames.get("H4"))
+                _pb_t0 = time.perf_counter()
+                for t2 in range(len(h1)):
+                    pb.live_signal(states, t2, h1)
+                print(f"MT5 startup: warmed {pb.name} "
+                      f"in {time.perf_counter() - _pb_t0:.1f}s", flush=True)
+            self._send_startup_progress(
+                "MT5 engine: playbooks warmed "
+                f"({len(_playbooks)} playbooks)")
+            # Adopt positions the broker already holds with our magic
+            # (restart sync — MT5 is the source of truth for open trades).
+            self._adopt_existing(executor)
+            # Adopt pending orders the broker still holds with our magic:
+            # a restart must not orphan a resting limit/stop.
+            self._adopt_existing_pending(executor)
 
-        # Startup ping: ONE Telegram "engine started" message, after
-        # feed connect + runner start, independent of command polling
-        # (it fires even with --no-poll-commands).  Never raises.
-        self._send_startup_ping(acct)
+            # Startup ping: ONE Telegram "engine started" message, after
+            # feed connect + runner start, independent of command polling
+            # (it fires even with --no-poll-commands).  Never raises.
+            self._send_startup_ping(acct)
+        except Exception as _startup_exc:
+            self._send_startup_progress(
+                f"MT5 engine FAILED to start: {_startup_exc}")
+            raise
 
         stats: dict = {"ticks": 0, "bars": 0, "signals": 0,
                        "executed": 0, "shadow": 0, "gated": 0,
@@ -5660,6 +5686,26 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: chart build failed for {alert_id}: {exc}")
             return None, None
+
+    def _send_startup_progress(self, text: str) -> None:
+        """One Telegram + console progress line during startup.
+
+        The owner watches Telegram, not the console: every startup
+        stage (starting / history / zones / playbooks / failed)
+        reports itself, so a slow-but-healthy start never looks
+        like a hang.  Never raises: no senders configured ->
+        console only; a send failure is journaled and start
+        continues.  Zone building has NO timeout — a slow zone
+        build is reported, never cut short.
+        """
+        print(f"MT5 startup: {text}", flush=True)
+        if not self.senders:
+            return
+        try:
+            self._send_alert(text)
+        except Exception as exc:  # noqa: BLE001 - never break start
+            self.journal.log_note(
+                f"mt5: startup progress send failed: {exc}")
 
     def _send_startup_ping(self, acct: dict) -> None:
         """One Telegram 'engine started' ping per process start.
