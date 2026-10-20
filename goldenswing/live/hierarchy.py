@@ -94,7 +94,7 @@ from ..entry.validator import SHAPE_PRIORITY, confirm_at_poi
 from ..reader.session_timeframes import compose as _compose_session
 from .multitf import (SWING, TimeframeConfig, atr14, detect_bos_msch_choch,
                       evaluate as _mtf_evaluate, evaluate_bias, find_swings,
-                      zones_by_side)
+                      poi_for_direction, zones_by_side)
 from .range import (RANGE_SIZE_MULT, RangeDef, detect_range,
                     range_setup, resolve_range_touch)
 
@@ -1029,6 +1029,56 @@ def log_feed_error(logger, *, symbol: str, reason: str,
                  symbol, reason, extra)
 
 
+def _no_poi_reason(h4: pd.DataFrame, bias_d1: int) -> str:
+    """Honest no-POI reason (arming-gate fix F3): name the side
+    that has no tradeable POI instead of pairing against a
+    wrong-side band."""
+    last_close = float(h4["close"].iloc[-1]) if len(h4) else 0.0
+    if bias_d1 < 0:
+        return ("no_h4_poi: no overhead H4 supply above price "
+                f"(last H4 close {last_close:.1f} — every confirmed "
+                "H4 swing high sits below it)")
+    return ("no_h4_poi: no H4 support below price "
+            f"(last H4 close {last_close:.1f} — every confirmed "
+            "H4 swing low sits above it)")
+
+
+def _continuation_break(h1: pd.DataFrame, direction: int,
+                        ref_level: float, buf: float) -> dict | None:
+    """The in-force H1 continuation break of ``ref_level``, or None.
+
+    A break is an EXCURSION of CLOSED H1 closes: consecutive closes
+    on the far side of ``ref_level`` (below it for shorts, above
+    for longs) running unbroken to the last bar, in which at least
+    one close cleared the level by >= ``buf`` — the first such
+    close is the break bar.  A close back beyond the level ends
+    the excursion (the break is invalidated; the arm dies with
+    it), and an excursion in which no close ever cleared ``buf``
+    is a drift across the level, not a break.  The break's
+    identity (direction + level + break-bar timestamp) is what
+    the runner spends exactly once: one arm per break.
+    """
+    closes = h1["close"].to_numpy(dtype=float)
+    if not len(closes):
+        return None
+    if direction < 0:
+        beyond = closes < ref_level
+        cleared = closes <= ref_level - buf
+    else:
+        beyond = closes > ref_level
+        cleared = closes >= ref_level + buf
+    if not beyond[-1]:
+        return None
+    start = len(closes) - 1
+    while start > 0 and beyond[start - 1]:
+        start -= 1
+    for pos in range(start, len(closes)):
+        if cleared[pos]:
+            return {"break_pos": int(pos),
+                    "break_ts": h1.index[pos]}
+    return None
+
+
 def _live_setup_impl(stack: TimeframeStack | dict, *,
                      swing_n: int = 3) -> tuple[dict | None, str]:
     """``live_setup`` + the reason it is / is not armed.
@@ -1086,19 +1136,81 @@ def _live_setup_impl(stack: TimeframeStack | dict, *,
     # it 46% arm, and the newly armed bars are H4-flat (no H4
     # opinion — not a veto) plus genuine pullbacks.  Direction
     # stays D1, always; H4's bias is recorded as context.
-    zones = zones_by_side(h4, swing_n=swing_n)
-    zone = zones.get("support") if bias_d1 > 0 \
-        else zones.get("resistance")
-    if zone is None:
-        return None, "no_h4_poi: no H4 POI on the D1 side"
     trig_highs, trig_lows = find_swings(
         h1["high"].to_numpy(), h1["low"].to_numpy(), swing_n)
+    # F1 (arming-gate fix): the POI is the freshest band on the
+    # TRADEABLE side of the last H4 close — overhead supply for
+    # shorts, support below for longs — selected from ALL
+    # confirmed H4 swings (see multitf.poi_for_direction).  The
+    # old pick (zones_by_side's most-recent swing, no side check)
+    # anchored the live short to a stale band UNDER the market and
+    # containment could never pass.  zones_by_side itself is
+    # unchanged for its other callers.
+    zone = poi_for_direction(h4, bias_d1, swing_n=swing_n)
     if not trig_highs or not trig_lows:
+        if zone is None:
+            return None, _no_poi_reason(h4, bias_d1)
         return None, "no_h1_swings: no confirmed H1 swings"
     atr_h1 = atr14(h1)
     if atr_h1 <= 0:
         return None, "no_atr: H1 ATR unmeasurable"
     buf = float(SWING.breakout_atr * atr_h1)
+    h4_highs, h4_lows = find_swings(
+        h4["high"].to_numpy(), h4["low"].to_numpy(), swing_n)
+    context = _h4_context(bias_d1, bias_h4)
+    levels = {
+        "bias_d1": int(bias_d1), "bias_h4": int(bias_h4),
+        "h4_context": context,
+        "direction": int(bias_d1),
+        "ref_high": float(trig_highs[-1][1]),
+        "minor_high": float(trig_highs[-2][1])
+        if len(trig_highs) >= 2 else None,
+        "ref_low": float(trig_lows[-1][1]),
+        "minor_low": float(trig_lows[-2][1])
+        if len(trig_lows) >= 2 else None,
+        "atr_h1": float(atr_h1),
+        "buf": buf,
+        "h4_highs": [float(p) for _, p in h4_highs],
+        "h4_lows": [float(p) for _, p in h4_lows],
+        "swing_n": int(swing_n),
+    }
+    # F2 — CONTINUATION ARM: a CLOSED H1 bar broke the H1
+    # reference level on the bias side by >= buf (short: close
+    # below ref_low - buf; long: close above ref_high + buf) and
+    # price has not closed back beyond the level since.  The old
+    # gate had NO such pattern — a straight-line move in the D1
+    # direction could never arm it (2026-10-19: bounce to ~4151,
+    # then a fall through 4132.7 to 4112.5, zero arms).  The break
+    # is the current completed event, so it takes precedence over
+    # the resting pullback arm below; it needs no H4 POI (price
+    # beyond every correct-side swing is exactly the condition F1
+    # reports as no_h4_poi).  The zone is the broken level's band;
+    # firing rides the same tick touch -> POI confirmation ->
+    # signal machinery as a pullback, and the runner spends each
+    # break exactly once (break_key — one arm per break).
+    broken_level = levels["ref_low"] if bias_d1 < 0 \
+        else levels["ref_high"]
+    brk = _continuation_break(h1, bias_d1, float(broken_level), buf)
+    if brk is not None:
+        swing_pos = int(trig_lows[-1][0]) if bias_d1 < 0 \
+            else int(trig_highs[-1][0])
+        half = 0.5 * float(atr_h1)
+        break_ts = pd.Timestamp(brk["break_ts"]).isoformat()
+        return {
+            **levels,
+            "regime": "trend", "arm": "continuation",
+            "zone": {"kind": "broken_level",
+                     "level": float(broken_level),
+                     "top": float(broken_level + half),
+                     "bottom": float(broken_level - half),
+                     "index": swing_pos},
+            "ref_level": float(broken_level),
+            "break_ts": break_ts,
+            "break_key": (f"{bias_d1:+d}|{float(broken_level):.4f}|"
+                          f"{break_ts}"),
+        }, "armed"
+    if zone is None:
+        return None, _no_poi_reason(h4, bias_d1)
     # CONTAINMENT FIRST: the H1 reference level on the zone side
     # (swing low for longs, swing high for shorts) must NEST
     # inside the H4 zone (± buf, the codebase's existing level
@@ -1112,31 +1224,20 @@ def _live_setup_impl(stack: TimeframeStack | dict, *,
         else float(trig_highs[-1][1])
     if not (zone["bottom"] - buf <= ref_level
             <= zone["top"] + buf):
+        last_close = float(h1["close"].iloc[-1])
+        if last_close < zone["bottom"]:
+            dist = zone["bottom"] - last_close
+        elif last_close > zone["top"]:
+            dist = last_close - zone["top"]
+        else:
+            dist = 0.0
         return None, (
             "containment: H1 ref level "
             f"{ref_level:.1f} outside H4 POI "
             f"{zone['bottom']:.1f}–{zone['top']:.1f} "
-            "(structure not at the zone yet)")
-    h4_highs, h4_lows = find_swings(
-        h4["high"].to_numpy(), h4["low"].to_numpy(), swing_n)
-    context = _h4_context(bias_d1, bias_h4)
-    return {
-        "bias_d1": int(bias_d1), "bias_h4": int(bias_h4),
-        "h4_context": context,
-        "direction": int(bias_d1), "zone": zone,
-        "ref_high": float(trig_highs[-1][1]),
-        "minor_high": float(trig_highs[-2][1])
-        if len(trig_highs) >= 2 else None,
-        "ref_low": float(trig_lows[-1][1]),
-        "minor_low": float(trig_lows[-2][1])
-        if len(trig_lows) >= 2 else None,
-        "ref_level": ref_level,
-        "atr_h1": float(atr_h1),
-        "buf": buf,
-        "h4_highs": [float(p) for _, p in h4_highs],
-        "h4_lows": [float(p) for _, p in h4_lows],
-        "swing_n": int(swing_n),
-    }, "armed"
+            f"(awaiting the pullback to the POI — last close "
+            f"{last_close:.1f}, ${dist:.1f} from the band)")
+    return {**levels, "zone": zone, "ref_level": ref_level}, "armed"
 
 
 def live_setup(stack: TimeframeStack | dict, *,
@@ -1160,6 +1261,16 @@ def live_setup(stack: TimeframeStack | dict, *,
     swing price lists used for the target.  The stack frames must
     hold CLOSED bars only (the live invariant); the forming bar is
     never here.
+
+    Trend setups come in two arms.  The PULLBACK arm (no ``arm``
+    key) is the resting one above: H1 structure nested in the H4
+    POI.  The CONTINUATION arm (``arm == "continuation"``,
+    ``regime == "trend"``) arms when a closed H1 bar has broken
+    the H1 reference level on the bias side by >= ``buf`` and
+    price has not closed back beyond it: ``zone`` is the broken
+    level's band (+/- 0.5 x ATR_H1), ``ref_level`` the broken
+    level, and ``break_key`` / ``break_ts`` identify the break —
+    the runner spends each break exactly once.
     """
     setup, _reason = _live_setup_impl(stack, swing_n=swing_n)
     return setup

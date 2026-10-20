@@ -670,6 +670,14 @@ class MT5Runner:
         # confirmed breakout — a confirmed breakout fires once, it
         # never re-fires on later ticks).
         self._breakout_fired_id: int = 0
+        # Continuation break_keys already fired (arming-gate fix
+        # F2: one arm per break — a break that fired never re-arms
+        # while price stays beyond the broken level; the stateless
+        # live_setup would otherwise re-issue the same setup on
+        # every refresh).  Spent at fire time in _run_live_signal;
+        # enforced in _refresh_live_setup (suppression) and in the
+        # tick clock (backstop).  In-memory like _breakout_fired_id.
+        self._continuation_spent: set[str] = set()
         # Persisted regime state: journal-adjacent
         # (<journal dir>/regime_state.json), never /tmp.
         self._regime_state_path = \
@@ -1863,6 +1871,21 @@ class MT5Runner:
             return
         self._live_setup = live_setup(self._stack)
         self._live_setup_reason = live_setup_reason(self._stack)
+        # Continuation one-arm-per-break: a break that already
+        # fired is spent — the stateless setup re-arms it on every
+        # refresh while price stays beyond the broken level.
+        # Suppress it (with the honest reason for /status); the
+        # tick clock checks the spent set too, as a backstop for
+        # ticks evaluated before this refresh.
+        if self._live_setup is not None \
+                and self._live_setup.get("arm") == "continuation" \
+                and str(self._live_setup.get("break_key") or "") \
+                in self._continuation_spent:
+            self._live_setup_reason = (
+                "continuation_spent: break of "
+                f"{float(self._live_setup['ref_level']):.1f} "
+                "already fired (one arm per break)")
+            self._live_setup = None
         # HOLD state: computed on every refresh (cheap, closed bars
         # only) so /status + logs always describe the CURRENT flat
         # state, not a stale one.  Logged at INFO as HOLD when the
@@ -2727,6 +2750,25 @@ class MT5Runner:
                 line += (f" · last price {mid:.1f} "
                          f"(${abs(mid - edge['level']):.1f} from "
                          f"broken edge)")
+            return line
+        if setup.get("arm") == "continuation":
+            # CONTINUATION arm: a closed H1 bar broke the reference
+            # level; the zone is the broken level's retest band,
+            # not an H4 POI — render it as what it is (F3).
+            direction = "LONG" if setup["direction"] > 0 else "SHORT"
+            zone = setup["zone"]
+            line = (f"setup: ARMED {direction} CONTINUATION · "
+                    f"broke H1 ref {setup['ref_level']:.1f} "
+                    f"(break {setup.get('break_ts', '')}) · "
+                    f"retest band {zone['bottom']:.1f}–"
+                    f"{zone['top']:.1f} (H4 "
+                    f"{setup.get('h4_context', '')})")
+            last = self._last_tick or {}
+            mid = last.get("mid")
+            if mid:
+                line += (f" · last price {mid:.1f} "
+                         f"(${abs(mid - setup['ref_level']):.1f} "
+                         "from broken level)")
             return line
         zone = setup["zone"]
         direction = "LONG" if setup["direction"] > 0 else "SHORT"
@@ -3649,6 +3691,14 @@ class MT5Runner:
                                 setup["zone"]["top"]):
                 return  # zone failed: terminated, no re-arm
             self._invalidated_zone = None  # zone changed: fresh setup
+        # Continuation spent-break block: this break already fired
+        # (one arm per break).  _refresh_live_setup suppresses the
+        # setup at the next TF close; this guards ticks evaluated
+        # against the pre-refresh setup within the same cycle.
+        if setup.get("arm") == "continuation" \
+                and str(setup.get("break_key") or "") \
+                in self._continuation_spent:
+            return
         # One trigger per H1-bar window: this bar already fired —
         # the setup is fixed within the bar, so a second fire here
         # would be the same setup re-firing on the same composing
@@ -3820,6 +3870,24 @@ class MT5Runner:
         closed-bar verdict — so the playbooks, confluence gate, and
         order path are unchanged.
         """
+        # One arm per break (arming-gate fix F2): a continuation
+        # setup that reaches the signal path has FIRED — spend its
+        # break so neither the tick clock nor the next setup
+        # refresh can arm the same break again.  (Breakout fires
+        # carry no ``arm`` key and are spent via _breakout_fired_id
+        # instead.)
+        fired_setup = pend.get("setup") or {}
+        if fired_setup.get("arm") == "continuation" \
+                and fired_setup.get("break_key"):
+            key = str(fired_setup["break_key"])
+            if key not in self._continuation_spent:
+                self._continuation_spent.add(key)
+                self.journal.log_note(
+                    "mt5: continuation break spent (one arm per "
+                    f"break): {int(fired_setup.get('direction', 0)):+d} "
+                    f"break of "
+                    f"{float(fired_setup.get('ref_level', 0.0)):.2f} "
+                    f"at {fired_setup.get('break_ts')}")
         # NOTE (layering): no holding guard here — _run_signal_path
         # branches to layers when holding, new positions when flat.
         h1_closed = self._stack.frames["H1"]
@@ -3902,9 +3970,19 @@ class MT5Runner:
         legs["h4_agree"]["reason"] = (
             f"H4 {h4_context or 'context'} {bias_h4:+d} (closed) — "
             f"POI supplier, direction stays D1 {direction:+d}")
-        legs["h4_zone"]["reason"] = "live price at H4 POI (zone touch)"
-        legs["h1_trigger"]["reason"] = \
-            f"zone touch + {pend['trigger']} confirm"
+        if setup.get("arm") == "continuation":
+            # The zone here is the broken H1 level's retest band,
+            # NOT an H4 POI — the verdict must not claim otherwise.
+            legs["h4_zone"]["reason"] = (
+                "live price at broken H1 level (continuation "
+                "retest)")
+            legs["h1_trigger"]["reason"] = (
+                f"continuation retest + {pend['trigger']} confirm")
+        else:
+            legs["h4_zone"]["reason"] = \
+                "live price at H4 POI (zone touch)"
+            legs["h1_trigger"]["reason"] = \
+                f"zone touch + {pend['trigger']} confirm"
         legs["entry"]["reason"] = \
             f"{pend['entry_clock']} POI confirm"
         return {

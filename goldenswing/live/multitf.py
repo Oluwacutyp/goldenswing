@@ -487,6 +487,53 @@ def zones_by_side(zone_bars: pd.DataFrame, *,
     return {"support": support, "resistance": resistance, "nearest": nearest}
 
 
+def poi_for_direction(zone_bars: pd.DataFrame, direction: int, *,
+                      swing_n: int = 3) -> dict | None:
+    """Freshest TRADEABLE-side POI band for a direction, or None.
+
+    ``zones_by_side`` returns the most recent swing per side with no
+    check of where it sits relative to price: a stale or
+    broken-through swing stays "the resistance" forever (live
+    2026-10-20: the most recent confirmed H4 swing high sat at
+    4073.2 with price at 4140, so the short arm paired the H1 ref
+    against a band UNDER the market and containment could never
+    pass).  This selector walks the confirmed swings on the
+    direction's side from most recent backwards and picks the
+    first band on the tradeable side of the last close: for shorts
+    (``direction < 0``) the freshest resistance whose level is
+    at/above the last close (overhead supply); for longs the
+    freshest support whose level is at/below it.  When the most
+    recent swing is already on the tradeable side this is exactly
+    the ``zones_by_side`` pick — the side check only skips swings
+    price has already left behind.  Bands are built exactly as
+    :func:`zones_by_side` builds them (+/- 0.5 x ATR14 around the
+    swing level).
+
+    Returns None when no correct-side POI exists (price beyond
+    every confirmed swing on that side) — callers must NOT fall
+    back to a wrong-side band; a wrong-side anchor is how the live
+    gate died.
+    """
+    if direction == 0:
+        return None
+    atr = atr14(zone_bars)
+    if atr <= 0 or not len(zone_bars):
+        return None
+    highs, lows = find_swings(zone_bars["high"], zone_bars["low"],
+                              swing_n)
+    last_close = float(zone_bars["close"].iloc[-1])
+    if direction < 0:
+        for idx, level in reversed(highs):
+            if float(level) >= last_close:
+                return _zone("resistance", float(level), int(idx),
+                             atr)
+        return None
+    for idx, level in reversed(lows):
+        if float(level) <= last_close:
+            return _zone("support", float(level), int(idx), atr)
+    return None
+
+
 def evaluate_zones(zone_bars: pd.DataFrame, *,
                    swing_n: int = 3) -> dict | None:
     """Nearest POI zone (swing high/low band) on the zone TF, or None."""
