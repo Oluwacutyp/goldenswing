@@ -134,11 +134,11 @@ def _drive(runner, h1, pb, engine, t=29, zone_d=None):
 def test_below_floor_emission_gets_signal_record(tmp_path):
     runner, h1 = _runner(tmp_path)
     # Production reaches _run_one_playbook via _run_signal_path,
-    # which supplies the verdict's armed band as zone context; the
-    # per-style floor only applies to zone-path (arrival) signals,
-    # so _drive passes the same armed-band dict explicitly.  (With
-    # zone_d=None the floor is not applied at all — see the
-    # no-zone-context note in _run_one_playbook.)
+    # which supplies the verdict's armed band as zone context.
+    # _drive passes the same armed-band dict explicitly so this
+    # test exercises the ZONE_PATH floor.  (P3 scope G: with
+    # zone_d=None the signal is floored on its open-space style
+    # row instead — no unfloored path remains.)
     zone_d = {"bottom": 1995.0, "top": 2005.0, "tier": "MINOR",
               "lifecycle": "tested", "touches": 1, "status": "active",
               "score": 40.0, "armed_band": True}
@@ -171,8 +171,28 @@ def test_gated_emission_gets_signal_record_with_reason(tmp_path):
     assert runner.executor.orders == []
 
 
+class _FakeScore:
+    """A passing Asymmetry Score stand-in.  P3 (scope G) floors
+    open-space signals too — the dead-flat fixture frame cannot
+    clear any floor with the REAL scorer, and these tests are
+    about journal plumbing, not scoring (scoring has its own
+    suite).  Structure+Efficiency = 50 >= the Path B 35 rule."""
+
+    total = 80.0
+    flipped = False
+
+    def component(self, name):
+        return {"structure": 30.0, "efficiency": 20.0,
+                "location": 15.0, "pullback": 10.0,
+                "session": 5.0, "macro": 0.0}.get(name, 0.0)
+
+    def breakdown(self):
+        return {"total": 80.0}
+
+
 def test_accepted_emission_joins_to_open_via_alert_id(tmp_path):
     runner, h1 = _runner(tmp_path)
+    runner._score_for = lambda **kw: _FakeScore()
     recs = _drive(runner, h1, _StubPlaybook("fvg_midline", 80.0),
                   _StubEngine())
     assert len(recs) == 1
@@ -187,6 +207,9 @@ def test_accepted_emission_joins_to_open_via_alert_id(tmp_path):
 
 def test_shadow_emission_recorded_not_ordered(tmp_path):
     runner, h1 = _runner(tmp_path)
+    # Same P3 note as the accepted test: pin a passing score so
+    # the flow reaches the accepted/shadow emission point.
+    runner._score_for = lambda **kw: _FakeScore()
     recs = _drive(runner, h1, _StubPlaybook("qm_m5", 80.0),
                   _StubEngine())
     assert len(recs) == 1

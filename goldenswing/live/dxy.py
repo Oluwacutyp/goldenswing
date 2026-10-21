@@ -116,6 +116,12 @@ class DXYTracker:
         self.symbol = symbol
         self.enabled = enabled
         self.state = DXYState()
+        #: P3: the last fetched CLOSED DXY frame, retained so the
+        #: SMT event read (live/smt.py) computes from the bars the
+        #: tracker already pulled — no second fetch.  None until
+        #: the first successful refresh; kept (stale-marked by
+        #: state.available) across failures.
+        self.frame: pd.DataFrame | None = None
 
     def refresh(self, gold_h1: pd.DataFrame | None) -> DXYState:
         """Fetch DXY H1, recompute correlation + bias.  Any failure
@@ -137,6 +143,7 @@ class DXYTracker:
             # forming bar included) needs the closed-only cut.
             corr, status = dxy_correlation(gold_h1, dxy_closed)
             bias = ema_bias(dxy_closed)
+            self.frame = dxy_closed
             self.state = DXYState(
                 corr=corr, bias=int(bias), available=True,
                 status=status, n_bars=len(dxy_closed))

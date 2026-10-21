@@ -75,8 +75,18 @@ from ..live.atr_regime import (atr_regime as _atr_regime,
                                baseline_atr as _baseline_atr,
                                scaled_thresholds as _scaled_thresholds)
 from ..live.dxy import DXYTracker
-from ..live.funding import detect_funding_events
+from ..live import day_context as _day_context
+from ..live import posture as _posture_mod
+from ..live.funding import (SMT_PLAYBOOKS as _SMT_PLAYBOOKS,
+                            FundingReport, detect_funding_events,
+                            smt_funding_event)
 from ..live.health import HealthMonitor
+from ..live.management_profiles import (
+    drift_triggered as _drift_triggered,
+    profile_for as _mgmt_profile_for, progress_due as _progress_due,
+    tp_ladder as _tp_ladder)
+from ..live.news import preprint_action as _preprint_action
+from ..live.smt import detect_smt as _detect_smt
 from ..live.opposing import risk_tier as _zone_risk_tier, \
     tier_spec as _tier_spec
 from ..live.sizing import RiskPool, size_for_risk
@@ -307,6 +317,24 @@ class MT5RunnerConfig:
     # 90-min post-news cooldown.  Management is never paused.
     # Config-file / env only — deliberately NOT /set-editable.
     news_pause_enabled: bool = True
+    # --- P3 trader build (spec v3 §12) ------------------------------
+    # Breakeven doctrine (S9/F13): "earned" — breakeven arms on a
+    # funding/structure event or TP1 bank, price touch demoted to
+    # the backstop.  "touch" restores the legacy +1R rule.
+    breakeven_mode: str = "earned"
+    breakeven_backstop_r: float = 2.0
+    # S5 pre-print position rule action for intraday exposure
+    # approaching an EXTREME print: "be" (stop to breakeven) |
+    # "trim" (bank half) | "be_trim" (both).
+    news_preprint_action: str = "be"
+    # S11 per-style daily trade ceiling (churn brake): a style
+    # whose playbooks have opened this many trades today stops
+    # opening more today.  0 = no ceiling.
+    max_daily_trades_per_style: int = 12
+    # Journey trading (G): counter-journey trades need a nested
+    # zone AND at least this much room (R multiples of the stop)
+    # to the opposing magnet.
+    counter_journey_min_room_r: float = 3.0
     # Entry gates (owner's-bot floor): per-day / per-hour trade caps,
     # cooldown after a close, fingerprint dedup.  In-memory per
     # process run (a restart resets them — see entry_gates.py).
@@ -617,7 +645,10 @@ class MT5Runner:
         self.tick_manager = tick_manager or TickManager(
             tick=TickConfig(
                 scalp_cap_minutes=float(self.cfg.scalp_cap_minutes),
-                time_exit_bars=self.cfg.time_exit_bars))
+                time_exit_bars=self.cfg.time_exit_bars,
+                breakeven_mode=str(self.cfg.breakeven_mode),
+                breakeven_backstop_r=float(
+                    self.cfg.breakeven_backstop_r)))
         # News calendar: the engine's single news source (fetch on
         # the entry path only — never per tick, never blocking).
         self.news = news_calendar or NewsCalendar(
@@ -768,9 +799,37 @@ class MT5Runner:
         self._last_scores: dict[str, dict] = {}
         self._last_score: dict | None = None
         self._funded_events: dict[int, set] = {}
-        self._pullback_watch: dict | None = None
+        # P3: PullbackWatch is MULTI-SLOT — several parked setups,
+        # each with its own zone/expiry/invalidation (was a single
+        # dict pre-P3; _pullback_watch property below keeps the
+        # legacy read for status).
+        self._pullback_watches: list[dict] = []
         self._resting_limit_key: str | None = None
         self._sizing_detail: dict[str, dict] = {}
+        # --- P3 scenario state (spec v3 §12) ---------------------
+        # Refreshed on every TF-close setup refresh: bedrock (the
+        # ONE regime brain), the day object, the composed posture,
+        # the NY acceptance checkpoint, the SMT read.
+        self._bedrock = None
+        self._day_ctx = None
+        self._posture = None
+        self._ny_checkpoint: str | None = None
+        self._ny_checkpoint_day: str = ""
+        self._smt_read = None
+        self._smt_unavailable_key: str = ""
+        self._last_clock = None
+        # Rolling spread samples (dead-window proof, S3/S4).
+        self._spread_samples: list[float] = []
+        self._spread_ratio: float | None = None
+        # Per-signal decision context (alert_id -> ctx) captured
+        # at acceptance, consumed at fill into the per-position
+        # management context (ticket -> ctx).
+        self._pending_signal_ctx: dict | None = None
+        self._signal_ctx: dict[str, dict] = {}
+        self._position_ctx: dict[int, dict] = {}
+        # S11 per-style daily open counts (churn ceilings).
+        self._style_opens_today: dict[str, int] = {}
+        self._style_day: str = ""
         # Funding events carried by a pending LAYER order, consumed
         # when the layer fills (ticket -> [FundingEvent]).
         self._pending_funding: dict[int, list] = {}
@@ -856,7 +915,7 @@ class MT5Runner:
         ``qm_d1`` is deliberately NOT here: the H1 path drives
         ``live_signal`` with H1 bars, and running D1 QM logic on H1
         bars would emit H1 patterns mislabelled as Daily QM.  The
-        Daily QM scan lives in :meth:`_scan_qm_d1`, which evaluates
+        Daily QM lives in :meth:`_run_qm_d1`, which evaluates
         it on the real D1 frame on every D1 close (see
         :meth:`_refresh_bars`) — it is outside A14's scope (not an
         H1-path playbook; no D1-clock order path exists yet)."""
@@ -1134,10 +1193,11 @@ class MT5Runner:
                        "invalidated": 0, "pending": 0,
                        "pending_filled": 0, "pending_cancelled": 0,
                        "qm_d1_shadow": 0}
-        # Daily QM shadow: evaluate the D1 frame once at warm start
-        # (the latest touch, if any, is logged here; later touches
-        # are logged on their D1 close by _refresh_bars).
-        self._scan_qm_d1(self._stack.frames.get("D1"), stats)
+        # Daily QM (P3 real order path): evaluate the D1 frame
+        # once at warm start (the latest touch, if any, is
+        # evaluated here; later touches on their D1 close by
+        # _refresh_bars).
+        self._run_qm_d1(self._stack.frames.get("D1"), stats)
         pump = TickPump(feed, interval=self.cfg.tick_interval)
         try:
             # on_idle: command polling MUST NOT depend on new ticks.
@@ -1181,6 +1241,23 @@ class MT5Runner:
             stats["ticks"] += 1
             self._tick_count += 1
             self._last_tick = tick
+            # P3 spread state (S3/S4): rolling sample book; the
+            # ratio vs the session norm is the dead-window /
+            # spike proof — measured, never clock-assumed.
+            try:
+                sp = float(tick.get("spread") or 0.0)
+                if sp > 0:
+                    self._spread_samples.append(sp)
+                    if len(self._spread_samples) > 600:
+                        self._spread_samples = \
+                            self._spread_samples[-600:]
+                    if len(self._spread_samples) >= 20:
+                        srt = sorted(self._spread_samples)
+                        med = srt[len(srt) // 2]
+                        if med > 0:
+                            self._spread_ratio = sp / med
+            except Exception:
+                pass
             self._health.note_tick(tick.get("time"))
             # Day rollover -> the honest recap for the day/week that
             # just ended (wins AND losses).  Never breaks the loop.
@@ -1253,6 +1330,28 @@ class MT5Runner:
                                 f"MT5 BREAKEVEN {pb} ticket {ticket}: "
                                 f"SL -> entry {action.level:.2f} — "
                                 f"risk off, trade is now free")
+                            # P3 (J): the BE event joins the
+                            # structured record, WITH its earning
+                            # evidence (funding kind / tp1 banked /
+                            # backstop) — F13's audit trail.
+                            if pos is not None:
+                                _be = self.tick_manager.be_state(
+                                    ticket)
+                                log_signal(
+                                    self.journal,
+                                    signal_id=str(pos.alert_id),
+                                    playbook=pb,
+                                    direction=int(pos.direction),
+                                    score=float(
+                                        (self._position_ctx.get(
+                                            int(ticket)) or {}).get(
+                                            "entry_total") or 0.0),
+                                    decision="management",
+                                    reason=(f"be_earned: "
+                                            f"{_be.get('by')}"
+                                            if _be else
+                                            "be_earned: plan"),
+                                    context=self._decision_context())
                         elif action.reason == "profit_lock":
                             self._send_alert(
                                 f"MT5 PROFIT LOCK {pb} ticket {ticket}: "
@@ -1670,6 +1769,10 @@ class MT5Runner:
         _funded = getattr(self, "_funded_events", None)
         if _funded is not None:
             _funded.pop(ticket, None)
+        # P3: the management context dies with the position.
+        _pctx = getattr(self, "_position_ctx", None)
+        if _pctx is not None:
+            _pctx.pop(ticket, None)
         if _pool is not None:
             self.journal.log_note(
                 f"mt5 pool closed: ticket {ticket} budget "
@@ -1837,7 +1940,7 @@ class MT5Runner:
                 self._qm_touch = self._advance_qm(
                     self._stack.frames.get("M5"))
             if tf == "D1":
-                self._scan_qm_d1(
+                self._run_qm_d1(
                     self._stack.frames.get("D1"), stats)
             if tf == "H1":
                 h1_accepted += accepted
@@ -1988,6 +2091,288 @@ class MT5Runner:
         self._update_boundary()
         # Multi-day structural zones (historical WHERE).
         self._update_zones()
+        # P3 scenario state: bedrock + day + posture + SMT (the
+        # decision flow's context — refreshed BEFORE any order
+        # decision on the new bars, like the boundary machine).
+        self._refresh_scenario()
+
+    # --------------------------------------- P3 scenario refresh
+    def _refresh_scenario(self) -> None:
+        """Recompute bedrock / day / posture / SMT from the stack.
+
+        Bedrock (live/regime.py five-axis) is the ONE regime
+        brain of the decision flow (S1): its classification is
+        computed here, on the H1 frame classify_regime is defined
+        on, and composed with the day object + session + loss
+        ladder into the posture every decision journals.  Failures
+        degrade to the previous state with a warning — a context
+        refresh must never kill the trading loop.
+        """
+        try:
+            if self._stack is None:
+                return
+            frames = self._stack.frames
+            h1 = frames.get("H1")
+            if h1 is None or not len(h1):
+                return
+            self._bedrock = classify_regime(h1)
+            prev_hist = self._day_ctx.day_type_history \
+                if self._day_ctx is not None else None
+            self._day_ctx = _day_context.compute_day_context(
+                frames, prior_history=prev_hist)
+            self._refresh_ny_checkpoint(frames)
+            self._refresh_smt(frames)
+            self._posture = self._compose_posture()
+        except Exception as exc:
+            _log.warning("mt5 scenario refresh failed (previous "
+                         "context kept): %s", exc)
+
+    def _refresh_ny_checkpoint(self, frames) -> None:
+        """Evaluate the NY acceptance checkpoint once per day, on
+        the first COMPLETED NY-session H1 bar (S3)."""
+        d = self._day_ctx
+        if d is None or self._ny_checkpoint_day == d.day_key:
+            return
+        h1 = frames.get("H1")
+        if h1 is None or not len(h1):
+            return
+        days = _day_context.group_days(h1)
+        cur = days.get(max(days.keys())) if days else None
+        if cur is None or not len(cur):
+            return
+        ny_bars = [(ts, r) for ts, r in cur.iterrows()
+                   if session_of(ts)[0] in ("newyork", "overlap")]
+        if len(ny_bars) < 1:
+            return
+        # The first NY bar must be COMPLETE: it is not the last
+        # bar of the frame.
+        first_ts, first = ny_bars[0]
+        if first_ts >= h1.index[-1]:
+            return
+        verdict = _posture_mod.ny_checkpoint(
+            d, ny_close=float(first["close"]),
+            ny_low=float(first["low"]), ny_high=float(first["high"]))
+        self._ny_checkpoint = verdict
+        self._ny_checkpoint_day = d.day_key
+        if verdict is not None:
+            self.journal.log_note(
+                f"mt5 NY checkpoint: London leg {verdict} — "
+                "acceptance read at the NY open (S3); posture "
+                "follows the read")
+
+    def _refresh_smt(self, frames) -> None:
+        """SMT read from the DXY tracker's already-fetched H1
+        frame (S7).  Unavailability is journaled ONCE per reason
+        — a broken correlation link is a fact in the record,
+        never a silent zero."""
+        tracker = getattr(self, "_dxy", None)
+        gold = frames.get("H1")
+        dxy_frame = None
+        corr = None
+        try:
+            if tracker is not None:
+                dxy_frame = getattr(tracker, "frame", None)
+                st = getattr(tracker, "state", None)
+                # Only a LIVE correlation read may arm SMT; a
+                # stale one reads as unavailable (never zero).
+                if st is not None and st.available:
+                    corr = st.corr
+        except Exception:
+            dxy_frame, corr = None, None
+        read = _detect_smt(gold, dxy_frame, corr=corr)
+        self._smt_read = read
+        if not read.available:
+            key = read.reason
+            if key != self._smt_unavailable_key:
+                self._smt_unavailable_key = key
+                self.journal.log_note(f"mt5 SMT: {read.reason}")
+        else:
+            self._smt_unavailable_key = ""
+            if read.event is not None:
+                self.journal.log_note(
+                    f"mt5 SMT event: {read.event.kind} — "
+                    f"{read.event.detail}")
+
+    def _compose_posture(self):
+        """Compose the live posture from bedrock + day + session
+        + ladder + news state (posture.compose_posture)."""
+        now = None
+        if self._last_tick is not None:
+            now = self._last_tick.get("time")
+        if now is None and self._stack is not None:
+            h1 = self._stack.frames.get("H1")
+            if h1 is not None and len(h1):
+                now = h1.index[-1]
+        if now is None:
+            now = pd.Timestamp.now(tz="UTC")
+        sess = _posture_mod.session_posture(
+            now, spread_ratio=self._spread_ratio)
+        st = {}
+        try:
+            st = self.guards.state()
+        except Exception:
+            st = {}
+        # Per-style opens reset on the NY trading day.
+        day_key = self._day_ctx.day_key if self._day_ctx else ""
+        if day_key and day_key != self._style_day:
+            self._style_day = day_key
+            self._style_opens_today = {}
+        ladder = _posture_mod.loss_ladder(
+            int(st.get("consecutive_losses", 0) or 0),
+            style_counts=dict(self._style_opens_today),
+            style_ceiling=int(self.cfg.max_daily_trades_per_style))
+        # Killzone cooldown: the ladder's cooldown holds only
+        # until the next killzone — if we ARE in one, it has
+        # already lifted.
+        if ladder.cooldown:
+            try:
+                from ..live.patterns import session_label
+                if session_label(now).get("in_killzone"):
+                    ladder = _posture_mod.LadderState(
+                        consecutive_losses=ladder.consecutive_losses,
+                        layer_cap_delta=ladder.layer_cap_delta,
+                        traffic_cap=ladder.traffic_cap,
+                        cooldown=False,
+                        style_blocked=ladder.style_blocked)
+            except Exception:
+                pass
+        news_block = False
+        if self.cfg.news_pause_enabled:
+            try:
+                news_block = bool(
+                    self.news.execution_state(
+                        self._tick_datetime()).paused)
+            except Exception:
+                news_block = False
+        post = _posture_mod.compose_posture(
+            bedrock=self._bedrock, day=self._day_ctx, session=sess,
+            ladder=ladder, news_block=news_block,
+            checkpoint=self._ny_checkpoint)
+        if not post.block_entries:
+            post.size_scalar = float(post.size_scalar) \
+                * float(sess.size_scalar)
+        return post
+
+    def _tick_datetime(self):
+        """Aware datetime of the last tick (news clock input)."""
+        t = (self._last_tick or {}).get("time")
+        if t is not None:
+            ts = pd.Timestamp(t)
+            return ts.to_pydatetime() if ts.tzinfo is not None \
+                else ts.tz_localize("UTC").to_pydatetime()
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc)
+
+    def _decision_context(self, extra: dict | None = None) -> dict:
+        """The J journaling context for one decision: regime
+        label + posture, day type, ADR state, session, SMT,
+        trigger clock.  Every decision record carries it."""
+        d = self._day_ctx
+        post = self._posture
+        ctx = {
+            "regime": (self._bedrock.label()
+                       if self._bedrock is not None else None),
+            "posture": (post.name if post is not None else None),
+            "posture_reason": (post.reason
+                               if post is not None else None),
+            "day_type": (d.day_type if d is not None else None),
+            "adr_pct": (round(d.adr_consumed_pct, 1)
+                        if d is not None else None),
+            "adr_state": (d.adr_state if d is not None else None),
+            "session": (post.session.name
+                        if post is not None and post.session
+                        else None),
+            "ny_checkpoint": self._ny_checkpoint,
+            "smt": (self._smt_read.event.kind
+                    if self._smt_read is not None
+                    and self._smt_read.event is not None else None),
+            "trigger_tf": (self._last_clock.trigger_tf
+                           if self._last_clock is not None
+                           else None),
+        }
+        if extra:
+            ctx.update(extra)
+        return ctx
+
+    def _log_management(self, ticket: int, pos, reason: str,
+                        note: str) -> None:
+        """Journal one position-management event (P3 J): a text
+        note AND a structured management record carrying the
+        scenario context — the per-playbook demo record is the
+        confirmation evidence (A14), management included."""
+        self.journal.log_note(note)
+        try:
+            log_signal(
+                self.journal, signal_id=str(pos.alert_id),
+                playbook=self._playbook_from_alert_id(pos.alert_id),
+                direction=int(pos.direction),
+                score=float((self._position_ctx.get(int(ticket))
+                             or {}).get("entry_total") or 0.0),
+                decision="management", reason=reason,
+                context=self._decision_context())
+        except Exception:
+            pass
+
+    def _runner_partial(self, ticket: int, pos, frac: float,
+                        reason: str, stats: dict,
+                        price: float) -> bool:
+        """Execute + book a runner-side partial (bar-close
+        management).  Volume is quantized DOWN to the spec step
+        and never below the broker minimum on the remainder —
+        a partial that would strand a sub-minimum remainder
+        closes the whole position instead (journaled as such)."""
+        try:
+            spec = self.executor.symbol_spec(self.cfg.symbol)
+            step = float(getattr(spec, "volume_step", 0.01) or 0.01)
+            minv = float(getattr(spec, "min_volume", 0.01) or 0.01)
+        except Exception:
+            step, minv = 0.01, 0.01
+        want = float(pos.volume) * float(frac)
+        vol = int(want / step) * step if step > 0 else want
+        remainder = float(pos.volume) - vol
+        if vol < minv or remainder < minv:
+            res = self.executor.close_position(int(ticket))
+            if not res.ok:
+                return False
+            self._log_management(
+                ticket, pos, reason,
+                f"mt5 {reason}: ticket {ticket} closing in full "
+                f"({pos.volume:.2f} lots — a {frac:.0%} partial "
+                "would strand a sub-minimum remainder)")
+            self._record_close(int(ticket), float(price),
+                               reason, stats)
+            return True
+        res = self.executor.close_position(int(ticket), volume=vol)
+        if not res.ok:
+            self.journal.log_note(
+                f"mt5 {reason}: partial close FAILED for ticket "
+                f"{ticket} ({res.message})")
+            return False
+        self.tick_manager.book_external_partial(int(ticket), vol)
+        self._log_management(
+            ticket, pos, reason,
+            f"mt5 {reason}: ticket {ticket} banked "
+            f"{vol:.2f} lots ({frac:.0%} of the position) @ "
+            f"{price:.2f}")
+        return True
+
+    def _day_levels(self) -> list:
+        """Location magnets from the day object: unswept session
+        extremes + prior day/week extremes + naked POCs (S3)."""
+        d = self._day_ctx
+        if d is None:
+            return []
+        out: list[float] = []
+        for v in (d.session_levels or {}).values():
+            out.append(float(v))
+        if d.prior:
+            out += [float(d.prior["high"]), float(d.prior["low"]),
+                    float(d.prior["poc"])]
+        if d.prior_week:
+            out += [float(d.prior_week["high"]),
+                    float(d.prior_week["low"])]
+        out += [float(x) for x in (d.naked_pocs or [])]
+        return out
 
     # --------------------------------------- boundary machine + state
     def _update_boundary(self) -> None:
@@ -2900,8 +3285,7 @@ class MT5Runner:
                     f"${st['consumed']:.2f} · headroom "
                     f"${st['headroom']:.2f} · "
                     f"{len(st['layers'])} layer(s) booked")
-        w = self._pullback_watch
-        if w is not None:
+        for w in self._pullback_watches:
             zone = w["zone"]
             left = int(self.cfg.pullback_watch_bars) \
                 - (self._current_h1_bar() - int(w["bar0"]))
@@ -2912,6 +3296,40 @@ class MT5Runner:
                     f"{float(zone['top']):.1f} · {max(left, 0)} H1 "
                     "bars left")
         return out
+
+    def day_line(self) -> str:
+        """P3 /status day line (spec v3 §12 J): the day object +
+        posture in one compact line — day type, ADR consumption,
+        IB state, session posture, NY checkpoint, SMT."""
+        d = self._day_ctx
+        if d is None:
+            return "day: — (no frames yet)"
+        parts = [f"day: {d.day_type}"]
+        if d.adr > 0:
+            parts.append(f"ADR {d.adr_consumed_pct:.0f}% "
+                         f"({d.adr_state})")
+        if d.ib_width > 0:
+            parts.append(
+                f"IB {'set' if d.ib_complete else 'forming'} "
+                f"{d.ib_low:.0f}–{d.ib_high:.0f}")
+        if self._posture is not None:
+            parts.append(f"posture {self._posture.name}")
+        sess = _posture_mod.session_posture(
+            self._last_tick.get("time") if self._last_tick
+            else pd.Timestamp.now(tz="UTC"),
+            spread_ratio=self._spread_ratio)
+        parts.append(f"session {sess.name}")
+        if self._ny_checkpoint:
+            parts.append(f"NY {self._ny_checkpoint}")
+        if d.gap_state != "none":
+            parts.append(f"gap {d.gap_state}")
+        read = self._smt_read
+        if read is not None:
+            if read.event is not None:
+                parts.append(f"SMT {read.event.kind}")
+            elif not read.available:
+                parts.append("SMT n/a (corr broken)")
+        return " · ".join(parts)
 
     def boundary_line(self) -> str:
         """Edge-boundary + persisted-state lines for /status.
@@ -3439,6 +3857,230 @@ class MT5Runner:
                             f"manipulation filter ON: {why}")
         return None
 
+    # --------------------------------------- P3 bar-close management
+    def _manage_positions_bar_close(self, stats: dict) -> None:
+        """Manage open positions like a trader, on the H1 close.
+
+        Per position (context from _register_position_ctx), in
+        desk order: (1) defended-stop breach — a CLOSE back
+        through the pullback pivot that justified the entry ends
+        the trade before the wick stop needs to; (2) the S5
+        pre-print rule into an EXTREME print; (3) the S10
+        progress stop (R-vs-time); (4) the S10 drift exit
+        (thesis decay); (5) bank into the opposing zone (A8);
+        (6) bank the runner into ADR exhaustion (S8).  Hard
+        invalidation (stop / narrative) always owns its exits
+        elsewhere and first — nothing here widens a stop or
+        resurrects a dead thesis.
+        """
+        h1 = self._stack.frames.get("H1") if self._stack else None
+        if h1 is None or not len(h1):
+            return
+        cur_bar = len(h1) - 1
+        last_close = float(h1["close"].iloc[-1])
+        atr_h1 = float(atr14(h1)) if len(h1) else 0.0
+        mid = float((self._last_tick or {}).get("mid")
+                    or last_close)
+        for ticket in list(self.tick_manager.tickets()):
+            pos = self.tick_manager.position(ticket)
+            ctx = self._position_ctx.get(int(ticket))
+            if pos is None or pos.closed or ctx is None:
+                continue
+            profile = ctx["profile"]
+            d = int(pos.direction)
+            elapsed = cur_bar - int(ctx["entry_bar"])
+            # (1) defended stop: close through the defended pivot.
+            defended = ctx.get("defended_stop")
+            if defended is not None and atr_h1 > 0:
+                if (last_close - float(defended)) * d \
+                        < -0.1 * atr_h1:
+                    res = self.executor.close_position(int(ticket))
+                    if res.ok:
+                        self._log_management(
+                            ticket, pos, "defended_stop",
+                            f"mt5 defended stop: ticket {ticket} "
+                            f"H1 close {last_close:.2f} through "
+                            f"the defended pivot {float(defended):.2f}"
+                            " — the pullback thesis is done")
+                        self._record_close(int(ticket), mid,
+                                           "defended_stop", stats)
+                    continue
+            # (2) pre-print rule (S5).
+            if self._preprint_for_position(ticket, pos, ctx, mid,
+                                            atr_h1, stats):
+                if self.tick_manager.position(ticket) is None \
+                        or pos.closed:
+                    continue
+            # (3) progress stop (S10): trim once, exit on a
+            # second full window of no progress.
+            if _progress_due(profile, elapsed_h1_bars=elapsed,
+                             best_r=float(pos.best_r)):
+                if not ctx["progress_trimmed"]:
+                    ctx["progress_trimmed"] = True
+                    ctx["progress_trim_bar"] = elapsed
+                    self._runner_partial(
+                        ticket, pos, 0.5, "progress_trim", stats,
+                        mid)
+                    continue
+                if ctx["progress_trim_bar"] is not None and \
+                        elapsed - int(ctx["progress_trim_bar"]) \
+                        >= profile.progress_h1_bars:
+                    res = self.executor.close_position(int(ticket))
+                    if res.ok:
+                        self._log_management(
+                            ticket, pos, "progress_exit",
+                            f"mt5 progress exit: ticket {ticket} "
+                            f"still < {profile.progress_floor_r}R "
+                            f"after {elapsed} H1 bars — the tape "
+                            "is not paying for this thesis (S10)")
+                        self._record_close(int(ticket), mid,
+                                           "progress_exit", stats)
+                    continue
+            # (4) drift exit (S10): re-score the position's own
+            # direction; decay below the entry floor − margin,
+            # with price NOT through invalidation, trims once and
+            # exits on persistence.
+            if ctx.get("entry_total") is not None:
+                try:
+                    now_score = self._score_for(
+                        direction=d, verdict=None, price=mid,
+                        zone_d=ctx.get("zone_d"), atr=atr_h1,
+                        style_key=ctx["style_key"],
+                        playbook=ctx["playbook"])
+                    through = (last_close
+                               - float(ctx["invalidation"])) * d < 0
+                    if _drift_triggered(
+                            profile, entry_floor=float(ctx["floor"]),
+                            current_total=float(now_score.total),
+                            through_invalidation=bool(through)):
+                        if not ctx["drift_trimmed"]:
+                            ctx["drift_trimmed"] = True
+                            self._runner_partial(
+                                ticket, pos, 0.5, "thesis_drift",
+                                stats, mid)
+                        else:
+                            res = self.executor.close_position(
+                                int(ticket))
+                            if res.ok:
+                                self._log_management(
+                                    ticket, pos, "thesis_drift",
+                                    f"mt5 drift exit: ticket "
+                                    f"{ticket} re-score "
+                                    f"{now_score.total:.0f} < entry "
+                                    f"floor {ctx['floor']:.0f} − "
+                                    f"{profile.drift_margin:.0f} — "
+                                    "the premise decayed (S10)")
+                                self._record_close(
+                                    int(ticket), mid,
+                                    "thesis_drift", stats)
+                        continue
+                except Exception as exc:
+                    _log.warning("mt5 drift read failed for "
+                                 "ticket %s: %s", ticket, exc)
+            # (5) bank into the opposing zone (A8): price reaches
+            # the magnet — take half off at the level the ladder
+            # named, once.
+            prox = ctx.get("opposing_prox")
+            if prox is not None and not ctx["zone_banked"] \
+                    and atr_h1 > 0:
+                if abs(mid - float(prox)) <= 0.25 * atr_h1 \
+                        or (mid - float(prox)) * d > 0:
+                    ctx["zone_banked"] = True
+                    self._runner_partial(
+                        ticket, pos, 0.5, "tp_zone", stats, mid)
+                    continue
+            # (6) ADR exhaustion bank (S8): the day's fuel is
+            # spent and the position is a runner in profit — bank
+            # half into the exhaustion rather than gifting it back.
+            day = self._day_ctx
+            if day is not None and not ctx["adr_banked"] \
+                    and day.adr_days >= 10 \
+                    and day.adr_consumed_pct >= 100.0 \
+                    and float(pos.best_r) >= 1.0:
+                ctx["adr_banked"] = True
+                self._runner_partial(
+                    ticket, pos, 0.5, "adr_bank", stats, mid)
+                continue
+
+    def _preprint_for_position(self, ticket, pos, ctx, mid,
+                               atr_h1, stats) -> bool:
+        """S5 pre-print rule for ONE position.  Returns True when
+        it acted.  Into an EXTREME title whose window opens within
+        the lead: intraday exposure is secured (stop to breakeven
+        and/or a trim, per config); a swing position whose stop
+        already sits beyond 2x the event's typical range is
+        exempt — journaled either way, once per event."""
+        if not self.cfg.news_pause_enabled:
+            return False
+        try:
+            nxt = self.news.next_event(self._tick_datetime())
+        except Exception:
+            return False
+        if nxt is None:
+            return False
+        ev, mins = nxt
+        from ..live.news import _is_extreme as _is_extreme_title
+        if not _is_extreme_title(ev.title) \
+                or mins > self.news.PREPRINT_LEAD_MIN \
+                or mins < -45.0:
+            return False
+        key = f"{ev.title}@{ev.time.isoformat()}"
+        if ctx.get("preprint_key") == key:
+            return False
+        ctx["preprint_key"] = key
+        # Typical event range proxy: 3x H1 ATR (a red print's
+        # first-hour range on gold runs ~2-4 H1 ATRs; documented
+        # proxy — the calendar carries no per-event range).
+        event_range = 3.0 * atr_h1 if atr_h1 > 0 else 0.0
+        eff_stop = self.tick_manager.effective_stop(int(ticket)) \
+            or float(ctx["invalidation"])
+        stop_distance = abs(float(pos.entry_price)
+                            - float(eff_stop))
+        action = _preprint_action(
+            style_family=("swing" if ctx["style_key"] == "swing"
+                          else "intraday"),
+            stop_distance=stop_distance,
+            event_range=event_range)
+        if action == "exempt":
+            self._log_management(
+                ticket, pos, "pre_print_exempt",
+                f"mt5 pre-print: ticket {ticket} EXEMPT from "
+                f"securing into {ev.title} — swing stop "
+                f"{stop_distance:.1f} beyond 2x the event range "
+                f"({event_range:.1f}) (S5)")
+            return True
+        mode = str(self.cfg.news_preprint_action or "be")
+        acted = False
+        if mode in ("trim", "be_trim"):
+            acted = self._runner_partial(
+                ticket, pos, 0.5, "pre_print_trim", stats, mid) \
+                or acted
+        if mode in ("be", "be_trim"):
+            # Stop to breakeven via the ordinary action path (the
+            # tick manager books it, the pool syncs in _manage_tick
+            # style below).
+            from .tick_manager import TickAction as _TA
+            act = _TA("modify_sl", level=float(pos.entry_price),
+                      reason="breakeven")
+            res = self.executor.modify_sl(int(ticket),
+                                          float(pos.entry_price))
+            if res.ok:
+                self.tick_manager.apply(int(ticket), act)
+                pool = self._pools.get(int(ticket))
+                if pool is not None:
+                    try:
+                        pool.move_stop(str(pos.alert_id),
+                                       float(pos.entry_price))
+                    except Exception:
+                        pass
+                self._log_management(
+                    ticket, pos, "pre_print_be",
+                    f"mt5 pre-print: ticket {ticket} stop secured "
+                    f"to breakeven into {ev.title} (window opens "
+                    f"in {mins:.0f}m) (S5)")
+                acted = True
+        return acted
+
     def _on_h1_close(self, tick: dict, stats: dict) -> None:
         """An H1 close: time stop + pending expiry + forming reset.
 
@@ -3466,6 +4108,15 @@ class MT5Runner:
                         ticket,
                         self._last_tick["mid"] if self._last_tick else 0.0,
                         "timeout", stats)
+        # P3 bar-close management (S5/S8/S10 + defended stops):
+        # progress / drift / pre-print / zone + ADR banking.
+        # Runs AFTER the time stop (a timed-out position is gone)
+        # and never breaks the close.
+        try:
+            self._manage_positions_bar_close(stats)
+        except Exception as exc:
+            _log.warning("mt5 bar-close management failed: %s",
+                         exc)
         # Pending-order expiry: unfilled past expiry_bar dies — the
         # setup went stale (a real trader does not leave a limit
         # resting at a dead zone).
@@ -3703,6 +4354,10 @@ class MT5Runner:
                         break
 
     # --------------------------------------- PullbackWatch (§5)
+    #: P3: PullbackWatch slot ceiling — several setups may park
+    #: at once, but the book stays readable.
+    _WATCH_SLOTS = 6
+
     def _enter_pullback_watch(self, pb, sig, verdict, zone_d,
                               score, funding) -> None:
         """Park a runaway setup in PullbackWatch (spec §5): the
@@ -3710,16 +4365,29 @@ class MT5Runner:
         is not dismantled, the watch awaits the pullback for up to
         ``pullback_watch_bars`` H1 bars, dying early only on a
         close through the zone's far edge (the idea is dead, not
-        merely late)."""
-        if self._pullback_watch is not None:
-            return  # one watch at a time; the first setup owns it
-        self._pullback_watch = {
+        merely late).  P3: MULTI-SLOT — each parked setup carries
+        its own zone, expiry and invalidation; a re-print of the
+        same setup refreshes its slot instead of stacking."""
+        key = (pb.name, int(sig.direction),
+               round(float(zone_d.get("level", 0.0)), 1))
+        for w in self._pullback_watches:
+            if w["key"] == key:
+                w["bar0"] = self._current_h1_bar()
+                w["score_total"] = float(score.total)
+                return
+        if len(self._pullback_watches) >= self._WATCH_SLOTS:
+            self.journal.log_note(
+                f"mt5 watch: {pb.name} runaway NOT parked — all "
+                f"{self._WATCH_SLOTS} watch slots are held")
+            return
+        self._pullback_watches.append({
+            "key": key,
             "direction": int(sig.direction),
             "zone": dict(zone_d),
             "playbook": pb.name,
             "bar0": self._current_h1_bar(),
             "score_total": float(score.total),
-        }
+        })
         self.journal.log_note(
             f"mt5 watch: {pb.name} "
             f"{'+' if sig.direction > 0 else '-'}1 runaway from "
@@ -3730,56 +4398,63 @@ class MT5Runner:
             f"{score.total:.0f}); the setup is parked, not reset")
 
     def _maintain_pullback_watch(self, mid: float) -> None:
-        """Per-tick watch upkeep: pullback arrival clears the
-        watch (the live setup re-arms through the normal trigger
-        machinery — nothing was dismantled); a close through the
-        far edge kills it; the bar budget lapses it."""
-        w = self._pullback_watch
-        if w is None:
+        """Per-tick watch upkeep, per slot: pullback arrival
+        clears that slot (the live setup re-arms through the
+        normal trigger machinery — nothing was dismantled); a
+        close through the far edge kills that slot; the bar
+        budget lapses it.  A filled position clears every slot —
+        the watches were alternatives to being in."""
+        if not self._pullback_watches:
             return
-        zone = w["zone"]
-        d = int(w["direction"])
         if self.tick_manager.tickets():
-            self._pullback_watch = None
+            self._pullback_watches = []
             self.journal.log_note(
                 "mt5 watch: cleared — a position is open, the "
-                "watch is moot")
+                "watches are moot")
             return
-        if float(zone["bottom"]) <= mid <= float(zone["top"]):
-            self._pullback_watch = None
-            self.journal.log_note(
-                f"mt5 watch: pullback arrived — price back inside "
-                f"the {zone.get('tf', '?')} zone "
-                f"{float(zone['bottom']):.1f}-{float(zone['top']):.1f}; "
-                "watch cleared, the armed setup owns the entry now")
-            return
-        # Invalidation: an H1 CLOSE beyond the far edge + buffer.
-        try:
-            h1 = (self._stack.frames.get("H1")
-                  if self._stack is not None else None)
-            atr = float(zone.get("atr") or self._last_zone_atr or 0.0)
-            if h1 is not None and len(h1) and atr > 0:
-                last_close = float(h1["close"].iloc[-1])
-                buf = 0.25 * atr
-                dead = (last_close < float(zone["bottom"]) - buf) \
-                    if d > 0 else \
-                    (last_close > float(zone["top"]) + buf)
-                if dead:
-                    self._pullback_watch = None
-                    self.journal.log_note(
-                        "mt5 watch: KILLED — H1 close through the "
-                        "zone's far edge; the idea is dead, not "
-                        "late (§5 probe-death rule)")
-                    return
-        except Exception:
-            pass
-        if self._current_h1_bar() - int(w["bar0"]) \
-                > int(self.cfg.pullback_watch_bars):
-            self._pullback_watch = None
-            self.journal.log_note(
-                f"mt5 watch: lapsed after "
-                f"{self.cfg.pullback_watch_bars} H1 bars without a "
-                "pullback")
+        survivors = []
+        for w in self._pullback_watches:
+            zone = w["zone"]
+            d = int(w["direction"])
+            if float(zone["bottom"]) <= mid <= float(zone["top"]):
+                self.journal.log_note(
+                    f"mt5 watch: pullback arrived — price back "
+                    f"inside the {zone.get('tf', '?')} zone "
+                    f"{float(zone['bottom']):.1f}-"
+                    f"{float(zone['top']):.1f} ({w['playbook']}); "
+                    "watch cleared, the armed setup owns the "
+                    "entry now")
+                continue
+            # Invalidation: an H1 CLOSE beyond the far edge + buf.
+            dead = False
+            try:
+                h1 = (self._stack.frames.get("H1")
+                      if self._stack is not None else None)
+                atr = float(zone.get("atr")
+                            or self._last_zone_atr or 0.0)
+                if h1 is not None and len(h1) and atr > 0:
+                    last_close = float(h1["close"].iloc[-1])
+                    buf = 0.25 * atr
+                    dead = (last_close < float(zone["bottom"]) - buf) \
+                        if d > 0 else \
+                        (last_close > float(zone["top"]) + buf)
+            except Exception:
+                dead = False
+            if dead:
+                self.journal.log_note(
+                    f"mt5 watch: KILLED ({w['playbook']}) — H1 "
+                    "close through the zone's far edge; the idea "
+                    "is dead, not late (§5 probe-death rule)")
+                continue
+            if self._current_h1_bar() - int(w["bar0"]) \
+                    > int(self.cfg.pullback_watch_bars):
+                self.journal.log_note(
+                    f"mt5 watch: lapsed ({w['playbook']}) after "
+                    f"{self.cfg.pullback_watch_bars} H1 bars "
+                    "without a pullback")
+                continue
+            survivors.append(w)
+        self._pullback_watches = survivors
 
     # --------------------------------------- resting limit (A6)
     def _maybe_place_resting_limit(self, tick: dict,
@@ -3793,6 +4468,13 @@ class MT5Runner:
         if not self.cfg.resting_limit_enabled:
             return
         if self.cfg.paused or self._regime_pause is not None:
+            return
+        # P3 posture hook (S1): resting zone interest survives
+        # postures that shelve NEW mid-range entries (compression
+        # explicitly keeps it live) — only a posture that closes
+        # resting interest itself suppresses placement.
+        if self._posture is not None \
+                and not self._posture.resting_interest_live:
             return
         # A resting order that filled / cancelled / expired frees
         # its dedupe key: a later identical setup may rest again.
@@ -3953,6 +4635,19 @@ class MT5Runner:
             request, track_request, stats, bar)
         if placed:
             self._resting_limit_key = key
+            # P3: park the decision context so the FILL registers
+            # a full management context (arrival_zone, zone path).
+            self._signal_ctx[alert_id] = {
+                "playbook": "arrival_zone",
+                "style_key": self._style_key_for(
+                    "arrival_zone", zone_d),
+                "style_bucket": self._style_bucket(
+                    self._style_key_for("arrival_zone", zone_d)),
+                "family": "zone", "floor": float(fl["floor"]),
+                "path": "ZONE_PATH",
+                "entry_total": float(score.total),
+                "zone_d": dict(zone_d), "clock_tf": "H1",
+                "defended_stop": None}
             if detail is not None:
                 self._sizing_detail[alert_id] = detail
             self.journal.log_note(
@@ -3971,7 +4666,8 @@ class MT5Runner:
                        "(A6)",
                 entry=entry, stop=invalidation, targets=[target],
                 score_breakdown=score.breakdown(),
-                trigger_source="resting_limit")
+                trigger_source="resting_limit",
+                context=self._decision_context())
 
     def _evaluate_live_tick(self, tick: dict, stats: dict) -> None:
         """Live evaluation clock: touch arms, family confirms, entry
@@ -4532,14 +5228,42 @@ class MT5Runner:
         except Exception:
             return None
 
+    def _adr_gauge_valid(self, atr: float) -> bool:
+        """The ADR fuel gauge is a measurement only when the
+        day object's ADR actually measures THIS market: enough
+        D1 days behind it (>= 10, the standing guard) AND a
+        magnitude commensurate with the intraday frame — a mean
+        daily range below the signal frame's own ATR is a scale
+        break between the D1 series and the intraday frames
+        (a day's range contains its hours' ranges), not a spent
+        day.  On a broken gauge the input reverts to absent
+        (P1 behaviour — never invented, never a block): the P3
+        regression was a 0.5-point ADR against a 41-point day
+        reading 8349% consumed and de-rating every continuation
+        score's session block to the floor factor."""
+        d = self._day_ctx
+        if d is None or d.adr_days < 10:
+            return False
+        adr = float(d.adr or 0.0)
+        if adr <= 0:
+            return False
+        try:
+            a = float(atr or 0.0)
+        except (TypeError, ValueError):
+            a = 0.0
+        return a <= 0 or adr >= a
+
     def _score_for(self, *, direction: int, verdict: dict | None,
                    price: float, zone_d: dict | None,
-                   atr: float) -> object:
+                   atr: float, style_key: str = "intraday",
+                   playbook: str = "") -> object:
         """Asymmetry Score for one candidate (spec §2).  Frames
-        are parameters, not premises: the H1 path scores on the
-        H1 frame (the path's clock) with the D1 frame as the
-        dealing range when the stack carries one — P3 floats
-        these per style.
+        are parameters, not premises: P3 floats the scoring frame
+        per style via the S12 clock contract (volatility +
+        structure clarity) — at NORMAL vol the desk's defaults
+        reproduce the P1 reads exactly (H1 path on H1).  The
+        chosen clock is stashed on ``self._last_clock`` and
+        journaled per decision (``trigger_tf_used``).
 
         At-zone candidates (price inside the zone band ± 0.5 ATR)
         are scored with allow_flip=False: the approach into a
@@ -4575,26 +5299,266 @@ class MT5Runner:
             range_frame = frames.get("D1")
         else:
             range_frame = frames.get("H1")
+        # --- P3 clock float (S12) --------------------------------
+        clock = self._clock_for_signal(style_key, frames)
+        self._last_clock = clock
+        score_frame = frames.get(clock.score_tf)
+        if score_frame is None:
+            score_frame = frames.get("H1")
+        frame_atr = float(atr or 0.0)
+        if clock.score_tf != "H1" and score_frame is not None \
+                and len(score_frame):
+            try:
+                fa = float(atr14(score_frame))
+                if fa > 0:
+                    frame_atr = fa
+            except Exception:
+                pass
+        # --- P3 score inputs --------------------------------------
+        smt_dir = 0
+        if self._smt_read is not None \
+                and self._smt_read.event is not None:
+            smt_dir = int(self._smt_read.event.direction)
+        from ..live.funding import SMT_PLAYBOOKS as _SMT_PBS
         ctx = ScoreContext(
             direction=int(direction),
-            frame=frames.get("H1"),
-            atr=float(atr or 0.0), price=float(price),
+            frame=score_frame,
+            atr=frame_atr, price=float(price),
             style="", zone=zone_d,
             opposing_zone=self._opposing_dict(direction),
             range_frame=range_frame,
             verdict=verdict,
-            dxy_corr=(verdict or {}).get("dxy_corr"))
+            dxy_corr=(verdict or {}).get("dxy_corr"),
+            smt_direction=smt_dir,
+            smt_context=("reversal" if playbook in _SMT_PBS
+                         else "trend"),
+            adr_consumed_pct=(self._day_ctx.adr_consumed_pct
+                              if self._adr_gauge_valid(atr)
+                              else None),
+            adr_applies=(_posture_mod.family_of(playbook)
+                         == "continuation"),
+            day_levels=self._day_levels())
         return score_asymmetry(ctx, allow_flip=not at_zone)
+
+    def _clock_for_signal(self, style_key: str, frames: dict):
+        """The S12 floated clock for one style: volatility regime
+        from the H4 ATR baseline + per-TF structure clarity."""
+        vol = "NORMAL"
+        try:
+            h4 = frames.get("H4")
+            atr = float(atr14(h4)) if h4 is not None and len(h4) \
+                else 0.0
+            if atr > 0:
+                reg = _atr_regime(atr, _baseline_atr(h4))
+                vol = str(reg.get("regime", "NORMAL"))
+                ratio = float(reg.get("ratio", 1.0) or 1.0)
+                if ratio <= 0.75:
+                    vol = "LOW"
+        except Exception:
+            vol = "NORMAL"
+        clarity = {}
+        if vol == "NORMAL":
+            for tf in ("M5", "M15", "H1", "H4"):
+                f = frames.get(tf)
+                if f is not None and len(f) >= 24:
+                    clarity[tf] = _posture_mod.structure_clarity(f)
+        return _posture_mod.clock_for(
+            style_key, vol_regime=vol, clarity=clarity or None)
+
+    def _style_key_for(self, pb_name: str,
+                       zone_d: dict | None) -> str:
+        """Clock/style bucket for a signal: qm_d1 runs the D1
+        clock; scalps (qm_m5 + scalp-named) the scalp clocks;
+        big-zone trades swing clocks; the rest intraday."""
+        if pb_name == "qm_d1":
+            return "qm_d1"
+        if pb_name == "qm_m5" or "scalp" in str(pb_name):
+            return "scalp"
+        zone_tf = str((zone_d or {}).get("tf") or "")
+        if zone_tf in ("W1", "MN1", "D1"):
+            return "swing"
+        return "intraday"
+
+    @staticmethod
+    def _style_bucket(style_key: str) -> str:
+        """StyleBook bucket name for one clock key (churn
+        ceilings + position context)."""
+        return {"swing": "MACRO_SWING", "qm_d1": "MACRO_SWING",
+                "intraday": "INTRADAY",
+                "scalp": "MICRO_SCALP"}.get(style_key, "INTRADAY")
+
+    def _floor_ok(self, fl: dict, score) -> bool:
+        """One floor row against one score: total + component
+        minimums + the Path B combined Structure+Efficiency
+        term where the row declares it (P3)."""
+        ok = score.total >= float(fl["floor"]) \
+            and score.component("location") >= float(
+                fl.get("min_location", 0.0)) \
+            and score.component("structure") >= float(
+                fl.get("min_structure", 0.0)) \
+            and score.component("efficiency") >= float(
+                fl.get("min_efficiency", 0.0)) \
+            and score.component("pullback") >= float(
+                fl.get("min_pullback", 0.0))
+        mse = fl.get("min_structure_efficiency")
+        if mse is not None:
+            ok = ok and (score.component("structure")
+                         + score.component("efficiency")) \
+                >= float(mse)
+        return ok
+
+    def _zone_dicts(self) -> list:
+        """The graded zone book as dicts (decision-flow reads)."""
+        out = []
+        for z in (self._structural_zones or []):
+            try:
+                out.append(z.to_dict())
+            except Exception:
+                continue
+        return out
+
+    def _zone_tp_targets(self, sig, zone_d) -> list:
+        """A8 zone-anchored TP targets for one accepted signal:
+        the graded zones AHEAD of entry (excluding the entry zone
+        itself) priced through tp_ladder.  Empty when no zone is
+        ahead — the playbook's own targets stand."""
+        try:
+            entry = float(sig.entry_ref)
+            stop = float(sig.invalidation)
+            d = int(sig.direction)
+            own = float((zone_d or {}).get("level", -1e18))
+            ahead = []
+            for z in self._zone_dicts():
+                if z.get("status", "active") != "active":
+                    continue
+                if abs(float(z.get("level", 0.0)) - own) < 1e-9:
+                    continue  # the entry zone is not a target
+                prox = float(z.get("proximal")
+                             or z.get("level") or 0.0)
+                if (prox - entry) * d > 0:
+                    ahead.append(z)
+            if not ahead:
+                return []
+            ladder = _tp_ladder(entry=entry, stop=stop,
+                                direction=d, zones_ahead=ahead)
+            targets = [float(ladder[k]) for k in
+                       ("tp1", "tp2", "tp3")
+                       if ladder.get(k) is not None]
+            if targets:
+                self.journal.log_note(
+                    "mt5 tp ladder: " + "; ".join(ladder["log"]))
+            return targets
+        except Exception:
+            return []
+
+    def _journey_context(self, *, direction: int, price: float,
+                         stop_dist: float, zone_d: dict | None,
+                         atr: float) -> dict:
+        """Journey geometry for an OPEN-SPACE signal (G): the
+        map is never empty between zones — the nearest graded
+        magnet ahead is the journey's draw.  With-journey trades
+        ride toward it (room < 1.5R is a geometry refusal: the
+        target is inside the noise).  Counter-journey trades
+        (the nearer draw is BEHIND) are refused unless a nested
+        faster-TF zone holds price AND the room to the magnet
+        clears the configured minimum — the refusal is journaled
+        with its reason, never silent."""
+        res: dict = {"state": "at_zone" if zone_d is not None
+                     else "open", "magnet": None,
+                     "magnet_dist_atr": None, "room_r": None,
+                     "refusal": None, "nested": False}
+        if zone_d is not None:
+            return res
+        zones = [z for z in self._zone_dicts()
+                 if z.get("status", "active") == "active"
+                 and z.get("tier") in ("MAJOR", "MINOR")]
+
+        def _prox(z):
+            return float(z.get("proximal") or z.get("level")
+                         or 0.0)
+
+        def _inside(z):
+            b, t = z.get("bottom"), z.get("top")
+            return b is not None and t is not None \
+                and float(b) <= price <= float(t)
+
+        # A zone whose band CONTAINS price is the holder, not the
+        # magnet — the journey's draw is the next zone beyond it.
+        ahead = [z for z in zones
+                 if (_prox(z) - price) * direction > 0
+                 and not _inside(z)]
+        behind = [z for z in zones
+                  if (_prox(z) - price) * direction < 0]
+        if not ahead:
+            return res
+        magnet = min(ahead, key=lambda z: abs(_prox(z) - price))
+        mdist = abs(_prox(magnet) - price)
+        res["magnet"] = magnet
+        res["magnet_dist_atr"] = (mdist / atr) if atr > 0 else None
+        res["room_r"] = (mdist / stop_dist) \
+            if stop_dist > 0 else None
+        bdist = min((abs(_prox(z) - price) for z in behind),
+                    default=None)
+        need = float(self.cfg.counter_journey_min_room_r)
+        if bdist is not None and bdist < mdist:
+            res["state"] = "counter"
+            try:
+                mag_idx = _TF_ORDER.index(str(magnet.get("tf")))
+            except ValueError:
+                mag_idx = 0
+            nested = False
+            for z in zones:
+                try:
+                    zi = _TF_ORDER.index(str(z.get("tf")))
+                except ValueError:
+                    continue
+                if zi > mag_idx and float(z.get("bottom", 0.0)) \
+                        - 0.5 * atr <= price \
+                        <= float(z.get("top", 0.0)) + 0.5 * atr:
+                    nested = True
+                    break
+            res["nested"] = nested
+            if not nested:
+                res["refusal"] = (
+                    "counter_journey: the nearer draw is behind "
+                    "the trade and no nested faster-TF zone holds "
+                    "price — counter-journey needs a nested zone "
+                    f"+ >= {need:.0f}R room to the magnet (G)")
+            elif res["room_r"] is not None \
+                    and res["room_r"] < need:
+                res["refusal"] = (
+                    f"counter_journey: room to the magnet "
+                    f"{res['room_r']:.1f}R < {need:.0f}R minimum "
+                    "— refused (G)")
+        else:
+            res["state"] = "with"
+            if res["room_r"] is not None and res["room_r"] < 1.5:
+                res["refusal"] = (
+                    f"journey_room: magnet only "
+                    f"{res['room_r']:.1f}R away — the target "
+                    "sits inside the noise (geometry, G)")
+        return res
 
     def _funding_report(self, verdict: dict | None,
                         zone_d: dict | None):
         """Funding-event detectors over the entry frame (spec
         §4.2): the chain evaluators reused, never gated on.  The
-        entry frame + ATR follow the narrative chain's own
-        convention (M15 bars, H4 ATR, regime-scaled thresholds)."""
+        entry frame follows the S12 floated funding clock for the
+        verdict's style (M15 at NORMAL vol — the narrative
+        chain's convention; H1 when vol promotes); ATR stays the
+        H4 reference with regime-scaled thresholds."""
         frames = (self._stack.frames if self._stack is not None
                   else {}) or {}
-        entry = frames.get("M15")
+        entry_clock = str((verdict or {}).get("entry_clock")
+                          or "M15")
+        style = "scalp" if entry_clock in ("M5", "M1") \
+            else "intraday"
+        clock = self._clock_for_signal(style, frames)
+        entry = frames.get(clock.funding_tf)
+        if entry is None:
+            entry = frames.get("M15")
+        if entry is None:
+            entry = frames.get("H1")
         h4 = frames.get("H4")
         atr = float(atr14(h4)) if h4 is not None and len(h4) else 0.0
         if atr <= 0:
@@ -4617,11 +5581,93 @@ class MT5Runner:
         no trim (the scalar prices a barrier; without one there
         is nothing to price)."""
         if not zone_d:
-            return "YELLOW", 1.0, 99
-        tier = _zone_risk_tier(zone_d)
-        spec = _tier_spec(tier)
-        ceiling = {"GREEN": 3, "YELLOW": 2, "RED": 1}.get(tier, 2)
-        return tier, float(spec.get("size_mult", 0.75)), ceiling
+            tier, mult, ceiling = "YELLOW", 1.0, 99
+        else:
+            tier = _zone_risk_tier(zone_d)
+            spec = _tier_spec(tier)
+            ceiling = {"GREEN": 3, "YELLOW": 2, "RED": 1}.get(
+                tier, 2)
+            mult = float(spec.get("size_mult", 0.75))
+        # S11 loss ladder: >= 2 consecutive losses caps the
+        # traffic light at YELLOW (size + layer ceiling follow
+        # the tier down).  A cap only ever trims — never vetoes.
+        ladder = self._posture.ladder if self._posture else None
+        if ladder is not None and ladder.traffic_cap == "YELLOW" \
+                and tier == "GREEN":
+            tier = "YELLOW"
+            mult = min(mult, float(_tier_spec("YELLOW").get(
+                "size_mult", 0.75)))
+            ceiling = min(ceiling, 2)
+        return tier, mult, ceiling
+
+    def _register_position_ctx(self, ticket: int, *,
+                               alert_id: str, entry: float,
+                               stop: float, direction: int) -> dict:
+        """P3: build the per-position management context at fill.
+
+        Consumes the decision context parked at placement (the
+        golden-confirm path may not carry one — defaults are then
+        derived from the playbook identity, never invented
+        scores).  The context is what bar-close management
+        (progress / drift / pre-print / zone bank / ADR bank /
+        defended stop) reads: entry score + floor, style, the
+        S9 management profile, the opposing magnet, one-shot
+        flags.  Also books the S11 per-style daily open count.
+        """
+        parked = self._signal_ctx.pop(alert_id, None) or {}
+        pb_name = parked.get("playbook") \
+            or self._playbook_from_alert_id(alert_id)
+        zone_d = parked.get("zone_d")
+        style_key = parked.get("style_key") \
+            or self._style_key_for(pb_name, zone_d)
+        bucket = parked.get("style_bucket") \
+            or self._style_bucket(style_key)
+        narr = self._narrative_states.get(int(ticket))
+        profile_style = "scalp" if bucket == "MICRO_SCALP" else (
+            "v_reversal" if pb_name == "v_reversal" else style_key)
+        profile = _mgmt_profile_for(
+            style=profile_style,
+            philosophy=(self._posture.target_philosophy
+                        if self._posture is not None else "trend"),
+            late_confirm=bool(getattr(narr, "late_confirm", False)),
+            high_vol=bool(getattr(narr, "high_vol", False))
+            or (self._bedrock is not None
+                and str(self._bedrock.volatility) in
+                ("high", "spike")),
+            clock_tf=parked.get("clock_tf") or "H1")
+        opp = self._opposing_dict(int(direction))
+        ctx = {
+            "ticket": int(ticket), "alert_id": alert_id,
+            "playbook": pb_name, "style_key": style_key,
+            "style_bucket": bucket,
+            "family": parked.get("family")
+            or _posture_mod.family_of(pb_name),
+            "floor": float(parked.get("floor", 50.0)),
+            "entry_total": parked.get("entry_total"),
+            "entry_bar": self._current_h1_bar(),
+            "clock_tf": parked.get("clock_tf") or "H1",
+            "profile": profile,
+            "defended_stop": parked.get("defended_stop"),
+            "invalidation": float(stop),
+            "direction": int(direction),
+            "zone_d": zone_d,
+            "opposing_prox": (float(opp["proximal"])
+                              if opp and opp.get("proximal")
+                              is not None else None),
+            "progress_trimmed": False, "progress_trim_bar": None,
+            "drift_trimmed": False, "preprint_key": None,
+            "zone_banked": False, "adr_banked": False,
+        }
+        self._position_ctx[int(ticket)] = ctx
+        # S11 churn bookkeeping: opens count against the style's
+        # daily ceiling (reset on the NY trading day).
+        day_key = self._day_ctx.day_key if self._day_ctx else ""
+        if day_key and day_key != self._style_day:
+            self._style_day = day_key
+            self._style_opens_today = {}
+        self._style_opens_today[bucket] = \
+            self._style_opens_today.get(bucket, 0) + 1
+        return ctx
 
     def _pool_for_open(self, ticket: int, *, lots: float,
                        entry: float, stop: float, direction: int,
@@ -4633,6 +5679,11 @@ class MT5Runner:
         evidence-driven.  Fixed mode books the owner's explicit
         lots against an envelope at least as large (the pool is
         the ledger there, RiskGuards remain the gate)."""
+        # P3: every base fill registers its management context
+        # (independent of the pool ledger's fate below).
+        self._register_position_ctx(
+            ticket, alert_id=alert_id, entry=entry, stop=stop,
+            direction=direction)
         if ticket in self._pools:
             return self._pools[ticket]
         try:
@@ -4766,6 +5817,39 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: funding detectors failed ({exc}) — "
                 "decisions proceed on score alone")
+        # P3 (S9/F13): funding events EARN the held position's
+        # breakeven — a structure/displacement/sweep print in the
+        # position's direction is the desk's evidence that the
+        # stop may move; the +1R price touch alone no longer
+        # moves it (backstop excepted, in the tick manager).
+        try:
+            _tickets = self.tick_manager.tickets()
+            if _tickets and funding is not None and funding.events:
+                _pos = self.tick_manager.position(_tickets[0])
+                if _pos is not None and int(_pos.direction) == int(
+                        (verdict or {}).get("direction", 0) or 0):
+                    _via = "funding:" + ",".join(sorted(
+                        {e.kind for e in funding.events}))
+                    if self.tick_manager.mark_be_earned(
+                            _tickets[0], _via):
+                        self.journal.log_note(
+                            f"mt5: breakeven EARNED for ticket "
+                            f"{_tickets[0]} ({_via}) — the stop "
+                            "moves on the next tick (S9)")
+                        log_signal(
+                            self.journal,
+                            signal_id=str(_pos.alert_id),
+                            playbook=self._playbook_from_alert_id(
+                                _pos.alert_id),
+                            direction=int(_pos.direction),
+                            score=float((self._position_ctx.get(
+                                _tickets[0]) or {}).get(
+                                "entry_total") or 0.0),
+                            decision="management",
+                            reason=f"be_earned: {_via}",
+                            context=self._decision_context())
+        except Exception:
+            pass
         for pb in self._get_playbooks():
             if pb.name in (self.cfg.disabled_playbooks or ()):
                 continue  # kill switch (/set) — not evaluated (A14)
@@ -4811,13 +5895,51 @@ class MT5Runner:
             if sig.index - self._last_sig_bar.get(pb.name, -10 ** 9) \
                     < self.cfg.signal_gap_bars:
                 continue
-            # ---- Asymmetry Score (the decision number) ----------
+            # ---- P3 style/family + journey pre-pass -------------
+            # The style bucket picks the floated clocks + the
+            # open-space floor row; the family is the posture unit.
+            # With NO zone context the trade is open-space: the
+            # journey map (zones both sides) decides with/counter
+            # -journey geometry, and a scalp whose magnet sits
+            # within reach is a scalp-INTO-zone — the approached
+            # zone becomes its scoring context.
+            style_key = self._style_key_for(pb.name, zone_d)
+            family = _posture_mod.family_of(
+                pb.name, str(getattr(pb, "regime_scope", "") or ""))
             atr_h1 = float(atr14(h1)) if len(h1) else 0.0
+            _atr = atr_h1 or float(getattr(sig, "atr", 0.0) or 0.0)
+            stop_dist = abs(float(sig.entry_ref)
+                            - float(sig.invalidation)) or _atr
+            scalp_into_zone = False
+            journey = self._journey_context(
+                direction=int(sig.direction),
+                price=float(sig.entry_ref), stop_dist=stop_dist,
+                zone_d=zone_d, atr=_atr)
+            if zone_d is None and style_key == "scalp" \
+                    and journey.get("magnet") is not None \
+                    and journey.get("magnet_dist_atr") is not None \
+                    and journey["magnet_dist_atr"] <= 1.5:
+                zone_d = journey["magnet"]
+                scalp_into_zone = True
+                # The scalp's geometry IS the magnet: the generic
+                # journey-room rule does not refuse it (its floor
+                # + defended stop govern instead).
+                journey["refusal"] = None
+                journey["state"] = "scalp_into_zone"
+            # ---- Asymmetry Score (the decision number) ----------
             score = self._score_for(
                 direction=int(sig.direction), verdict=verdict,
                 price=float(sig.entry_ref), zone_d=zone_d,
-                atr=atr_h1 or float(getattr(sig, "atr", 0.0) or 0.0))
+                atr=_atr, style_key=style_key, playbook=pb.name)
             breakdown = score.breakdown()
+            if self._last_clock is not None:
+                breakdown["frame_tf"] = self._last_clock.score_tf
+                breakdown["trigger_tf"] = self._last_clock.trigger_tf
+                breakdown["clock_reason"] = self._last_clock.reason
+            if self._posture is not None:
+                breakdown["posture"] = self._posture.name
+            if self._day_ctx is not None:
+                breakdown["day_type"] = self._day_ctx.day_type
             self._last_scores[pb.name] = breakdown
             self._last_score = breakdown
             hier_rec = {
@@ -4844,7 +5966,8 @@ class MT5Runner:
                     stop=float(sig.invalidation),
                     targets=[float(x) for x in (sig.targets or [])],
                     factors=list(getattr(sig, "factors", []) or []),
-                    hierarchy=hier_rec, score_breakdown=breakdown)
+                    hierarchy=hier_rec, score_breakdown=breakdown,
+                    context=self._decision_context())
                 continue
             if zone_d is not None \
                     and str(zone_d.get("lifecycle") or "") == "used_up":
@@ -4864,7 +5987,8 @@ class MT5Runner:
                     stop=float(sig.invalidation),
                     targets=[float(x) for x in (sig.targets or [])],
                     factors=list(getattr(sig, "factors", []) or []),
-                    hierarchy=hier_rec, score_breakdown=breakdown)
+                    hierarchy=hier_rec, score_breakdown=breakdown,
+                    context=self._decision_context())
                 continue
             # ---- hard lines: declarations + cost ----------------
             # The real engine exposes hard_line_check (rework).
@@ -4902,8 +6026,88 @@ class MT5Runner:
                     stop=float(sig.invalidation),
                     targets=[float(x) for x in (sig.targets or [])],
                     factors=list(getattr(sig, "factors", []) or []),
-                    hierarchy=hier_rec, score_breakdown=breakdown)
+                    hierarchy=hier_rec, score_breakdown=breakdown,
+                    context=self._decision_context())
                 continue
+            # ---- P3 posture gate (S1/S3/S11/S12) ----------------
+            # The composed scenario posture rules BEFORE the floor
+            # (eligibility precedes quality): entry-blocking
+            # postures (spike / dead window / loss cooldown),
+            # family shelvings, per-style churn ceilings, and the
+            # floated clock's stand-aside.  Every refusal is a
+            # JOURNALED posture with its reason — never silent.
+            post = self._posture
+            if post is not None:
+                # bedrock.direction speaks "up"/"down"/"flat"
+                # (regime.py) — normalize through posture.dir_int,
+                # never a raw int() (int("flat") crashed the tick
+                # signal path: the exception was swallowed by
+                # _run_signal_path and the fired trigger died
+                # journaled only as "signal path failed").
+                _trend_dir = _posture_mod.dir_int(
+                    getattr(self._bedrock, "direction", 0)) \
+                    if self._bedrock is not None else 0
+                _block = None
+                if post.block_entries:
+                    _block = f"posture {post.name}: {post.reason}"
+                else:
+                    _shelved = post.shelved_reason(
+                        family, direction=int(sig.direction),
+                        trend_direction=_trend_dir)
+                    if _shelved:
+                        _block = _shelved
+                    elif post.ladder is not None and \
+                            self._style_bucket(style_key) in \
+                            post.ladder.style_blocked:
+                        _block = (
+                            f"posture churn ceiling: style "
+                            f"{self._style_bucket(style_key)} hit "
+                            f"its daily ceiling of "
+                            f"{self.cfg.max_daily_trades_per_style} "
+                            "opens (S11 — the style is done for "
+                            "today, not the engine)")
+                    elif self._last_clock is not None \
+                            and self._last_clock.stand_aside:
+                        _block = f"clock float: {self._last_clock.reason}"
+                if _block is not None:
+                    stats["gated"] = stats.get("gated", 0) + 1
+                    self._record_blocked(_block, pb.name)
+                    self.journal.log_note(
+                        f"mt5: {pb.name} signal posture-gated: "
+                        f"{_block}")
+                    log_signal(
+                        self.journal, signal_id=alert_id,
+                        playbook=pb.name,
+                        direction=int(sig.direction),
+                        score=float(sig.score), decision="gated",
+                        reason=_block,
+                        bar_ts=h1.index[t] if t < len(h1) else None,
+                        entry=float(sig.entry_ref),
+                        stop=float(sig.invalidation),
+                        targets=[float(x) for x in
+                                 (sig.targets or [])],
+                        factors=list(getattr(sig, "factors", [])
+                                     or []),
+                        hierarchy=hier_rec,
+                        score_breakdown=breakdown,
+                        context=self._decision_context())
+                    continue
+            # ---- P3 SMT funding leg (S7) -------------------------
+            # A live SMT event backing a REVERSAL playbook at a
+            # level joins this signal's funding report (colour
+            # +5) — composed per playbook, the shared verdict
+            # report is never mutated.
+            if funding is not None and self._smt_read is not None:
+                _smt_ev = smt_funding_event(
+                    self._smt_read.event, playbook=pb.name,
+                    direction=int(sig.direction),
+                    at_level=zone_d is not None)
+                if _smt_ev is not None:
+                    funding = FundingReport(
+                        events=[*funding.events, _smt_ev],
+                        runaway=funding.runaway,
+                        confirm_decision=funding.confirm_decision,
+                        logs=funding.logs)
             # ---- per-style floor (was: flat min_score) ----------
             # The floor is defined for zone-path trades (P1 is the
             # arrival pass).  A signal with NO zone context is not
@@ -4936,6 +6140,7 @@ class MT5Runner:
             _arm = str(_v.get("arm") or _nested.get("arm") or "")
             _style = str(_v.get("style") or _nested.get("style")
                          or getattr(pb, "style", "") or "")
+            floor_exempt = False
             if str(_v.get("regime", "")) == "range":
                 path = "RANGE"
             elif _arm == "continuation" \
@@ -4944,25 +6149,79 @@ class MT5Runner:
                 path = "INTRADAY_CONTINUATION"
             elif _style in STYLE_FLOORS:
                 path = _style
+            elif scalp_into_zone:
+                path = "MICRO_SCALP_OPEN"
+            elif zone_d is None:
+                # P3 OPEN SPACE (G): a DECLARED open-space trade
+                # floors on its style row (Path B: total +
+                # component minimums + Structure+Efficiency
+                # >= 35), and the journey geometry below rules
+                # the map between zones.  Declaration is a
+                # positive marker: an open-space style bucket
+                # (swing / scalp / qm_d1 — the map below) or the
+                # scenario verdict's declared trend regime (the
+                # §3.3 mid-range continuation).  A signal with NO
+                # zone context and NO open-space declaration is
+                # not an open-space trade — it is the residue the
+                # P1 scope boundary covered ("not an arrival-path
+                # signal; hard lines only"), and defaulting it
+                # onto the continuation row floored trades the
+                # desk never classified (the P3 regression: the
+                # Golden Swing ceremony, the manipulation hard
+                # line and reasoning attachment all sit downstream
+                # of this check).  The boundary is restored for
+                # the undeclared residue only; every declared
+                # open-space trade keeps its Path B floor.
+                if style_key in ("swing", "scalp", "qm_d1") \
+                        or str(_v.get("regime", "")) == "trend":
+                    path = {"swing": "MACRO_SWING_OPEN",
+                            "qm_d1": "MACRO_SWING_OPEN",
+                            "scalp": "MICRO_SCALP_OPEN"}.get(
+                                style_key, "INTRADAY_CONTINUATION")
+                else:
+                    path = "ZONE_PATH"
+                    floor_exempt = True
             else:
                 path = "ZONE_PATH"
             fl = floor_for(path)
-            if zone_d is None:
-                floor_ok = True
+            floor_ok = True if floor_exempt else self._floor_ok(
+                fl, score)
+            if floor_exempt:
                 self.journal.log_note(
-                    f"mt5: {pb.name} signal has no zone context — "
-                    "asymmetry floor not applied (not an "
+                    f"mt5: {pb.name} signal has no zone context "
+                    "— asymmetry floor not applied (not an "
                     "arrival-path signal); hard lines only")
-            else:
-                floor_ok = score.total >= float(fl["floor"]) \
-                    and score.component("location") >= float(
-                        fl.get("min_location", 0.0)) \
-                    and score.component("structure") >= float(
-                        fl.get("min_structure", 0.0)) \
-                    and score.component("efficiency") >= float(
-                        fl.get("min_efficiency", 0.0)) \
-                    and score.component("pullback") >= float(
-                        fl.get("min_pullback", 0.0))
+            elif zone_d is None:
+                self.journal.log_note(
+                    f"mt5: {pb.name} open-space signal — floored "
+                    f"on {path} (Path B), journey "
+                    f"{journey.get('state')}"
+                    + (f", room {journey['room_r']:.1f}R to the "
+                       "magnet" if journey.get("room_r")
+                       is not None else ""))
+            # Journey geometry refusal (G): with-journey room or
+            # counter-journey rules — journaled with the reason,
+            # binding on layers too (geometry does not care which
+            # leg it is).
+            if journey.get("refusal"):
+                stats["gated"] = stats.get("gated", 0) + 1
+                self._record_blocked(journey["refusal"], pb.name)
+                self.journal.log_note(
+                    f"mt5: {pb.name} signal journey-refused: "
+                    f"{journey['refusal']}")
+                log_signal(
+                    self.journal, signal_id=alert_id,
+                    playbook=pb.name, direction=int(sig.direction),
+                    score=float(sig.score), decision="gated",
+                    reason=journey["refusal"],
+                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    entry=float(sig.entry_ref),
+                    stop=float(sig.invalidation),
+                    targets=[float(x) for x in (sig.targets or [])],
+                    factors=list(getattr(sig, "factors", []) or []),
+                    hierarchy=hier_rec, score_breakdown=breakdown,
+                    context=self._decision_context())
+                continue
             holding = bool(self.tick_manager.tickets())
             if not floor_ok and not holding:
                 reason = (
@@ -4992,7 +6251,8 @@ class MT5Runner:
                         factors=list(getattr(sig, "factors", [])
                                      or []),
                         hierarchy=hier_rec, score_breakdown=breakdown,
-                        trigger_source="arrival_score")
+                        trigger_source="arrival_score",
+                        context=self._decision_context())
                     continue
                 self._record_blocked(
                     f"min_score: {reason}", pb.name)
@@ -5006,13 +6266,27 @@ class MT5Runner:
                     stop=float(sig.invalidation),
                     targets=[float(x) for x in (sig.targets or [])],
                     factors=list(getattr(sig, "factors", []) or []),
-                    hierarchy=hier_rec, score_breakdown=breakdown)
+                    hierarchy=hier_rec, score_breakdown=breakdown,
+                    context=self._decision_context())
                 continue
             conf, notes = engine.score_live_signal(
                 pb, sig, ctx, hierarchy_verdict=verdict)
             trigger_source = "funding_layer" if (
                 holding and funding is not None
                 and funding.events) else "arrival_score"
+            # S5 label (P3): a reversal entry inside the
+            # post-print reaction window, at a level, is the
+            # desk's spike-fade shape — the record says so.
+            if trigger_source == "arrival_score" \
+                    and pb.name in _SMT_PLAYBOOKS \
+                    and zone_d is not None \
+                    and self.cfg.news_pause_enabled:
+                try:
+                    if self.news.reaction_state(
+                            self._tick_datetime()) is not None:
+                        trigger_source = "post_print_fade"
+                except Exception:
+                    pass
             self._last_sig_bar[pb.name] = sig.index
             stats["signals"] += 1
             self._signal_counts[pb.name] = \
@@ -5061,7 +6335,8 @@ class MT5Runner:
                 study=study,
                 hierarchy=hier_rec,
                 score_breakdown=breakdown,
-                trigger_source=trigger_source)
+                trigger_source=trigger_source,
+                context=self._decision_context())
             if not auto:
                 # Config-narrowed execute list (A14 override): the
                 # signal was evaluated and logged; the owner's
@@ -5110,7 +6385,8 @@ class MT5Runner:
                         entry=float(sig.entry_ref),
                         stop=float(sig.invalidation),
                         targets=[float(x) for x in (sig.targets or [])],
-                        factors=list(notes))
+                        factors=list(notes),
+                        context=self._decision_context())
                     continue
             if self.tick_manager.tickets():
                 self._try_layer(pb, sig, stats, verdict=verdict,
@@ -5126,10 +6402,31 @@ class MT5Runner:
                 self._stage_order_confirm(pb, sig, stats,
                                           verdict=verdict, entry_bar=t)
             else:
-                self._place_live_order(pb, sig, stats,
-                                       verdict=verdict,
-                                       entry_bar=t, score=score,
-                                       zone_d=zone_d)
+                # P3: park the decision context for the fill +
+                # price the A8 zone TP ladder for the order.
+                _sig_ctx = {
+                    "playbook": pb.name, "style_key": style_key,
+                    "style_bucket": self._style_bucket(style_key),
+                    "family": family, "floor": float(fl["floor"]),
+                    "path": path,
+                    "entry_total": float(score.total),
+                    "zone_d": (dict(zone_d) if zone_d else None),
+                    "clock_tf": (self._last_clock.trigger_tf
+                                 if self._last_clock else "H1"),
+                    "defended_stop": (
+                        float(sig.invalidation) if path in (
+                            "INTRADAY_CONTINUATION",
+                            "MACRO_SWING_OPEN", "MICRO_SCALP_OPEN")
+                        else None),
+                }
+                _ladder_targets = self._zone_tp_targets(
+                    sig, zone_d)
+                if _ladder_targets:
+                    _sig_ctx["targets"] = _ladder_targets
+                self._place_live_order(
+                    pb, sig, stats, verdict=verdict,
+                    entry_bar=t, score=score, zone_d=zone_d,
+                    funding=funding, signal_ctx=_sig_ctx)
 
     # ------------------------------------------------------------- layering
     # Scale-in onto ONE position: a confirming setup in the same
@@ -5165,9 +6462,19 @@ class MT5Runner:
             return
         layers = self.tick_manager.layers(ticket)
         # Traffic-light scalar trims the layer CEILING (§4.4) —
-        # it never vetoes the position itself.
+        # it never vetoes the position itself.  P3 adds the
+        # posture cap (coil: 1) and the S11 loss-ladder delta
+        # (>= 2 consecutive losses: ceiling -1) to the same min.
         _tier, _smult, ceiling = self._traffic(zone_d)
         max_layers = min(int(self.cfg.layer_max_layers), ceiling)
+        post = self._posture
+        if post is not None:
+            if post.layer_ceiling_cap is not None:
+                max_layers = min(max_layers,
+                                 int(post.layer_ceiling_cap))
+            if post.ladder is not None:
+                max_layers = max(
+                    1, max_layers + int(post.ladder.layer_cap_delta))
         if len(layers) >= max_layers:
             self.journal.log_note(
                 f"mt5: layer skipped {pb.name}: layer ceiling "
@@ -5876,7 +7183,9 @@ class MT5Runner:
                           is_layer: bool = False,
                           layer_lots: float | None = None,
                           funding_events: list | None = None,
-                          score=None, zone_d: dict | None = None
+                          score=None, zone_d: dict | None = None,
+                          funding=None,
+                          signal_ctx: dict | None = None
                           ) -> None:
         """Setup-dependent order selection + placement.
 
@@ -5921,6 +7230,38 @@ class MT5Runner:
                     f"({state.regime} {state.event_title})")
                 return
             news_mult = state.size_mult
+            # S5 post-print REACTION state (P3): for ~30 min after
+            # an EXTREME print the desk trades the REACTION, not
+            # the clock — an entry needs the first post-print
+            # structure (displacement / structure shift in the
+            # funding report).  Once structure prints, the size
+            # blend keys off IT (full mult), not the cooldown
+            # clock.  A fade AT a graded level off the spike's
+            # termination is the sanctioned exception shape — it
+            # still needs its displacement leg, which the fade's
+            # own funding carries when real.
+            _reaction = self.news.reaction_state(
+                self._tick_datetime())
+            if _reaction is not None:
+                _has_structure = funding is not None and any(
+                    e.kind in ("structure_shift", "displacement")
+                    for e in funding.events)
+                if not _has_structure:
+                    stats["gate_reaction"] = stats.get(
+                        "gate_reaction", 0) + 1
+                    self.journal.log_note(
+                        f"mt5: order refused {pb.name}: post-print "
+                        f"reaction state ({_reaction.title}) — no "
+                        "first displacement / structure print yet; "
+                        "the desk trades the reaction, it does "
+                        "not front-run it")
+                    return
+                news_mult = 1.0
+                self.journal.log_note(
+                    f"mt5: post-print reaction entry {pb.name}: "
+                    f"structure printed after {_reaction.title} "
+                    "— size blend keys off the structure, not "
+                    "the clock (S5)")
         # Entry gates (base orders only): caps / cooldown /
         # fingerprint dedup.  Layers are management of a held
         # position, never gated.  The fingerprint is recorded only
@@ -5979,6 +7320,11 @@ class MT5Runner:
             risk_money *= float(
                 (verdict or {}).get("size_mult", 1.0) or 1.0)
             risk_money *= float(news_mult)
+            # P3 posture scalar (S1/S3): the scenario's size
+            # expression — trend/rotation/choppy/session posture
+            # priced into the risk, never a gate.
+            if self._posture is not None:
+                risk_money *= float(self._posture.size_scalar)
             if self.cfg.golden_swing_sizing_enabled:
                 risk_money *= float(self._alignment.size_multiplier)
             risk_money *= session_multiplier(
@@ -6051,6 +7397,12 @@ class MT5Runner:
                 lots, spec,
                 session_multiplier(now_utc, self.cfg.session_multipliers),
                 f"session {pb.name}")
+            # P3 posture scalar (S1/S3): same treatment as the
+            # other sizing expressions on this legacy path.
+            if self._posture is not None:
+                lots = self._apply_size_multiplier(
+                    lots, spec, float(self._posture.size_scalar),
+                    f"posture {self._posture.name} {pb.name}")
         # Safety gates (order time, never silent): RiskGuards, then
         # margin + swing margin shield.  Both must pass — a refusal
         # is journalled + counted by leg.
@@ -6110,17 +7462,31 @@ class MT5Runner:
                     f"mt5: ladder {pb.name}: rung 0 {level:.2f} "
                     f"({lots:.2f} lots), "
                     f"{len(_ladder_levels)} rungs remaining")
+        # P3: the A8 zone-anchored TP ladder (computed at signal
+        # acceptance) replaces the playbook's raw targets when it
+        # priced rungs — the opposing zone IS the target map.
+        _targets = [float(x) for x in (sig.targets or [])]
+        if signal_ctx is not None and signal_ctx.get("targets"):
+            _targets = [float(x) for x in signal_ctx["targets"]]
+            self.journal.log_note(
+                f"mt5: {pb.name} targets from the zone TP "
+                f"ladder: {[round(x, 2) for x in _targets]}")
         request = OrderRequest(
             symbol=self.cfg.symbol, direction=int(sig.direction),
             volume=lots, stop_loss=float(stop0),
             entry_ref=float(sig.entry_ref),
-            take_profit=float(sig.targets[0]) if sig.targets else None,
-            targets=[float(x) for x in (sig.targets or [])],
+            take_profit=float(_targets[0]) if _targets else None,
+            targets=list(_targets),
             atr=float(sig.atr), risk_money=0.0,
             alert_id=f"MT5-{pb.name}-{sig.index}",
             bar_index=int(sig.index), magic=self.cfg.magic,
             order_kind=kind,
             order_price=float(level) if kind != "market" else 0.0)
+        # P3: park the decision context against the alert — the
+        # fill (market now, pending later) consumes it into the
+        # per-position management context.
+        if signal_ctx is not None and not is_layer:
+            self._signal_ctx[request.alert_id] = dict(signal_ctx)
         # The stepper measures R on the BUFFERED stop: pass the
         # invalidation-view request for tracking so the buffer is not
         # applied twice (broker SL is already stop0).
@@ -6128,7 +7494,7 @@ class MT5Runner:
             symbol=self.cfg.symbol, direction=int(sig.direction),
             volume=lots, stop_loss=float(sig.invalidation),
             entry_ref=float(sig.entry_ref),
-            targets=[float(x) for x in (sig.targets or [])],
+            targets=list(_targets),
             atr=float(sig.atr), bar_index=int(sig.index),
             alert_id=request.alert_id, magic=self.cfg.magic,
             is_scalp=pb.name in self.cfg.scalp_playbooks)
@@ -6833,18 +8199,27 @@ class MT5Runner:
                 f"mt5: QM M5 scan failed (annotation only): {exc}")
             return None
 
-    def _scan_qm_d1(self, d1_df, stats: dict | None = None) -> list[dict]:
-        """Daily QM SHADOW scan on the D1 frame: evaluated + logged,
-        never ordered, never charted, never alerted.
+    def _run_qm_d1(self, d1_df, stats: dict | None = None
+                   ) -> list[dict]:
+        """qm_d1 REAL order path on its own D1 clock (P3 — closes
+        the P1-flagged exception; A14: the demo IS the shadow).
 
         Runs on the real D1 frame at warm start and on every D1
         close (see :meth:`_refresh_bars`) — NOT through the
-        H1-clocked signal path, which would run D1 logic on H1 bars.
-        Each touch is journal-logged exactly once (tracked by
-        ``_qm_d1_last_logged``); the scan itself is the shadow book
-        for this playbook.  Switched off via
-        ``/set playbook.qm_d1 off`` like any other shadow playbook.
-        Failures return [] (annotation missing, never a crash).
+        H1-clocked signal path, which would run D1 logic on H1
+        bars.  Each fresh touch (deduped by ``_qm_d1_last_logged``)
+        goes through the desk's ordinary machinery denominated in
+        D1: Asymmetry Score on the D1 frame (clock D1/D1/D1) ->
+        hard lines -> MACRO_SWING_OPEN floor (Path B) -> posture
+        -> journey geometry -> order or layer through
+        ``_place_live_order`` with the signal's own D1 stop
+        (beyond the QM head).  The Golden Swing Confirm ceremony
+        is NOT used: it validates against the H1 live setup, which
+        a D1-clock signal cannot satisfy — the order still passes
+        RiskGuards, margin, news and posture.  The playbook's
+        batch-engine ``live=False`` is untouched (the batch book
+        stays shadow; the MT5 demo book executes, exactly like
+        qm_m5).  Kill switch: ``/set playbook.qm_d1 off``.
         """
         if "qm_d1" in (self.cfg.disabled_playbooks or ()):
             return []
@@ -6857,7 +8232,9 @@ class MT5Runner:
             out: list[dict] = []
             for cand in pb.candidates(ctx):
                 if cand.signal_index <= self._qm_d1_last_logged:
-                    continue  # already logged on an earlier scan
+                    continue  # already evaluated on an earlier scan
+                self._qm_d1_last_logged = max(
+                    self._qm_d1_last_logged, int(cand.signal_index))
                 sig = cand.outcome.signal
                 lc = dict(getattr(sig, "live_context", None) or {})
                 touch = {"direction": int(cand.direction),
@@ -6871,27 +8248,155 @@ class MT5Runner:
                          "exit_reason": cand.outcome.exit_reason}
                 out.append(touch)
                 self.journal.log_note(
-                    f"mt5 [SHADOW] qm_d1 "
+                    f"mt5 qm_d1 "
                     f"{'+' if touch['direction'] > 0 else '-'}1 "
                     f"touch {touch['touch_ts'].date()} "
                     f"QM {touch['qm_level']:.1f} head "
                     f"{touch['head']:.1f} neckline "
-                    f"{touch['neckline']:.1f} "
-                    f"-> {touch['r_net']:+.2f}R "
-                    f"({touch['exit_reason']})"
+                    f"{touch['neckline']:.1f} — evaluating for a "
+                    "live order on the D1 clock (P3/A14)"
                     + (f" tags:{','.join(touch['tags'])}"
                        if touch["tags"] else ""))
-            if out:
-                self._qm_d1_last_logged = max(
-                    t["touch_index"] for t in out)
-                if stats is not None:
-                    stats["qm_d1_shadow"] = stats.get(
-                        "qm_d1_shadow", 0) + len(out)
+                try:
+                    self._execute_qm_d1_candidate(
+                        pb, sig, d1_df, ctx, stats)
+                except Exception as exc:
+                    self.journal.log_note(
+                        f"mt5: qm_d1 order path failed for the "
+                        f"{touch['touch_ts'].date()} touch: {exc}")
+            if out and stats is not None:
+                stats["qm_d1_signals"] = stats.get(
+                    "qm_d1_signals", 0) + len(out)
             return out
         except Exception as exc:
             self.journal.log_note(
-                f"mt5: QM D1 shadow scan failed (never ordered): {exc}")
+                f"mt5: QM D1 scan failed: {exc}")
             return []
+
+    def _execute_qm_d1_candidate(self, pb, sig, d1_df, ctx,
+                                 stats) -> None:
+        """One fresh qm_d1 touch through the desk machinery."""
+        stats = stats if stats is not None else {}
+        engine = self._get_engine()
+        direction = int(sig.direction)
+        entry = float(sig.entry_ref)
+        stop = float(sig.invalidation)
+        atr_d1 = float(sig.atr or atr14(d1_df))
+        alert_id = f"MT5-qm_d1-{sig.index}"
+        verdict = {
+            "bias_d1": direction, "bias_h4": 0, "regime": "trend",
+            "direction": direction, "zone": None,
+            "major_zone": None, "trigger": "qm_d1",
+            "entry_clock": "D1", "amd_phase": "unknown",
+            "qm": {"status": "qm_d1"}, "volume": {},
+            "dxy_corr": (self._dxy.state.corr
+                         if self._dxy is not None
+                         and self._dxy.state is not None else None),
+            "size_mult": 1.0,
+        }
+        score = self._score_for(
+            direction=direction, verdict=verdict, price=entry,
+            zone_d=None, atr=atr_d1, style_key="qm_d1",
+            playbook="qm_d1")
+        breakdown = dict(score.breakdown())
+        if self._last_clock is not None:
+            breakdown["frame_tf"] = self._last_clock.score_tf
+            breakdown["trigger_tf"] = self._last_clock.trigger_tf
+            breakdown["clock_reason"] = self._last_clock.reason
+        breakdown["posture"] = (self._posture.name
+                                if self._posture else "open")
+        targets = [float(x) for x in (sig.targets or [])]
+        factors = list(getattr(sig, "factors", []) or [])
+        bar_ts = d1_df.index[sig.index] \
+            if sig.index < len(d1_df) else None
+
+        def _journal(decision: str, reason: str) -> None:
+            log_signal(
+                self.journal, signal_id=alert_id, playbook="qm_d1",
+                direction=direction, score=float(sig.score),
+                decision=decision, reason=reason, bar_ts=bar_ts,
+                entry=entry, stop=stop, targets=targets,
+                factors=factors, score_breakdown=breakdown,
+                trigger_source="qm_d1",
+                context=self._decision_context())
+
+        # Hard lines (spread / hunting ground / session / the
+        # playbook's own live check on the D1 frame).
+        tick = self._last_tick or {}
+        spread_px = (float(tick["ask"]) - float(tick["bid"])) \
+            if tick.get("ask") and tick.get("bid") else 0.0
+        _hl = getattr(engine, "hard_line_check", None)
+        if callable(_hl):
+            ok, reason = _hl(pb, sig, ctx, spread_px)
+        else:
+            ok, reason = engine.gate_live_signal(
+                pb, sig, ctx, hierarchy_verdict=verdict,
+                spread_px=spread_px)
+        if not ok:
+            stats["hard_blocked"] = stats.get("hard_blocked", 0) + 1
+            self._record_blocked(reason, "qm_d1")
+            _journal("gated", reason)
+            return
+        # Posture (block / shelve) — qm_d1 is the 'zone' family.
+        post = self._posture
+        if post is not None:
+            why = None
+            if post.block_entries:
+                why = f"posture_block: {post.name} — {post.reason}"
+            else:
+                shed = post.shelved_reason(
+                    "zone", direction,
+                    self._bedrock.direction
+                    if self._bedrock is not None else 0)
+                if shed:
+                    why = (f"posture_shelved: {shed} "
+                           f"({post.name})")
+            if why:
+                stats["gated"] = stats.get("gated", 0) + 1
+                self._record_blocked(why, "qm_d1")
+                _journal("gated", why)
+                return
+        # Journey geometry in open space (D1-denominated).
+        journey = self._journey_context(
+            direction=direction, price=entry,
+            stop_dist=abs(entry - stop), zone_d=None, atr=atr_d1)
+        if journey.get("refusal"):
+            stats["gated"] = stats.get("gated", 0) + 1
+            self._record_blocked(journey["refusal"], "qm_d1")
+            _journal("gated", journey["refusal"])
+            return
+        # MACRO_SWING_OPEN floor (Path B).
+        fl = floor_for("MACRO_SWING_OPEN")
+        if not self._floor_ok(fl, score):
+            stats["below_floor"] = stats.get("below_floor", 0) + 1
+            _journal(
+                "below_floor",
+                f"asymmetry_floor: total {score.total:.1f} < "
+                f"{fl['floor']:.0f} or component minimum unmet "
+                f"(location {score.component('location'):.1f} "
+                f">= {fl.get('min_location', 0):.0f} required on "
+                "MACRO_SWING_OPEN)")
+            return
+        _journal("accepted",
+                 f"asymmetry {score.total:.0f} clears "
+                 "MACRO_SWING_OPEN (Path B, D1 clock)")
+        sig_ctx = {
+            "playbook": "qm_d1", "style_key": "qm_d1",
+            "style_bucket": "MACRO_SWING", "family": "zone",
+            "floor": float(fl["floor"]), "path": "MACRO_SWING_OPEN",
+            "entry_total": float(score.total), "zone_d": None,
+            "clock_tf": "D1",
+            "defended_stop": stop,
+        }
+        if self.tick_manager.tickets():
+            self._try_layer(pb, sig, stats, verdict=verdict,
+                            entry_bar=None, score=score,
+                            funding=None, zone_d=None)
+        else:
+            self._place_live_order(
+                pb, sig, stats, verdict=verdict, entry_bar=None,
+                score=score, zone_d=None, funding=None,
+                signal_ctx=sig_ctx)
 
     # ------------------------------------------------- alerts + charts
     def _build_chart(self, sig, verdict: dict | None, *,

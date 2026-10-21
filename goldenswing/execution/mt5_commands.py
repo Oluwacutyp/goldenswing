@@ -377,6 +377,15 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("🏛️", "Structural Zones"))
             lines.append(zones_line())
             lines.append("")
+    # P3 day line: the trading day as an object (day type, ADR
+    # consumption, IB state, posture, session, NY checkpoint).
+    # Guarded — old runners lack it.
+    if ctrl is not None:
+        day_line = getattr(ctrl, "day_line", None)
+        if callable(day_line):
+            lines.append(fmt_section("🗓️", "Day"))
+            lines.append(day_line())
+            lines.append("")
     # Engine state
     lines.append(fmt_section("⚙️", "Engine"))
     if cfg is not None and cfg.get("paused"):

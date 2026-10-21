@@ -65,12 +65,15 @@ STYLE_FLOORS: dict[str, dict] = {
     "ZONE_PATH": {"floor": 50.0, "min_location": 12.0,
                   "min_structure": 0.0},
     "MACRO_SWING_OPEN": {"floor": 60.0, "min_location": 0.0,
-                         "min_structure": 15.0, "min_efficiency": 10.0},
+                         "min_structure": 15.0, "min_efficiency": 10.0,
+                         "min_structure_efficiency": 35.0},
     "INTRADAY_CONTINUATION": {"floor": 65.0, "min_location": 0.0,
                               "min_structure": 18.0,
-                              "min_efficiency": 12.0, "min_pullback": 6.0},
+                              "min_efficiency": 12.0, "min_pullback": 6.0,
+                              "min_structure_efficiency": 35.0},
     "MICRO_SCALP_OPEN": {"floor": 55.0, "min_location": 0.0,
-                         "min_structure": 15.0, "min_efficiency": 10.0},
+                         "min_structure": 15.0, "min_efficiency": 10.0,
+                         "min_structure_efficiency": 35.0},
     "RANGE": {"floor": 45.0, "min_location": 8.0,
               "min_structure": 0.0},
 }
@@ -100,6 +103,12 @@ class ScoreContext:
     verdict: dict | None = None         # hierarchy verdict (macro)
     dxy_corr: float | None = None
     session_info: dict | None = None    # patterns.session_label()
+    # --- P3 inputs (all optional; absent = P1 behaviour) --------
+    smt_direction: int = 0              # live SMT event direction
+    smt_context: str = ""               # "reversal" | "trend"
+    adr_consumed_pct: float | None = None   # day fuel gauge (S8)
+    adr_applies: bool = False           # continuation-family trade
+    day_levels: list | None = None      # session/prior extremes
 
 
 @dataclass
@@ -492,10 +501,37 @@ def _location(ctx: ScoreContext, max_points: float) -> ComponentResult:
                 z *= 0.75
             subs["zone"] = (z / 6.0) * 0.40
             subs["zone_lifecycle"] = lifecycle
-    # --- draw: room to the next opposing magnet
+    # --- draw: room to the next opposing magnet.  For an
+    # at-zone trade the draw is the opposing structural zone
+    # (§2.4: the magnet the position's own ladder targets) or,
+    # when none is known, the open-road default below — the P1
+    # contract the ZONE_PATH Location >= 12 condition is built
+    # on.  P3: day levels (unswept Asia/London extremes,
+    # prior-day high/low — S3's session liquidity objects) feed
+    # the draw of OPEN-SPACE trades (no zone context): there
+    # the day's liquidity map is the location read.  They never
+    # reprice an at-zone trade by mere proximity — session
+    # extremes sit within ~1 ATR of most intraday entries and
+    # a session pool ahead is the trade's first waypoint, not
+    # its terminus (the P3 pullback regression: an Asia extreme
+    # 0.7 ATR ahead compressed location to 11.1 < 12 where P1
+    # read the open road).  The journey geometry keeps its own
+    # nearest-magnet read for open-space decisions.
     opp = ctx.opposing_zone
-    if opp is not None and ctx.atr > 0:
-        d = abs(float(opp.get("level", ctx.price)) - ctx.price) / ctx.atr
+    draw_level = None
+    if opp is not None:
+        draw_level = float(opp.get("level", ctx.price))
+    if draw_level is None and zone is None \
+            and ctx.day_levels and ctx.atr > 0:
+        ahead = [float(x) for x in ctx.day_levels
+                 if (float(x) - ctx.price) * ctx.direction
+                 > 0.2 * ctx.atr]
+        if ahead:
+            draw_level = min(ahead,
+                             key=lambda x: abs(x - ctx.price))
+            subs["draw_source"] = "day_level"
+    if draw_level is not None and ctx.atr > 0:
+        d = abs(draw_level - ctx.price) / ctx.atr
         subs["draw"] = _clamp01((d - 0.5) / 1.5) * 0.30
         subs["draw_atr"] = round(d, 2)
     else:
@@ -547,6 +583,25 @@ def _session(ctx: ScoreContext, max_points: float) -> ComponentResult:
     res.points = max_points * (0.7 * sess_pts + 0.3 * vol_pts)
     res.subs.update({"session_pts": round(sess_pts, 2),
                      "vol_pts": round(vol_pts, 2)})
+    # --- S8 fuel gauge (P3): past ~85% ADR consumed, a
+    # CONTINUATION trade is buying the tail of the day's range —
+    # the block de-rates (priced, NEVER gated: trend days print
+    # 120-150% and the extension is allowed, it just scores what
+    # it is).  Only the runner knows the trade's family, so the
+    # de-rate applies only when ctx.adr_applies is set.
+    if ctx.adr_applies and ctx.adr_consumed_pct is not None \
+            and ctx.adr_consumed_pct >= 85.0:
+        pct = float(ctx.adr_consumed_pct)
+        if pct >= 150.0:
+            factor = 0.30
+        elif pct >= 100.0:
+            factor = 0.80 - (pct - 100.0) / 50.0 * 0.35
+        else:
+            factor = 1.0 - (pct - 85.0) / 15.0 * 0.20
+        res.points *= factor
+        res.flags.append("adr_spent")
+        res.subs["adr_consumed_pct"] = round(pct, 1)
+        res.subs["adr_factor"] = round(factor, 2)
     return res
 
 
@@ -576,9 +631,28 @@ def _macro(ctx: ScoreContext, max_points: float) -> ComponentResult:
     if not legs:
         res.flags.append("macro_no_verdict")
     bonus, _ = dxy_bonus(ctx.dxy_corr)
+    res.subs = {"aligned": round(base01, 2), "dxy_bonus": bonus}
+    # --- S7 SMT (P3): a live structural divergence event is
+    # transmission EVIDENCE, stronger than the correlation
+    # coefficient's drift.  In REVERSAL contexts it REPLACES the
+    # +/-0.5 nudge (+1.5 of the block when the event backs the
+    # trade, 0 when it fights it — the nudge's noise is dropped
+    # either way).  In trend contexts it augments (+0.75 aligned).
+    if ctx.smt_direction:
+        aligned_smt = ctx.smt_direction == ctx.direction
+        if ctx.smt_context == "reversal":
+            bonus = 0.0
+            smt_pts = 1.5 if aligned_smt else 0.0
+            res.flags.append("smt_replaces_nudge")
+        else:
+            smt_pts = 0.75 if aligned_smt else 0.0
+        res.points = max(0.0, min(
+            max_points, max_points * base01 + bonus + smt_pts))
+        res.subs["smt_pts"] = smt_pts
+        res.subs["smt_direction"] = int(ctx.smt_direction)
+        return res
     pts = max_points * base01 + bonus
     res.points = max(0.0, min(max_points, pts))
-    res.subs = {"aligned": round(base01, 2), "dxy_bonus": bonus}
     return res
 
 
@@ -648,7 +722,12 @@ def score_asymmetry(ctx: ScoreContext, *,
             price=ctx.price, style=ctx.style, zone=ctx.zone,
             opposing_zone=ctx.opposing_zone,
             range_frame=ctx.range_frame, verdict=ctx.verdict,
-            dxy_corr=ctx.dxy_corr, session_info=ctx.session_info)
+            dxy_corr=ctx.dxy_corr, session_info=ctx.session_info,
+            smt_direction=ctx.smt_direction,
+            smt_context=ctx.smt_context,
+            adr_consumed_pct=ctx.adr_consumed_pct,
+            adr_applies=ctx.adr_applies,
+            day_levels=ctx.day_levels)
         flipped_ctx._flip_guard = True  # type: ignore[attr-defined]
         out = score_asymmetry(flipped_ctx, weights=weights)
         out.flipped = True

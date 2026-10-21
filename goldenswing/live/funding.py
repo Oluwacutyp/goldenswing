@@ -38,6 +38,33 @@ WEAK_SWEEP_COLOUR = 2.0
 FVG_COLOUR = 3.0
 ABSORPTION_COLOUR = 4.0
 
+# S7 SMT colour (P3): a live structural DXY divergence at a level
+# funds REVERSAL entries (the transmission failure IS the fade's
+# evidence).  Trend contexts consume SMT through the score's
+# Macro block instead — no double-counting here.
+SMT_COLOUR = 5.0
+SMT_PLAYBOOKS = frozenset({
+    "v_reversal", "turtle_soup", "retracement_trap", "judas_swing",
+    "qm_m5", "qm_d1"})
+
+
+def smt_funding_event(smt_event, *, playbook: str, direction: int,
+                      at_level: bool) -> FundingEvent | None:
+    """The S7 funding leg: an SMT event whose direction backs a
+    REVERSAL playbook's trade AT A LEVEL becomes a funding event
+    (colour +5) — the same evidentiary tier as a sweep print.
+    Returns None when any leg of that sentence is missing."""
+    if smt_event is None or not at_level:
+        return None
+    if playbook not in SMT_PLAYBOOKS:
+        return None
+    if int(getattr(smt_event, "direction", 0)) != int(direction):
+        return None
+    return FundingEvent(
+        kind=str(getattr(smt_event, "kind", "smt")),
+        colour=SMT_COLOUR,
+        detail=str(getattr(smt_event, "detail", "SMT divergence")))
+
 
 @dataclass
 class FundingEvent:

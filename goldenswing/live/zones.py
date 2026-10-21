@@ -154,6 +154,16 @@ EXHAUSTED_TOUCH = 4
 # tired/exhausted PENALTIES live in freshness.py (conditional on
 # the reaction after the touch) — applied once, there, not here.
 TOUCH_GRADE = {0: 5.0, 1: 2.0, 2: 0.0}
+# P3 departure-ratio canon (zone mining A3): impulse out of the
+# base / base width.  >= 2:1 = a validated departure (Moreno);
+# >= 3:1 = Seiden's ideal.  Below 1:1 there is no imbalance.
+DEPARTURE_RATIO_MIN = 2.0
+DEPARTURE_RATIO_IDEAL = 3.0
+# A10 interaction-silence decay (P3): the -fresh clock is TIME
+# SINCE THE LAST INTERACTION, never the zone's birthday — a
+# 3-month-old level touched yesterday is fresher than a 3-week
+# level nobody has visited since.  Applied in score_zone.
+SILENCE_DECAY_DAYS = ((90.0, -5.0), (180.0, -10.0))
 # Expiry: H4 untested after 100 H4 bars (~400h); H1/M15/M5
 # untested after 20 D1 bars.  D1/W1/MN1 NEVER expire on age.
 H4_EXPIRY_HOURS = 100 * 4
@@ -228,23 +238,74 @@ class StructuralZone:
     # Base length in bars at formation (A4): consecutive small-range
     # bars ending at the swing whose ranges overlap the band.
     base_bars: int = 0
+    # --- P3 zone completion (spec v3 §12, zone mining A11/A3) ----
+    # Base-candle geometry: the body edges of the formation base.
+    # ``base_proximal`` = the base-body edge nearest incoming price
+    # (demand: highest body top of the base; supply: lowest body
+    # bottom); ``base_distal`` = the wick extreme of the base.
+    # None on legacy rows / rows seeded before P3 — consumers fall
+    # back to the swing band.
+    base_proximal: float | None = None
+    base_distal: float | None = None
+    # Departure ratio (P3): formation departure distance / base
+    # width, computed by score_zone (Moreno >= 2:1 / Seiden >= 3:1
+    # canon, graded).  0.0 = not computable (legacy / no base).
+    departure_ratio: float = 0.0
+    # Liquidity swept through this zone's far edge BEFORE it broke
+    # (a wick beyond the far edge while the zone was active) — the
+    # canon condition that turns a break into a BREAKER record.
+    swept_first: bool = False
+    # True for breaker records (flipped polarity of a swept-then-
+    # broken zone).  A breaker is tradeable on retest like any
+    # zone; the flag is provenance for grading/journaling.
+    is_breaker: bool = False
     _key_cache: tuple | None = field(  # lazy key() memo, compare=False
         default=None, compare=False, repr=False)  # (eq ignores it)
 
     # ------------------------------------------------ A11 edges
     @property
     def proximal(self) -> float:
-        """A11 proximal edge: the band edge nearest incoming price —
-        the entry reference (support: top edge; resistance: bottom
-        edge).  This engine's zones are swing bands (level ± 0.5 ATR
-        at formation), so the base geometry IS the band; P3's zone
-        rebuild may refine these to base-candle body edges."""
+        """A11 proximal edge: the edge nearest incoming price —
+        the entry reference.  P3: where base-candle geometry
+        exists it WINS (the base's body edge is where the
+        imbalance actually starts — Sam Seiden's proximal line);
+        legacy rows fall back to the swing band edge."""
+        if self.base_proximal is not None:
+            return float(self.base_proximal)
         return self.top if self.side == "support" else self.bottom
 
     @property
     def distal(self) -> float:
-        """A11 distal edge: the far band edge — the stop reference."""
+        """A11 distal edge: the stop reference — base wick extreme
+        where base geometry exists, else the far band edge."""
+        if self.base_distal is not None:
+            return float(self.base_distal)
         return self.bottom if self.side == "support" else self.top
+
+    @property
+    def base_width(self) -> float:
+        """Formation base width in price (proximal -> distal);
+        the swing band width when no base geometry was stored."""
+        if self.base_proximal is not None \
+                and self.base_distal is not None:
+            return abs(float(self.base_proximal)
+                       - float(self.base_distal))
+        return abs(float(self.top) - float(self.bottom))
+
+    @property
+    def departure_validated(self) -> bool:
+        """A3 departure validation (P3 ratio form): the move that
+        left the base must be >= 2x the base width (Moreno's
+        minimum; Seiden's 3:1 grades higher in score_zone).
+        Legacy rows without a computable ratio fall back to the
+        ATR form (>= 2 formation ATR)."""
+        if self.departure_ratio > 0:
+            return self.departure_ratio >= DEPARTURE_RATIO_MIN
+        # Same effective-departure fallback score_zone grades by:
+        # formation departure when known, else the displacement.
+        disp = self.departure_atr if self.departure_atr > 0 \
+            else self.displacement_atr
+        return disp >= 2.0
 
     # ------------------------------------------------ A2 lifecycle
     @property
@@ -267,8 +328,12 @@ class StructuralZone:
 
     @property
     def resting_limit_eligible(self) -> bool:
-        """A6: only a FRESH MAJOR zone may hold a resting limit."""
-        return self.lifecycle == "fresh" and self.tier == "MAJOR"
+        """A6: only a FRESH MAJOR zone may hold a resting limit.
+        P3 adds the A3 canon condition: the departure must be
+        validated (>= 2:1 ratio / >= 2 ATR) — a zone price merely
+        left, without imbalance, never holds a resting order."""
+        return self.lifecycle == "fresh" and self.tier == "MAJOR" \
+            and self.departure_validated
 
     @property
     def key(self) -> tuple:
@@ -313,6 +378,17 @@ class StructuralZone:
             "base_bars": int(self.base_bars),
             "proximal": float(self.proximal),
             "distal": float(self.distal),
+            # P3 zone completion surface.
+            "base_proximal": (float(self.base_proximal)
+                              if self.base_proximal is not None
+                              else None),
+            "base_distal": (float(self.base_distal)
+                            if self.base_distal is not None
+                            else None),
+            "departure_ratio": float(self.departure_ratio),
+            "departure_validated": bool(self.departure_validated),
+            "is_breaker": bool(self.is_breaker),
+            "swept_first": bool(self.swept_first),
         }
 
     def describe(self, *, now=None, cluster: bool = False) -> str:
@@ -355,7 +431,8 @@ def major_zones(zones: list[StructuralZone]) -> list[StructuralZone]:
 
 # ---------------------------------------------------------------- scoring
 
-def score_zone(zone: StructuralZone, others, *, age_d1: float) -> tuple[float, str]:
+def score_zone(zone: StructuralZone, others, *, age_d1: float,
+               silence_d1: float = 0.0) -> tuple[float, str]:
     """New scoring (replaces the v1 buckets).  Pure function.
 
     ``others`` = all zones in the working set (for confluence /
@@ -363,6 +440,11 @@ def score_zone(zone: StructuralZone, others, *, age_d1: float) -> tuple[float, s
     without circularity: provisional (everything except recency)
     >= 60 -> MAJOR track (recency +10/+5/0, never negative);
     else recency = +10/+5/0/-10 by age.
+
+    P3: ``silence_d1`` = days since the zone's last interaction
+    (touch / inside close / break) — the A10 decay clock.  It is
+    NOT the zone's age: compute() derives it from ``last_tested``
+    (falling back to the swing time for never-tested zones).
     """
     atr = zone.atr if zone.atr > 0 else 1.0
     provisional = TF_WEIGHT.get(zone.tf, 0.0)
@@ -373,19 +455,41 @@ def score_zone(zone: StructuralZone, others, *, age_d1: float) -> tuple[float, s
     provisional += TOUCH_GRADE.get(int(zone.touches), 0.0)
     if zone.weak_break:
         provisional -= 20.0
-    # A3 (v2): when the formation departure is known it replaces
-    # the monotonic excursion as the displacement input — a zone is
-    # validated by the move that LEFT its base (impulse >= 2 ATR
-    # full marks; < 1 ATR never validated it).  Legacy rows
-    # (departure unknown = 0) fall back to displacement_atr.
-    disp = zone.departure_atr if zone.departure_atr > 0 \
-        else zone.displacement_atr
-    if disp >= 2.0:
-        provisional += 15.0
-    elif disp >= 1.0:
-        provisional += 5.0
-    elif zone.departure_atr > 0:
-        provisional -= 10.0
+    # A10 interaction-silence decay (P3): a level price abandoned
+    # loses significance even if its birthday is recent — graded
+    # deduction, never a veto (freshness.py's reaction penalties
+    # still apply separately on the decision path).
+    for days, penalty in SILENCE_DECAY_DAYS:
+        if silence_d1 > days:
+            provisional += penalty
+            break
+    # A3 departure validation (P3 ratio form): where the base
+    # width is known, the impulse that left the base is graded
+    # against the base itself — >= 2:1 validated (full marks),
+    # >= 3:1 Seiden-ideal (full marks; the ratio is recorded for
+    # consumers), 1-2:1 partial, < 1:1 no imbalance (deducted).
+    # The ratio is (re)computed here and stashed on the zone —
+    # scoring is the only writer, matching the flag precedent.
+    width = zone.base_width
+    if width > 0 and zone.departure_atr > 0:
+        zone.departure_ratio = zone.departure_atr * atr / width
+    if zone.departure_ratio > 0:
+        if zone.departure_ratio >= DEPARTURE_RATIO_MIN:
+            provisional += 15.0
+        elif zone.departure_ratio >= 1.0:
+            provisional += 5.0
+        else:
+            provisional -= 10.0
+    else:
+        # Legacy fallback: ATR-denominated departure (v2 form).
+        disp = zone.departure_atr if zone.departure_atr > 0 \
+            else zone.displacement_atr
+        if disp >= 2.0:
+            provisional += 15.0
+        elif disp >= 1.0:
+            provisional += 5.0
+        elif zone.departure_atr > 0:
+            provisional -= 10.0
     # A4 (v2): base length grades the departure's quality — a short
     # base precedes a strong departure; a long base weakens it.
     # Graded, never a veto (Wyckoff range-edge caveat).
@@ -574,6 +678,23 @@ class ZoneStore:
         if "base_bars" not in cols:
             c.execute("ALTER TABLE zones ADD COLUMN "
                       "base_bars INTEGER NOT NULL DEFAULT 0")
+        # P3 migration: base-candle geometry + departure ratio +
+        # breaker provenance.  Same guarded-ALTER pattern; legacy
+        # rows read back with base edges None (band fallback).
+        if "base_proximal" not in cols:
+            c.execute("ALTER TABLE zones ADD COLUMN "
+                      "base_proximal REAL")
+        if "base_distal" not in cols:
+            c.execute("ALTER TABLE zones ADD COLUMN base_distal REAL")
+        if "departure_ratio" not in cols:
+            c.execute("ALTER TABLE zones ADD COLUMN "
+                      "departure_ratio REAL NOT NULL DEFAULT 0")
+        if "swept_first" not in cols:
+            c.execute("ALTER TABLE zones ADD COLUMN "
+                      "swept_first INTEGER NOT NULL DEFAULT 0")
+        if "is_breaker" not in cols:
+            c.execute("ALTER TABLE zones ADD COLUMN "
+                      "is_breaker INTEGER NOT NULL DEFAULT 0")
         c.execute(
             "CREATE TABLE IF NOT EXISTS meta ("
             "key TEXT PRIMARY KEY, value TEXT)")
@@ -643,7 +764,21 @@ class ZoneStore:
             departure_atr=(float(row["departure_atr"])
                            if "departure_atr" in keys else 0.0),
             base_bars=(int(row["base_bars"])
-                       if "base_bars" in keys else 0))
+                       if "base_bars" in keys else 0),
+            base_proximal=(float(row["base_proximal"])
+                           if "base_proximal" in keys
+                           and row["base_proximal"] is not None
+                           else None),
+            base_distal=(float(row["base_distal"])
+                         if "base_distal" in keys
+                         and row["base_distal"] is not None
+                         else None),
+            departure_ratio=(float(row["departure_ratio"])
+                             if "departure_ratio" in keys else 0.0),
+            swept_first=(bool(row["swept_first"])
+                         if "swept_first" in keys else False),
+            is_breaker=(bool(row["is_breaker"])
+                        if "is_breaker" in keys else False))
 
     @staticmethod
     def _zone_to_row(zone: StructuralZone) -> tuple:
@@ -656,7 +791,10 @@ class ZoneStore:
                 _ts_iso(zone.swing_ts), zone.volume_ratio,
                 float(zone.atr), zone.last_tested, zone.last_pattern,
                 int(zone.seen_inside), int(zone.consec_beyond),
-                float(zone.departure_atr), int(zone.base_bars))
+                float(zone.departure_atr), int(zone.base_bars),
+                zone.base_proximal, zone.base_distal,
+                float(zone.departure_ratio), int(zone.swept_first),
+                int(zone.is_breaker))
 
     # -- reads -------------------------------------------------------
 
@@ -712,9 +850,10 @@ class ZoneStore:
                     "round_number, weak_break, age_d1, swing_ts, "
                     "volume_ratio, atr, last_tested, last_pattern, "
                     "seen_inside, consec_beyond, departure_atr, "
-                    "base_bars) VALUES "
+                    "base_bars, base_proximal, base_distal, "
+                    "departure_ratio, swept_first, is_breaker) VALUES "
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     self._zone_to_row(zone))
                 if cur.rowcount:
                     inserted += 1
@@ -920,7 +1059,12 @@ class ZoneStore:
             for zone in list(actives):
                 w = _working(zone)
                 age = _age_d1(w.swing_ts, last_ts)
-                score, tier = score_zone(w, view, age_d1=age)
+                # A10: silence = time since last interaction
+                # (last_tested), NOT since birth (swing_ts).
+                silence = _age_d1(w.last_tested or w.swing_ts,
+                                   last_ts)
+                score, tier = score_zone(w, view, age_d1=age,
+                                         silence_d1=silence)
                 if score != w.score or tier != w.tier:
                     w.score, w.tier = score, tier
                     w.age_d1 = age
@@ -940,9 +1084,63 @@ class ZoneStore:
         # earlier transaction is already dead; a sub-zone that
         # holds on its own afterwards is a genuine hold.
         self._apply_cluster_rule(outcomes, working, frames)
+        # 6) P3 BREAKER records (canon-conditional): a zone that
+        # was SWEPT FIRST (liquidity taken through its far edge
+        # while it lived) and then BROKE leaves a flipped-polarity
+        # record at the same band — support becomes resistance and
+        # vice versa — tradeable on retest.  A zone that broke
+        # WITHOUT a prior sweep stays simply broken: no record, no
+        # retest interest (the break carried no trapped liquidity
+        # story).  Runs after the cluster rule so cluster-broken
+        # sub-zones are judged on their final state.
+        self._record_breakers(outcomes, working, frames)
         changed = [w for w in working.values()
                    if w != self._mirror.get(w.key)]
         return outcomes, changed, new_marks
+
+    def _record_breakers(self, outcomes, working, frames) -> None:
+        """Create breaker records for this transaction's BROKEN
+        outcomes whose zones were swept first.  Mutates ``working``
+        + ``outcomes`` only (compute() stays pure)."""
+        broken_keys = [o.zone_key for o in outcomes
+                       if o.outcome == "BROKEN"]
+        if not broken_keys:
+            return
+        view = self._view(working)
+        for key in broken_keys:
+            zone = working.get(key) or next(
+                (z for z in view if z.key == key), None)
+            if zone is None or not zone.swept_first:
+                continue
+            frame = frames.get(zone.tf)
+            if frame is None or not len(frame):
+                continue
+            break_ts = _ts_iso(frame.index[-1])
+            flipped = "support" if zone.side == "resistance" \
+                else "resistance"
+            bkey = (zone.tf, flipped, break_ts)
+            if bkey in self._mirror or bkey in working:
+                continue
+            breaker = StructuralZone(
+                tf=zone.tf, side=flipped, level=float(zone.level),
+                top=float(zone.top), bottom=float(zone.bottom),
+                status="active", swing_ts=break_ts,
+                atr=float(zone.atr),
+                base_proximal=zone.base_proximal,
+                base_distal=zone.base_distal,
+                base_bars=int(zone.base_bars), is_breaker=True,
+                age_d1=0.0)
+            score, tier = score_zone(breaker, view + [breaker],
+                                     age_d1=0.0)
+            breaker.score, breaker.tier = score, tier
+            if tier == "noise":
+                breaker.status = "noise"
+            working[bkey] = breaker
+            outcomes.append(ZoneOutcome(
+                zone_key=bkey, outcome="BREAKER",
+                reason=("swept first, then broke — flipped "
+                        "polarity record (breaker)"),
+                detail=breaker.describe(now=frame.index[-1])))
 
     def _view(self, working: dict) -> list[StructuralZone]:
         """Current-transaction working set (copies + untouched)."""
@@ -984,26 +1182,52 @@ class ZoneStore:
         # A4 base length: consecutive bars ending at the swing
         # whose ranges overlap the band and stay within 1 ATR —
         # the consolidation price sat in before departing.
+        # P3: the same walk captures BASE-CANDLE GEOMETRY (A11
+        # full version): the body edges of that base.  Demand:
+        # proximal = the highest body top in the base (where the
+        # imbalance starts), distal = the lowest wick.  Supply is
+        # the mirror.  When no bar qualifies as base, the swing
+        # bar alone is the base.
         base_bars = 0
+        base_proximal = None
+        base_distal = None
         try:
             band_lo = float(price) - ZONE_HALF_ATR * atr
             band_hi = float(price) + ZONE_HALF_ATR * atr
+            body_edges: list[tuple[float, float, float, float]] = []
             j = q
             while j >= 0 and base_bars < 12:
                 row = frame.iloc[j]
                 hi, lo = float(row["high"]), float(row["low"])
                 if hi - lo > 1.0 * atr or hi < band_lo or lo > band_hi:
                     break
+                o, cl = float(row["open"]), float(row["close"])
+                body_edges.append((max(o, cl), min(o, cl), hi, lo))
                 base_bars += 1
                 j -= 1
+            if not body_edges:
+                row = frame.iloc[q]
+                o, cl = float(row["open"]), float(row["close"])
+                body_edges.append((max(o, cl), min(o, cl),
+                                   float(row["high"]),
+                                   float(row["low"])))
+            if side == "support":
+                base_proximal = max(e[0] for e in body_edges)
+                base_distal = min(e[3] for e in body_edges)
+            else:
+                base_proximal = min(e[1] for e in body_edges)
+                base_distal = max(e[2] for e in body_edges)
         except Exception:
             base_bars = 0
+            base_proximal = None
+            base_distal = None
         zone = StructuralZone(
             tf=tf, side=side, level=float(price),
             top=float(price) + ZONE_HALF_ATR * atr,
             bottom=float(price) - ZONE_HALF_ATR * atr,
             status="active", swing_ts=frame.index[q],
             atr=atr, volume_ratio=volume_ratio, base_bars=base_bars,
+            base_proximal=base_proximal, base_distal=base_distal,
             age_d1=_age_d1(frame.index[q], frame.index[p]))
         for j in range(q + 1, p + 1):
             term, note = self._apply_bar(
@@ -1058,6 +1282,13 @@ class ZoneStore:
             else (l < far)
         breakout_dir = 1 if zone.side == "resistance" else -1
         ts_iso = _ts_iso(bar["ts"])
+        # P3 breaker provenance: liquidity was swept through the
+        # far edge while this zone lived.  Recorded on ANY bar
+        # whose wick pierces the far edge — if the zone later
+        # breaks (rather than rejecting), the sweep-first canon
+        # condition for a breaker record is met.
+        if wick_beyond:
+            zone.swept_first = True
         if inside:
             if zone.consec_beyond > 0:
                 zone.weak_break = True  # beyond close, returned
@@ -1293,9 +1524,10 @@ class ZoneStore:
                     "round_number, weak_break, age_d1, swing_ts, "
                     "volume_ratio, atr, last_tested, last_pattern, "
                     "seen_inside, consec_beyond, departure_atr, "
-                    "base_bars) VALUES "
+                    "base_bars, base_proximal, base_distal, "
+                    "departure_ratio, swept_first, is_breaker) VALUES "
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(tf, side, swing_ts) DO UPDATE SET "
                     "level=excluded.level, top=excluded.top, "
                     "bottom=excluded.bottom, score=excluded.score, "
@@ -1313,7 +1545,12 @@ class ZoneStore:
                     "seen_inside=excluded.seen_inside, "
                     "consec_beyond=excluded.consec_beyond, "
                     "departure_atr=excluded.departure_atr, "
-                    "base_bars=excluded.base_bars",
+                    "base_bars=excluded.base_bars, "
+                    "base_proximal=excluded.base_proximal, "
+                    "base_distal=excluded.base_distal, "
+                    "departure_ratio=excluded.departure_ratio, "
+                    "swept_first=excluded.swept_first, "
+                    "is_breaker=excluded.is_breaker",
                     self._zone_to_row(zone))
                 if self.rtree_available:
                     zid = self._conn.execute(

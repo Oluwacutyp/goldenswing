@@ -62,6 +62,15 @@ from .manager import ExitStepper, TrackedPosition
 class TickConfig:
     #: Favourable excursion (R) at which the stop moves to breakeven.
     breakeven_trigger_r: float = 1.0
+    #: P3 (S9/F13): HOW breakeven is earned on the TickConfig path.
+    #: "touch" = the legacy rule (the trigger above).  "earned" =
+    #: breakeven arms only when a funding/structure event or a
+    #: banked partial has EARNED it (see mark_be_earned), with the
+    #: price touch demoted to a backstop at breakeven_backstop_r.
+    #: F13's arithmetic is why touch is no longer the desk
+    #: default: the runner constructs its manager with "earned".
+    breakeven_mode: str = "touch"
+    breakeven_backstop_r: float = 2.0
     #: Breakeven SL = entry + direction * breakeven_offset_r * risk.
     #: 0.0 = exactly entry (pure breakeven).
     breakeven_offset_r: float = 0.0
@@ -176,6 +185,10 @@ class TickAction:
 class _TickState:
     pos: TrackedPosition
     breakeven_done: bool = False
+    #: P3 earned-breakeven state: set by mark_be_earned (funding/
+    #: structure event) or by a banked partial (TP1) in apply().
+    be_earned: bool = False
+    be_earned_by: str = ""
     #: SL actually on the broker (breakeven/trailing moves only tighten).
     broker_sl: float | None = None
     #: Entry legs: base first, added layers after.
@@ -308,6 +321,45 @@ class TickManager:
         st = self._states.get(ticket)
         return dict(st.narrative_plan) \
             if st is not None and st.narrative_plan is not None else None
+
+    # --------------------------------------- P3 earned breakeven
+    def mark_be_earned(self, ticket: int, via: str) -> bool:
+        """Arm breakeven for a position: a funding/structure event
+        printed in its favour (or another earner the runner
+        names).  The stop itself moves on the next tick via the
+        ordinary candidate path — this only records the earning,
+        so /status and the journal can say WHY.  False when the
+        ticket is unknown or breakeven already happened."""
+        st = self._states.get(ticket)
+        if st is None or st.breakeven_done:
+            return False
+        if not st.be_earned:
+            st.be_earned = True
+            st.be_earned_by = str(via)
+        return True
+
+    def be_state(self, ticket: int) -> dict:
+        st = self._states.get(ticket)
+        if st is None:
+            return {}
+        return {"earned": bool(st.be_earned),
+                "by": st.be_earned_by,
+                "done": bool(st.breakeven_done)}
+
+    def book_external_partial(self, ticket: int,
+                              volume: float) -> bool:
+        """Book a partial the RUNNER executed outside the tick
+        action flow (bar-close management: progress trim, drift
+        trim, zone bank, ADR bank, pre-print trim).  Keeps the
+        tracked volume honest so tiers/stops stay consistent.
+        False when the ticket is unknown."""
+        st = self._states.get(ticket)
+        if st is None or st.pos.closed:
+            return False
+        st.pos.volume = max(0.0, st.pos.volume - float(volume))
+        if st.pos.volume <= 0:
+            st.pos.closed = True
+        return True
 
     def check_narrative_invalidation(self, ticket: int, price: float,
                                      *, fvg_mitigated: bool = False) -> bool:
@@ -559,7 +611,18 @@ class TickManager:
             # closes; this tick trailing is its best-excursion
             # equivalent.
             be_trig = float(plan.get("breakeven_at_r", 1.0))
-            if not st.breakeven_done and pos.best_r >= be_trig:
+            # P3: the plan's be_mode governs.  "earned" (clean
+            # profile): the plan's touch threshold no longer arms
+            # breakeven by itself — an earning event (funding /
+            # TP1) or the backstop excursion does.  "touch" (late
+            # profile): the threshold arms it, as before.
+            if str(plan.get("be_mode", "touch")) == "earned":
+                backstop = float(plan.get(
+                    "be_backstop_r", tcfg.breakeven_backstop_r))
+                be_armed = st.be_earned or pos.best_r >= backstop
+            else:
+                be_armed = pos.best_r >= be_trig
+            if not st.breakeven_done and be_armed:
                 candidates.append((pos.entry_price, "breakeven"))
             if st.narrative_atr > 0:
                 best_price = pos.entry_price + d * pos.best_r \
@@ -590,8 +653,16 @@ class TickManager:
                         if pos.atr > 0 else 0.0)
                     candidates.append((
                         pos.entry_price + d * lock_dist, "profit_lock"))
-            if not st.breakeven_done \
-                    and pos.best_r >= tcfg.breakeven_trigger_r:
+            # P3: earned mode — the +1R touch alone does NOT move
+            # the stop (F13); an earning event or the backstop
+            # excursion does.  Touch mode keeps the legacy rule
+            # (default TickConfig — the runner opts into earned).
+            if tcfg.breakeven_mode == "earned":
+                be_armed = st.be_earned or \
+                    pos.best_r >= tcfg.breakeven_backstop_r
+            else:
+                be_armed = pos.best_r >= tcfg.breakeven_trigger_r
+            if not st.breakeven_done and be_armed:
                 candidates.append((
                     pos.entry_price + d * tcfg.breakeven_offset_r
                     * pos.risk_price, "breakeven"))
@@ -627,6 +698,11 @@ class TickManager:
             st.broker_sl = float(action.level)
             if action.reason == "breakeven":
                 st.breakeven_done = True
+                if not st.be_earned:
+                    # Fired on the backstop (or legacy touch): the
+                    # record says so — earned stays distinguishable
+                    # from touched in the journal/status.
+                    st.be_earned_by = st.be_earned_by or "backstop"
             if action.reason == "profit_lock":
                 pos.profit_lock_done = True
             # Keep the stepper's trail level in sync so active_stop
@@ -639,6 +715,11 @@ class TickManager:
             if action.reason.startswith("partial_tier_"):
                 pos.tiers_done += 1
             pos.partial_done = True
+            # P3/S9: banking TP1 EARNS breakeven (the desk's rule:
+            # once the first bank is in, the rest rides free).
+            if not st.be_earned:
+                st.be_earned = True
+                st.be_earned_by = "tp1_banked"
             pos.volume = max(0.0, pos.volume - action.volume)
             if pos.volume <= 0:
                 pos.closed = True

@@ -77,6 +77,22 @@ def _is_extreme(title: str) -> bool:
     return any(key.upper() in upper for key in EXTREME_TITLES)
 
 
+def preprint_action(*, style_family: str, stop_distance: float,
+                    event_range: float) -> str:
+    """S5 pre-print position rule, pure form.  Into an EXTREME
+    print: intraday exposure gets secured ("secure" — stop to
+    breakeven or a trim, runner's config chooses); a SWING
+    position whose structural stop already sits beyond 2x the
+    event's typical range is EXEMPT (the print's range is inside
+    its stop's noise budget — securing it would be theatre).
+    Every outcome is journaled by the runner, exempt included.
+    """
+    if style_family == "swing" and event_range > 0 \
+            and stop_distance >= 2.0 * event_range:
+        return "exempt"
+    return "secure"
+
+
 def _parse_time(raw: str) -> datetime | None:
     try:
         dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
@@ -161,6 +177,52 @@ class NewsCalendar:
                                      regime="NORMAL")
         return NewsExecution(paused=False, size_mult=1.0,
                              regime="NORMAL")
+
+    # ------------------------------------------------- P3 doctrine (S5)
+    #: Minutes after a red print's window closes during which the
+    #: market is in the REACTION state (the desk trades the
+    #: reaction — first displacement + held retracement — not the
+    #: clock).
+    REACTION_MIN = 30.0
+    #: Pre-print doctrine lead: an event whose window opens
+    #: within this many minutes triggers the pre-print position
+    #: rule on open intraday exposure.
+    PREPRINT_LEAD_MIN = 30.0
+
+    def next_event(self, now: datetime | None = None
+                   ) -> tuple[NewsEvent, float] | None:
+        """The next event whose PAUSE WINDOW has not yet opened,
+        with minutes until that window opens (negative once it
+        has).  None when the calendar holds nothing ahead."""
+        now = now or self._clock()
+        best: tuple[NewsEvent, float] | None = None
+        for ev in self.events(now):
+            start = ev.time - timedelta(minutes=NEWS_BEFORE_MIN)
+            mins = (start - now).total_seconds() / 60.0
+            if ev.time + timedelta(minutes=NEWS_AFTER_MIN) < now:
+                continue  # fully past
+            if best is None or mins < best[1]:
+                best = (ev, mins)
+        return best
+
+    def reaction_state(self, now: datetime | None = None
+                       ) -> NewsEvent | None:
+        """The event whose post-print REACTION window contains
+        ``now`` (window closed within the last REACTION_MIN
+        minutes), else None.  Only EXTREME titles open a reaction
+        state — a minor print's aftermath is ordinary tape."""
+        now = now or self._clock()
+        found: NewsEvent | None = None
+        found_end: datetime | None = None
+        for ev in self.events(now):
+            if not _is_extreme(ev.title):
+                continue
+            end = ev.time + timedelta(minutes=NEWS_AFTER_MIN)
+            if end <= now <= end + timedelta(
+                    minutes=self.REACTION_MIN):
+                if found_end is None or end > found_end:
+                    found, found_end = ev, end
+        return found
 
     # ------------------------------------------------------------- fetch
     @staticmethod

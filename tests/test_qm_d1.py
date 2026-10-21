@@ -287,9 +287,13 @@ def test_qm_d1_is_shadow_in_config_not_executing():
 
 
 def test_runner_scans_d1_frame_not_h1_path(tmp_path):
-    """The runner evaluates qm_d1 on the D1 frame (_scan_qm_d1), NOT
+    """The runner evaluates qm_d1 on the D1 frame (_run_qm_d1), NOT
     through the H1-clocked _get_playbooks path (which would run D1
-    logic on H1 bars)."""
+    logic on H1 bars).  P3/A14: the scan is a REAL order path on
+    the demo (the demo IS the shadow) — this bare runner has no
+    live executor wired, so the touch is evaluated + journaled
+    and the order attempt fails safe inside the per-candidate
+    guard; the full fill path is covered in test_p3_trader.py."""
     cfg = MT5RunnerConfig(
         journal_path=tmp_path / "mt5_journal.jsonl",
         risk_state_path=tmp_path / "mt5_risk.json",
@@ -299,16 +303,17 @@ def test_runner_scans_d1_frame_not_h1_path(tmp_path):
     assert "qm_d1" not in names
     df = _df(BEARISH)
     stats: dict = {}
-    first = runner._scan_qm_d1(df, stats)
+    first = runner._run_qm_d1(df, stats)
     assert len(first) == 1
     assert first[0]["touch_index"] == 31
-    assert stats["qm_d1_shadow"] == 1
+    assert stats["qm_d1_signals"] == 1
     journal = (tmp_path / "mt5_journal.jsonl").read_text()
-    assert "mt5 [SHADOW] qm_d1 -1" in journal
-    # Second scan: same touch is NOT re-logged.
-    second = runner._scan_qm_d1(df, stats)
+    assert "mt5 qm_d1 -1 touch" in journal
+    assert "evaluating for a live order on the D1 clock" in journal
+    # Second scan: same touch is NOT re-evaluated.
+    second = runner._run_qm_d1(df, stats)
     assert second == []
-    assert stats["qm_d1_shadow"] == 1
+    assert stats["qm_d1_signals"] == 1
 
 
 def test_runner_scan_respects_disabled(tmp_path):
@@ -318,4 +323,4 @@ def test_runner_scan_respects_disabled(tmp_path):
         kill_switch_path=tmp_path / "mt5_KILL",
         disabled_playbooks=("qm_d1",))
     runner = MT5Runner(cfg)
-    assert runner._scan_qm_d1(_df(BEARISH), {}) == []
+    assert runner._run_qm_d1(_df(BEARISH), {}) == []

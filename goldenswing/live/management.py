@@ -88,6 +88,14 @@ class ManagementPlan:
     invalidation: str = "standard"
     upgraded: bool = False
     log: str = ""
+    # P3 (S9/F13): HOW breakeven is earned.  "earned" = a funding/
+    # structure event or TP1 banking arms it; the price touch is
+    # demoted to a backstop at be_backstop_r.  "touch" = the
+    # legacy pure price-touch rule — plan_management selects it
+    # for the LATE profile only (its entries are already late;
+    # for them the touch IS the discipline, per S9).
+    be_mode: str = "earned"
+    be_backstop_r: float = 2.0
 
 
 def plan_management(*, direction: int, entry_price: float,
@@ -120,6 +128,8 @@ def plan_management(*, direction: int, entry_price: float,
         plan.max_r = 2.0
         plan.tp3_exit_all_if_high_vol = bool(high_vol)
         plan.invalidation = "full_exit"
+        plan.be_mode = "touch"      # S9: late profile keeps the
+        plan.be_backstop_r = 0.0    # touch (breakeven immediate)
         plan.log = ("late confirm, 0.5x size, $ risk halved — "
                     "TP1 +0.75R / TP2 +1.5R / TP3 +2R, "
                     "breakeven immediate, M5 trail, time stop "

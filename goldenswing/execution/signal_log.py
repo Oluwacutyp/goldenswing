@@ -42,10 +42,13 @@ replacement for the live counters).
 from __future__ import annotations
 
 
-#: Decisions a raw signal record can carry.
+#: Decisions a raw signal record can carry.  "management" (P3)
+#: covers position-management events journaled against an open
+#: trade (be_earned / progress / drift / tp_zone / pre_print) —
+#: the reason string names the action.
 DECISIONS = (
     "accepted", "shadow", "gated", "below_floor",
-    "manipulation_blocked", "invalidated", "watch",
+    "manipulation_blocked", "invalidated", "watch", "management",
 )
 
 
@@ -63,7 +66,8 @@ def log_signal(journal, *, signal_id: str, playbook: str,
                study: dict | None = None,
                score_breakdown: dict | None = None,
                trigger_source: str | None = None,
-               pool: dict | None = None) -> dict:
+               pool: dict | None = None,
+               context: dict | None = None) -> dict:
     """Append one structured signal record.  Never raises: a logging
     failure must not break the signal path (the caller treats the
     record as best-effort audit, like the text notes)."""
@@ -95,6 +99,11 @@ def log_signal(journal, *, signal_id: str, playbook: str,
             "score_breakdown": score_breakdown,
             "trigger_source": trigger_source,
             "pool": pool,
+            # P3 scenario context (spec v3 §12 J): regime label +
+            # posture, day type, ADR state, session posture, SMT,
+            # trigger clock — the scenario the decision was made
+            # IN, on the record.  None on legacy-path records.
+            "context": context,
         })
     except Exception:
         return {}
