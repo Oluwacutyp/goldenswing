@@ -1,22 +1,56 @@
 """MT5 playbook expansion: promotion + new real-trader setups.
 
-The MT5 engine executes exactly the validated playbook set.  The
-promotion (sweep_reversal anchor + fvg_limit) and each new setup get
-their tests here: signal fires on the right structure, does not fire
-on chop, no repainting (batch candidates == live_signal signal set),
-hierarchy still gates every playbook, and a non-validating setup
-stays shadow (live=False, not in the execute list).
+A14 (rework, owner addendum 2026-10-21): the shadow tier is
+abolished on the MT5 path — every playbook the runner evaluates is
+eligible to execute through the same decision flow (Asymmetry
+Score floors, RiskPool, hard lines); the demo engine IS the
+shadow.  ``execute_playbooks`` defaults to None (= all evaluated);
+an explicit tuple remains the owner's narrowing override, and
+``disabled_playbooks`` is the per-playbook kill switch.  The
+promotion (sweep_reversal anchor + fvg_limit) and each new setup
+get their tests here: signal fires on the right structure, does
+not fire on chop, no repainting (batch candidates == live_signal
+signal set).
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pandas as pd
 
-from goldenswing.execution.mt5_runner import MT5RunnerConfig
+from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
+from goldenswing.execution.risk import gold_spec
 from goldenswing.playbooks.base import EngineContext
 
 
 def _ctx(df):
     return EngineContext(df=df, states=[], years=2.0, instrument="XAUUSD")
+
+
+class _FakeExecutor:
+    def symbol_spec(self, symbol):
+        return gold_spec()
+
+    def positions(self, symbol=None):
+        return []
+
+    def account_state(self):
+        return {"equity": 10000.0}
+
+
+def _runner(tmp_path, **cfg_kw):
+    cfg = MT5RunnerConfig(
+        journal_path=tmp_path / "mt5_journal.jsonl",
+        risk_state_path=tmp_path / "mt5_risk.json",
+        kill_switch_path=tmp_path / "mt5_KILL",
+        news_pause_enabled=False,
+        **cfg_kw)
+    runner = MT5Runner(cfg, executor=_FakeExecutor())
+    runner.feed = SimpleNamespace(
+        account_state=lambda: {"equity": 10000.0, "balance": 10000.0,
+                               "free_margin": 10000.0},
+        poll_status=lambda: {"ok": True})
+    return runner
 
 
 def _df(rows, freq="h"):
@@ -29,48 +63,47 @@ def _df(rows, freq="h"):
     )
 
 
-def test_mt5_execute_list_is_exactly_the_validated_set():
+def test_mt5_execute_set_defaults_to_all_evaluated(tmp_path):
+    """A14: no validated-subset execute list any more — the default
+    config executes EVERY playbook the runner evaluates (shadow was
+    unconfirmable by construction; the demo engine is the shadow).
+    An explicit tuple remains the owner's narrowing override."""
     from goldenswing.playbooks import (
         FVGLimitPlaybook,
         FVGMidlinePlaybook,
         InversionPlaybook,
         JudasSwingPlaybook,
         KillzoneOpenPlaybook,
-        OrderBlockPlaybook,
-        QMM5Playbook,
-        RetracementTrapPlaybook,
         SweepReversalPlaybook,
         TrendlineRetestPlaybook,
-        TurtleSoupPlaybook,
-        VReversalPlaybook,
     )
 
-    executed = set(MT5RunnerConfig().execute_playbooks)
-    # Validated set: the promoted anchor + sleeves + the setups
-    # that passed the iron rule (inversion PF 1.11, killzone_open
-    # PF 2.23, judas_swing PF 1.93) + the four RANGE-regime
-    # playbooks (D1 flat is a range, not a shutdown).  The range
-    # set is regime-gated (confluence gate 0b): range playbooks
-    # never fire in a TREND verdict, trend playbooks never fire
-    # in a RANGE verdict.
-    assert executed == {"sweep_reversal", "fvg_midline",
-                        "trendline_retest", "fvg_limit",
-                        "inversion", "killzone_open", "judas_swing",
-                        "range_sweep_reclaim", "range_qm",
-                        "range_mean_reversion",
-                        "range_compression_breakout"}
-    # QM M5 stays shadow: unvalidated, annotation only.
-    assert "qm_m5" not in executed
-    assert QMM5Playbook.live is False
-    # Failed validation stays shadow: never executed, live=False.
-    for name, cls in (("v_reversal", VReversalPlaybook),
-                      ("retracement_trap", RetracementTrapPlaybook),
-                      ("order_block", OrderBlockPlaybook),
-                      ("turtle_soup", TurtleSoupPlaybook)):
-        assert name not in executed
-        assert cls.live is False
-    # Every executed playbook must be live-capable (the runner only
-    # runs pb.live playbooks through the signal path).
+    # Default: execute_playbooks is None — "all evaluated".
+    assert MT5RunnerConfig().execute_playbooks is None
+    runner = _runner(tmp_path)
+    evaluated = {pb.name for pb in runner._get_playbooks()}
+    assert evaluated == {"sweep_reversal", "fvg_midline",
+                         "trendline_retest", "fvg_limit",
+                         "inversion", "killzone_open", "judas_swing",
+                         "turtle_soup", "v_reversal",
+                         "retracement_trap", "order_block", "qm_m5",
+                         "range_sweep_reclaim", "range_qm",
+                         "range_mean_reversion",
+                         "range_compression_breakout", "narrative"}
+    # Evaluated set == execute set under the default config —
+    # including the playbooks the old tier kept shadow (qm_m5,
+    # turtle_soup, v_reversal, retracement_trap, order_block).
+    assert all(runner._executes(name) for name in evaluated)
+    # An explicit tuple narrows execution to exactly its members;
+    # evaluation is unaffected (the kill switch is separate).
+    narrowed = _runner(tmp_path, execute_playbooks=("judas_swing",))
+    assert narrowed._executes("judas_swing")
+    assert not narrowed._executes("turtle_soup")
+    assert not narrowed._executes("qm_m5")
+    assert {pb.name for pb in narrowed._get_playbooks()} == evaluated
+    # Playbook class facts the expansion originally pinned (these
+    # describe the playbooks themselves, not the runner's execute
+    # set): the promoted anchor + sleeves are live-capable…
     for cls in (SweepReversalPlaybook, FVGMidlinePlaybook,
                 TrendlineRetestPlaybook, FVGLimitPlaybook,
                 InversionPlaybook, KillzoneOpenPlaybook,

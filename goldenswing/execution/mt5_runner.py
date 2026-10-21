@@ -69,8 +69,17 @@ from ..charts.engine import render_mt5_signal
 from ..confluence import ConfluenceEngine
 from ..features.engine import read_and_featurize
 from ..feed.tick_log import TickLogger
+from ..live.asymmetry import (STYLE_FLOORS, ScoreContext, floor_for,
+                              score_asymmetry)
+from ..live.atr_regime import (atr_regime as _atr_regime,
+                               baseline_atr as _baseline_atr,
+                               scaled_thresholds as _scaled_thresholds)
 from ..live.dxy import DXYTracker
+from ..live.funding import detect_funding_events
 from ..live.health import HealthMonitor
+from ..live.opposing import risk_tier as _zone_risk_tier, \
+    tier_spec as _tier_spec
+from ..live.sizing import RiskPool, size_for_risk
 from ..live.urgency import urgency_score
 from ..live.volume_profile import volume_profile
 from ..live.hierarchy import (LEG_ORDER, TimeframeStack, TF_MINUTES,
@@ -194,14 +203,31 @@ class MT5RunnerConfig:
     risk_pct: float = 0.01
     fixed_lots: float | None = None  # when set, every trade uses it
     magic: int = 260101
-    execute_playbooks: tuple = ("sweep_reversal", "fvg_midline",
-                                "trendline_retest", "fvg_limit",
-                                "inversion", "killzone_open",
-                                "judas_swing",
-                                "range_sweep_reclaim", "range_qm",
-                                "range_mean_reversion",
-                                "range_compression_breakout")
+    # A14 UNSHADOW (owner addendum 2026-10-21): the shadow tier is
+    # abolished on the MT5 path — a log-only signal can never be
+    # confirmed, and the demo engine IS the shadow.  None = ALL
+    # playbooks evaluated on the H1 path execute through the same
+    # decision flow (score floors, RiskPool, hard lines).  An
+    # explicit tuple remains possible as a config override.
+    # Capital protection is NOT this list: it is the RiskPool
+    # ceiling + StyleBook per-style caps + the RiskGuards daily
+    # cap (spec §11 A14).  The per-playbook kill switch is
+    # ``disabled_playbooks`` below (default: all enabled).
+    execute_playbooks: tuple | None = None
     min_score: float = 60.0
+    # --- Confluence rework (spec v2, arrival pass) ------------------
+    # Sizing mode (A13): "risk" = sizes computed from risk money in
+    # Decimal (live/sizing.py), ledgered per position in a
+    # RiskPool; risk is the MT5-path default.  "fixed" is the
+    # legacy behaviour and is selected by setting fixed_lots (the
+    # EC2 --fixed-lots flag), which always wins when present.
+    sizing_mode: str = "risk"
+    # A6: resting limits at FRESH MAJOR POIs, placed ahead of
+    # arrival at the zone's proximal edge.
+    resting_limit_enabled: bool = True
+    # §5 PullbackWatch: H1 bars a runaway watch survives awaiting
+    # the pullback before it lapses.
+    pullback_watch_bars: int = 12
     signal_gap_bars: int = 0
     journal_path: Path = DATA_DIR / "mt5_journal.jsonl"
     # Deterministic engine: when True the runner dual-writes every
@@ -732,6 +758,22 @@ class MT5Runner:
         # it and runs finalize_exit (STATE 7).  Never consulted
         # for non-narrative tickets.
         self._narrative_states: dict[int, NarrativeState] = {}
+        # Confluence rework (arrival pass): per-ticket RiskPool
+        # ledgers (A13), the latest Asymmetry Score breakdown per
+        # playbook (journal/status), funding-event keys already
+        # consumed per ticket, the PullbackWatch state (§5), the
+        # resting-limit dedupe key (A6) and the last sizing detail
+        # per alert_id (authorized vs realized risk, §6).
+        self._pools: dict[int, RiskPool] = {}
+        self._last_scores: dict[str, dict] = {}
+        self._last_score: dict | None = None
+        self._funded_events: dict[int, set] = {}
+        self._pullback_watch: dict | None = None
+        self._resting_limit_key: str | None = None
+        self._sizing_detail: dict[str, dict] = {}
+        # Funding events carried by a pending LAYER order, consumed
+        # when the layer fills (ticket -> [FundingEvent]).
+        self._pending_funding: dict[int, list] = {}
         self._last_processed: dict[str, pd.Timestamp] = {}
         self._last_sig_bar: dict[str, int] = {}
         self._tick_count = 0
@@ -800,21 +842,24 @@ class MT5Runner:
 
     # ------------------------------------------------------------ wiring
     def _get_playbooks(self) -> list:
-        """Every playbook the H1-clocked signal path knows: the 11
-        executing ones (7 trend + 4 range) plus the 5 shadow ones.
-        Instantiation alone
-        never orders — the ``auto = pb.name in execute_playbooks``
-        gate at the order step decides, and shadow playbooks only
-        ever get evaluated + logged (see _run_signal_path).  A
-        playbook missing from this list can never fire, executing
-        or shadow, ON THE H1 PATH.
+        """Every playbook the H1-clocked signal path knows.
+
+        A14 (owner addendum 2026-10-21): there is no shadow tier
+        on this path any more.  Every playbook here is evaluated
+        AND eligible to execute through the same decision flow
+        (Asymmetry Score floors, RiskPool, hard lines) — see
+        :meth:`_executes`.  The only opt-out is the per-playbook
+        kill switch (``disabled_playbooks``).  Capital protection
+        is the RiskPool ceiling + StyleBook caps + RiskGuards
+        daily cap, not a log-only tier.
 
         ``qm_d1`` is deliberately NOT here: the H1 path drives
         ``live_signal`` with H1 bars, and running D1 QM logic on H1
         bars would emit H1 patterns mislabelled as Daily QM.  The
-        Daily QM shadow lives in :meth:`_scan_qm_d1`, which evaluates
+        Daily QM scan lives in :meth:`_scan_qm_d1`, which evaluates
         it on the real D1 frame on every D1 close (see
-        :meth:`_refresh_bars`)."""
+        :meth:`_refresh_bars`) — it is outside A14's scope (not an
+        H1-path playbook; no D1-clock order path exists yet)."""
         if self._playbooks is None:
             self._playbooks = [SweepReversalPlaybook(),
                                FVGMidlinePlaybook(),
@@ -1194,6 +1239,12 @@ class MT5Runner:
                     res = self.executor.modify_sl(ticket, action.level)
                     if res.ok:
                         self.tick_manager.apply(ticket, action)
+                        # A13: the pool's base layer rolls with the
+                        # broker stop (refund net of reserve).
+                        if pos is not None:
+                            self._pool_sync_stop(
+                                ticket, pos.alert_id,
+                                float(action.level))
                         self.journal.log_note(
                             f"mt5 tick: ticket {ticket} SL -> "
                             f"{action.level:.2f} ({action.reason})")
@@ -1465,11 +1516,14 @@ class MT5Runner:
         Only narrative signals (``kind == "narrative"``) get a plan.
         The chain is rebuilt from the live frames at fill time
         (``advance`` from a fresh state — the same evaluation the
-        NarrativePlaybook ran when it emitted the signal); when the
-        chain is no longer in ENTRY at fill time, no plan is
-        attached rather than a stale one.  ``mark_entered`` locks
-        the SL at fill and builds the differentiated management
-        plan (clean/late, tier, opposing, ATR regime).
+        NarrativePlaybook ran when it emitted the signal).
+        REWORK (spec §3.2): if the chain is no longer in ENTRY at
+        fill time the plan is STILL built — from the fill, via
+        ``mark_entered`` — because the fill was score-authorized
+        and the chain's ENTRY precondition was a gating artifact.
+        ``mark_entered`` locks the SL at fill and builds the
+        differentiated management plan (clean/late, tier,
+        opposing, ATR regime).
 
         Returns ``(state, kwargs)`` where ``kwargs`` are the
         ``tick_manager.open`` narrative kwargs; ``(None, {})``
@@ -1486,10 +1540,25 @@ class MT5Runner:
                 return None, {}
             state = advance_narrative(NarrativeState(), frames)
             if state.state != _NARR_ENTRY:
+                # REWORK (spec §3.2, following the CODE): the
+                # per-position state write is re-pointed at
+                # plan_management via mark_entered.  Under the
+                # rework a narrative fill is score-authorized, so
+                # the chain may have moved past ENTRY (or never
+                # completed) by fill time — refusing the plan
+                # would leave a live position on TickConfig
+                # defaults for a gating artifact that no longer
+                # exists.  The runner attests the fill: the state
+                # is set to ENTRY with the SIGNAL's direction and
+                # the one real plan builder runs unchanged (tier /
+                # opposing / ATR adjustments included).
                 self.journal.log_note(
-                    "mt5 narrative: chain no longer ENTRY at fill, "
-                    "no management plan attached")
-                return None, {}
+                    "mt5 narrative: chain not ENTRY at fill "
+                    f"(state {state.state}) — management plan "
+                    "built from the fill itself (score-authorized, "
+                    "spec §3.2 re-point)")
+                state.direction = int(sig.direction)
+                state.state = _NARR_ENTRY
             state = _mark_narrative_entered(
                 state, entry_price=float(fill_price),
                 stop=float(sig.invalidation),
@@ -1590,6 +1659,22 @@ class MT5Runner:
         # never reach here (they go through tick_manager.apply),
         # so this is the full close only.
         _narr_state = self._narrative_states.pop(ticket, None)
+        # Rework: close out the position's RiskPool ledger — its
+        # final state joins the close evidence (A13/A14).
+        # getattr-guarded like everything else on this fail-open
+        # path: a partially constructed runner must never crash a
+        # close.
+        _pools = getattr(self, "_pools", None)
+        _pool = _pools.pop(ticket, None) if _pools is not None \
+            else None
+        _funded = getattr(self, "_funded_events", None)
+        if _funded is not None:
+            _funded.pop(ticket, None)
+        if _pool is not None:
+            self.journal.log_note(
+                f"mt5 pool closed: ticket {ticket} budget "
+                f"{_pool.budget} consumed at close "
+                f"{_pool.consumption()} ({pb} {pnl_r:+.2f}R)")
         if _narr_state is not None:
             try:
                 _idle, _entry = _finalize_narrative_exit(
@@ -2698,7 +2783,8 @@ class MT5Runner:
                 if mid:
                     line += f" · last price {mid:.1f}"
                 return line
-            return f"setup: none — {self._live_setup_reason}"
+            return (f"setup: none — {self._live_setup_reason}"
+                    + self._score_pool_lines())
         if setup.get("regime") == "range":
             # RANGE regime: range band + touches + mid + nearest
             # edge + distance to it — never "HOLD d1_flat".
@@ -2785,7 +2871,47 @@ class MT5Runner:
                 line += f" · last price {mid:.1f} (${mid - zone['top']:.1f} above zone)"
             else:
                 line += f" · last price {mid:.1f} INSIDE zone (armed, awaiting POI confirm)"
+        line += self._score_pool_lines()
         return line
+
+    def _score_pool_lines(self) -> str:
+        """Rework /status additions (spec §6.2): the live setup's
+        latest Asymmetry Score breakdown + the held position's
+        RiskPool state + any active PullbackWatch.  Appended to
+        the setup line — every pre-existing status field is
+        untouched."""
+        out = ""
+        b = self._last_score
+        if b:
+            def _p(name):
+                return float((b.get(name) or {}).get("points", 0.0))
+            out += (f"\nscore: {float(b.get('total', 0.0)):.0f}/100 "
+                    f"[structure {_p('structure'):.0f}/30 · "
+                    f"efficiency {_p('efficiency'):.0f}/25 · "
+                    f"pullback {_p('pullback'):.0f}/15 · "
+                    f"location {_p('location'):.0f}/15 · "
+                    f"session {_p('session'):.0f}/10 · "
+                    f"macro {_p('macro'):.0f}/5]"
+                    + (" · FLIPPED" if b.get("flipped") else ""))
+        for ticket, pool in self._pools.items():
+            st = pool.state()
+            out += (f"\npool: ticket {ticket} budget "
+                    f"${st['budget']:.2f} · consumed "
+                    f"${st['consumed']:.2f} · headroom "
+                    f"${st['headroom']:.2f} · "
+                    f"{len(st['layers'])} layer(s) booked")
+        w = self._pullback_watch
+        if w is not None:
+            zone = w["zone"]
+            left = int(self.cfg.pullback_watch_bars) \
+                - (self._current_h1_bar() - int(w["bar0"]))
+            out += (f"\nwatch: {w['playbook']} "
+                    f"{'+' if w['direction'] > 0 else '-'}1 "
+                    f"pullback watch on {zone.get('tf', '?')} zone "
+                    f"{float(zone['bottom']):.1f}–"
+                    f"{float(zone['top']):.1f} · {max(left, 0)} H1 "
+                    "bars left")
+        return out
 
     def boundary_line(self) -> str:
         """Edge-boundary + persisted-state lines for /status.
@@ -3576,6 +3702,277 @@ class MT5Runner:
                         self._drop_staged_confirm(key, payload, stats)
                         break
 
+    # --------------------------------------- PullbackWatch (§5)
+    def _enter_pullback_watch(self, pb, sig, verdict, zone_d,
+                              score, funding) -> None:
+        """Park a runaway setup in PullbackWatch (spec §5): the
+        DO NOT CHASE reset is gone on the arrival path — the setup
+        is not dismantled, the watch awaits the pullback for up to
+        ``pullback_watch_bars`` H1 bars, dying early only on a
+        close through the zone's far edge (the idea is dead, not
+        merely late)."""
+        if self._pullback_watch is not None:
+            return  # one watch at a time; the first setup owns it
+        self._pullback_watch = {
+            "direction": int(sig.direction),
+            "zone": dict(zone_d),
+            "playbook": pb.name,
+            "bar0": self._current_h1_bar(),
+            "score_total": float(score.total),
+        }
+        self.journal.log_note(
+            f"mt5 watch: {pb.name} "
+            f"{'+' if sig.direction > 0 else '-'}1 runaway from "
+            f"{zone_d.get('tf', '?')} zone "
+            f"{float(zone_d['bottom']):.1f}-{float(zone_d['top']):.1f} "
+            f"— PullbackWatch armed for "
+            f"{self.cfg.pullback_watch_bars} H1 bars (asym "
+            f"{score.total:.0f}); the setup is parked, not reset")
+
+    def _maintain_pullback_watch(self, mid: float) -> None:
+        """Per-tick watch upkeep: pullback arrival clears the
+        watch (the live setup re-arms through the normal trigger
+        machinery — nothing was dismantled); a close through the
+        far edge kills it; the bar budget lapses it."""
+        w = self._pullback_watch
+        if w is None:
+            return
+        zone = w["zone"]
+        d = int(w["direction"])
+        if self.tick_manager.tickets():
+            self._pullback_watch = None
+            self.journal.log_note(
+                "mt5 watch: cleared — a position is open, the "
+                "watch is moot")
+            return
+        if float(zone["bottom"]) <= mid <= float(zone["top"]):
+            self._pullback_watch = None
+            self.journal.log_note(
+                f"mt5 watch: pullback arrived — price back inside "
+                f"the {zone.get('tf', '?')} zone "
+                f"{float(zone['bottom']):.1f}-{float(zone['top']):.1f}; "
+                "watch cleared, the armed setup owns the entry now")
+            return
+        # Invalidation: an H1 CLOSE beyond the far edge + buffer.
+        try:
+            h1 = (self._stack.frames.get("H1")
+                  if self._stack is not None else None)
+            atr = float(zone.get("atr") or self._last_zone_atr or 0.0)
+            if h1 is not None and len(h1) and atr > 0:
+                last_close = float(h1["close"].iloc[-1])
+                buf = 0.25 * atr
+                dead = (last_close < float(zone["bottom"]) - buf) \
+                    if d > 0 else \
+                    (last_close > float(zone["top"]) + buf)
+                if dead:
+                    self._pullback_watch = None
+                    self.journal.log_note(
+                        "mt5 watch: KILLED — H1 close through the "
+                        "zone's far edge; the idea is dead, not "
+                        "late (§5 probe-death rule)")
+                    return
+        except Exception:
+            pass
+        if self._current_h1_bar() - int(w["bar0"]) \
+                > int(self.cfg.pullback_watch_bars):
+            self._pullback_watch = None
+            self.journal.log_note(
+                f"mt5 watch: lapsed after "
+                f"{self.cfg.pullback_watch_bars} H1 bars without a "
+                "pullback")
+
+    # --------------------------------------- resting limit (A6)
+    def _maybe_place_resting_limit(self, tick: dict,
+                                   stats: dict) -> None:
+        """A6: when the armed POI is a FRESH MAJOR zone, rest a
+        limit at its proximal edge AHEAD of arrival — subject to
+        the score floor, the RiskPool budget logic (placement-time
+        sizing), RiskGuards and the margin check.  Journaled with
+        trigger_source=resting_limit, playbook 'arrival_zone' (the
+        decision flow is the actor; no playbook fired)."""
+        if not self.cfg.resting_limit_enabled:
+            return
+        if self.cfg.paused or self._regime_pause is not None:
+            return
+        # A resting order that filled / cancelled / expired frees
+        # its dedupe key: a later identical setup may rest again.
+        if self._resting_limit_key is not None \
+                and not self._pending_orders \
+                and not self.tick_manager.tickets():
+            self._resting_limit_key = None
+        if self.tick_manager.tickets() or self._pending_orders:
+            return
+        if self._pending is not None:
+            return  # a touch is already armed — arrival path owns it
+        setup = self._live_setup
+        if not setup or setup.get("regime") not in (None, "trend"):
+            return
+        if setup.get("arm") == "continuation":
+            return  # retest bands are not graded POIs
+        direction = int(setup.get("direction", 0) or 0)
+        if direction == 0:
+            return
+        major = setup.get("major_zone")
+        if not major:
+            return
+        if str(major.get("lifecycle") or "") != "fresh" \
+                or str(major.get("tier") or "") != "MAJOR":
+            return
+        side = str(major.get("side", ""))
+        if (direction > 0) != (side == "support"):
+            return
+        mid = float(tick["mid"])
+        atr = float(setup.get("atr_h1") or self._last_zone_atr or 0.0)
+        if atr <= 0:
+            return
+        prox = float(major.get("proximal")
+                     or (major["top"] if direction > 0
+                         else major["bottom"]))
+        distal = float(major.get("distal")
+                       or (major["bottom"] if direction > 0
+                           else major["top"]))
+        # Ahead of arrival only: approach side, within 2 ATR,
+        # not yet at/inside the band, not through it.
+        if direction > 0:
+            if mid <= prox or mid - prox > 2.0 * atr:
+                return
+        else:
+            if mid >= prox or prox - mid > 2.0 * atr:
+                return
+        key = f"{major.get('zone_id') or major.get('level')}:{direction}"
+        if self._resting_limit_key == key:
+            return
+        zone_d = dict(major)
+        # The score prices the TRADE, whose entry is the proximal
+        # edge — not the current tick (evaluating location at the
+        # tick would make any approach beyond 0.5 ATR
+        # mathematically unauthorizable, a dead feature).
+        score = self._score_for(direction=direction, verdict=None,
+                                price=prox, zone_d=zone_d, atr=atr)
+        fl = floor_for("ZONE_PATH")
+        if score.total < float(fl["floor"]) \
+                or score.component("location") < float(
+                    fl.get("min_location", 0.0)):
+            if getattr(self, "_resting_skip_key", None) != key:
+                self._resting_skip_key = key
+                self.journal.log_note(
+                    f"mt5 resting limit: NOT placed at fresh MAJOR "
+                    f"{major.get('tf', '?')} {prox:.1f} — asymmetry "
+                    f"{score.total:.0f} below the zone-path floor "
+                    f"({fl['floor']:.0f} + location "
+                    f"{fl.get('min_location', 0.0):.0f})")
+            return
+        buf = float(setup.get("buf") or 0.25 * atr)
+        invalidation = distal - buf if direction > 0 \
+            else distal + buf
+        entry = prox
+        risk = abs(entry - invalidation)
+        if risk <= 0:
+            return
+        opp = self._opposing_dict(direction)
+        target = float(opp["level"]) if opp else \
+            entry + direction * 2.0 * risk
+        try:
+            spec = self.executor.symbol_spec(self.cfg.symbol)
+            acct = self.feed.account_state()
+        except Exception:
+            return
+        stop0 = TickManager.planned_stop(
+            OrderRequest(symbol=self.cfg.symbol, direction=direction,
+                         volume=0.0, stop_loss=invalidation, atr=atr))
+        bar = self._current_h1_bar()
+        alert_id = f"MT5-arrival_zone-{bar}"
+        detail = None
+        if self._sizing_mode() == "risk":
+            total = float(score.total)
+            band = 1.0 if total >= 75.0 else (
+                0.75 if total >= 60.0 else 0.5)
+            _tier, tier_mult, _ceil = self._traffic(zone_d)
+            risk_money = float(acct.get("equity", 0.0)) \
+                * float(self.cfg.risk_pct) * band * tier_mult
+            result = size_for_risk(
+                risk_money, abs(entry - stop0), spec)
+            if not result.ok:
+                self.journal.log_note(
+                    f"mt5 resting limit: DECLINED sizing "
+                    f"{result.verdict} at fresh MAJOR "
+                    f"{major.get('tf', '?')} {prox:.1f} (never "
+                    "rounded up)")
+                return
+            lots = float(result.lots)
+            detail = {"authorized_risk": float(result.risk_money),
+                      "realized_risk": float(result.realized_risk),
+                      "drag": float(result.drag),
+                      "raw_lots": float(result.raw_lots),
+                      "lots": lots}
+        elif self.cfg.fixed_lots is not None:
+            lots = float(self.cfg.fixed_lots)
+        else:
+            sizing = size_position(
+                balance=float(acct.get("equity", 0.0)),
+                risk_pct=self.cfg.risk_pct, entry=entry, stop=stop0,
+                spec=spec)
+            if sizing.lots <= 0:
+                return
+            lots = float(sizing.lots)
+        from types import SimpleNamespace
+        pb_stub = SimpleNamespace(name="arrival_zone")
+        sig_stub = SimpleNamespace(
+            direction=direction, entry_ref=entry,
+            invalidation=invalidation, targets=[target], atr=atr,
+            index=bar, score=float(score.total),
+            factors=["resting_limit"], kind="")
+        if not self._check_risk_guards(pb_stub, sig_stub, lots,
+                                       stop0, acct):
+            return
+        if not self._check_margin(pb_stub, sig_stub, lots, False,
+                                  acct):
+            return
+        request = OrderRequest(
+            symbol=self.cfg.symbol, direction=direction,
+            volume=lots, stop_loss=float(stop0),
+            entry_ref=entry, take_profit=target,
+            targets=[target], atr=atr, risk_money=0.0,
+            alert_id=alert_id, bar_index=bar,
+            magic=self.cfg.magic, order_kind="limit",
+            order_price=entry)
+        track_request = OrderRequest(
+            symbol=self.cfg.symbol, direction=direction,
+            volume=lots, stop_loss=float(invalidation),
+            entry_ref=entry, targets=[target], atr=atr,
+            bar_index=bar, alert_id=alert_id, magic=self.cfg.magic)
+        verdict_stub = {
+            "zone": zone_d, "direction": direction,
+            "trigger": "resting_limit",
+            "bias_d1": setup.get("bias_d1"),
+            "bias_h4": setup.get("bias_h4"),
+            "entry_clock": "H1", "amd_phase": None, "qm": {},
+            "volume": None, "dxy_corr": None, "urgency": None}
+        placed = self._place_pending_order(
+            pb_stub, sig_stub, verdict_stub, "limit", entry,
+            request, track_request, stats, bar)
+        if placed:
+            self._resting_limit_key = key
+            if detail is not None:
+                self._sizing_detail[alert_id] = detail
+            self.journal.log_note(
+                f"mt5 resting limit: LIMIT "
+                f"{'+' if direction > 0 else '-'}1 {lots} lots @ "
+                f"{entry:.2f} (proximal edge of fresh MAJOR "
+                f"{major.get('tf', '?')} zone "
+                f"{float(major['bottom']):.1f}-"
+                f"{float(major['top']):.1f}) SL {stop0:.2f} — "
+                f"asym {score.total:.0f}, source resting_limit")
+            log_signal(
+                self.journal, signal_id=alert_id,
+                playbook="arrival_zone", direction=direction,
+                score=float(score.total), decision="accepted",
+                reason="resting limit at fresh MAJOR proximal edge "
+                       "(A6)",
+                entry=entry, stop=invalidation, targets=[target],
+                score_breakdown=score.breakdown(),
+                trigger_source="resting_limit")
+
     def _evaluate_live_tick(self, tick: dict, stats: dict) -> None:
         """Live evaluation clock: touch arms, family confirms, entry
         on entry-TF closes.  H1 closes never gate evaluation."""
@@ -3645,6 +4042,12 @@ class MT5Runner:
         # Tick management runs elsewhere and is unaffected.
         if self._regime_pause is not None:
             return
+        # Rework per-tick upkeep: PullbackWatch maintenance (§5)
+        # + the A6 resting-limit check (fresh MAJOR POI ahead of
+        # arrival).  Both are cheap guards first, no-ops unless
+        # their state calls for action.
+        self._maintain_pullback_watch(mid)
+        self._maybe_place_resting_limit(tick, stats)
         # Stale re-arm block: if a previous touch disarmed as stale,
         # price must have EXITED that zone before any re-arm.  The
         # clear runs here (before the setup-None return) so an exit
@@ -3991,6 +4394,16 @@ class MT5Runner:
             "h4_context": h4_context,
             "regime": regime, "range": setup.get("range"),
             "size_mult": size_mult,
+            # Trade-style marker (hierarchy F2): the arming
+            # setup's arm rides the verdict so the per-style
+            # floor in _run_one_playbook routes a continuation
+            # trade to its own floor row.  The setup dict is the
+            # only place this marker exists on the tick path
+            # (live_setup sets arm == "continuation"); without
+            # this copy the verdict reaching the floor had lost
+            # it.  Pullback / range setups carry no arm (None)
+            # and route exactly as before.
+            "arm": setup.get("arm"),
             # Boundary-gate fields (confluence gate): sweep
             # confirmations + edge cooldowns from the persisted
             # boundary machine.  A wick alone never passes the
@@ -4039,6 +4452,252 @@ class MT5Runner:
                 zone=zone, frame=frame)
         except Exception:
             return None
+
+    # --------------------------------------- rework decision helpers
+    def _executes(self, pb_name: str) -> bool:
+        """A14: is this playbook eligible to execute on the MT5
+        path?  Default (execute_playbooks None) = every evaluated
+        playbook.  An explicit config tuple narrows it; the
+        disabled list is the kill switch and is checked by the
+        caller before evaluation."""
+        if self.cfg.execute_playbooks is None:
+            return True
+        return pb_name in self.cfg.execute_playbooks
+
+    def _sizing_mode(self) -> str:
+        """Effective sizing mode (A13): an explicit fixed_lots
+        always wins (the EC2 --fixed-lots flag is the owner's
+        deliberate override); otherwise the configured mode."""
+        if self.cfg.fixed_lots is not None:
+            return "fixed"
+        return str(self.cfg.sizing_mode or "risk")
+
+    def _zone_dict_for(self, verdict: dict | None,
+                       direction: int) -> dict | None:
+        """The graded structural zone behind this verdict, as a
+        dict (zones.to_dict shape, incl. lifecycle A2): the
+        setup's coincident MAJOR zone when the refresh annotated
+        one; else the nearest structural zone overlapping the
+        trigger band; else the trigger band itself, graded
+        'tested' (a retest band is definitionally tested) so the
+        score still reads a zone context."""
+        if not verdict:
+            return None
+        major = verdict.get("major_zone")
+        if major:
+            return dict(major)
+        zone = verdict.get("zone") or {}
+        top, bottom = zone.get("top"), zone.get("bottom")
+        if top is None or bottom is None:
+            return None
+        best = None
+        best_d = None
+        for z in self._structural_zones or []:
+            try:
+                d = min(abs(float(z.top) - float(top)),
+                        abs(float(z.bottom) - float(bottom)))
+            except Exception:
+                continue
+            if best_d is None or d < best_d:
+                best, best_d = z, d
+        atr = float(verdict.get("risk") or 0.0)
+        if best is not None and (best_d is not None
+                                 and (atr <= 0 or best_d <= atr)):
+            return best.to_dict()
+        out = dict(zone)
+        out.setdefault("tier", "MINOR")
+        out.setdefault("lifecycle", "tested")
+        out.setdefault("touches", 1)
+        out.setdefault("status", "active")
+        out.setdefault("score", 40.0)
+        # This band is the hierarchy's own ARMED entry level (legs
+        # 1-2 marked it; the trigger fired there).  It carries no
+        # ZoneStore grade, so no tier is invented for it — the
+        # marker tells the Location component to credit the
+        # at-the-level share in full (the setup armed HERE) while
+        # curve + draw carry the quality discrimination.
+        out["armed_band"] = True
+        return out
+
+    def _opposing_dict(self, direction: int) -> dict | None:
+        """Nearest opposing structural zone (the draw magnet)."""
+        try:
+            from ..live.opposing import opposing_zone_for
+            zones = [z.to_dict() for z in self._structural_zones or []]
+            price = float((self._last_tick or {}).get("mid") or 0.0)
+            if not zones or price <= 0:
+                return None
+            opp = opposing_zone_for(zones, price, direction)
+            return dict(opp) if opp else None
+        except Exception:
+            return None
+
+    def _score_for(self, *, direction: int, verdict: dict | None,
+                   price: float, zone_d: dict | None,
+                   atr: float) -> object:
+        """Asymmetry Score for one candidate (spec §2).  Frames
+        are parameters, not premises: the H1 path scores on the
+        H1 frame (the path's clock) with the D1 frame as the
+        dealing range when the stack carries one — P3 floats
+        these per style.
+
+        At-zone candidates (price inside the zone band ± 0.5 ATR)
+        are scored with allow_flip=False: the approach into a
+        zone closes through minor trigger-frame pivots on the
+        way in — arrival, not a thesis flip; the zone's far edge
+        governs invalidation there (spec §5)."""
+        frames = (self._stack.frames if self._stack is not None
+                  else {}) or {}
+        at_zone = False
+        if zone_d is not None and atr and float(atr) > 0:
+            try:
+                at_zone = float(zone_d["bottom"]) - 0.5 * float(atr) \
+                    <= float(price) \
+                    <= float(zone_d["top"]) + 0.5 * float(atr)
+            except Exception:
+                at_zone = False
+        # The dealing range for the Location curve is the range of
+        # the trade's CONTEXT — the timeframe that owns the zone
+        # (an H4 POI trade is located in the H4 range; measuring it
+        # against D1 would grade a different trade).  Fallback:
+        # D1, then the scoring frame.
+        range_frame = None
+        zone_tf = str((zone_d or {}).get("tf") or "")
+        if not zone_tf and verdict is not None \
+                and verdict.get("h4_context"):
+            # The verdict's own provenance: its POI is the
+            # hierarchy's H4 zone (h4_context is only set when
+            # the H4 leg built the setup).
+            zone_tf = "H4"
+        if zone_tf and frames.get(zone_tf) is not None:
+            range_frame = frames.get(zone_tf)
+        elif frames.get("D1") is not None:
+            range_frame = frames.get("D1")
+        else:
+            range_frame = frames.get("H1")
+        ctx = ScoreContext(
+            direction=int(direction),
+            frame=frames.get("H1"),
+            atr=float(atr or 0.0), price=float(price),
+            style="", zone=zone_d,
+            opposing_zone=self._opposing_dict(direction),
+            range_frame=range_frame,
+            verdict=verdict,
+            dxy_corr=(verdict or {}).get("dxy_corr"))
+        return score_asymmetry(ctx, allow_flip=not at_zone)
+
+    def _funding_report(self, verdict: dict | None,
+                        zone_d: dict | None):
+        """Funding-event detectors over the entry frame (spec
+        §4.2): the chain evaluators reused, never gated on.  The
+        entry frame + ATR follow the narrative chain's own
+        convention (M15 bars, H4 ATR, regime-scaled thresholds)."""
+        frames = (self._stack.frames if self._stack is not None
+                  else {}) or {}
+        entry = frames.get("M15")
+        h4 = frames.get("H4")
+        atr = float(atr14(h4)) if h4 is not None and len(h4) else 0.0
+        if atr <= 0:
+            atr = float((verdict or {}).get("risk") or 0.0)
+        try:
+            reg = _atr_regime(atr, _baseline_atr(h4))
+            th = _scaled_thresholds(str(reg.get("regime", "NORMAL")))
+        except Exception:
+            th = {"disp_min_atr": 1.5, "volume_spike_min": 1.5}
+        direction = int((verdict or {}).get("direction", 0) or 0)
+        return detect_funding_events(
+            entry, direction=direction, atr=atr, zone=zone_d,
+            disp_min_atr=float(th["disp_min_atr"]),
+            volume_spike_min=float(th["volume_spike_min"]))
+
+    def _traffic(self, zone_d: dict | None) -> tuple[str, float, int]:
+        """Traffic-light scalar (spec §4.4): (tier, size_mult,
+        layer_ceiling) from the armed zone's corrected grade.
+        Trims size/layers/TPs — never vetoes.  No zone grade ->
+        no trim (the scalar prices a barrier; without one there
+        is nothing to price)."""
+        if not zone_d:
+            return "YELLOW", 1.0, 99
+        tier = _zone_risk_tier(zone_d)
+        spec = _tier_spec(tier)
+        ceiling = {"GREEN": 3, "YELLOW": 2, "RED": 1}.get(tier, 2)
+        return tier, float(spec.get("size_mult", 0.75)), ceiling
+
+    def _pool_for_open(self, ticket: int, *, lots: float,
+                       entry: float, stop: float, direction: int,
+                       alert_id: str) -> RiskPool | None:
+        """Create + book the RiskPool for a freshly opened base
+        position (A13).  Budget = the legacy total-risk envelope
+        (equity x risk_pct x layer cap multiple) so the rework's
+        ceiling is exactly the old one; distribution inside it is
+        evidence-driven.  Fixed mode books the owner's explicit
+        lots against an envelope at least as large (the pool is
+        the ledger there, RiskGuards remain the gate)."""
+        if ticket in self._pools:
+            return self._pools[ticket]
+        try:
+            spec = self.executor.symbol_spec(self.cfg.symbol)
+            acct = self.feed.account_state()
+            equity = float(acct.get("equity", 0.0) or 0.0)
+        except Exception:
+            return None
+        if equity <= 0:
+            return None
+        budget = equity * float(self.cfg.risk_pct) \
+            * float(self.cfg.layer_max_total_risk_mult)
+        pool = RiskPool(budget)
+        if not pool.authorize(alert_id, lots, entry, stop,
+                              int(direction), spec):
+            # The order already filled (the pool is created at
+            # fill time) — the ledger must book reality, so widen
+            # the budget to the layer's realized risk and journal
+            # it.  In fixed mode this is expected (owner-explicit
+            # lots; RiskGuards gated the order).  In risk mode it
+            # means placement sized past the envelope — visible,
+            # never silent.
+            try:
+                realized = float(spec.money_for_move(
+                    abs(float(entry) - float(stop)), float(lots)))
+            except Exception:
+                realized = budget
+            self.journal.log_note(
+                f"mt5 pool: base layer risk {realized:.2f} exceeds "
+                f"the position budget {budget:.2f} for ticket "
+                f"{ticket} ({self._sizing_mode()} mode) — ledger "
+                "widened to fit the filled order, headroom 0")
+            pool = RiskPool(max(budget, realized))
+            pool.authorize(alert_id, lots, entry, stop,
+                           int(direction), spec)
+        self._pools[ticket] = pool
+        return pool
+
+    def _pool_book_layer(self, ticket: int, *, lots: float,
+                         entry: float, stop: float, direction: int,
+                         alert_id: str) -> bool:
+        """Book one filled layer into the position's pool.
+        Returns the authorize verdict (False = over the ceiling;
+        the caller journals — a filled order is never un-filled)."""
+        pool = self._pools.get(ticket)
+        if pool is None:
+            return True
+        try:
+            spec = self.executor.symbol_spec(self.cfg.symbol)
+        except Exception:
+            return True
+        return pool.authorize(alert_id, lots, entry, stop,
+                              int(direction), spec)
+
+    def _pool_sync_stop(self, ticket: int, layer_key: str,
+                        new_stop: float) -> None:
+        """Roll a pool layer's stop (tighten-only; widening is
+        ignored — pool accounting never loosens)."""
+        pool = self._pools.get(ticket)
+        if pool is None:
+            return
+        try:
+            pool.move_stop(layer_key, new_stop)
+        except Exception:
+            pass
 
     def _run_signal_path(self, h1: pd.DataFrame, t: int,
                          states, years: float, verdict: dict,
@@ -4095,17 +4754,28 @@ class MT5Runner:
         ctx = EngineContext(df=h1, states=states, years=years,
                             instrument=self.cfg.symbol)
         engine = self._get_engine()
+        # Rework decision context, computed ONCE per verdict (not
+        # per playbook): the graded zone behind the setup + the
+        # funding-event report (chain evaluators as detectors).
+        zone_d = self._zone_dict_for(
+            verdict, int((verdict or {}).get("direction", 0) or 0))
+        funding = None
+        try:
+            funding = self._funding_report(verdict, zone_d)
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: funding detectors failed ({exc}) — "
+                "decisions proceed on score alone")
         for pb in self._get_playbooks():
             if pb.name in (self.cfg.disabled_playbooks or ()):
-                continue  # switched off via /set — not evaluated
+                continue  # kill switch (/set) — not evaluated (A14)
             try:
                 self._run_one_playbook(pb, sig_ctx=(ctx, engine),
                                        h1=h1, t=t, verdict=verdict,
-                                       stats=stats)
+                                       stats=stats, zone_d=zone_d,
+                                       funding=funding)
             except Exception as exc:
-                # A crashing playbook never kills the signal path
-                # (shadow playbooks in particular only ran behind
-                # the live-skip before this wiring fix).
+                # A crashing playbook never kills the signal path.
                 self._record_blocked(
                     f"playbook_error: {type(exc).__name__}: {exc}",
                     pb.name)
@@ -4113,15 +4783,20 @@ class MT5Runner:
                     f"mt5: {pb.name} signal path failed: "
                     f"{type(exc).__name__}: {exc}")
 
-    def _run_one_playbook(self, pb, *, sig_ctx, h1, t, verdict, stats
-                          ) -> None:
-        """One playbook through gate -> score -> (order | shadow log).
+    def _run_one_playbook(self, pb, *, sig_ctx, h1, t, verdict, stats,
+                          zone_d=None, funding=None) -> None:
+        """One playbook through the REWORK decision flow (spec §3).
 
-        Shadow playbooks (not in ``execute_playbooks``) are
-        EVALUATED + LOGGED + COUNTED exactly like executing ones —
-        but they never reach chart/alert/order: the ``auto`` gate
-        below is the only thing that may order, and it is False for
-        them.  Instantiation never orders by itself.
+        Per signal: Asymmetry Score (live/asymmetry.py) -> hard
+        lines only (declaration gates via the engine's
+        hard_line_check + the manipulation filter) -> per-style
+        score floor (the flat min_score and the hierarchy/chain
+        permission gates are GONE on this path: the verdict feeds
+        the Macro block + traffic scalar, the chain evaluators
+        feed funding events) -> order / layer.  A14: every
+        evaluated playbook can execute — there is no shadow
+        branch; a signal is authorized, floored, gated by a hard
+        line, parked in PullbackWatch, or the playbook is off.
         """
         ctx, engine = sig_ctx
         # Range playbooks need the native H4 frame (threaded in
@@ -4133,33 +4808,88 @@ class MT5Runner:
         sigs = pb.live_signal(ctx.states, t, h1) or []
         for sig in sigs:
             alert_id = f"MT5-{pb.name}-{sig.index}"
-            if sig.score < self.cfg.min_score:
-                self._record_blocked(
-                    f"min_score: score {sig.score:.0f} < "
-                    f"{self.cfg.min_score:.0f}", pb.name)
+            if sig.index - self._last_sig_bar.get(pb.name, -10 ** 9) \
+                    < self.cfg.signal_gap_bars:
+                continue
+            # ---- Asymmetry Score (the decision number) ----------
+            atr_h1 = float(atr14(h1)) if len(h1) else 0.0
+            score = self._score_for(
+                direction=int(sig.direction), verdict=verdict,
+                price=float(sig.entry_ref), zone_d=zone_d,
+                atr=atr_h1 or float(getattr(sig, "atr", 0.0) or 0.0))
+            breakdown = score.breakdown()
+            self._last_scores[pb.name] = breakdown
+            self._last_score = breakdown
+            hier_rec = {
+                "bias_d1": (verdict or {}).get("bias_d1"),
+                "bias_h4": (verdict or {}).get("bias_h4"),
+                "trigger": (verdict or {}).get("trigger"),
+                "entry_clock": (verdict or {}).get("entry_clock"),
+            }
+            if score.flipped:
+                # The score object is for the OTHER side: it can
+                # never fund this direction (spec §2.1 flip rule).
+                reason = ("asymmetry_flip: close through the last "
+                          "defended pivot — structure funds the "
+                          "opposite side only")
+                self._record_blocked(reason, pb.name)
+                self.journal.log_note(
+                    f"mt5: {pb.name} signal refused: {reason}")
                 log_signal(
                     self.journal, signal_id=alert_id, playbook=pb.name,
                     direction=int(sig.direction), score=float(sig.score),
-                    decision="below_floor",
-                    reason=f"min_score: score {sig.score:.0f} < "
-                           f"{self.cfg.min_score:.0f}",
+                    decision="gated", reason=reason,
                     bar_ts=h1.index[t] if t < len(h1) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
                     targets=[float(x) for x in (sig.targets or [])],
-                    factors=list(getattr(sig, "factors", []) or []))
+                    factors=list(getattr(sig, "factors", []) or []),
+                    hierarchy=hier_rec, score_breakdown=breakdown)
                 continue
-            if sig.index - self._last_sig_bar.get(pb.name, -10 ** 9) \
-                    < self.cfg.signal_gap_bars:
+            if zone_d is not None \
+                    and str(zone_d.get("lifecycle") or "") == "used_up":
+                # A2: a used-up zone is abandoned — not traded
+                # even on confirmation.
+                reason = ("zone_used_up: armed zone lifecycle is "
+                          "used_up (touches consume; A2 abandon)")
+                self._record_blocked(reason, pb.name)
+                self.journal.log_note(
+                    f"mt5: {pb.name} signal refused: {reason}")
+                log_signal(
+                    self.journal, signal_id=alert_id, playbook=pb.name,
+                    direction=int(sig.direction), score=float(sig.score),
+                    decision="gated", reason=reason,
+                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    entry=float(sig.entry_ref),
+                    stop=float(sig.invalidation),
+                    targets=[float(x) for x in (sig.targets or [])],
+                    factors=list(getattr(sig, "factors", []) or []),
+                    hierarchy=hier_rec, score_breakdown=breakdown)
                 continue
-            ok, reason = engine.gate_live_signal(
-                pb, sig, ctx, hierarchy_verdict=verdict,
-                spread_px=(self._last_tick or {}).get("spread"))
+            # ---- hard lines: declarations + cost ----------------
+            # The real engine exposes hard_line_check (rework).
+            # Pre-rework engine doubles (older test stubs) fall
+            # back to gate_live_signal with the chain requirement
+            # waived — production always takes the first branch.
+            _hl = getattr(engine, "hard_line_check", None)
+            if _hl is not None:
+                ok, reason = _hl(
+                    pb, sig, ctx,
+                    spread_px=(self._last_tick or {}).get("spread"))
+            else:
+                try:
+                    ok, reason = engine.gate_live_signal(
+                        pb, sig, ctx, hierarchy_verdict=verdict,
+                        spread_px=(self._last_tick or {}).get(
+                            "spread"),
+                        chain_required=False)
+                except TypeError:
+                    ok, reason = engine.gate_live_signal(
+                        pb, sig, ctx, hierarchy_verdict=verdict,
+                        spread_px=(self._last_tick or {}).get(
+                            "spread"))
             if not ok:
                 stats["gated"] += 1
-                if reason.startswith("hierarchy:"):
-                    stats["hierarchy_blocked"] = stats.get(
-                        "hierarchy_blocked", 0) + 1
                 self._record_blocked(reason, pb.name)
                 self.journal.log_note(
                     f"mt5: {pb.name} signal gated: {reason}")
@@ -4172,21 +4902,123 @@ class MT5Runner:
                     stop=float(sig.invalidation),
                     targets=[float(x) for x in (sig.targets or [])],
                     factors=list(getattr(sig, "factors", []) or []),
-                    hierarchy={
-                        "bias_d1": (verdict or {}).get("bias_d1"),
-                        "bias_h4": (verdict or {}).get("bias_h4"),
-                        "trigger": (verdict or {}).get("trigger"),
-                        "entry_clock": (verdict or {}).get("entry_clock"),
-                    })
+                    hierarchy=hier_rec, score_breakdown=breakdown)
+                continue
+            # ---- per-style floor (was: flat min_score) ----------
+            # The floor is defined for zone-path trades (P1 is the
+            # arrival pass).  A signal with NO zone context is not
+            # an arrival-path signal — production verdicts always
+            # carry the setup's zone, so this branch is a stated
+            # scope boundary, journaled when it happens.
+            #
+            # Routing (by the trade's actual style, in priority
+            # order): (1) RANGE — verdict regime, exactly as
+            # before; range setups never carry an arm and are
+            # mutually exclusive with the continuation arm.
+            # (2) CONTINUATION — the hierarchy F2 arm: the verdict's
+            # ``arm`` marker (threaded by _live_verdict from the
+            # arming setup dict — live_setup is its only source;
+            # the closed-bar verdict from evaluate_hierarchy has
+            # no arm concept, so no continuation can arise there),
+            # a verdict ``style`` marker, a nested verdict
+            # ``setup`` dict's arm/style, or a playbook-declared
+            # ``style`` naming the continuation row.  Playbooks
+            # today declare only regime_scope (base.py), never a
+            # STYLE_FLOORS style, so that last check is inert until
+            # one does.  (3) A playbook/verdict style that names a
+            # STYLE_FLOORS row verbatim.  (4) ZONE_PATH default —
+            # the P1 arrival path, whose Location >= 12 condition
+            # is a zone-arrival trade-TYPE condition and stays
+            # exactly as-is for arrival signals.
+            _v = verdict or {}
+            _nested = _v.get("setup") if isinstance(
+                _v.get("setup"), dict) else {}
+            _arm = str(_v.get("arm") or _nested.get("arm") or "")
+            _style = str(_v.get("style") or _nested.get("style")
+                         or getattr(pb, "style", "") or "")
+            if str(_v.get("regime", "")) == "range":
+                path = "RANGE"
+            elif _arm == "continuation" \
+                    or _style in ("continuation",
+                                  "INTRADAY_CONTINUATION"):
+                path = "INTRADAY_CONTINUATION"
+            elif _style in STYLE_FLOORS:
+                path = _style
+            else:
+                path = "ZONE_PATH"
+            fl = floor_for(path)
+            if zone_d is None:
+                floor_ok = True
+                self.journal.log_note(
+                    f"mt5: {pb.name} signal has no zone context — "
+                    "asymmetry floor not applied (not an "
+                    "arrival-path signal); hard lines only")
+            else:
+                floor_ok = score.total >= float(fl["floor"]) \
+                    and score.component("location") >= float(
+                        fl.get("min_location", 0.0)) \
+                    and score.component("structure") >= float(
+                        fl.get("min_structure", 0.0)) \
+                    and score.component("efficiency") >= float(
+                        fl.get("min_efficiency", 0.0)) \
+                    and score.component("pullback") >= float(
+                        fl.get("min_pullback", 0.0))
+            holding = bool(self.tick_manager.tickets())
+            if not floor_ok and not holding:
+                reason = (
+                    f"asymmetry_floor: total {score.total:.0f} < "
+                    f"{fl['floor']:.0f} or component minimum unmet "
+                    f"(location {score.component('location'):.1f} "
+                    f">= {fl.get('min_location', 0.0):.0f} required "
+                    f"on {path})")
+                # §5 PullbackWatch: a runaway (confirmation said
+                # price ran) parks the setup instead of resetting
+                # it — the watch awaits the pullback.
+                if funding is not None and funding.runaway \
+                        and zone_d is not None:
+                    self._enter_pullback_watch(
+                        pb, sig, verdict, zone_d, score, funding)
+                    log_signal(
+                        self.journal, signal_id=alert_id,
+                        playbook=pb.name,
+                        direction=int(sig.direction),
+                        score=float(sig.score), decision="watch",
+                        reason="runaway: price ran from the zone — "
+                               "PullbackWatch armed (§5)",
+                        bar_ts=h1.index[t] if t < len(h1) else None,
+                        entry=float(sig.entry_ref),
+                        stop=float(sig.invalidation),
+                        targets=[float(x) for x in (sig.targets or [])],
+                        factors=list(getattr(sig, "factors", [])
+                                     or []),
+                        hierarchy=hier_rec, score_breakdown=breakdown,
+                        trigger_source="arrival_score")
+                    continue
+                self._record_blocked(
+                    f"min_score: {reason}", pb.name)
+                stats["below_floor"] = stats.get("below_floor", 0) + 1
+                log_signal(
+                    self.journal, signal_id=alert_id, playbook=pb.name,
+                    direction=int(sig.direction), score=float(sig.score),
+                    decision="below_floor", reason=reason,
+                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    entry=float(sig.entry_ref),
+                    stop=float(sig.invalidation),
+                    targets=[float(x) for x in (sig.targets or [])],
+                    factors=list(getattr(sig, "factors", []) or []),
+                    hierarchy=hier_rec, score_breakdown=breakdown)
                 continue
             conf, notes = engine.score_live_signal(
                 pb, sig, ctx, hierarchy_verdict=verdict)
+            trigger_source = "funding_layer" if (
+                holding and funding is not None
+                and funding.events) else "arrival_score"
             self._last_sig_bar[pb.name] = sig.index
             stats["signals"] += 1
             self._signal_counts[pb.name] = \
                 self._signal_counts.get(pb.name, 0) + 1
-            auto = pb.name in self.cfg.execute_playbooks
-            tag = "MT5" if auto else "SHADOW"
+            auto = self._executes(pb.name)
+            tag = "MT5"
             # Dynamic reasoning + study package (accepted signals
             # only): the why + the key levels/data behind it — on
             # the signal record and in the Telegram alert (with the
@@ -4204,7 +5036,8 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5 [{tag}] {pb.name} "
                 f"{'+' if sig.direction > 0 else '-'}1 "
-                f"score={sig.score:.0f} conf={conf:.0f} "
+                f"score={sig.score:.0f} asym={score.total:.0f} "
+                f"conf={conf:.0f} "
                 f"entry~{sig.entry_ref:.1f} stop~{sig.invalidation:.1f} "
                 f"factors={'+'.join(notes) if notes else '-'} "
                 f"hierarchy: D1 {verdict['bias_d1']:+d} / H4 "
@@ -4226,15 +5059,13 @@ class MT5Runner:
                 urgency=(verdict or {}).get("urgency"),
                 reasoning=reasoning,
                 study=study,
-                hierarchy={
-                    "bias_d1": (verdict or {}).get("bias_d1"),
-                    "bias_h4": (verdict or {}).get("bias_h4"),
-                    "trigger": (verdict or {}).get("trigger"),
-                    "entry_clock": (verdict or {}).get("entry_clock"),
-                })
+                hierarchy=hier_rec,
+                score_breakdown=breakdown,
+                trigger_source=trigger_source)
             if not auto:
-                # Shadow: evaluated + logged + counted — never
-                # charted, alerted, or ordered.
+                # Config-narrowed execute list (A14 override): the
+                # signal was evaluated and logged; the owner's
+                # explicit tuple keeps it from ordering.
                 continue
             # Chart: H4 zone + entry/stop/targets + verdict, saved
             # next to the journal and attached to the alert.
@@ -4283,7 +5114,8 @@ class MT5Runner:
                     continue
             if self.tick_manager.tickets():
                 self._try_layer(pb, sig, stats, verdict=verdict,
-                                entry_bar=t)
+                                entry_bar=t, score=score,
+                                funding=funding, zone_d=zone_d)
             elif self.cfg.golden_swing_confirm_enabled \
                     and self._alignment.golden_swing:
                 # Golden Swing base order: the order WAITS for the
@@ -4296,7 +5128,8 @@ class MT5Runner:
             else:
                 self._place_live_order(pb, sig, stats,
                                        verdict=verdict,
-                                       entry_bar=t)
+                                       entry_bar=t, score=score,
+                                       zone_d=zone_d)
 
     # ------------------------------------------------------------- layering
     # Scale-in onto ONE position: a confirming setup in the same
@@ -4306,9 +5139,15 @@ class MT5Runner:
     # magic); the engine tracks the legs in TickManager.layers.
     def _try_layer(self, pb, sig, stats: dict,
                    verdict: dict | None = None,
-                   entry_bar: int | None = None) -> None:
-        """A gated signal while holding: layer or skip, never a
-        second position."""
+                   entry_bar: int | None = None,
+                   score=None, funding=None, zone_d=None) -> None:
+        """A signal while holding: layer or skip, never a second
+        position.  REWORK (spec §4): layers are released by the
+        funding ladder — a NEW funding event (structure shift /
+        displacement / CHoCH-MSB / FVG / sweep / absorption) with
+        the stop at breakeven, or the legacy in-profit path — and
+        sized from the RiskPool's headroom in risk mode.  Fixed
+        mode keeps the legacy arithmetic, unchanged."""
         tickets = self.tick_manager.tickets()
         if len(tickets) != 1:
             self.journal.log_note(
@@ -4325,21 +5164,41 @@ class MT5Runner:
                 f"held position (no flip)")
             return
         layers = self.tick_manager.layers(ticket)
-        if len(layers) >= self.cfg.layer_max_layers:
+        # Traffic-light scalar trims the layer CEILING (§4.4) —
+        # it never vetoes the position itself.
+        _tier, _smult, ceiling = self._traffic(zone_d)
+        max_layers = min(int(self.cfg.layer_max_layers), ceiling)
+        if len(layers) >= max_layers:
             self.journal.log_note(
-                f"mt5: layer skipped {pb.name}: max layers "
-                f"({self.cfg.layer_max_layers}) reached")
+                f"mt5: layer skipped {pb.name}: layer ceiling "
+                f"{max_layers} reached (config "
+                f"{self.cfg.layer_max_layers}, traffic {_tier})")
             return
+        # Funding events not yet consumed by this position.
+        consumed = self._funded_events.setdefault(ticket, set())
+        new_events = [e for e in (funding.events if funding else [])
+                      if e.key not in consumed]
         # In profit?  R measured on the base layer's risk.
         mid = float((self._last_tick or {}).get("mid")
                     or (verdict or {}).get("entry")
                     or sig.entry_ref)
         unreal_r = int(pos.direction) * (mid - pos.entry_price) \
             / pos.risk_price if pos.risk_price > 0 else 0.0
-        if unreal_r < self.cfg.layer_min_profit_r:
+        # Stop at breakeven or better — the funding ladder's
+        # precondition (spec §4.2).
+        eff_stop = self.tick_manager.effective_stop(ticket)
+        d = int(pos.direction)
+        be_secured = eff_stop is not None and (
+            (d > 0 and eff_stop >= pos.entry_price - 1e-9)
+            or (d < 0 and eff_stop <= pos.entry_price + 1e-9))
+        event_funded = bool(new_events) and be_secured
+        if not event_funded \
+                and unreal_r < self.cfg.layer_min_profit_r:
             self.journal.log_note(
-                f"mt5: layer skipped {pb.name}: position +{unreal_r:.2f}R "
-                f"< +{self.cfg.layer_min_profit_r:.2f}R required")
+                f"mt5: layer skipped {pb.name}: position "
+                f"+{unreal_r:.2f}R < +{self.cfg.layer_min_profit_r:.2f}R "
+                "required and no funding event with the stop at "
+                "breakeven")
             return
         # Total risk cap: base risk money x max_mult, across all layers.
         try:
@@ -4348,6 +5207,57 @@ class MT5Runner:
             self.journal.log_note(f"mt5: layer skipped {pb.name}: "
                                   f"no symbol spec")
             return
+        # The layer's own stop (buffered, like a base order).
+        stop0 = TickManager.planned_stop(
+            OrderRequest(symbol=self.cfg.symbol, direction=sig.direction,
+                         volume=0.0, stop_loss=sig.invalidation,
+                         atr=sig.atr))
+        pool = self._pools.get(ticket)
+        if self._sizing_mode() == "risk" and pool is not None:
+            # ---- RiskPool path (A13): size from headroom --------
+            headroom = pool.headroom()
+            if headroom <= 0:
+                self.journal.log_note(
+                    f"mt5: layer skipped {pb.name}: RiskPool "
+                    f"headroom exhausted (consumed "
+                    f"{pool.consumption()} of {pool.budget})")
+                return
+            result = size_for_risk(
+                headroom, abs(float(sig.entry_ref) - stop0), spec)
+            if not result.ok:
+                self.journal.log_note(
+                    f"mt5: layer DECLINED {pb.name}: sizing "
+                    f"{result.verdict} — headroom {headroom} over "
+                    f"stop distance "
+                    f"{abs(float(sig.entry_ref) - stop0):.2f} gives "
+                    f"raw {result.raw_lots} lots, below the broker "
+                    "minimum after step flooring (never rounded up)")
+                log_signal(
+                    self.journal,
+                    signal_id=f"MT5-{pb.name}-{sig.index}-layer",
+                    playbook=pb.name, direction=int(sig.direction),
+                    score=float(sig.score), decision="gated",
+                    reason=f"sizing_decline: {result.verdict}",
+                    entry=float(sig.entry_ref), stop=float(stop0),
+                    score_breakdown=(score.breakdown()
+                                     if score is not None else None),
+                    trigger_source="funding_layer",
+                    pool=pool.state())
+                return
+            self._sizing_detail[
+                f"MT5-{pb.name}-{sig.index}-layer"] = {
+                    "authorized_risk": float(result.risk_money),
+                    "realized_risk": float(result.realized_risk),
+                    "drag": float(result.drag),
+                    "raw_lots": float(result.raw_lots)}
+            self._place_live_order(
+                pb, sig, stats, verdict=verdict,
+                entry_bar=entry_bar, is_layer=True,
+                layer_lots=float(result.lots),
+                funding_events=new_events,
+                score=score, zone_d=zone_d)
+            return
+        # ---- legacy / fixed-mode arithmetic (unchanged) ---------
         base = layers[0]
         base_risk = spec.money_for_move(
             abs(base.entry - base.sl), base.volume)
@@ -4360,11 +5270,6 @@ class MT5Runner:
                 f"mt5: layer skipped {pb.name}: total risk cap "
                 f"({self.cfg.layer_max_total_risk_mult}x base) reached")
             return
-        # The layer's own stop (buffered, like a base order).
-        stop0 = TickManager.planned_stop(
-            OrderRequest(symbol=self.cfg.symbol, direction=sig.direction,
-                         volume=0.0, stop_loss=sig.invalidation,
-                         atr=sig.atr))
         risk_per_lot = spec.money_for_move(
             abs(float(sig.entry_ref) - stop0), 1.0)
         if risk_per_lot <= 0:
@@ -4395,15 +5300,24 @@ class MT5Runner:
             return
         self._place_live_order(pb, sig, stats, verdict=verdict,
                                entry_bar=entry_bar, is_layer=True,
-                               layer_lots=float(lots))
+                               layer_lots=float(lots),
+                               funding_events=new_events,
+                               score=score, zone_d=zone_d)
 
     def _record_layer_fill(self, pb_name: str, sig, *, fill: float,
-                           lots: float, stop0: float, stats: dict) -> None:
+                           lots: float, stop0: float, stats: dict,
+                           funding_events: list | None = None) -> None:
         """A layer order filled: append the leg, move the broker SL
         to the base breakeven (only ever TIGHTENS), journal + alert.
         No new open record — the layer is a leg of the one position,
         not a second trade (the position's close record settles the
         whole stack).
+
+        REWORK (spec §4.2): the layer is booked into the RiskPool;
+        the funding events that released it are marked consumed,
+        and the roll target is the tightest of (base breakeven,
+        the events' invalidation levels) that still tightens the
+        current stop and stays on the safe side of the mid.
         """
         tickets = self.tick_manager.tickets()
         if len(tickets) != 1:
@@ -4423,11 +5337,37 @@ class MT5Runner:
         stats["layers"] = stats.get("layers", 0) + 1
         stats["layer_fills"] = stats.get("layer_fills", 0) + 1
         layers = self.tick_manager.layers(ticket)
-        # Move the broker SL to the base breakeven (safe) — only if
-        # it tightens the current broker SL, never looser.
+        # RiskPool booking + funding-event consumption (A13/§4.2).
+        if not self._pool_book_layer(
+                ticket, lots=float(lots), entry=float(fill),
+                stop=float(stop0), direction=int(pos.direction),
+                alert_id=layer.alert_id):
+            self.journal.log_note(
+                f"mt5 pool: layer {layer.alert_id} on ticket "
+                f"{ticket} exceeds the pool ceiling — booked by "
+                "the broker already; consumption is over budget "
+                "and no further layer can fund until stops roll")
+        if funding_events:
+            consumed = self._funded_events.setdefault(ticket, set())
+            for e in funding_events:
+                consumed.add(e.key)
+        # Move the broker SL to the roll target (base breakeven,
+        # or a funding event's tighter invalidation) — only if it
+        # tightens the current broker SL, never looser.
         d = int(pos.direction)
         eff = self.tick_manager.effective_stop(ticket)
         level = float(pos.entry_price)
+        roll_note = "breakeven"
+        mid = float((self._last_tick or {}).get("mid") or fill)
+        for e in (funding_events or []):
+            inv = getattr(e, "invalidation", None)
+            if inv is None:
+                continue
+            inv = float(inv)
+            if d > 0 and level < inv < mid:
+                level, roll_note = inv, f"funding {e.kind}"
+            elif d < 0 and mid < inv < level:
+                level, roll_note = inv, f"funding {e.kind}"
         moved = False
         if eff is not None and ((d == 1 and level > eff)
                                 or (d == -1 and level < eff)):
@@ -4437,6 +5377,9 @@ class MT5Runner:
                     ticket, TickAction("modify_sl", level=level,
                                        reason="breakeven"))
                 moved = True
+                # The pool's base layer rolls with the broker stop
+                # (refund net of the friction reserve, §4/A13).
+                self._pool_sync_stop(ticket, pos.alert_id, level)
             else:
                 self.journal.log_note(
                     f"mt5 layer: broker SL move to breakeven FAILED "
@@ -4446,12 +5389,13 @@ class MT5Runner:
             f"{'+' if sig.direction > 0 else '-'}1 {lots} lots @ "
             f"{fill:.2f} SL {stop0:.2f} "
             f"({len(layers)} layers)"
-            + (f" broker SL -> breakeven {level:.2f}" if moved else ""))
+            + (f" broker SL -> {roll_note} {level:.2f}" if moved else ""))
         self._send_alert(
             f"MT5 LAYER {pb_name} {'+' if sig.direction > 0 else '-'}1 "
             f"{lots} lots @ {fill:.2f} SL {stop0:.2f} "
             f"({len(layers)} layers, ticket {ticket})"
-            + (f" — broker SL -> breakeven {level:.2f}" if moved else ""))
+            + (f" — broker SL -> {roll_note} {level:.2f}"
+               if moved else ""))
 
     def trim_top_layer(self) -> str:
         """Manual trim (/trim): close the top (most recent) added
@@ -4930,7 +5874,10 @@ class MT5Runner:
                           verdict: dict | None = None,
                           entry_bar: int | None = None,
                           is_layer: bool = False,
-                          layer_lots: float | None = None) -> None:
+                          layer_lots: float | None = None,
+                          funding_events: list | None = None,
+                          score=None, zone_d: dict | None = None
+                          ) -> None:
         """Setup-dependent order selection + placement.
 
         The order type is chosen by where price is vs the entry level
@@ -5017,6 +5964,54 @@ class MT5Runner:
             lots = float(layer_lots)
         elif self.cfg.fixed_lots is not None:
             lots = float(self.cfg.fixed_lots)
+        elif self._sizing_mode() == "risk":
+            # ---- A13 risk sizing (Decimal, quantized once) ------
+            # Risk money = equity x risk_pct x score band x traffic
+            # scalar x the legacy size multipliers (alignment /
+            # regime / news / session applied to the RISK, so the
+            # lot quantization happens exactly once, in Decimal).
+            total = float(score.total) if score is not None else 75.0
+            band = 1.0 if total >= 75.0 else (
+                0.75 if total >= 60.0 else 0.5)
+            _tier, tier_mult, _ceil = self._traffic(zone_d)
+            risk_money = float(acct["equity"]) \
+                * float(self.cfg.risk_pct) * band * tier_mult
+            risk_money *= float(
+                (verdict or {}).get("size_mult", 1.0) or 1.0)
+            risk_money *= float(news_mult)
+            if self.cfg.golden_swing_sizing_enabled:
+                risk_money *= float(self._alignment.size_multiplier)
+            risk_money *= session_multiplier(
+                now_utc, self.cfg.session_multipliers)
+            result = size_for_risk(
+                risk_money, abs(float(sig.entry_ref) - stop0), spec)
+            if not result.ok:
+                self.journal.log_note(
+                    f"mt5: order DECLINED {pb.name}: sizing "
+                    f"{result.verdict} — risk {risk_money:.2f} over "
+                    f"stop distance "
+                    f"{abs(float(sig.entry_ref) - stop0):.2f} gives "
+                    f"raw {result.raw_lots} lots (below broker "
+                    "minimum after step flooring; never rounded up)")
+                log_signal(
+                    self.journal,
+                    signal_id=f"MT5-{pb.name}-{sig.index}",
+                    playbook=pb.name, direction=int(sig.direction),
+                    score=float(sig.score), decision="gated",
+                    reason=f"sizing_decline: {result.verdict}",
+                    entry=float(sig.entry_ref), stop=float(stop0),
+                    targets=[float(x) for x in (sig.targets or [])],
+                    score_breakdown=(score.breakdown()
+                                     if score is not None else None),
+                    trigger_source="arrival_score")
+                return
+            lots = float(result.lots)
+            self._sizing_detail[f"MT5-{pb.name}-{sig.index}"] = {
+                "authorized_risk": float(result.risk_money),
+                "realized_risk": float(result.realized_risk),
+                "drag": float(result.drag),
+                "raw_lots": float(result.raw_lots),
+                "lots": lots}
         else:
             sizing = size_position(balance=acct["equity"],
                                    risk_pct=self.cfg.risk_pct,
@@ -5160,7 +6155,8 @@ class MT5Runner:
                 pb, sig, verdict, kind, level, request, track_request,
                 stats, entry_bar, is_layer=is_layer,
                 ladder_levels=_ladder_levels,
-                ladder_lots=_ladder_lots)
+                ladder_lots=_ladder_lots,
+                funding_events=funding_events)
             if placed and fingerprint:
                 self.entry_gate.record_open(time.time(), fingerprint)
             return
@@ -5180,7 +6176,8 @@ class MT5Runner:
             float(sig.atr))
         if is_layer:
             self._record_layer_fill(pb.name, sig, fill=fill, lots=lots,
-                                    stop0=stop0, stats=stats)
+                                    stop0=stop0, stats=stats,
+                                    funding_events=funding_events)
             return
         if fingerprint:
             self.entry_gate.record_open(time.time(), fingerprint)
@@ -5193,6 +6190,12 @@ class MT5Runner:
                                **_narr_kwargs)
         if _narr_state is not None:
             self._narrative_states[int(res.ticket)] = _narr_state
+        # A13: open the position's RiskPool ledger on the fill.
+        self._pool_for_open(
+            int(res.ticket), lots=float(lots), entry=float(fill),
+            stop=float(sig.invalidation),
+            direction=int(sig.direction),
+            alert_id=request.alert_id)
         stats["executed"] = stats.get("executed", 0) + 1
         # Open record: without it, /trades /report /harvest cannot see
         # this fill (they join close -> open by alert_id).  Stop here is
@@ -5215,6 +6218,16 @@ class MT5Runner:
             f"mt5 fill: ticket {res.ticket} {pb.name} "
             f"{'+' if sig.direction > 0 else '-'}1 {lots} lots @ {fill:.2f} "
             f"SL {stop0:.2f}")
+        _sd = self._sizing_detail.get(request.alert_id)
+        if _sd is not None:
+            _pool = self._pools.get(int(res.ticket))
+            self.journal.log_note(
+                f"mt5 sizing: {pb.name} authorized risk "
+                f"${_sd['authorized_risk']:.2f} -> realized "
+                f"${_sd['realized_risk']:.2f} (quantization drag "
+                f"${_sd['drag']:.2f}, raw {_sd['raw_lots']:.4f} "
+                f"lots) · pool "
+                f"{_pool.state() if _pool is not None else 'n/a'}")
         # Fill chart: same levels + the actual fill price, saved
         # alongside the signal chart and attached to the fill alert.
         png, _path = self._build_chart(
@@ -5313,7 +6326,9 @@ class MT5Runner:
                              entry_bar: int | None,
                              is_layer: bool = False,
                              ladder_levels: list | None = None,
-                             ladder_lots: list | None = None) -> bool:
+                             ladder_lots: list | None = None,
+                             funding_events: list | None = None
+                             ) -> bool:
         """Place a pending LIMIT / STOP and start tracking it.
         Returns True when the broker accepted the order."""
         # One-position rule: a pending order COUNTS — never a second
@@ -5349,6 +6364,8 @@ class MT5Runner:
             placed_bar=placed_bar, sig=sig, verdict=verdict,
             track_request=track_request, is_layer=is_layer,
             ladder_levels=ladder_levels, ladder_lots=ladder_lots)
+        if is_layer and funding_events:
+            self._pending_funding[state.ticket] = list(funding_events)
         stats["pending"] = stats.get("pending", 0) + 1
         self.journal.log_note(
             f"mt5 pending: {kind.upper()} {pb.name} "
@@ -5521,6 +6538,13 @@ class MT5Runner:
                         volume=filled_vol, sl=float(state.sl),
                         alert_id=state.alert_id,
                         playbook=state.playbook)
+                    self._pool_book_layer(
+                        self.tick_manager.tickets()[0],
+                        lots=float(filled_vol),
+                        entry=float(pos.entry_price),
+                        stop=float(state.sl),
+                        direction=int(state.direction),
+                        alert_id=f"{state.alert_id}#partial")
                     state.volume = state.volume - filled_vol
                     stats["pending_partial"] = stats.get(
                         "pending_partial", 0) + 1
@@ -5536,7 +6560,9 @@ class MT5Runner:
                 self._record_layer_fill(
                     state.playbook or "pending", state.sig,
                     fill=float(state.level), lots=float(state.volume),
-                    stop0=float(state.sl), stats=stats)
+                    stop0=float(state.sl), stats=stats,
+                    funding_events=self._pending_funding.pop(
+                        state.ticket, None))
                 return
             # No single held position: drop (same as a full layer
             # fill with no position — see _record_layer_fill).
@@ -5544,7 +6570,9 @@ class MT5Runner:
             self._record_layer_fill(
                 state.playbook or "pending", state.sig,
                 fill=float(state.level), lots=float(state.volume),
-                stop0=float(state.sl), stats=stats)
+                stop0=float(state.sl), stats=stats,
+                funding_events=self._pending_funding.pop(
+                    state.ticket, None))
             return
         # --- remainder fill (a partial fill's second leg) ---------
         # ``filled_vol`` is already the NEW volume (the growth for
@@ -5560,6 +6588,12 @@ class MT5Runner:
                     held.ticket, entry=float(pos.entry_price),
                     volume=added, sl=float(state.sl),
                     alert_id=state.alert_id, playbook=state.playbook)
+                self._pool_book_layer(
+                    held.ticket, lots=float(added),
+                    entry=float(pos.entry_price),
+                    stop=float(state.sl),
+                    direction=int(state.direction),
+                    alert_id=f"{state.alert_id}#remainder")
                 self.journal.log_note(
                     f"mt5 fill: ticket {pos.ticket} "
                     f"{state.playbook or 'pending'} "
@@ -5589,6 +6623,12 @@ class MT5Runner:
                 **_narr_kwargs)
             if _narr_state is not None:
                 self._narrative_states[int(pos.ticket)] = _narr_state
+            self._pool_for_open(
+                int(pos.ticket), lots=float(filled_vol),
+                entry=float(pos.entry_price),
+                stop=float(state.invalidation),
+                direction=int(state.direction),
+                alert_id=state.alert_id)
             state.volume = state.volume - filled_vol
             stats["executed"] = stats.get("executed", 0) + 1
             stats["pending_filled"] = stats.get("pending_filled", 0) + 1
@@ -5609,6 +6649,12 @@ class MT5Runner:
                                **_narr_kwargs)
         if _narr_state is not None:
             self._narrative_states[int(pos.ticket)] = _narr_state
+        self._pool_for_open(
+            int(pos.ticket), lots=float(state.volume),
+            entry=float(pos.entry_price),
+            stop=float(state.invalidation),
+            direction=int(state.direction),
+            alert_id=state.alert_id)
         stats["executed"] = stats.get("executed", 0) + 1
         stats["pending_filled"] = stats.get("pending_filled", 0) + 1
         self._journal_fill_open(state, pos, float(state.volume), stats,
@@ -5657,6 +6703,16 @@ class MT5Runner:
             + (" — PARTIAL, "
                f"{state.volume} lots remain pending)" if partial
                else ")"))
+        _sd = self._sizing_detail.get(state.alert_id)
+        if _sd is not None:
+            _pool = self._pools.get(int(pos.ticket))
+            self.journal.log_note(
+                f"mt5 sizing: {state.playbook or 'pending'} "
+                f"authorized risk ${_sd['authorized_risk']:.2f} -> "
+                f"realized ${_sd['realized_risk']:.2f} "
+                f"(quantization drag ${_sd['drag']:.2f}, raw "
+                f"{_sd['raw_lots']:.4f} lots) · pool "
+                f"{_pool.state() if _pool is not None else 'n/a'}")
         # Fill chart when the signal is known (placed this run);
         # adopted pendings (restart) have no signal — text only.
         png = None

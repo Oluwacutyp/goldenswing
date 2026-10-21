@@ -8,7 +8,9 @@ management.
 
 - GREEN Safe / Institutional Grade: multi-year W1/MN1 zones,
   heavy volume, structural OB, aligned LTF confirms,
-  touches >= 2, displacement >= 2 ATR, score >= 80.
+  displacement >= 2 ATR, score >= 80.  (v2/A1: no touch-count
+  requirement — freshness is strength under the consumption
+  model, so a fresh W1 zone can be GREEN.)
   Full size 1.0x, TP 1R/2R/3R, time stop 12 H1, trailing
   normal, runner allowed.
 - YELLOW Mid Risk: clean displacement + one prior respected
@@ -117,11 +119,16 @@ def risk_tier(zone) -> str:
     """Risk tier of a zone: GREEN / YELLOW / RED.  Tiering
     never gates — it only adjusts size and management."""
     score = float(_get(zone, "score", 0.0) or 0.0)
-    touches = int(_get(zone, "touches", 0) or 0)
+    # A1 (v2): GREEN no longer requires >= 2 touches — under the
+    # consumption model the FRESHEST zone is the strongest, and the
+    # old rule made a fresh W1 zone un-GREEN-able (the contradiction
+    # that surfaced the inverted sign).  Touch count no longer
+    # appears in the tier rule at all: consumption is priced by the
+    # corrected score (zones.py A1) and the lifecycle class (A2).
     disp = float(_get(zone, "displacement_atr", 0.0) or 0.0)
     tf = str(_get(zone, "tf", "") or "")
     vol = _get(zone, "volume_ratio")
-    if score >= 80 and touches >= 2 and disp >= 2.0 and \
+    if score >= 80 and disp >= 2.0 and \
             tf in ("W1", "MN1"):
         if vol is not None and float(vol) < 1.0:
             return "YELLOW"

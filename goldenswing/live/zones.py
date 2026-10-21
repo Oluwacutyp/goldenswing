@@ -142,6 +142,18 @@ ROUND_STEP = 50.0           # gold round numbers: multiples of 50
 MITIGATION_PUSH_ATR = 0.5   # penetration into the zone to mitigate
 MAJOR_MIN = 60.0
 MINOR_MIN = 40.0
+# A2 lifecycle thresholds — the freshness consumption model is the
+# single grading source (spec §11 A1/A2); these mirror
+# live/freshness.py TIRED_TOUCH / EXHAUSTED_TOUCH exactly.
+TIRED_TOUCH = 3
+EXHAUSTED_TOUCH = 4
+# A1 touch grade (v2): touches CONSUME a zone, they never add to it.
+# Untested = a small freshness premium that spends down with each
+# respected touch (kept small on purpose: the premium must order
+# fresh > tested without re-tiering zones wholesale).  The
+# tired/exhausted PENALTIES live in freshness.py (conditional on
+# the reaction after the touch) — applied once, there, not here.
+TOUCH_GRADE = {0: 5.0, 1: 2.0, 2: 0.0}
 # Expiry: H4 untested after 100 H4 bars (~400h); H1/M15/M5
 # untested after 20 D1 bars.  D1/W1/MN1 NEVER expire on age.
 H4_EXPIRY_HOURS = 100 * 4
@@ -206,8 +218,57 @@ class StructuralZone:
     last_pattern: str | None = None  # "OB" | "sweep" (bar-shape mapping)
     seen_inside: bool = False  # a close inside the zone (no mitigate yet)
     consec_beyond: int = 0    # consecutive closes beyond the far edge
+    # --- v2 grading geometry (spec §11 A3/A4) -------------------------
+    # Formation departure: max excursion AWAY from the zone achieved
+    # before the first touch/inside close, in formation ATR.  Unlike
+    # displacement_atr (monotonic max excursion, later travel
+    # included), this separates the departure that CREATED the zone
+    # from everything price did afterwards (mining F2).
+    departure_atr: float = 0.0
+    # Base length in bars at formation (A4): consecutive small-range
+    # bars ending at the swing whose ranges overlap the band.
+    base_bars: int = 0
     _key_cache: tuple | None = field(  # lazy key() memo, compare=False
         default=None, compare=False, repr=False)  # (eq ignores it)
+
+    # ------------------------------------------------ A11 edges
+    @property
+    def proximal(self) -> float:
+        """A11 proximal edge: the band edge nearest incoming price —
+        the entry reference (support: top edge; resistance: bottom
+        edge).  This engine's zones are swing bands (level ± 0.5 ATR
+        at formation), so the base geometry IS the band; P3's zone
+        rebuild may refine these to base-candle body edges."""
+        return self.top if self.side == "support" else self.bottom
+
+    @property
+    def distal(self) -> float:
+        """A11 distal edge: the far band edge — the stop reference."""
+        return self.bottom if self.side == "support" else self.top
+
+    # ------------------------------------------------ A2 lifecycle
+    @property
+    def lifecycle(self) -> str:
+        """Lifecycle class (spec §11 A2): ``fresh`` | ``tested`` |
+        ``used_up``, from the freshness consumption thresholds.
+        Behaviour mapping consumed by the decision flow:
+        fresh -> resting-limit eligible (A6); tested -> score /
+        funding entry only; used_up -> abandoned, not traded even
+        on confirmation.  A non-active zone (mitigated / broken /
+        expired) is used_up by definition — a broken zone survives
+        in the store as its A7 breaker record, never as a trade."""
+        if self.status != "active":
+            return "used_up"
+        if self.touches <= 0:
+            return "fresh"
+        if self.touches < TIRED_TOUCH:
+            return "tested"
+        return "used_up"
+
+    @property
+    def resting_limit_eligible(self) -> bool:
+        """A6: only a FRESH MAJOR zone may hold a resting limit."""
+        return self.lifecycle == "fresh" and self.tier == "MAJOR"
 
     @property
     def key(self) -> tuple:
@@ -245,6 +306,13 @@ class StructuralZone:
             "atr": float(self.atr),
             "last_tested": self.last_tested,
             "last_pattern": self.last_pattern,
+            # v2 grading surface (A2/A3/A4/A11): the decision flow
+            # and the journal read lifecycle + geometry from here.
+            "lifecycle": self.lifecycle,
+            "departure_atr": float(self.departure_atr),
+            "base_bars": int(self.base_bars),
+            "proximal": float(self.proximal),
+            "distal": float(self.distal),
         }
 
     def describe(self, *, now=None, cluster: bool = False) -> str:
@@ -298,12 +366,32 @@ def score_zone(zone: StructuralZone, others, *, age_d1: float) -> tuple[float, s
     """
     atr = zone.atr if zone.atr > 0 else 1.0
     provisional = TF_WEIGHT.get(zone.tf, 0.0)
-    provisional += min(int(zone.touches), 3) * 10.0
+    # A1 (v2): the v1 term paid +10 per touch (cap +30) — the
+    # inverted freshness sign.  Touches consume; the grade now pays
+    # a freshness premium that spends down (TOUCH_GRADE).  Tired /
+    # exhausted penalties are freshness.py's, applied once there.
+    provisional += TOUCH_GRADE.get(int(zone.touches), 0.0)
     if zone.weak_break:
         provisional -= 20.0
-    if zone.displacement_atr >= 2.0:
+    # A3 (v2): when the formation departure is known it replaces
+    # the monotonic excursion as the displacement input — a zone is
+    # validated by the move that LEFT its base (impulse >= 2 ATR
+    # full marks; < 1 ATR never validated it).  Legacy rows
+    # (departure unknown = 0) fall back to displacement_atr.
+    disp = zone.departure_atr if zone.departure_atr > 0 \
+        else zone.displacement_atr
+    if disp >= 2.0:
         provisional += 15.0
-    elif zone.displacement_atr >= 1.0:
+    elif disp >= 1.0:
+        provisional += 5.0
+    elif zone.departure_atr > 0:
+        provisional -= 10.0
+    # A4 (v2): base length grades the departure's quality — a short
+    # base precedes a strong departure; a long base weakens it.
+    # Graded, never a veto (Wyckoff range-edge caveat).
+    if zone.base_bars > 6:
+        provisional -= 5.0
+    elif 0 < zone.base_bars <= 3:
         provisional += 5.0
     confluence = False
     pool_n = 0
@@ -476,6 +564,16 @@ class ZoneStore:
             "seen_inside INTEGER NOT NULL DEFAULT 0, "
             "consec_beyond INTEGER NOT NULL DEFAULT 0, "
             "UNIQUE(tf, side, swing_ts))")
+        # v2 migration: formation-geometry columns (A3/A4).  Guarded
+        # ALTERs so an existing zones.db (EC2) gains them in place.
+        cols = {r["name"] for r in
+                c.execute("PRAGMA table_info(zones)").fetchall()}
+        if "departure_atr" not in cols:
+            c.execute("ALTER TABLE zones ADD COLUMN "
+                      "departure_atr REAL NOT NULL DEFAULT 0")
+        if "base_bars" not in cols:
+            c.execute("ALTER TABLE zones ADD COLUMN "
+                      "base_bars INTEGER NOT NULL DEFAULT 0")
         c.execute(
             "CREATE TABLE IF NOT EXISTS meta ("
             "key TEXT PRIMARY KEY, value TEXT)")
@@ -522,6 +620,7 @@ class ZoneStore:
 
     @staticmethod
     def _row_to_zone(row) -> StructuralZone:
+        keys = row.keys()
         return StructuralZone(
             tf=row["tf"], side=row["side"], level=float(row["level"]),
             top=float(row["top"]), bottom=float(row["bottom"]),
@@ -540,7 +639,11 @@ class ZoneStore:
             last_tested=row["last_tested"],
             last_pattern=row["last_pattern"],
             seen_inside=bool(row["seen_inside"]),
-            consec_beyond=int(row["consec_beyond"]))
+            consec_beyond=int(row["consec_beyond"]),
+            departure_atr=(float(row["departure_atr"])
+                           if "departure_atr" in keys else 0.0),
+            base_bars=(int(row["base_bars"])
+                       if "base_bars" in keys else 0))
 
     @staticmethod
     def _zone_to_row(zone: StructuralZone) -> tuple:
@@ -552,7 +655,8 @@ class ZoneStore:
                 int(zone.weak_break), float(zone.age_d1),
                 _ts_iso(zone.swing_ts), zone.volume_ratio,
                 float(zone.atr), zone.last_tested, zone.last_pattern,
-                int(zone.seen_inside), int(zone.consec_beyond))
+                int(zone.seen_inside), int(zone.consec_beyond),
+                float(zone.departure_atr), int(zone.base_bars))
 
     # -- reads -------------------------------------------------------
 
@@ -607,9 +711,10 @@ class ZoneStore:
                     "displacement_atr, confluence, liquidity, "
                     "round_number, weak_break, age_d1, swing_ts, "
                     "volume_ratio, atr, last_tested, last_pattern, "
-                    "seen_inside, consec_beyond) VALUES "
+                    "seen_inside, consec_beyond, departure_atr, "
+                    "base_bars) VALUES "
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?, ?)",
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     self._zone_to_row(zone))
                 if cur.rowcount:
                     inserted += 1
@@ -876,12 +981,29 @@ class ZoneStore:
                 else None
         except Exception:
             volume_ratio = None
+        # A4 base length: consecutive bars ending at the swing
+        # whose ranges overlap the band and stay within 1 ATR —
+        # the consolidation price sat in before departing.
+        base_bars = 0
+        try:
+            band_lo = float(price) - ZONE_HALF_ATR * atr
+            band_hi = float(price) + ZONE_HALF_ATR * atr
+            j = q
+            while j >= 0 and base_bars < 12:
+                row = frame.iloc[j]
+                hi, lo = float(row["high"]), float(row["low"])
+                if hi - lo > 1.0 * atr or hi < band_lo or lo > band_hi:
+                    break
+                base_bars += 1
+                j -= 1
+        except Exception:
+            base_bars = 0
         zone = StructuralZone(
             tf=tf, side=side, level=float(price),
             top=float(price) + ZONE_HALF_ATR * atr,
             bottom=float(price) - ZONE_HALF_ATR * atr,
             status="active", swing_ts=frame.index[q],
-            atr=atr, volume_ratio=volume_ratio,
+            atr=atr, volume_ratio=volume_ratio, base_bars=base_bars,
             age_d1=_age_d1(frame.index[q], frame.index[p]))
         for j in range(q + 1, p + 1):
             term, note = self._apply_bar(
@@ -920,6 +1042,13 @@ class ZoneStore:
             exc = (h - zone.level) / atr
         if exc > zone.displacement_atr:
             zone.displacement_atr = exc
+        # A3: formation departure tracks the same excursion ONLY
+        # until the zone is first tested (a touch or an inside
+        # close) — after that, later travel must not rewrite the
+        # grade the departure earned at formation.
+        if zone.touches == 0 and not zone.seen_inside \
+                and exc > zone.departure_atr:
+            zone.departure_atr = exc
         far = zone.top if zone.side == "resistance" else zone.bottom
         near = zone.bottom if zone.side == "resistance" else zone.top
         inside = zone.bottom <= c <= zone.top
@@ -1163,9 +1292,10 @@ class ZoneStore:
                     "displacement_atr, confluence, liquidity, "
                     "round_number, weak_break, age_d1, swing_ts, "
                     "volume_ratio, atr, last_tested, last_pattern, "
-                    "seen_inside, consec_beyond) VALUES "
+                    "seen_inside, consec_beyond, departure_atr, "
+                    "base_bars) VALUES "
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?, ?) "
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(tf, side, swing_ts) DO UPDATE SET "
                     "level=excluded.level, top=excluded.top, "
                     "bottom=excluded.bottom, score=excluded.score, "
@@ -1181,7 +1311,9 @@ class ZoneStore:
                     "atr=excluded.atr, last_tested=excluded.last_tested, "
                     "last_pattern=excluded.last_pattern, "
                     "seen_inside=excluded.seen_inside, "
-                    "consec_beyond=excluded.consec_beyond",
+                    "consec_beyond=excluded.consec_beyond, "
+                    "departure_atr=excluded.departure_atr, "
+                    "base_bars=excluded.base_bars",
                     self._zone_to_row(zone))
                 if self.rtree_available:
                     zid = self._conn.execute(

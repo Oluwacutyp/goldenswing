@@ -119,27 +119,43 @@ def _verdict():
             "entry": 2000.0, "zone": {"bottom": 1995.0, "top": 2005.0}}
 
 
-def _drive(runner, h1, pb, engine, t=29):
+def _drive(runner, h1, pb, engine, t=29, zone_d=None):
     from goldenswing.playbooks.base import EngineContext
     ctx = EngineContext(df=h1, states=[], years=0.0,
                         instrument="XAUUSD")
     runner._run_one_playbook(pb, sig_ctx=(ctx, engine), h1=h1, t=t,
                              verdict=_verdict(),
-                             stats={"signals": 0, "gated": 0})
+                             stats={"signals": 0, "gated": 0},
+                             zone_d=zone_d)
     return [r for r in runner.journal.records()
             if r.get("type") == "signal"]
 
 
 def test_below_floor_emission_gets_signal_record(tmp_path):
     runner, h1 = _runner(tmp_path)
+    # Production reaches _run_one_playbook via _run_signal_path,
+    # which supplies the verdict's armed band as zone context; the
+    # per-style floor only applies to zone-path (arrival) signals,
+    # so _drive passes the same armed-band dict explicitly.  (With
+    # zone_d=None the floor is not applied at all — see the
+    # no-zone-context note in _run_one_playbook.)
+    zone_d = {"bottom": 1995.0, "top": 2005.0, "tier": "MINOR",
+              "lifecycle": "tested", "touches": 1, "status": "active",
+              "score": 40.0, "armed_band": True}
     recs = _drive(runner, h1, _StubPlaybook("fvg_midline", 40.0),
-                  _StubEngine())
+                  _StubEngine(), zone_d=zone_d)
     assert len(recs) == 1
     rec = recs[0]
     assert rec["decision"] == "below_floor"
     assert rec["playbook"] == "fvg_midline"
     assert rec["score"] == pytest.approx(40.0)
-    assert "min_score" in rec["reason"]
+    # New reason contract: the flat min_score gate is gone; the
+    # record's reason IS the asymmetry-floor verdict (the legacy
+    # "min_score" prefix survives only in blocked-leg bookkeeping,
+    # never in the signal record's reason).
+    assert rec["reason"].startswith("asymmetry_floor")
+    assert "min_score" not in rec["reason"]
+    assert rec["score_breakdown"]["total"] < 50.0  # ZONE_PATH floor
     assert rec["signal_id"] == "MT5-fvg_midline-29"
     assert runner.executor.orders == []  # still dropped, just recorded
 

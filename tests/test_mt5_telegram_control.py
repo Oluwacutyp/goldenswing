@@ -1,9 +1,10 @@
 """MT5 Telegram control: inline buttons, /config /set, confirm flow,
 owner-only enforcement, blocked-leg stats, playbook wiring.
 
-Covers: _get_playbooks instantiates all 12 playbooks (the 7 executing
-+ 5 shadow); judas_swing fires live into a real order; shadow
-playbooks are evaluated + logged + counted but never order;
+Covers: _get_playbooks instantiates all 17 playbooks and (A14)
+every one of them is execute-eligible by default — the shadow tier
+is abolished, the per-playbook kill switch is the only opt-out;
+judas_swing fires live into a real order on realistic geometry;
 callback_query handling (answer + act + message edited); Pause /
 Resume / Trim / Cancel pending / Refresh buttons; config get/set
 (valid applies + persists + survives a simulated restart; invalid
@@ -156,12 +157,56 @@ def _turtle_sig():
                       "stop": 1990.0, "invalidation": 1990.0})
 
 
-def _run_path(runner, verdict=None, stats=None):
-    h1 = _h1()
+def _judas_frame():
+    """Realistic judas-swing geometry (40 H1 bars): a decline from
+    2058, a defended staircase of higher lows (swing lows 1958 /
+    1972 / 1986, each held on closes), then the London raid — bar
+    35 wicks to 1979 THROUGH the 1986 pivot and closes back at
+    1993 — and a three-bar displacement reclaim into bar 39.
+
+    The old harness fed 40 perfectly flat bars: no pivots, no leg,
+    no arrival — the Asymmetry Score has nothing to measure there
+    (total ~42, all of it location/session/macro context) and the
+    per-style floor correctly declines.  This frame gives the
+    scorer the playbook's actual setup: structure 26 / location
+    14 / session 10 / macro 5 -> total ~65 >= the 50 floor."""
+    rows = [
+        (2052, 2058, 2044, 2046, 900), (2046, 2050, 2036, 2038, 920),
+        (2038, 2042, 2028, 2030, 940), (2030, 2034, 2018, 2020, 960),
+        (2020, 2024, 2008, 2010, 980), (2010, 2014, 1998, 2000, 1000),
+        (2000, 2004, 1988, 1990, 1020), (1990, 1993, 1978, 1980, 1040),
+        (1980, 1983, 1966, 1968, 1060), (1968, 1974, 1958, 1966, 1150),
+        (1966, 1978, 1963, 1975, 1080), (1975, 1985, 1970, 1982, 1030),
+        (1982, 1990, 1976, 1988, 1010), (1988, 1993, 1982, 1985, 960),
+        (1985, 1995, 1984, 1993, 1020), (1993, 2001, 1989, 1999, 1050),
+        (1999, 2004, 1993, 1996, 990), (1996, 2002, 1988, 1990, 960),
+        (1990, 1994, 1979, 1981, 1010), (1981, 1990, 1972, 1986, 1060),
+        (1986, 1996, 1983, 1994, 1030), (1994, 2002, 1990, 2000, 1050),
+        (2000, 2006, 1994, 1998, 1000), (1998, 2003, 1991, 1993, 970),
+        (1993, 2000, 1989, 1997, 1010), (1997, 2005, 1992, 2002, 1040),
+        (2002, 2007, 1995, 1999, 990), (1999, 2003, 1986, 1990, 1020),
+        (1990, 1998, 1989, 1996, 1030), (1996, 2004, 1993, 2001, 1050),
+        (2001, 2008, 1996, 2004, 1020), (2004, 2009, 1998, 2001, 1000),
+        (2001, 2006, 1995, 2003, 990), (2003, 2008, 1999, 2005, 1010),
+        (2005, 2007, 1996, 1998, 1080), (1998, 2000, 1979, 1993, 1400),
+        (1993, 2003, 1989, 2001, 1350), (2001, 2009, 1997, 2007, 1300),
+        (2007, 2012, 2002, 2009, 1250), (2009, 2013, 2003, 2006, 1500),
+    ]
+    idx = pd.date_range("2026-01-01", periods=len(rows), freq="h",
+                        tz="UTC")
+    return pd.DataFrame(
+        {"open": [r[0] for r in rows], "high": [r[1] for r in rows],
+         "low": [r[2] for r in rows], "close": [r[3] for r in rows],
+         "volume": [float(r[4]) for r in rows]},
+        index=idx)
+
+
+def _run_path(runner, verdict=None, stats=None, frame=None):
+    h1 = frame if frame is not None else _h1()
     runner._stack = TimeframeStack.from_frames({"H1": h1})
     stats = stats if stats is not None else {
         "signals": 0, "gated": 0, "executed": 0}
-    runner._run_signal_path(h1, 39, [], 2.0,
+    runner._run_signal_path(h1, len(h1) - 1, [], 2.0,
                             verdict or _verdict(), stats)
     return stats
 
@@ -216,7 +261,11 @@ def test_get_playbooks_instantiates_all_seventeen(tmp_path):
                      # runner (fill -> management plan, close ->
                      # STATE 7), so it is the 17th playbook.
                      "narrative"}
-    assert set(runner.cfg.execute_playbooks) <= names
+    # A14: the default config carries NO execute list — None means
+    # every evaluated playbook executes (the shadow tier is gone);
+    # the formerly-shadow names are ordinary members of the set.
+    assert runner.cfg.execute_playbooks is None
+    assert all(runner._executes(n) for n in names)
     assert {"turtle_soup", "v_reversal", "retracement_trap",
             "order_block", "qm_m5"} <= names
 
@@ -226,27 +275,58 @@ def test_judas_swing_fires_live_into_real_order(tmp_path):
     judas = [pb for pb in runner._get_playbooks()
              if pb.name == "judas_swing"][0]
     judas.live_signal = lambda *a, **k: [_judas_sig()]
-    stats = _run_path(runner)
-    assert stats["executed"] == 1
-    assert len(runner.executor.orders) == 1
-    assert runner.executor.orders[0].alert_id.startswith("MT5-judas_swing-")
+    stats = _run_path(runner, frame=_judas_frame())
+    # The judas signal cleared the score floor on its real geometry
+    # and placed exactly one market order.  (Assertions are scoped
+    # to judas's own alert_id: on realistic data other playbooks
+    # legitimately act too — inversion parks a pending limit on
+    # this frame — so raw order/executed totals are not judas's.)
+    judas_orders = [o for o in runner.executor.orders
+                    if o.alert_id.startswith("MT5-judas_swing-")]
+    assert len(judas_orders) == 1
+    assert stats["executed"] >= 1
     assert runner._signal_counts.get("judas_swing") == 1
+    recs = [r for r in runner.journal.records()
+            if r.get("type") == "signal"
+            and r.get("playbook") == "judas_swing"]
+    assert len(recs) == 1 and recs[0]["decision"] == "accepted"
+    assert recs[0]["score_breakdown"]["total"] >= 50.0
 
 
-def test_shadow_playbook_evaluated_logged_never_ordered(tmp_path):
+def test_unshadowed_playbook_executes_kill_switch_disables(tmp_path):
+    """A14 (replaces the shadow-tier pin): turtle_soup — a
+    formerly-shadow playbook — routes through the same decision
+    flow as everyone else and CAN order when its signal clears the
+    score floor; no "[SHADOW]" note and no log-only "shadow"
+    decision is emitted for it on the MT5 path.  The only opt-out
+    is the per-playbook kill switch (disabled_playbooks)."""
     runner = _runner(tmp_path)
     turtle = [pb for pb in runner._get_playbooks()
               if pb.name == "turtle_soup"][0]
     turtle.live_signal = lambda *a, **k: [_turtle_sig()]
-    stats = _run_path(runner)
-    # Evaluated + counted + journaled as SHADOW…
+    stats = _run_path(runner, frame=_judas_frame())
     assert runner._signal_counts.get("turtle_soup") == 1
+    turtle_orders = [o for o in runner.executor.orders
+                     if o.alert_id.startswith("MT5-turtle_soup-")]
+    assert len(turtle_orders) == 1
+    assert stats["executed"] >= 1
+    recs = [r for r in runner.journal.records()
+            if r.get("type") == "signal"
+            and r.get("playbook") == "turtle_soup"]
+    assert len(recs) == 1 and recs[0]["decision"] == "accepted"
     notes = [r.get("text", "") for r in runner.journal.records()
              if r.get("type") == "note"]
-    assert any("[SHADOW] turtle_soup" in n for n in notes)
-    # …but never ordered.
-    assert runner.executor.orders == []
-    assert stats["executed"] == 0
+    assert not any("[SHADOW] turtle_soup" in n for n in notes)
+    # Kill switch: the same playbook, disabled, is not evaluated.
+    runner2 = _runner(tmp_path)
+    runner2.cfg.disabled_playbooks = ("turtle_soup",)
+    turtle2 = [pb for pb in runner2._get_playbooks()
+               if pb.name == "turtle_soup"][0]
+    turtle2.live_signal = lambda *a, **k: [_turtle_sig()]
+    _run_path(runner2, frame=_judas_frame())
+    assert runner2._signal_counts.get("turtle_soup") is None
+    assert not any(o.alert_id.startswith("MT5-turtle_soup-")
+                   for o in runner2.executor.orders)
 
 
 def test_disabled_playbook_not_evaluated(tmp_path):
@@ -262,22 +342,46 @@ def test_disabled_playbook_not_evaluated(tmp_path):
 
 # ------------------------------------------------------- blocked-leg stats
 
-def test_hierarchy_blocked_signal_counted_in_status(tmp_path):
+def test_counter_bias_signal_scored_by_floor_counted_in_status(tmp_path):
+    """Choke (a) removed: gate 0 no longer BLOCKS on the MT5 path.
+    A counter-bias verdict (the legacy shape still carries
+    allowed=False / blocked_leg='d1_bias'; D1 bias is AGAINST this
+    long) does not gate the signal — the verdict is demoted to
+    Macro CONTEXT.  The signal is scored like any other, the Macro
+    component shows the disagreement (aligned 0.5: D1 against, H4
+    with), and the per-style FLOOR makes the decision — here the
+    flat harness data totals 42 < 50, so the decline is booked
+    under the floor leg, never under a hierarchy leg."""
     runner = _runner(tmp_path)
     judas = [pb for pb in runner._get_playbooks()
              if pb.name == "judas_swing"][0]
     judas.live_signal = lambda *a, **k: [_judas_sig()]
     blocked = _verdict(allowed=False, blocked_leg="d1_bias",
+                       bias_d1=-1,
                        legs={"d1_bias": {"passed": False,
                                          "reason": "D1 bias down"}})
     _run_path(runner, verdict=blocked)
     assert runner.executor.orders == []
-    assert runner.blocked_stats()["legs"].get("d1_bias") == 1
+    legs = runner.blocked_stats()["legs"]
+    assert legs.get("d1_bias") is None     # gate 0 counts nothing
+    assert legs.get("min_score") == 1      # the floor decided
+    recs = [r for r in runner.journal.records()
+            if r.get("type") == "signal"
+            and r.get("playbook") == "judas_swing"]
+    assert len(recs) == 1
+    assert recs[0]["decision"] == "below_floor"
+    assert recs[0]["reason"].startswith("asymmetry_floor")
+    breakdown = recs[0]["score_breakdown"]
+    assert breakdown["total"] < 50.0
+    # The counter-bias is visible as scored context, not a veto:
+    # macro aligned 0.5 (D1 -1 against the long, H4 +1 with it).
+    assert breakdown["macro"]["subs"]["aligned"] == 0.5
     ctx = CommandContext(journal=runner.journal, mt5_control=runner)
     res, _ = mt5_router(OWNER).dispatch(_update("/status"), ctx)
-    assert "d1_bias" in res.text
     assert "why no trades" in res.text
-    assert "judas_swing" in res.text  # per-playbook signal counts
+    assert "min_score" in res.text         # the floor leg, counted
+    assert "judas_swing" in res.text       # last-blocked names it
+    assert "d1_bias" not in res.text       # no hierarchy leg exists
     assert res.reply_markup == mt5_control_keyboard()
 
 

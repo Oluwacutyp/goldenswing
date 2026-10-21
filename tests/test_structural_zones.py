@@ -279,8 +279,17 @@ def test_incremental_update_no_recalc(tmp_path):
 # ------------------------------------------------------------- scoring
 
 def test_scoring_formula():
-    """Score = base + touches + displacement + confluence + pool +
-    round + volume + recency (MAJOR track never negative)."""
+    """Score = base + touch grade + displacement + confluence +
+    pool + round + volume + recency (MAJOR track never negative).
+
+    A1 (rework): touches CONSUME a zone — the v1 term paid +10 per
+    touch (cap +30), the inverted freshness sign.  score_zone now
+    pays only the TOUCH_GRADE freshness premium that spends down
+    (0 touches +5, 1 +2, 2+ +0) and NEVER subtracts for touches:
+    the tired/exhausted penalties are freshness.py's alone
+    (TIRED -15 / EXHAUSTED drop, conditional on the reaction after
+    the touch) — applied once, there, never double-counted here.
+    """
     others = [
         StructuralZone(tf="D1", side="resistance", level=4300.0,
                        top=4310.0, bottom=4290.0, atr=20.0),
@@ -294,8 +303,8 @@ def test_scoring_formula():
                        touches=3, displacement_atr=2.5,
                        volume_ratio=1.5)
     score, tier = score_zone(z, others + [z], age_d1=2.0)
-    # 45 + 30 + 15 + 15 (confluence) + 10 (pool) + 5 (round)
-    # + 10 (volume) = 130 provisional -> recency +10 -> clamp 100.
+    # 45 + 0 (TOUCH_GRADE[3]) + 15 + 15 (confluence) + 10 (pool)
+    # + 5 (round) + 10 (volume) = 100 provisional -> clamp 100.
     assert score == pytest.approx(100.0) and tier == "MAJOR"
     # Fresh H4, one touch, modest displacement, no confluence,
     # not a round number (4513 is 13 away from 4500).
@@ -303,23 +312,43 @@ def test_scoring_formula():
                         top=4523.0, bottom=4503.0, atr=20.0,
                         touches=1, displacement_atr=1.5)
     score2, tier2 = score_zone(z2, [z2], age_d1=3.0)
-    # 25 + 10 + 5 + 0 + 0 + 0 = 40 provisional -> recency +10 = 50.
-    assert score2 == pytest.approx(50.0) and tier2 == "MINOR"
+    # 25 + 2 (TOUCH_GRADE[1]) + 5 + 0 + 0 + 0 = 32 provisional
+    # -> recency +10 = 42.
+    assert score2 == pytest.approx(42.0) and tier2 == "MINOR"
     # Old minor fades: provisional < 60, age > 100 -> recency -10.
     # (4113 is not a round number: 13 away from 4100.)
     z3 = StructuralZone(tf="H1", side="support", level=4113.0,
                         top=4123.0, bottom=4103.0, atr=20.0,
                         touches=0, displacement_atr=0.5)
     score3, tier3 = score_zone(z3, [z3], age_d1=150.0)
-    # 10 + 0 + 0 = 10 -> recency -10 -> 0.
-    assert score3 == pytest.approx(0.0) and tier3 == "noise"
+    # 10 + 5 (TOUCH_GRADE[0] fresh premium) + 0 = 15
+    # -> recency -10 -> 5.
+    assert score3 == pytest.approx(5.0) and tier3 == "noise"
     # MAJOR track never penalised for age alone.
     z4 = StructuralZone(tf="D1", side="resistance", level=4300.0,
                         top=4310.0, bottom=4290.0, atr=20.0,
                         touches=3, displacement_atr=2.5)
     score4, _ = score_zone(z4, [z4], age_d1=900.0)
-    # 40 + 30 + 15 + 5 (round) = 90 provisional -> recency 0.
-    assert score4 == pytest.approx(90.0)
+    # 40 + 0 (TOUCH_GRADE[3]) + 15 + 5 (round) = 60 provisional
+    # -> recency 0.
+    assert score4 == pytest.approx(60.0)
+    # Touch schedule in isolation (same zone, only touches vary;
+    # age 50 -> recency 0): the premium spends down monotonically
+    # and floors at zero — a 3rd/4th/5th touch costs NOTHING here.
+    # The tired (3rd) / exhausted (4th) penalties live only in
+    # freshness.evaluate_zone_freshness; if score_zone ever applied
+    # them too, touches=3 would drop 15 below touches=2.
+    by_touches = {}
+    for n in (0, 1, 2, 3, 5):
+        zn = StructuralZone(tf="H1", side="support", level=4113.0,
+                            top=4123.0, bottom=4103.0, atr=20.0,
+                            touches=n, displacement_atr=0.5)
+        by_touches[n] = score_zone(zn, [zn], age_d1=50.0)[0]
+    assert by_touches[0] == pytest.approx(15.0)   # 10 + 5
+    assert by_touches[1] == pytest.approx(12.0)   # 10 + 2
+    assert by_touches[2] == pytest.approx(10.0)   # 10 + 0
+    assert by_touches[3] == by_touches[2]         # no penalty here
+    assert by_touches[5] == by_touches[2]         # never negative
 
 
 # ------------------------------------------------------------- zones never trigger

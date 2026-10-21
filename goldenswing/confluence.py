@@ -437,7 +437,8 @@ class ConfluenceEngine:
     def gate_live_signal(self, pb: Playbook, signal,
                          ctx: EngineContext,
                          hierarchy_verdict: dict | None = None,
-                         spread_px: float | None = None
+                         spread_px: float | None = None,
+                         chain_required: bool = True
                          ) -> tuple[bool, str]:
         """The context gates for a live (un-simulated) signal — the
         same gates the batch path applies, in the same order, plus
@@ -518,7 +519,14 @@ class ConfluenceEngine:
             # requires_narrative_chain fires only with a COMPLETE
             # chain (ENTRY state at the signal's direction).  A
             # single pattern alone never trades.
-            if getattr(pb, "requires_narrative_chain", False):
+            # REWORK (spec §3.3c): on the MT5 arrival path the
+            # caller passes chain_required=False — the chain's
+            # evaluators are reused as FUNDING-event detectors
+            # (live/funding.py) and no longer permit anything.
+            # The default stays True so the paper runner's
+            # behaviour is bit-identical until its own migration.
+            if chain_required and \
+                    getattr(pb, "requires_narrative_chain", False):
                 from .live.narrative import chain_check
                 narr = hierarchy_verdict.get("narrative")
                 if narr is None:
@@ -528,6 +536,38 @@ class ConfluenceEngine:
                 ok, why = chain_check(narr, signal.direction)
                 if not ok:
                     return False, f"narrative: {why}"
+        ok, reason = self._session_allowed(pb, signal.index, ctx)
+        if not ok:
+            return False, reason
+        ok, reason = pb.check_live_signal(signal, ctx)
+        if not ok:
+            return False, f"required-context tripwire: {reason}"
+        ok, reason = self._check_hunting_ground_signal(
+            pb, signal, ctx)
+        if not ok:
+            return False, reason
+        ok, reason = cost_gate_ok(
+            signal, getattr(signal, "entry_ref", None),
+            self.cfg, playbook=pb.name, spread_px=spread_px)
+        if not ok:
+            return False, f"cost_gate: {reason}"
+        return True, ""
+
+    def hard_line_check(self, pb: Playbook, signal,
+                        ctx: EngineContext,
+                        spread_px: float | None = None
+                        ) -> tuple[bool, str]:
+        """REWORK hard lines only (spec §3.1 / §4.4): the checks
+        that remain GATES on the MT5 arrival path — session scope
+        (gate 1, a playbook declaration), the playbook's own
+        required-context tripwire (gate 2), the measured
+        hunting-ground exclusions (gate 3) and the broker-cost
+        gate (gate 4).  Hierarchy permission (gate 0), the
+        regime/sweep/cooldown scoping (0b-0d) and the narrative
+        chain (0e) are deliberately NOT here: on the arrival path
+        they are score inputs (Macro block, traffic-light scalar)
+        and funding events, never permission.  The full legacy
+        gate above is untouched for the paper runner."""
         ok, reason = self._session_allowed(pb, signal.index, ctx)
         if not ok:
             return False, reason

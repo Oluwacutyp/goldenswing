@@ -15,11 +15,22 @@ carrying the same ``alert_id`` the open record will carry, so a
 signal joins to its trade exactly like opens join to closes.
 
 Decisions recorded: ``accepted`` (ordered), ``shadow`` (evaluated,
-never ordered), ``gated`` (confluence/hierarchy gate), ``below_floor``
+never ordered — HISTORICAL: the MT5 path no longer emits it since
+the A14 unshadow; the paper runner's records may still carry it),
+``gated`` (confluence/hierarchy gate), ``below_floor``
 (score floor), ``manipulation_blocked``, ``invalidated`` (order
-selection).  Path-level blocks (paused, market-closed) and playbook
-crashes produce no emission, so they produce no signal record —
-there is nothing to attribute; the text notes already cover them.
+selection), ``watch`` (rework §5: runaway from the zone — the
+setup is parked in PullbackWatch, not reset).  Path-level blocks
+(paused, market-closed) and playbook crashes produce no emission,
+so they produce no signal record — there is nothing to
+attribute; the text notes already cover them.
+
+Rework records (§6) additionally carry the Asymmetry Score
+breakdown (``score_breakdown``), the trigger source
+(``trigger_source``: resting_limit | arrival_score | funding_layer)
+and the RiskPool state (``pool``) — per-decision, per-playbook
+evidence; under A14 this journal IS the per-playbook confirmation
+record (fills, management and R outcomes join on alert_id).
 
 ``summarize_signals`` aggregates the records back into filter
 stats: per-playbook counts by decision, and per-reason counts for
@@ -34,7 +45,7 @@ from __future__ import annotations
 #: Decisions a raw signal record can carry.
 DECISIONS = (
     "accepted", "shadow", "gated", "below_floor",
-    "manipulation_blocked", "invalidated",
+    "manipulation_blocked", "invalidated", "watch",
 )
 
 
@@ -49,7 +60,10 @@ def log_signal(journal, *, signal_id: str, playbook: str,
                urgency: float | None = None,
                hierarchy: dict | None = None,
                reasoning: str | None = None,
-               study: dict | None = None) -> dict:
+               study: dict | None = None,
+               score_breakdown: dict | None = None,
+               trigger_source: str | None = None,
+               pool: dict | None = None) -> dict:
     """Append one structured signal record.  Never raises: a logging
     failure must not break the signal path (the caller treats the
     record as best-effort audit, like the text notes)."""
@@ -77,6 +91,10 @@ def log_signal(journal, *, signal_id: str, playbook: str,
             # the why + the key levels/data behind it, on the record.
             "reasoning": reasoning,
             "study": study,
+            # Rework §6 fields (None on legacy-path records).
+            "score_breakdown": score_breakdown,
+            "trigger_source": trigger_source,
+            "pool": pool,
         })
     except Exception:
         return {}
