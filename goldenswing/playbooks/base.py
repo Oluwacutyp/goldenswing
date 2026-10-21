@@ -19,6 +19,24 @@ from ..contextmap import HuntingGround
 from ..reader.state import MarketState
 
 
+def canonical_instrument(symbol: str) -> str:
+    """Map a broker symbol to the validated asset name.
+
+    Brokers spell the same asset differently (Exness gold is
+    ``XAUUSDm``, other brokers use ``XAUUSD.r`` / ``XAUUSD.pro``).
+    The playbooks' required-context tripwires validate the ASSET
+    (gold, H1), not the broker's spelling — so the broker symbol
+    belongs to orders/positions/specs, never to ``EngineContext``.
+    Any ``XAUUSD*`` variant canonicalizes to ``XAUUSD``; anything
+    else passes through unchanged, so a genuinely wrong instrument
+    (e.g. EURUSD) still trips the tripwire exactly as before.
+    """
+    s = str(symbol or "")
+    if s.startswith("XAUUSD"):
+        return "XAUUSD"
+    return s
+
+
 @dataclass
 class EngineContext:
     """Everything a playbook or the engine may read.  Built once per
@@ -29,6 +47,14 @@ class EngineContext:
     states: list[MarketState]
     years: float
     instrument: str = "GC=F"
+
+    def __post_init__(self) -> None:
+        # The live MT5 runner adopts the broker's resolved symbol
+        # (XAUUSD -> XAUUSDm on Exness) for orders; that spelling
+        # must not leak into validated-universe checks.  Canonicalize
+        # once here so EVERY construction path (live signal path,
+        # QM scans, batch/backtest) is immune.
+        self.instrument = canonical_instrument(self.instrument)
     start_balance: float = 10_000.0
     forecast_table: object = None  # ForecastTable | None — the quality
     # dial: horizon agreement earns a confluence bonus / sizing input,
