@@ -253,9 +253,11 @@ class LiveRunner:
                                FVGMidlinePlaybook(),
                                TrendlineRetestPlaybook(),
                                FVGLimitPlaybook(),
-                               # QM M5: shadow-only (live=False) — it
-                               # appears in candidates/the journal/the
-                               # shadow book, never in exec_set.
+                               # QM M5: live=True since the owner
+                               # directive of 2026-10-22 — evaluated
+                               # with the live sleeves; auto-paper
+                               # execution still requires exec_set
+                               # membership (a separate step).
                                QMM5Playbook()]
         return self._playbooks
 

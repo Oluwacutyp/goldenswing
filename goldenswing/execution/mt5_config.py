@@ -26,13 +26,21 @@ import tempfile
 from pathlib import Path
 
 #: Playbooks the engine may ORDER from (validated set).
+#: Executing playbooks: evaluated AND eligible to order (subject to
+#: the per-playbook kill switch and every live gate — hierarchy,
+#: confluence floors, regime, news).  Owner directive 2026-10-22:
+#: the whole roster executes on the demo; backtests map where a
+#: setup historically worked, they never gate this list.  Forward
+#: live-demo performance is the verdict.
 EXECUTE_PLAYBOOK_NAMES: tuple[str, ...] = (
     "sweep_reversal", "fvg_midline", "trendline_retest", "fvg_limit",
-    "inversion", "killzone_open", "judas_swing")
-#: Shadow playbooks: evaluated + logged, never ordered.
-SHADOW_PLAYBOOK_NAMES: tuple[str, ...] = (
+    "inversion", "killzone_open", "judas_swing",
     "turtle_soup", "v_reversal", "retracement_trap", "order_block",
     "qm_m5", "qm_d1", "narrative")
+#: Shadow playbooks: evaluated + logged, never ordered.  EMPTY since
+#: the owner directive of 2026-10-22 (the roster is live; a playbook
+#: leaves execution via the kill switch, not a shadow tier).
+SHADOW_PLAYBOOK_NAMES: tuple[str, ...] = ()
 ALL_PLAYBOOK_NAMES: tuple[str, ...] = (
     EXECUTE_PLAYBOOK_NAMES + SHADOW_PLAYBOOK_NAMES)
 

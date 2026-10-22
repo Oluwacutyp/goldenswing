@@ -48,12 +48,14 @@ ATR, target 1.5R, invalidation exit at close, 48-bar max hold.
 
 VALIDATION (scripts/validate_new_playbooks.py, OANDA XAUUSD H1
 2024-10 -> 2026-10, 11987 bars): 78 trades, 27% win, total R +2.1,
-PF 1.07, avg +0.03R, maxDD -6.6R, halves -0.0 / +2.1.  FAILS the
-iron rule (PF 1.07 < 1.10) — MARGINAL: the rejection-leg FVG
-retracement barely breaks even on H1; the 3-bar imbalance does not
-hold as reliably as a session pool (cf. Judas PF 1.93 on the same
-window).  STAYS SHADOW.  Do not execute without a new experiment
-(e.g. FVG + HTF confluence, or soup only at HTF levels).
+PF 1.07, avg +0.03R, maxDD -6.6R, halves -0.0 / +2.1.  That is the
+historical MAP, kept as measured: under the old bar it read
+MARGINAL (PF 1.07 vs the 1.10 reference line) — the rejection-leg
+FVG retracement barely broke even on H1; the 3-bar imbalance did
+not hold as reliably as a session pool (cf. Judas PF 1.93 on the
+same window).  STATUS: LIVE on the demo (owner directive
+2026-10-22).  The map reading does not gate execution; forward
+live-demo performance is the verdict.
 """
 from __future__ import annotations
 
@@ -318,7 +320,9 @@ class TurtleSoupPlaybook(Playbook):
         "holding retracement into the rejection-leg FVG — enter at "
         "the FVG near edge"
     )
-    live = False  # FAILED validation (PF 1.07, +2.1R) — shadow only
+    live = True  # measured PF 1.07 standalone (the map, in the
+    # docstring); promoted to live demo by owner directive 2026-10-22
+    # for forward testing — the demo decides.
     live_threshold = 0.0  # every holding retracement is graded
     context_description = (
         "XAUUSD H1, any session. Entry at the rejection-leg FVG near "

@@ -14,8 +14,11 @@ One AWARE system, multiple entry playbooks.  Each bar the engine:
    skipped and why, the full thesis behind every fill.
 
 Live vs shadow: only playbooks with ``live=True`` may enter the live
-P&L book.  Shadow playbooks are scored, logged and graded in their own
-paper books — promotion to live needs OOS evidence (CONFLUENCE.md).
+P&L book; shadow playbooks are scored, logged and graded in their own
+paper books.  Which playbooks are live is the owner's decision
+(directive 2026-10-22): backtests map where a setup historically
+worked — evidence, never a promotion gate.  Forward live-demo
+performance is the verdict (see playbooks/common.py).
 """
 from __future__ import annotations
 

@@ -46,13 +46,13 @@ A pivot at bar i is only usable once bar i+3 has closed (no
 lookahead).  Consecutive same-side pivots keep only the more extreme
 one (the MQL5 zig-zag rule); the QM level freezes at the break bar.
 
-STATUS: SHADOW-ONLY (live=False).  QM has NO measured validation in
-this repo — no backtest, no win rate, no context map.  It appears in
-batch candidates, the journal, and the shadow book, never in live
-P&L.  Promotion to live needs forward paper observation on a real M5
-feed (the live paper loop is H1-only today, so QM has no live feed
-yet).  The base score is a documented placeholder like the other
-sleeves, NOT a measured score.
+STATUS: LIVE on the demo (owner directive 2026-10-22).  QM has NO
+measured validation in this repo — no backtest, no win rate, no
+context map; that absence is the historical MAP, recorded honestly,
+and under the owner's doctrine it is not a gate: the playbook now
+executes on the live demo and forward live-demo performance is the
+measurement.  The base score is a documented placeholder like the
+other sleeves, NOT a measured score.
 
 PARAMETERIZATION: this module owns the ONE QM state machine
 (:class:`_QMEngine`) behind every QM timeframe.  Timeframe-specific
@@ -183,9 +183,12 @@ class _Triple:
     sweep_head: bool = False
 
     def to_dict(self) -> dict:
+        # bool() coercion: exported state is JSON-persisted by the
+        # StateStore — a numpy bool_ here crashes the save.
         return {"direction": self.direction,
                 "p0": self.p0.to_dict(), "p1": self.p1.to_dict(),
-                "p2": self.p2.to_dict(), "sweep_head": self.sweep_head}
+                "p2": self.p2.to_dict(),
+                "sweep_head": bool(self.sweep_head)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "_Triple":
@@ -219,7 +222,7 @@ class _Broken:
     def to_dict(self) -> dict:
         return {"triple": self.triple.to_dict(),
                 "break_index": self.break_index,
-                "displacement": self.displacement}
+                "displacement": bool(self.displacement)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "_Broken":
@@ -420,7 +423,8 @@ class _QMEngine:
                 body_atr = (abs(c[t] - o[t]) / atr) if atr > 0 else 0.0
                 self.broken.append(_Broken(
                     triple=tr, break_index=t,
-                    displacement=body_atr >= p.displacement_body_atr))
+                    displacement=bool(
+                        body_atr >= p.displacement_body_atr)))
             else:
                 kept.append(tr)
         self.pending = kept
@@ -523,9 +527,9 @@ class QMPlaybookBase(Playbook):
     simulator, gate, and streaming cursor are shared, never copied."""
 
     params: QMParams = M5_PARAMS
-    live = False  # SHADOW: QM is unvalidated on every timeframe —
-    # shadow book + journal only, never live P&L, until validation
-    # promotes it (a separate owner decision per timeframe).
+    live = True  # LIVE on the demo (owner directive 2026-10-22):
+    # QM is unmeasured on every timeframe (the map is empty, not
+    # negative) — forward live-demo performance is the measurement.
     live_threshold = 0.0  # every qualifying touch is graded
     session_scope = "any"
     hunting_ground = HuntingGround(excluded=set(), bonuses={})
@@ -662,8 +666,8 @@ class QMM5Playbook(QMPlaybookBase):
         "rally (QM level) -> close through the neckline -> limit at the "
         "QM level, stop beyond the head, target the broken neckline"
     )
-    live = False  # SHADOW: unvalidated — shadow book + journal only,
-    # never live P&L, until forward paper observation promotes it.
+    live = True  # LIVE on the demo (owner directive 2026-10-22):
+    # unmeasured — forward live-demo performance is the measurement.
     live_threshold = 0.0  # every qualifying touch is graded
     context_description = (
         "UNVALIDATED (no backtest, no win rate, no context map yet). "

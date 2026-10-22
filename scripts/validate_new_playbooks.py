@@ -1,17 +1,22 @@
-"""Validate the new MT5 playbooks on OANDA XAUUSD H1 (2024-10 -> 2026-10).
+"""Measure the new MT5 playbooks on OANDA XAUUSD H1 (2024-10 -> 2026-10).
 
 Each new setup (V-reversal, retracement trap, inversion, order block,
 killzone open, turtle soup, Judas swing) runs its own
 ``candidates()`` over the full window with its own entry rules and
 the shared exit discipline (1.5R target, stop = invalidation +/-
-0.25 ATR, invalidation exit at close, 48-bar max hold).  The iron
-rule is applied mechanically:
+0.25 ATR, invalidation exit at close, 48-bar max hold).  Each
+reading is reported against the historical bar:
 
-    PASS (executes):  PF >= 1.10 AND total R > 0 AND trades >= 30
-    FAIL (stays shadow): anything else
+    PF >= 1.10 AND total R > 0 AND trades >= 30
+
+That bar is a MAP reference line, not a gate (owner directive
+2026-10-22): backtests show where a setup historically worked;
+promotion to live execution on the demo is the owner's decision
+and forward live-demo performance is the verdict.  This script
+measures — it no longer assigns executing vs shadow.
 
 Halves (first/second half R) are printed for stability: a setup
-positive in only one half is suspect even when it passes.
+positive in only one half is suspect wherever it trades.
 
 Usage:  python scripts/validate_new_playbooks.py
 """
@@ -65,8 +70,8 @@ def main() -> int:
     mid = len(df) // 2
     print(f"bars: {len(df)}  window: {df.index[0].date()} -> "
           f"{df.index[-1].date()}  ({years:.2f} years)")
-    print(f"promotion rule: PF >= {MIN_PF} AND total R > 0 AND "
-          f"trades >= {MIN_TRADES}")
+    print(f"historical bar (map reference, not a gate): PF >= "
+          f"{MIN_PF} AND total R > 0 AND trades >= {MIN_TRADES}")
     print()
     verdicts: dict[str, bool] = {}
     for cls in PLAYBOOKS:
@@ -86,13 +91,14 @@ def main() -> int:
               f"avg_R={s['avg_r']:+.2f} maxDD={s['max_dd_r']:.1f}R "
               f"first_half_R={sum(first):+.1f} "
               f"second_half_R={sum(second):+.1f} -> "
-              f"{'PASS executes' if ok else 'FAIL stays shadow'} "
+              f"{'clears the historical bar' if ok else 'under the bar'} "
               f"({reason})")
     print()
-    executing = [n for n, ok in verdicts.items() if ok]
-    shadow = [n for n, ok in verdicts.items() if not ok]
-    print(f"executing: {executing or 'none'}")
-    print(f"shadow: {shadow or 'none'}")
+    above = [n for n, ok in verdicts.items() if ok]
+    below = [n for n, ok in verdicts.items() if not ok]
+    print(f"clears the historical bar: {above or 'none'}")
+    print(f"under the bar (map reading only — execution is the "
+          f"owner's call): {below or 'none'}")
     return 0
 
 

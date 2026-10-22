@@ -165,7 +165,7 @@ def test_mt5_position_pending_none_markers(tmp_path):
 def test_mt5_playbooks_rows_keep_contract(tmp_path):
     text = _mt5_text(_journal(tmp_path), tmp_path, "/playbooks")
     assert "judas_swing: executing, on, signals 3" in text
-    assert "turtle_soup: shadow, off, signals 0" in text
+    assert "turtle_soup: executing, off, signals 0" in text
 
 
 def test_mt5_config_health_journal_reconcile_have_headers(tmp_path):

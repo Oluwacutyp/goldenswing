@@ -799,8 +799,8 @@ def test_playbooks_command_shows_state_and_counts(tmp_path):
     ctx = CommandContext(journal=runner.journal, mt5_control=runner)
     res, _ = mt5_router(OWNER).dispatch(_update("/playbooks"), ctx)
     assert "judas_swing: executing, on, signals 3" in res.text
-    assert "turtle_soup: shadow, off, signals 0" in res.text
-    assert "qm_m5: shadow, on" in res.text
+    assert "turtle_soup: executing, off, signals 0" in res.text
+    assert "qm_m5: executing, on" in res.text
     assert res.reply_markup == mt5_control_keyboard()
 
 

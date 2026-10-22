@@ -26,11 +26,14 @@ ATR, target 1.5R, invalidation exit at close, 48-bar max hold.
 
 VALIDATION (scripts/validate_new_playbooks.py, OANDA XAUUSD H1
 2024-10 -> 2026-10, 11987 bars): 163 trades, 35% win, total R -39.4,
-PF 0.68, negative in BOTH halves (-18.6 / -20.8).  FAILS the iron
-rule.  STAYS SHADOW — the V-reversal as defined here does not have an
-edge on XAUUSD H1: capitulation spikes reclaim, then fail.  Do not
-execute without a new experiment (e.g. reclaim + displacement, or
-V only at HTF levels).
+PF 0.68, negative in BOTH halves (-18.6 / -20.8).  That is the
+historical MAP, kept as measured: standalone on H1 under the shared
+fixed-exit discipline, capitulation spikes reclaimed, then failed.
+STATUS: LIVE on the demo (owner directive 2026-10-22).  The map
+reading does not gate execution; forward live-demo performance is
+the verdict — the live question is the V as a trigger at HTF levels
+with displacement behind it, which the standalone frame never
+measured.
 """
 from __future__ import annotations
 
@@ -167,7 +170,9 @@ class VReversalPlaybook(Playbook):
         "Capitulation spike (fresh low/high + rejection wick) + reclaim "
         "of the spike midpoint within 3 bars; enter on the reclaim close"
     )
-    live = False  # FAILED validation (PF 0.68, -39.4R) — shadow only
+    live = True  # measured PF 0.68 standalone (the map, in the
+    # docstring); promoted to live demo by owner directive 2026-10-22
+    # for forward testing — the demo decides.
     live_threshold = 0.0  # every reclaim is graded
     context_description = (
         "XAUUSD H1, any session. Entry is the reclaim close; stop is the "

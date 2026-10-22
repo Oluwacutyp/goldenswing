@@ -23,13 +23,14 @@ attempts the owner's Oct 14 2026 setup replay on the native file
 and reports exactly what the playbook finds (or why it is blocked).
 
 Backtests map WHERE a setup works, never binary kill/adopt: the
-script reports the iron-rule verdict (PF >= 1.10 AND total R > 0 AND
->= 30 trades) AND breakdowns by direction, tags (sweep_head /
-displacement_break), drift alignment (QM direction vs the 50-bar
-drift into the touch — a reversal that runs WITH the longer drift
-vs one that fights it), ATR regime (touch-bar ATR vs its median),
-and first/second half.  qm_d1 stays SHADOW regardless: promotion is
-a separate owner decision.
+script reports the reading against the historical bar (PF >= 1.10
+AND total R > 0 AND >= 30 trades) AND breakdowns by direction, tags
+(sweep_head / displacement_break), drift alignment (QM direction vs
+the 50-bar drift into the touch — a reversal that runs WITH the
+longer drift vs one that fights it), ATR regime (touch-bar ATR vs
+its median), and first/second half.  The reading is the map, not a
+gate: qm_d1 is LIVE on the demo (owner directive 2026-10-22) and
+forward live-demo performance is the verdict.
 
 Usage:  python3 scripts/validate_qm_d1.py [--csv PATH] [--replay-oct14]
 """
@@ -116,7 +117,7 @@ def report(label: str, d1: pd.DataFrame) -> dict:
           f"avg_R={s['avg_r']:+.2f} maxDD={s['max_dd_r']:.1f}R "
           f"first_half_R={sum(first):+.1f} "
           f"second_half_R={sum(second):+.1f} -> "
-          f"{'PASS iron rule' if ok else 'FAIL iron rule'} ({reason})")
+          f"{'clears the historical bar' if ok else 'under the bar'} ({reason})")
     print("  breakdowns (where it works / doesn't):")
     _breakdown("long", [c for c in cands if c.direction == 1])
     _breakdown("short", [c for c in cands if c.direction == -1])
@@ -239,10 +240,10 @@ def main() -> int:
     ap.add_argument("--replay-oct14", action="store_true",
                     help="attempt the Oct 14 2026 setup replay")
     args = ap.parse_args()
-    print(f"promotion rule: PF >= {MIN_PF} AND total R > 0 AND "
-          f"trades >= {MIN_TRADES} (iron rule)")
-    print("qm_d1 stays SHADOW regardless — promotion is a separate "
-          "owner decision.")
+    print(f"historical bar (map reference, not a gate): PF >= "
+          f"{MIN_PF} AND total R > 0 AND trades >= {MIN_TRADES}")
+    print("qm_d1 is LIVE on the demo (owner directive 2026-10-22) — "
+          "this script only measures the historical map.")
     print()
     if args.csv is not None:
         print(f"Daily QM (qm_d1) validation — NATIVE MT5 D1 ({args.csv.name})")

@@ -48,12 +48,22 @@ class TradeJournal:
                  factors: list | tuple = (),
                  forecaster_prob: float | None = None,
                  forecaster_rank: float | None = None,
-                 risk_atr: float | None = None) -> dict:
-        return self.append({
+                 risk_atr: float | None = None,
+                 intended_entry: float | None = None,
+                 slippage: float | None = None) -> dict:
+        # Friction audit (owner directive 2026-10-22): every open
+        # record carries its stop distance (|entry - stop|, price
+        # units) so R geometry is auditable from the journal alone;
+        # execution sites that know the intended entry also record
+        # it plus the signed slippage (price units, adverse-positive:
+        # direction * (fill - intended)) so M5-scale friction can be
+        # measured against the stop it eats into.
+        record = {
             "type": "open", "alert_id": alert_id, "instrument": instrument,
             "mode": mode, "playbook": playbook, "phase": phase,
             "direction": direction, "score": score, "source": source,
             "ticket": ticket, "entry": entry, "stop": stop,
+            "stop_distance": abs(float(entry) - float(stop)),
             "volume": volume, "risk_money": risk_money,
             "factors": list(factors),
             "forecaster_prob": forecaster_prob,
@@ -66,7 +76,12 @@ class TradeJournal:
                 "risk_atr": risk_atr,
                 "n_factors": len(factors),
             },
-        })
+        }
+        if intended_entry is not None:
+            record["intended_entry"] = float(intended_entry)
+        if slippage is not None:
+            record["slippage"] = float(slippage)
+        return self.append(record)
 
     def log_close(self, *, alert_id: str, ticket: int | None = None,
                   exit_price: float, reason: str, pnl_money: float,

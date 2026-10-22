@@ -267,7 +267,10 @@ def test_session_clock_is_d1():
     assert "qm_d1 keeps D1 clock; session is annotation only" in m.tags
 
 
-def test_confluence_shadow_not_live():
+def test_confluence_live_book_not_shadow():
+    """Owner directive 2026-10-22: qm_d1 is live — its candidates
+    book in the LIVE book, not the shadow book.  Detection coverage
+    is unchanged (the same fixture still scores exactly 1 candidate)."""
     df = _df(BEARISH)
     tmp = Path(tempfile.mkdtemp())
     eng = ConfluenceEngine([QMD1Playbook()],
@@ -276,14 +279,16 @@ def test_confluence_shadow_not_live():
                            risk_mode="shadow")
     rep = eng.run(_ctx(df))
     assert len(rep.scored["qm_d1"]) == 1
-    assert rep.shadow["qm_d1"]["n_candidates"] == 1
-    assert rep.live_outcomes == []  # live=False: never in the live book
+    assert "qm_d1" not in rep.shadow  # live: never in the shadow book
+    assert len(rep.live_outcomes) == 1  # the candidate books live
 
 
-def test_qm_d1_is_shadow_in_config_not_executing():
-    assert "qm_d1" in SHADOW_PLAYBOOK_NAMES
-    assert "qm_d1" not in EXECUTE_PLAYBOOK_NAMES
-    assert QMD1Playbook.live is False
+def test_qm_d1_is_executing_in_config_not_shadow():
+    """Owner directive 2026-10-22: qm_d1 executes — the roster of
+    record lists it as executing, never shadow."""
+    assert "qm_d1" not in SHADOW_PLAYBOOK_NAMES
+    assert "qm_d1" in EXECUTE_PLAYBOOK_NAMES
+    assert QMD1Playbook.live is True
 
 
 def test_runner_scans_d1_frame_not_h1_path(tmp_path):

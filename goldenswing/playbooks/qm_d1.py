@@ -55,11 +55,13 @@ Entry clock: D1 (see ``reader/session_timeframes.py`` — ``qm_d1``
   direction, tags, drift alignment, and ATR regime instead of by
   session.
 
-STATUS: SHADOW-ONLY (live=False).  Validated by
+STATUS: LIVE on the demo (owner directive 2026-10-22).  Measured by
 ``scripts/validate_qm_d1.py`` — see its output and the numbers in
-:attr:`QMD1Playbook.context_description`.  Promotion to executing is
-a SEPARATE owner decision after validation; this file never
-promotes itself.
+:attr:`QMD1Playbook.context_description`.  The measurement is the
+historical MAP (positive R, far too few trades to mean anything);
+under the owner's doctrine it never gated execution, and the
+promotion decision the old text waited for is the 2026-10-22
+directive itself.  Forward live-demo performance is the verdict.
 """
 from __future__ import annotations
 
@@ -96,17 +98,17 @@ class QMD1Playbook(QMPlaybookBase):
         "rally (QM level) -> close through the neckline -> limit at the "
         "QM level, stop beyond the head, target the broken neckline"
     )
-    live = False  # SHADOW: validated by scripts/validate_qm_d1.py, but
-    # promotion to executing is a separate owner decision — this file
-    # never promotes itself.
+    live = True  # LIVE on the demo (owner directive 2026-10-22):
+    # measured by scripts/validate_qm_d1.py (positive R, tiny sample —
+    # the map, in context_description); the demo decides.
     live_threshold = 0.0  # every qualifying touch is graded
     context_description = (
         "Daily Quasimodo reversal, MEASURED by "
         "scripts/validate_qm_d1.py (OANDA XAUUSD H1 resampled to D1): "
         "PRIMARY 2y (2024-10 -> 2026-10): 4 trades, 50% win, +1.5R, "
-        "PF 1.73 — FAILS the iron rule on sample size (< 30 trades). "
+        "PF 1.73 — under the old bar on sample size (< 30 trades). "
         "EXTENDED ~4.8y (2022-01 -> 2026-10): 8 trades, 50% win, "
-        "+1.4R, PF 1.34 — also fails on sample. Positive R but far "
+        "+1.4R, PF 1.34 — also under the bar on sample. Positive R but far "
         "too few trades to mean anything: Daily QM on gold is RARE "
         "(~2 qualifying touches/year) under these strict params. "
         "Breakdowns at this n are noise, not findings — the only "
@@ -116,7 +118,8 @@ class QMD1Playbook(QMPlaybookBase):
         "4-for-4 (+5.4R), a WATCH hypothesis, not a gate. "
         "Diagnostic (NOT validation): loosening the 1R floor + "
         "windows fires 36 trades / +8.9R — a hypothesis for a future "
-        "OOS experiment, never a post-hoc re-tune. Stays SHADOW. "
+        "OOS experiment, never a post-hoc re-tune. LIVE on the demo "
+        "since 2026-10-22 (owner directive) — the demo decides. "
         "Mechanics: confirmed fractal pivots (swing_n=3), both legs "
         ">= 0.5 ATR, failed rally short of the head by >= 0.25 ATR, "
         "close through the neckline within 60 bars of the head (one "

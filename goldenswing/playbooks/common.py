@@ -13,11 +13,17 @@ exit policy is not re-invented per setup.
   invalidation level sits inside the stop, as in fvg_limit).
 - Max hold: 48 H1 bars; unresolved trades are dropped, never booked.
 
-Promotion rule (the iron rule, applied by
-``scripts/validate_new_playbooks.py``): a new playbook executes only
-when its full-window backtest shows PF >= 1.10 AND total R > 0 AND
-at least 30 trades.  Anything else stays shadow (``live = False``,
-never in the MT5 execute list).
+Promotion doctrine (owner directive 2026-10-22 — this supersedes
+the former backtest gate): backtests MAP where a setup historically
+worked; they are evidence, never a binary kill/adopt gate.  A
+playbook executes on the live DEMO when the owner says it executes,
+and forward live-demo performance is the verdict.  The historical
+bar below (full-window PF >= 1.10 AND total R > 0 AND >= 30 trades,
+measured by ``scripts/validate_new_playbooks.py``) stays recorded
+as the map's reference line: a playbook measured under it carries
+that reading in its own file, honestly — failures included, never
+relabeled.  The reading informs the owner; it does not gate the
+``live`` flag.
 """
 from __future__ import annotations
 
@@ -31,9 +37,9 @@ STOP_BUFFER_ATR = 0.25
 MAX_HOLD_BARS = 48
 #: 14-bar mean true range.
 ATR_N = 14
-#: Promotion rule: profit factor floor.
+#: Historical bar: profit factor reference line for validation maps.
 MIN_PF = 1.10
-#: Promotion rule: minimum trade count (enough sample to mean anything).
+#: Historical bar: minimum trade count (enough sample to mean anything).
 MIN_TRADES = 30
 
 
@@ -158,12 +164,18 @@ def confirmed_swings(high, low, up_to: int, n: int = 3,
 
 
 def promotion_verdict(summary: dict) -> tuple[bool, str]:
-    """Iron-rule gate: PF >= 1.10 AND total R > 0 AND >= 30 trades."""
+    """Historical-bar reading of a validation summary: does the
+    measured window clear the reference bar (PF >= 1.10 AND total
+    R > 0 AND >= 30 trades)?  A MAP reading, not a promotion gate —
+    under the owner directive of 2026-10-22 the verdict on a
+    playbook is its forward live-demo performance, decided by the
+    owner; this function only reports where the historical
+    measurement sits against the bar."""
     if summary["trades"] < MIN_TRADES:
         return False, (f"only {summary['trades']} trades "
-                       f"(need >= {MIN_TRADES})")
+                       f"(historical bar >= {MIN_TRADES})")
     if summary["total_r"] <= 0:
-        return False, f"total R {summary['total_r']:+.1f} (need > 0)"
+        return False, f"total R {summary['total_r']:+.1f} (bar > 0)"
     if summary["pf"] < MIN_PF:
-        return False, f"PF {summary['pf']:.2f} (need >= {MIN_PF})"
-    return True, "passes the iron rule"
+        return False, f"PF {summary['pf']:.2f} (bar >= {MIN_PF})"
+    return True, "clears the historical bar"

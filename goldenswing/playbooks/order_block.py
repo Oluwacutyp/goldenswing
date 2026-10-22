@@ -36,11 +36,15 @@ ATR, target 1.5R, invalidation exit at close, 48-bar max hold.
 
 VALIDATION (scripts/validate_new_playbooks.py, OANDA XAUUSD H1
 2024-10 -> 2026-10, 11987 bars): 495 trades, 36% win, total R -134.3,
-PF 0.67, negative in BOTH halves (-56.3 / -78.0).  FAILS the iron
-rule.  STAYS SHADOW — OB retracements on H1 get run through more
-often than they hold; the block is not the edge by itself.  Do not
-execute without a new experiment (e.g. OB + FVG confluence, or OB
-only at HTF POI).
+PF 0.67, negative in BOTH halves (-56.3 / -78.0).  That is the
+historical MAP, kept as measured: standalone on H1 under the shared
+fixed-exit discipline, OB retracements got run through more often
+than they held — the block alone was not the edge in that frame.
+STATUS: LIVE on the demo (owner directive 2026-10-22).  The map
+reading does not gate execution; forward live-demo performance is
+the verdict.  The practitioner's frame — OB as a POI inside an HTF
+narrative, not a standalone signal — is exactly what the live
+machinery around it (hierarchy, zones, confluence) supplies.
 """
 from __future__ import annotations
 
@@ -187,7 +191,9 @@ class OrderBlockPlaybook(Playbook):
         "Displacement close-through a swing level; enter on the first "
         "retracement into the last opposing candle (the order block)"
     )
-    live = False  # FAILED validation (PF 0.67, -134.3R) — shadow only
+    live = True  # measured PF 0.67 standalone (the map, in the
+    # docstring); promoted to live demo by owner directive 2026-10-22
+    # for forward testing — the demo decides.
     live_threshold = 0.0  # every OB retracement is graded
     context_description = (
         "XAUUSD H1, any session. Entry at the OB near edge; stop beyond "

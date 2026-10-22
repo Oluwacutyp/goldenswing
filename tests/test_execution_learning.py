@@ -36,6 +36,46 @@ def test_journal_round_trip_and_aggregation(tmp_path):
     assert agg["skips"] == 1
 
 
+def test_journal_open_records_friction_fields(tmp_path):
+    """Friction audit (owner directive 2026-10-22): an open record
+    always carries its stop distance, and an execution site that
+    knows the intended entry also records it plus the signed
+    slippage (adverse-positive, direction * (fill - intended)), so
+    M5-scale friction is auditable from the journal alone."""
+    j = TradeJournal(tmp_path / "journal.jsonl")
+    # Long filled 0.30 above the intended entry, stop 2.00 below fill.
+    j.log_open(alert_id="F1", instrument="XAUUSD", mode="MT5",
+               playbook="qm_m5", phase="live", direction=1,
+               score=55.0, source="mt5", ticket=501,
+               entry=2000.30, stop=1998.30, volume=0.01,
+               risk_money=2.0, intended_entry=2000.0,
+               slippage=1 * (2000.30 - 2000.0))
+    # Short filled 0.10 above the intended entry (a short sells —
+    # higher is favourable, so signed slippage is negative).
+    j.log_open(alert_id="F2", instrument="XAUUSD", mode="MT5",
+               playbook="order_block", phase="live", direction=-1,
+               score=52.0, source="mt5", ticket=502,
+               entry=2000.10, stop=2001.60, volume=0.01,
+               risk_money=1.5, intended_entry=2000.0,
+               slippage=-1 * (2000.10 - 2000.0))
+    # No execution context (batch/simulated): friction fields absent,
+    # stop distance still recorded.
+    j.log_open(alert_id="F3", instrument="XAUUSD", mode="swing",
+               playbook="fvg_midline", phase="expansion_up", direction=1,
+               score=70.0, source="execute", ticket=503,
+               entry=2000.0, stop=1990.0, volume=0.1, risk_money=100.0)
+    opens = {r["alert_id"]: r for r in j.records()
+             if r["type"] == "open"}
+    f1, f2, f3 = opens["F1"], opens["F2"], opens["F3"]
+    assert f1["intended_entry"] == pytest.approx(2000.0)
+    assert f1["slippage"] == pytest.approx(0.30)  # adverse for a long
+    assert f1["stop_distance"] == pytest.approx(2.00)
+    assert f2["slippage"] == pytest.approx(-0.10)  # favourable for a short
+    assert f2["stop_distance"] == pytest.approx(1.50)
+    assert f3["stop_distance"] == pytest.approx(10.0)
+    assert "intended_entry" not in f3 and "slippage" not in f3
+
+
 def test_training_export_carries_features_and_labels(tmp_path):
     j = TradeJournal(tmp_path / "journal.jsonl")
     j.log_open(alert_id="A0", instrument="XAUUSD", mode="swing",

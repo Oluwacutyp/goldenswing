@@ -27,11 +27,14 @@ ATR, target 1.5R, invalidation exit at close, 48-bar max hold.
 
 VALIDATION (scripts/validate_new_playbooks.py, OANDA XAUUSD H1
 2024-10 -> 2026-10, 11987 bars): 434 trades, 38% win, total R -48.7,
-PF 0.84, negative in BOTH halves (-14.8 / -33.9).  FAILS the iron
-rule.  STAYS SHADOW — false-breakout traps on H1 resolve into the
-break more often than they reverse.  Do not execute without a new
-experiment (e.g. trap + HTF confluence, or trap only at Asia-range
-extremes).
+PF 0.84, negative in BOTH halves (-14.8 / -33.9).  That is the
+historical MAP, kept as measured: standalone on H1 under the shared
+fixed-exit discipline, false-breakout traps resolved into the break
+more often than they reversed.  STATUS: LIVE on the demo (owner
+directive 2026-10-22).  The map reading does not gate execution;
+forward live-demo performance is the verdict — the live question is
+the trap as a trigger inside structure (HTF confluence, session
+extremes), which the standalone frame never measured.
 """
 from __future__ import annotations
 
@@ -184,7 +187,9 @@ class RetracementTrapPlaybook(Playbook):
         "False breakdown/breakout (CLOSE beyond a confirmed swing level) "
         "that fails within 3 bars — enter on the reclaim close"
     )
-    live = False  # FAILED validation (PF 0.84, -48.7R) — shadow only
+    live = True  # measured PF 0.84 standalone (the map, in the
+    # docstring); promoted to live demo by owner directive 2026-10-22
+    # for forward testing — the demo decides.
     live_threshold = 0.0  # every trap failure is graded
     context_description = (
         "XAUUSD H1, any session. Entry is the reclaim close; stop is the "

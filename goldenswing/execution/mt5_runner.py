@@ -7579,7 +7579,10 @@ class MT5Runner:
             source="mt5", ticket=int(res.ticket), entry=float(fill),
             stop=float(sig.invalidation), volume=float(lots),
             risk_money=float(risk_money),
-            factors=list(getattr(sig, "factors", []) or []))
+            factors=list(getattr(sig, "factors", []) or []),
+            intended_entry=float(sig.entry_ref),
+            slippage=(int(sig.direction)
+                      * (float(fill) - float(sig.entry_ref))))
         self.journal.log_note(
             f"mt5 fill: ticket {res.ticket} {pb.name} "
             f"{'+' if sig.direction > 0 else '-'}1 {lots} lots @ {fill:.2f} "
@@ -8052,7 +8055,10 @@ class MT5Runner:
             stop=float(state.invalidation),
             volume=float(volume), risk_money=float(risk_money),
             factors=list(getattr(sig, "factors", []) or [])
-            if sig is not None else [])
+            if sig is not None else [],
+            intended_entry=float(state.level),
+            slippage=(int(state.direction)
+                      * (float(pos.entry_price) - float(state.level))))
         self._det_journal("trade_opened", {
             "alert_id": state.alert_id, "ticket": int(pos.ticket),
             "entry": float(pos.entry_price),
@@ -8217,9 +8223,10 @@ class MT5Runner:
         is NOT used: it validates against the H1 live setup, which
         a D1-clock signal cannot satisfy — the order still passes
         RiskGuards, margin, news and posture.  The playbook's
-        batch-engine ``live=False`` is untouched (the batch book
-        stays shadow; the MT5 demo book executes, exactly like
-        qm_m5).  Kill switch: ``/set playbook.qm_d1 off``.
+        batch-engine flag is ``live=True`` since the owner directive
+        of 2026-10-22 (the batch book executes too; the MT5 demo
+        book always did, exactly like qm_m5).  Kill switch:
+        ``/set playbook.qm_d1 off``.
         """
         if "qm_d1" in (self.cfg.disabled_playbooks or ()):
             return []

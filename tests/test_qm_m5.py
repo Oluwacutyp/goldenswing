@@ -269,7 +269,10 @@ def test_router_maps_qm_kind():
     assert playbook_of(None, "qm_m5") == "qm_m5"
 
 
-def test_confluence_shadow_not_live():
+def test_confluence_live_book_not_shadow():
+    """Owner directive 2026-10-22: qm_m5 is live — its candidates
+    book in the LIVE book, not the shadow book.  Detection coverage
+    is unchanged (the same fixture still scores exactly 1 candidate)."""
     df = _df(BEARISH)
     tmp = Path(tempfile.mkdtemp())
     eng = ConfluenceEngine([QMM5Playbook()],
@@ -278,5 +281,5 @@ def test_confluence_shadow_not_live():
                            risk_mode="shadow")
     rep = eng.run(_ctx(df))
     assert len(rep.scored["qm_m5"]) == 1
-    assert rep.shadow["qm_m5"]["n_candidates"] == 1
-    assert rep.live_outcomes == []  # live=False: never in the live book
+    assert "qm_m5" not in rep.shadow  # live: never in the shadow book
+    assert len(rep.live_outcomes) == 1  # the candidate books live
