@@ -492,6 +492,82 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
                          reply_markup=mt5_control_keyboard())
 
 
+@mt5_command("/assess", "the engine's latest market assessment: /assess [playbook|all]")
+def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
+    """Visible market reading (owner milestone, 2026-10-23):
+    render the LATEST funnel assessment per playbook from THIS
+    engine's journal — structure read, itemized evidence,
+    competing scenarios, verdict + plain-language reason, with
+    absent capabilities marked, never invented.  ``/assess``
+    shows the newest assessment plus a per-playbook verdict
+    index; ``/assess <playbook>`` one playbook in full;
+    ``/assess all`` the whole roster (a document when the text
+    would exceed a Telegram message, the /recap pattern)."""
+    from .assessment_render import (is_shadow_record,
+                                    latest_evaluations,
+                                    render_assessment)
+    if ctx.journal is None:
+        return CommandResult(text="no journal attached.")
+    try:
+        records = ctx.journal.records()
+    except Exception:
+        records = []
+    latest = latest_evaluations(records)
+    if not latest:
+        return CommandResult(
+            text="no playbook evaluations journaled yet — the "
+                 "engine has not assessed anything on this "
+                 "journal.")
+    ctrl = _control(ctx)
+    symbol = getattr(getattr(ctrl, "cfg", None), "symbol", None)
+
+    def _text_of(rec: dict) -> str:
+        return rec.get("assessment_text") or render_assessment(
+            rec, symbol=symbol)
+
+    def _index_line(name: str, rec: dict) -> str:
+        a = rec.get("assessment") or {}
+        verdict = str(a.get("verdict") or "?").upper()
+        mark = " (SHADOW)" if is_shadow_record(rec) else ""
+        return (f"  {name}: {verdict}{mark} · "
+                f"bar {rec.get('last_bar_ts') or '?'}")
+
+    arg = (args[0].lower() if args else "")
+    if arg and arg != "all":
+        rec = latest.get(arg)
+        if rec is None:
+            known = ", ".join(sorted(latest))
+            return CommandResult(
+                text=f"no evaluation journaled for {arg!r} yet.\n"
+                     f"assessed so far: {known}\n"
+                     f"usage: /assess [playbook|all]")
+        return CommandResult(
+            text=_text_of(rec)
+            + "\n" + fmt_next_cta("/assess all", "/status"))
+    if arg == "all":
+        blocks = [_text_of(latest[name]) for name in sorted(latest)]
+        text = ("\n\n" + "—" * 24 + "\n\n").join(blocks)
+        if len(text) <= 3500 or not ctx.reports_dir:
+            return CommandResult(
+                text=text + "\n" + fmt_next_cta("/assess", "/status"))
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        path = Path(ctx.reports_dir) / f"mt5-assess-{stamp}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return CommandResult(
+            document=path,
+            caption=f"🧭 MT5 market assessments — latest per "
+                    f"playbook ({len(blocks)} playbooks)")
+    newest_name = max(latest, key=lambda n: latest[n].get("ts") or "")
+    lines = [_text_of(latest[newest_name]), "",
+             fmt_section("🧭", "Latest per playbook")]
+    for name in sorted(latest):
+        lines.append(_index_line(name, latest[name]))
+    lines.append(fmt_next_cta("/assess <playbook>", "/assess all",
+                              "/status"))
+    return CommandResult(text="\n".join(lines))
+
+
 @mt5_command("/position", "open MT5 positions with layers")
 def _mt5_position(ctx: CommandContext, args: list[str]) -> CommandResult:
     lines = [fmt_section("📈", "MT5 OPEN POSITIONS:"), ""]

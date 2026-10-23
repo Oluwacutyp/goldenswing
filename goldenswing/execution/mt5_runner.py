@@ -145,6 +145,10 @@ from .funnel import (assessment_block as _assessment_block,
                      decision_bucket as _decision_bucket,
                      terminal_decision as _terminal_decision,
                      verdict_blocks as _verdict_blocks)
+from .assessment_render import (is_shadow_record as
+                                _is_shadow_record,
+                                render_assessment as
+                                _render_assessment)
 from . import candidate_lifecycle as _lifecycle
 from .friction_gate import (
     FRICTION_REASON_CODE as _FRICTION_CODE,
@@ -1190,6 +1194,17 @@ class MT5Runner:
         except Exception:
             record["assessment"] = None
             record["reason_text"] = reason or ""
+        # Visible market-reading milestone (owner, 2026-10-23):
+        # the RENDERED assessment rides on the record itself, so
+        # the journal is human-readable evidence — the owner can
+        # read what the engine saw without a separate tool.  The
+        # renderer prints only what the record carries (absent
+        # sections render as explicit not-produced lines).
+        try:
+            record["assessment_text"] = _render_assessment(
+                record, symbol=getattr(self.cfg, "symbol", None))
+        except Exception:
+            record["assessment_text"] = None
         try:
             self.journal.append(record)
         except Exception:
@@ -1284,6 +1299,49 @@ class MT5Runner:
         except Exception:
             pass  # best-effort durability; the in-memory set and
             # the cursors still dedupe within this process.
+
+    def _announce_assessment(self, record: dict | None) -> None:
+        """Send one LIVE terminal evaluation's rendered market
+        assessment to the owner (visible market-reading
+        milestone): when a live evaluation produces a signal or
+        watch verdict, the outbound signal surface carries the
+        assessment itself — not a bare score.  Guards keep this
+        honest and quiet:
+
+        - only signal / watch verdicts (rejected / expired /
+          no-setup stay journal-only);
+        - only LIVE sources (live_close / trigger_path) —
+          warmup, catch-up and replay records never announce
+          (the EC2 burst class);
+        - shadow records never announce (no order authority —
+          they are grading records, not signals), and the
+          scheduled scans are never routed here at all (their
+          records are journal-only by call site);
+        - sent through the existing _send_alert path — no new
+          sender, no new poller.  Never raises into the tick
+          loop (same contract as _send_alert's callers)."""
+        try:
+            if not record:
+                return
+            if record.get("evaluation_source") not in (
+                    _lifecycle.SOURCE_LIVE_CLOSE,
+                    _lifecycle.SOURCE_TRIGGER_PATH):
+                return
+            if _is_shadow_record(record):
+                return
+            assessment = record.get("assessment") or {}
+            if assessment.get("verdict") not in ("signal", "watch"):
+                return
+            text = record.get("assessment_text")
+            if not text:
+                text = _render_assessment(
+                    record,
+                    symbol=getattr(self.cfg, "symbol", None))
+            if text:
+                self._send_alert(text)
+        except Exception:
+            pass  # an announcement failure must never break
+            # the signal path (log_signal's contract).
 
     def _emit_trigger_event(self, stage: str, reason_code: str,
                             reason: str) -> None:
@@ -6592,7 +6650,7 @@ class MT5Runner:
                 dec.setdefault(
                     "floor_authority",
                     _FLOOR_AUTHORITY["h1_roster"])
-                self._emit_eval(
+                return self._emit_eval(
                     playbook=pb.name,
                     evaluation_clock="h1_trigger",
                     intended_tf=_native_tf(pb.name) or "H1",
@@ -7168,7 +7226,7 @@ class MT5Runner:
                 _ores = "layer_no_order"
             else:
                 _ores = "refused_in_order_path"
-            _emit_sig(
+            _terminal_record = _emit_sig(
                 result="accepted", execution_eligible=True,
                 order_result=_ores,
                 reason_code=(
@@ -7183,6 +7241,11 @@ class MT5Runner:
                               "total": float(score.total),
                               "path": path},
                 reason=f"accepted on {path}; order outcome: {_ores}")
+            # Visible market reading: a live signal/watch verdict
+            # announces its rendered assessment (the helper's
+            # guards keep refusals, scans and shadow records
+            # journal-only).
+            self._announce_assessment(_terminal_record)
         # FUNNEL §1.1: no per-signal record was emitted for this
         # evaluation — zero signals, or every signal was skipped
         # by the signal-gap dedupe before reaching a decision.
@@ -9993,7 +10056,7 @@ class MT5Runner:
                 "layer_pending") else "refused (see order_result)"),
             "detail": f"shared order path outcome: {_ores}"
                       + (f" ({_ocode})" if _ocode else "")})
-        self._emit_eval(
+        _rec = self._emit_eval(
             playbook="qm_m5", evaluation_clock="m5_close",
             intended_tf="M5", actual_input_tf="M5",
             last_bar_ts=last_bar_ts, data_freshness_s=freshness_s,
@@ -10028,6 +10091,7 @@ class MT5Runner:
                     "not a veto (gates-vs-scores law)",
                 ]},
             evidence=evidence, source=_src)
+        self._announce_assessment(_rec)
         return _ocode
 
     def _run_qm_d1(self, d1_df, stats: dict | None = None, *,
@@ -10444,7 +10508,7 @@ class MT5Runner:
             _ores = "layer_no_order"
         else:
             _ores = "refused_in_order_path"
-        self._emit_eval(
+        _rec = self._emit_eval(
             playbook="qm_d1", evaluation_clock="d1_close",
             intended_tf="D1", actual_input_tf="D1",
             last_bar_ts=bar_ts, outcome="candidate_emitted",
@@ -10492,6 +10556,7 @@ class MT5Runner:
             evidence={"route": "qm_d1_native",
                       "provenance": provenance},
             source=_src)
+        self._announce_assessment(_rec)
 
     # --------------------------- scheduled evaluations (P0-3)
     # Phase 2: EVERY registered playbook evaluates on its agreed
