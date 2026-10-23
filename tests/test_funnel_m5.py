@@ -56,7 +56,21 @@ from test_qm_d1 import BEARISH, _df as _qm_df
 def _m5_fixture():
     """The textbook bearish QM (test_qm_d1.BEARISH) on a 5-minute
     clock: head 100 -> neckline 90 -> QM level 96 -> break ->
-    touch at bar 31."""
+    touch at bar 31.
+
+    Phase 2 revision: the frame is truncated AT the touch bar —
+    a live-close evaluation presents the frame as of the touch's
+    own close (the streaming machine emits the signal ON the
+    touch bar).  The full-history frame (bars past the touch)
+    models a late discovery and is the Phase 2 replay fixture
+    (tests/test_phase2_fixes.py): under the candidate-lifecycle
+    contract such a candidate is expired and never routes."""
+    return _qm_df(BEARISH, freq="5min").iloc[:32]
+
+
+def _m5_history_fixture():
+    """The UNtruncated BEARISH frame: the touch sits 19 bars
+    inside history — the warmup / catch-up / replay shape."""
     return _qm_df(BEARISH, freq="5min")
 
 
@@ -278,14 +292,19 @@ class _BadGeometryQM:
     hunting_ground = SimpleNamespace(excluded=[], bonuses={})
 
     def candidates(self, ctx):
+        # The bad-geometry touch lands on the frame's LAST bar
+        # (the live-close shape — Phase 2 lifecycle: an older
+        # touch would be refused as expired before geometry is
+        # ever consulted, which is a different test).
+        last = len(ctx.df) - 1
         sig = SimpleNamespace(
-            direction=-1, index=31, score=70.0, entry_ref=96.0,
+            direction=-1, index=last, score=70.0, entry_ref=96.0,
             invalidation=90.0, targets=[85.0], atr=2.0,
             factors=["qm"], kind="qm",
             live_context={"qm_level": 96.0, "head": 100.0,
                           "neckline": 90.0, "tags": []})
         yield SimpleNamespace(
-            signal_index=31, direction=-1,
+            signal_index=last, direction=-1,
             outcome=SimpleNamespace(signal=sig, r_net=1.0,
                                     exit_reason="target"))
 

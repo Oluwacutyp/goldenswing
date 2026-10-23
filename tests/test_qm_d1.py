@@ -306,7 +306,11 @@ def test_runner_scans_d1_frame_not_h1_path(tmp_path):
     runner = MT5Runner(cfg)
     names = {pb.name for pb in runner._get_playbooks()}
     assert "qm_d1" not in names
-    df = _df(BEARISH)
+    # Phase 2: present the frame as of the touch's own close
+    # (touch at bar 31 = the last bar).  The full-history frame
+    # is late-discovery provenance — expired, never routed
+    # (candidate_lifecycle; covered in test_phase2_fixes.py).
+    df = _df(BEARISH).iloc[:32]
     stats: dict = {}
     first = runner._run_qm_d1(df, stats)
     assert len(first) == 1

@@ -826,14 +826,18 @@ class _FakeQMD1:
     hunting_ground = SimpleNamespace(excluded=[], bonuses={})
 
     def candidates(self, ctx):
+        # Touch on the frame's LAST bar — the live-close shape
+        # (Phase 2 candidate lifecycle: a touch buried inside
+        # the frame is expired provenance and never routes).
+        last = len(ctx.df) - 1
         sig = SimpleNamespace(
-            direction=-1, index=31, score=70.0, entry_ref=4100.0,
+            direction=-1, index=last, score=70.0, entry_ref=4100.0,
             invalidation=4130.0, targets=[4040.0], atr=25.0,
             factors=["qm_d1"], kind="qm",
             live_context={"qm_level": 4100.0, "head": 4125.0,
                           "neckline": 4040.0, "tags": []})
         yield SimpleNamespace(
-            signal_index=31, direction=-1,
+            signal_index=last, direction=-1,
             outcome=SimpleNamespace(signal=sig, r_net=1.2,
                                     exit_reason="target"))
 

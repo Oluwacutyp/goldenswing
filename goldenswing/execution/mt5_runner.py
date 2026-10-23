@@ -140,7 +140,12 @@ from .executor import OrderRequest, PendingOrder
 from ..engine.runtime import DeterministicRuntime
 from .learning import TradeJournal
 from .mt5 import MT5Executor, build_ladder, select_order_type
-from .funnel import classify_reason as _funnel_classify
+from .funnel import (assessment_block as _assessment_block,
+                     classify_reason as _funnel_classify,
+                     decision_bucket as _decision_bucket,
+                     terminal_decision as _terminal_decision,
+                     verdict_blocks as _verdict_blocks)
+from . import candidate_lifecycle as _lifecycle
 from .friction_gate import (
     FRICTION_REASON_CODE as _FRICTION_CODE,
     assess_entry_friction as _assess_friction)
@@ -148,7 +153,9 @@ from .signal_log import log_signal
 from .mt5_commands import (mt5_confirm_keyboard, mt5_control_keyboard,
                            mt5_router, parse_mt5_callback)
 from .mt5_config import LiveConfigStore, unknown_disabled_names
-from .playbook_registry import (PLAYBOOK_REGISTRY, ROSTER_SPECS,
+from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
+                                PLAYBOOK_REGISTRY, RANGE_SPECS,
+                                ROSTER_SPECS, ROSTER_SPECS_H1,
                                 native_tf_of as _native_tf)
 from .risk import RiskConfig, RiskGuards, size_position
 from .tick_manager import (DEFAULT_TIME_EXIT_BARS, TickAction, TickConfig,
@@ -694,6 +701,18 @@ class MT5Runner:
         self._qm_m5_last_logged: int = -1
         self._qm_m5_last_touch: dict | None = None
         self._qm_m5_disabled_noted: bool = False
+        # Phase 2 (P0-1): the durable seen-instance set for the
+        # native routes — instance key -> terminal disposition.
+        # The in-memory cursors above reset on restart, which is
+        # exactly how the EC2 warm start re-routed nine days of
+        # historical touches; this set is loaded from (and saved
+        # to) a JSON sidecar beside the journal so a setup
+        # instance can never be routed twice across restarts,
+        # rescans or repeated evaluations.  Friction refusals are
+        # NOT recorded (RULING 6: the setup stays alive).
+        self._seen_instances: dict[str, str] | None = None
+        self._seen_instances_path = (
+            self.cfg.journal_path.parent / "candidate_instances.json")
         # Live evaluation clock (zone-touch arm, family confirm):
         # the forming H1 bar tracked from ticks, the cached trigger
         # levels from closed bars, and the pending (armed touch,
@@ -1101,13 +1120,26 @@ class MT5Runner:
                    decision: dict | None = None,
                    evidence: dict | None = None,
                    kind: str = "playbook_eval",
-                   trigger_stage: str | None = None) -> dict | None:
+                   trigger_stage: str | None = None,
+                   source: str | None = None,
+                   assessment: dict | None = None) -> dict | None:
         """Append ONE funnel evaluation record + update the
         in-memory /status counters.  Never raises; returns the
-        record (or None when the funnel is disabled)."""
+        record (or None when the funnel is disabled).
+
+        Phase 2: the decision block is normalized to TERMINAL
+        semantics before it is journaled (an analytical acceptance
+        the order path refused terminates as a refusal, with the
+        analytical verdict preserved — see
+        funnel.terminal_decision), and ``source`` records where
+        the evaluation came from (live close / warmup scan /
+        trigger path) — provenance is a journal fact, not an
+        inference."""
         self._funnel_seq += 1
         if not getattr(self.cfg, "funnel_enabled", True):
             return None
+        if decision is not None:
+            decision = _terminal_decision(decision)
         if decision is not None and "reason_category" not in decision:
             from .funnel import category_for_code
             decision = dict(decision)
@@ -1132,7 +1164,32 @@ class MT5Runner:
             "decision": decision,
             "evidence": evidence,
             "trigger_stage": trigger_stage,
+            "evaluation_source": source,
         }
+        # Amendment 3 (owner, 2026-10-23): every evaluation record
+        # carries a renderable MARKET ASSESSMENT — structure read,
+        # HTF context, itemized evidence (detector + source-bar
+        # ts, correlated items grouped), supporting vs
+        # contradictory lists, competing scenarios, the verdict
+        # in the owner's vocabulary and a plain-language reason —
+        # with absent/stale/not-integrated capabilities MARKED,
+        # never silently omitted.  A caller-supplied ``assessment``
+        # overlays richer route-specific fields on the derived
+        # shape.  The presentation layer is a later milestone;
+        # these records are what it will render from.
+        try:
+            record["assessment"] = _assessment_block(
+                outcome=outcome, decision=decision,
+                evidence=evidence, candidate=candidate,
+                reason=reason, reason_code=reason_code or None,
+                last_bar_ts=last_bar_ts,
+                data_freshness_s=data_freshness_s,
+                overlay=assessment)
+            record["reason_text"] = \
+                record["assessment"]["reason_text"]
+        except Exception:
+            record["assessment"] = None
+            record["reason_text"] = reason or ""
         try:
             self.journal.append(record)
         except Exception:
@@ -1147,24 +1204,86 @@ class MT5Runner:
         else:
             slot = self._funnel_counts.setdefault(playbook, {
                 "evaluations": 0, "no_setup": 0, "candidates": 0,
-                "refused": 0, "ordered": 0})
+                "refused": 0, "ordered": 0, "ineligible": 0,
+                "no_order": 0, "unresolved": 0})
             slot["evaluations"] += 1
             if outcome == "no_setup":
                 slot["no_setup"] += 1
             elif outcome == "candidate_emitted":
                 slot["candidates"] += 1
                 dec = decision or {}
-                if dec.get("result") == "refused":
+                # ONE terminal bucket per candidate (funnel.
+                # decision_bucket): candidates reconcile as
+                # ordered + refused + ineligible + no_order +
+                # unresolved — the Phase 1 counter read only
+                # decision.result, so the 23 order-path refusals
+                # of run cb9b3fb522b7 rendered unaccounted.
+                bucket = _decision_bucket(dec)
+                if bucket == "refused":
                     slot["refused"] += 1
                     code = dec.get("reason_code") or reason_code
                     if code:
                         self._funnel_refusals[code] = \
                             self._funnel_refusals.get(code, 0) + 1
-                elif dec.get("order_result") in (
-                        "filled", "placed_pending", "layer_filled",
-                        "layer_pending"):
+                elif bucket == "ordered":
                     slot["ordered"] += 1
+                elif bucket == "ineligible":
+                    slot["ineligible"] += 1
+                elif bucket == "no_order":
+                    slot["no_order"] += 1
+                else:
+                    slot["unresolved"] += 1
         return record
+
+    # --------------------------------- candidate instances (P0-1)
+    def _load_seen_instances(self) -> dict[str, str]:
+        """The durable seen-instance set (lazy, fail-open to an
+        empty set only when the sidecar does not exist yet; a
+        corrupt sidecar is journaled and treated as empty — the
+        order-path eligibility backstop still refuses any
+        candidate that is not affirmatively eligible)."""
+        if self._seen_instances is not None:
+            return self._seen_instances
+        seen: dict[str, str] = {}
+        try:
+            if self._seen_instances_path.exists():
+                raw = json.loads(
+                    self._seen_instances_path.read_text(
+                        encoding="utf-8"))
+                if isinstance(raw, dict):
+                    seen = {str(k): str(v)
+                            for k, v in raw.items()}
+        except Exception as exc:
+            try:
+                self.journal.log_note(
+                    f"mt5: candidate instance store unreadable "
+                    f"({exc}) — starting empty; eligibility "
+                    "backstops still apply")
+            except Exception:
+                pass
+        self._seen_instances = seen
+        return seen
+
+    def _mark_instance_seen(self, key: str, disposition: str) -> None:
+        """Record one setup instance's terminal disposition and
+        persist it (bounded: the oldest entries fall off past
+        10,000 — a setup older than 10,000 routed instances is
+        far outside any validity window anyway)."""
+        seen = self._load_seen_instances()
+        if key in seen:
+            return
+        seen[key] = disposition
+        while len(seen) > 10000:
+            seen.pop(next(iter(seen)))
+        try:
+            self._seen_instances_path.parent.mkdir(
+                parents=True, exist_ok=True)
+            tmp = self._seen_instances_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(seen), encoding="utf-8")
+            tmp.replace(self._seen_instances_path)
+        except Exception:
+            pass  # best-effort durability; the in-memory set and
+            # the cursors still dedupe within this process.
 
     def _emit_trigger_event(self, stage: str, reason_code: str,
                             reason: str) -> None:
@@ -1180,18 +1299,53 @@ class MT5Runner:
             trigger_stage=stage)
 
     @staticmethod
-    def _candidate_dict(sig, breakdown: dict | None = None) -> dict:
-        """The candidate block of a funnel record, from a signal."""
-        return {
+    def _candidate_dict(sig, breakdown: dict | None = None,
+                        provenance: dict | None = None) -> dict:
+        """The candidate block of a funnel record, from a signal.
+
+        Phase 2 (P0-2): TWO scores, separately named.  The
+        playbook's own ``sig.score`` is the SLEEVE BASE score —
+        for the QM sleeves a documented placeholder (60.0) that
+        ranks sleeves against each other; it is NOT a measured
+        quality score and never a floor input.  The score the
+        DECISION uses is the Asymmetry total, which rides in
+        ``score_components["total"]`` when a breakdown exists.
+        Phase 1 records carried the sleeve base as the headline
+        ``score`` (60.0 flat on all 32 burst candidates while the
+        component totals ranged 31.5–48.1) — a constant wearing
+        a computed value's name.  Now: ``score`` is the Asymmetry
+        total when a breakdown exists (the actual computed value
+        it claims to be — no constant, no clamp-to-floor), else
+        the sleeve base; both are always present under their own
+        names.  Floor authority per route:
+        playbook_registry.FLOOR_AUTHORITY.
+
+        ``provenance`` (candidate_lifecycle) is attached verbatim
+        when the emitting route computed it.
+        """
+        sleeve_base = float(getattr(sig, "score", 0.0) or 0.0)
+        asymmetry = None
+        if breakdown is not None and breakdown.get("total") is not None:
+            try:
+                asymmetry = float(breakdown["total"])
+            except (TypeError, ValueError):
+                asymmetry = None
+        out = {
             "direction": int(sig.direction),
             "entry": float(sig.entry_ref),
             "stop": float(sig.invalidation),
             "targets": [float(x) for x in (sig.targets or [])],
-            "score": float(getattr(sig, "score", 0.0) or 0.0),
+            "score": (asymmetry if asymmetry is not None
+                      else sleeve_base),
+            "asymmetry_score": asymmetry,
+            "sleeve_base_score": sleeve_base,
             "score_components": breakdown,
             "factors": list(getattr(sig, "factors", []) or []),
             "index": int(getattr(sig, "index", -1)),
         }
+        if provenance is not None:
+            out["provenance"] = provenance
+        return out
 
     def _journal_manifest(self) -> None:
         """FUNNEL §4.6 / directive §2: the runtime manifest,
@@ -1219,7 +1373,10 @@ class MT5Runner:
                 "feed": type(getattr(self, "feed", None)).__name__
                 if getattr(self, "feed", None) is not None else None,
                 "roster": [{"name": s.name, "clock": s.native_tf,
-                            "route": s.route}
+                            "route": s.route,
+                            "refinement_clock": s.refinement_tf,
+                            "shadow_evaluation":
+                                s.shadow_evaluation}
                            for s in PLAYBOOK_REGISTRY],
                 "doctrine": {
                     "execute_playbooks": self.cfg.execute_playbooks,
@@ -1227,7 +1384,21 @@ class MT5Runner:
                         self.cfg.disabled_playbooks or ()),
                     "fixed_lots": self.cfg.fixed_lots,
                     "sizing_mode": self.cfg.sizing_mode,
+                    # Phase 2 (P1-1): the manifest previously
+                    # printed fixed_lots AND sizing_mode raw,
+                    # which read as a contradiction on EC2
+                    # (fixed_lots=0.01 AND sizing_mode="risk").
+                    # The truth is A13 precedence (see
+                    # _sizing_mode): an explicit fixed_lots ALWAYS
+                    # wins; sizing_mode is the configured mode
+                    # used only when fixed_lots is unset.  Print
+                    # the EFFECTIVE mode + the override fact, so
+                    # the conflict is surfaced, not implied.
+                    "sizing_mode_effective": self._sizing_mode(),
+                    "fixed_lots_override": (
+                        self.cfg.fixed_lots is not None),
                     "min_score": self.cfg.min_score,
+                    "floor_authority": dict(_FLOOR_AUTHORITY),
                 }})
         except Exception:
             pass
@@ -1256,11 +1427,28 @@ class MT5Runner:
                          "a zero here is a fact, see the journal)")
         for name in sorted(self._funnel_counts):
             c = self._funnel_counts[name]
-            lines.append(
+            # Phase 2: ONE reconciling view — candidates must
+            # equal ordered + refused + ineligible + no-order (+
+            # unresolved, printed when nonzero: it is a defect
+            # signal, never silently absorbed).
+            line = (
                 f"  `{name}`: eval {c['evaluations']} · "
                 f"no-setup {c['no_setup']} · "
                 f"candidates {c['candidates']} · "
-                f"refused {c['refused']} · ordered {c['ordered']}")
+                f"ordered {c['ordered']} · "
+                f"refused {c['refused']} · "
+                f"ineligible {c.get('ineligible', 0)}")
+            if c.get("no_order"):
+                line += f" · no-order {c['no_order']}"
+            if c.get("unresolved"):
+                line += f" · UNRESOLVED {c['unresolved']}"
+            lines.append(line)
+        _not_evaluated = [s.name for s in PLAYBOOK_REGISTRY
+                          if s.name not in self._funnel_counts]
+        if _not_evaluated:
+            lines.append(
+                "not evaluated this run: "
+                + ", ".join(f"`{n}`" for n in _not_evaluated))
         if self._funnel_refusals:
             top = sorted(self._funnel_refusals.items(),
                          key=lambda kv: -kv[1])[:5]
@@ -1483,13 +1671,29 @@ class MT5Runner:
         # Daily QM (P3 real order path): evaluate the D1 frame
         # once at warm start (the latest touch, if any, is
         # evaluated here; later touches on their D1 close by
-        # _refresh_bars).
-        self._run_qm_d1(self._stack.frames.get("D1"), stats)
+        # _refresh_bars).  Phase 2: the warm-start scan is
+        # source="warmup_scan" — its candidates are journaled
+        # with full provenance and are categorically
+        # execution-ineligible (candidate_lifecycle); they can
+        # never reach the order path.
+        self._run_qm_d1(self._stack.frames.get("D1"), stats,
+                        source="warmup_scan")
         # M5 QM (funnel §2 native route): same shape — evaluate
         # the M5 frame once at warm start (also feeds the
         # _qm_touch annotation state); later touches on their
         # M5 close by _refresh_bars.
-        self._run_qm_m5(self._stack.frames.get("M5"), stats)
+        self._run_qm_m5(self._stack.frames.get("M5"), stats,
+                        source="warmup_scan")
+        # Phase 2 (P0-3): the scheduled roster evaluations run
+        # once at warm start too — every playbook's evaluation
+        # (or its honest not_eligible reason) is on record from
+        # the run's first minutes, not only after its clock or
+        # the trigger happens to fire.
+        self._run_roster_close_evals(stats, source="warmup_scan")
+        self._run_range_family("h4_generation", stats,
+                               source="warmup_scan")
+        self._run_range_family("h1_refinement", stats,
+                               source="warmup_scan")
         pump = TickPump(feed, interval=self.cfg.tick_interval)
         try:
             # on_idle: command polling MUST NOT depend on new ticks.
@@ -2254,6 +2458,21 @@ class MT5Runner:
             self._refresh_dxy()
         if any(tf in ("D1", "H4", "H1") for tf in appended):
             self._refresh_live_setup()
+        # Phase 2 (P0-3): scheduled evaluations on their own
+        # clocks, independent of the generic H1 trigger — an H1
+        # close evaluates the H1 roster + range refinement; an
+        # H4 close evaluates range scenario generation.  (The
+        # native M5/D1 routes fired inside the append loop
+        # above, on their own closes, with the default
+        # live_close source.)
+        if "H1" in appended:
+            self._run_roster_close_evals(stats,
+                                         source="live_close")
+            self._run_range_family("h1_refinement", stats,
+                                   source="live_close")
+        if "H4" in appended:
+            self._run_range_family("h4_generation", stats,
+                                   source="live_close")
         # Phase 3: entry-TF closes — the Close Rule FIRST (a bar
         # closing beyond the invalidation level kills the setup
         # instantly, before any confirmation on the same close),
@@ -2477,6 +2696,25 @@ class MT5Runner:
                     corr = st.corr
         except Exception:
             dxy_frame, corr = None, None
+        # Phase 2 census fix: align the frames on bar timestamps
+        # before the event read — detect_smt indexes the DXY
+        # arrays positionally, so unaligned frames (a DXY fetch
+        # with a missing/extra bar) would compare DIFFERENT bars
+        # as if they were the same moment.  Unalignable frames
+        # read as SMT-unavailable, never as a fabricated event.
+        if gold is not None and dxy_frame is not None:
+            from ..live.smt import SmtRead, align_on_timestamps
+            gold, dxy_frame = align_on_timestamps(gold, dxy_frame)
+            if gold is None:
+                read = SmtRead(
+                    available=False, corr=corr,
+                    reason="SMT unavailable: gold/DXY frames "
+                           "could not be aligned on timestamps")
+                self._smt_read = read
+                if read.reason != self._smt_unavailable_key:
+                    self._smt_unavailable_key = read.reason
+                    self.journal.log_note(f"mt5 SMT: {read.reason}")
+                return
         read = _detect_smt(gold, dxy_frame, corr=corr)
         self._smt_read = read
         if not read.available:
@@ -6327,6 +6565,33 @@ class MT5Runner:
                     dec["execution_eligible"] = execution_eligible
                 if order_result is not None:
                     dec["order_result"] = order_result
+                # Two verdict layers, distinct (owner ruling):
+                # analytical qualification vs risk-layer
+                # eligibility, derived from this record's own
+                # terminal fields.
+                _vb_eligible = (
+                    order_result in ("filled", "placed_pending",
+                                     "layer_filled", "layer_pending",
+                                     "layer_no_order")
+                    if order_result is not None
+                    else (bool(execution_eligible)
+                          if execution_eligible is not None
+                          else result == "accepted"))
+                dec.update(_verdict_blocks(
+                    analytical=("qualified" if result == "accepted"
+                                else "not_qualified"),
+                    analytical_code=(None if result == "accepted"
+                                     else (reason_code or None)),
+                    eligible=_vb_eligible,
+                    execution_code=(
+                        (reason_code or None)
+                        if order_result in (
+                            "refused_in_order_path", "rejected")
+                        else None),
+                    outcome=order_result or "not_attempted"))
+                dec.setdefault(
+                    "floor_authority",
+                    _FLOOR_AUTHORITY["h1_roster"])
                 self._emit_eval(
                     playbook=pb.name,
                     evaluation_clock="h1_trigger",
@@ -6336,7 +6601,16 @@ class MT5Runner:
                     outcome="candidate_emitted",
                     reason_code=reason_code, reason=reason,
                     candidate=self._candidate_dict(sig, breakdown),
-                    decision=dec)
+                    decision=dec,
+                    # Phase 2 (addendum B/C wiring): the HTF
+                    # hierarchy context was computed for every
+                    # roster candidate and carried on the SIGNAL
+                    # record, but never reached the FUNNEL
+                    # record — HTF disagreement is now explicit
+                    # evidence there too, never a silent factor.
+                    evidence={"route": "h1_trigger",
+                              "hierarchy": hier_rec},
+                    source="trigger_path")
 
             hier_rec = {
                 "bias_d1": (verdict or {}).get("bias_d1"),
@@ -7578,16 +7852,11 @@ class MT5Runner:
         except Exception as exc:
             return False, f"market_open check failed: {exc}"
 
-    def _check_risk_guards(self, pb, sig, lots: float, stop0: float,
-                           acct: dict) -> bool:
-        """RiskGuards on the live path: may this order open?"""
-        try:
-            spec = self.executor.symbol_spec(self.cfg.symbol)
-        except Exception as exc:
-            self.journal.log_note(
-                f"mt5: order refused {pb.name}: risk guard check "
-                f"failed, no symbol spec ({exc})")
-            return False
+    def _open_risk_state(self, spec) -> tuple[float, int]:
+        """(open risk money, unstopped position count) across the
+        held book — the RiskGuards inputs, computed once and
+        shared by the order path and the decision-stage solvency
+        pre-check so both read the SAME book state."""
         open_risk = 0.0
         unstopped = 0
         for ticket in self.tick_manager.tickets():
@@ -7601,6 +7870,19 @@ class MT5Runner:
             else:
                 open_risk += spec.money_for_move(
                     abs(pos.entry_price - pos.risk_price), pos.volume)
+        return open_risk, unstopped
+
+    def _check_risk_guards(self, pb, sig, lots: float, stop0: float,
+                           acct: dict) -> bool:
+        """RiskGuards on the live path: may this order open?"""
+        try:
+            spec = self.executor.symbol_spec(self.cfg.symbol)
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: order refused {pb.name}: risk guard check "
+                f"failed, no symbol spec ({exc})")
+            return False
+        open_risk, unstopped = self._open_risk_state(spec)
         new_risk = spec.money_for_move(
             abs(float(sig.entry_ref) - stop0), lots)
         decision = self.guards.check_new_trade(
@@ -7615,6 +7897,86 @@ class MT5Runner:
             f"mt5: order refused {pb.name}: risk guard — "
             f"{decision.reason}")
         return False
+
+    def _decision_solvency(self, pb, sig, score=None
+                           ) -> tuple[bool, str]:
+        """Phase 2 (P1-1): decision-stage solvency pre-check.
+
+        The EC2 burst showed the seam: 23 candidates were
+        analytically "accepted" at decision and only refused
+        inside the order path by RiskGuards (daily loss room
+        0.36 vs trade risks 4.45–13.84) — the decision stage
+        never asked the question the order path was guaranteed
+        to answer NO.  This pre-check asks it, with the SAME
+        accounting: the planned stop (TickManager.planned_stop,
+        the order path's own helper), the intended size under
+        the EFFECTIVE sizing mode, the live book's open risk,
+        and the real RiskGuards.check_new_trade — so a candidate
+        the room would refuse is refused AT DECISION with the
+        guard's exact reason (gate.solvency), and the order path
+        remains the authoritative backstop (it re-checks
+        everything, including margin, at placement time).
+
+        Sizing truth (A13, see _sizing_mode): an explicit
+        fixed_lots always wins — the intended size is then known
+        exactly.  In risk mode the intended size is derived from
+        the risk budget, so the candidate's worst-case new risk
+        IS the budget itself (equity x risk_pct x score band,
+        pre-multiplier): if the BUDGET cannot fit the room, no
+        size the order path could compute fits either.  No
+        silent fallback exists on either branch: invalid risk
+        sizing declines inside the order path (sizing_declined)
+        and is never rescued by fixed lots.
+
+        Fail closed: if the check itself cannot run (no spec,
+        no account state), the candidate is refused at decision
+        with the reason — an unanswerable solvency question is
+        not a pass.  Returns (ok, reason).
+        """
+        try:
+            spec = self.executor.symbol_spec(self.cfg.symbol)
+            acct = self.feed.account_state()
+            stop0 = TickManager.planned_stop(
+                OrderRequest(symbol=self.cfg.symbol,
+                             direction=int(sig.direction),
+                             volume=0.0,
+                             stop_loss=float(sig.invalidation),
+                             atr=float(sig.atr or 0.0)))
+            mode = self._sizing_mode()
+            if mode == "fixed":
+                lots = float(self.cfg.fixed_lots)
+                new_risk = spec.money_for_move(
+                    abs(float(sig.entry_ref) - stop0), lots)
+                sizing_desc = f"fixed {lots:.2f} lots"
+            else:
+                total = float(score.total) \
+                    if score is not None else 75.0
+                band = 1.0 if total >= 75.0 else (
+                    0.75 if total >= 60.0 else 0.5)
+                new_risk = float(acct.get("equity", 0.0)) \
+                    * float(self.cfg.risk_pct) * band
+                sizing_desc = (f"risk budget {new_risk:.2f} "
+                               f"(band {band})")
+            open_risk, unstopped = self._open_risk_state(spec)
+            decision = self.guards.check_new_trade(
+                balance=float(acct.get("balance", 0.0)),
+                open_risk_money=open_risk,
+                new_risk_money=new_risk,
+                open_count=len(self.tick_manager.tickets()),
+                unstopped_positions=unstopped)
+            if decision.allowed:
+                return True, ""
+            return False, (
+                f"{decision.reason} [decision-stage solvency: "
+                f"{sizing_desc}, planned stop {stop0:.2f}, "
+                f"new risk {new_risk:.2f}, open risk "
+                f"{open_risk:.2f}, balance "
+                f"{float(acct.get('balance', 0.0)):.2f}]")
+        except Exception as exc:
+            return False, (
+                f"decision-stage solvency check could not run "
+                f"({type(exc).__name__}: {exc}) — fail closed, "
+                "no order")
 
     def _check_margin(self, pb, sig, lots: float, is_layer: bool,
                       acct: dict) -> bool:
@@ -7778,6 +8140,31 @@ class MT5Runner:
         one; ``layer_lots`` is the pre-capped layer size from
         ``_try_layer``.
         """
+        # Phase 2 (P0-1) ELIGIBILITY BACKSTOP: a candidate
+        # stamped execution-ineligible at creation (warmup /
+        # catch-up / replay provenance, expired validity window,
+        # unestablishable age — see candidate_lifecycle) is
+        # refused HERE, at the shared order boundary, whatever
+        # caller produced it.  The native routes check before
+        # dispatch; this check makes the refusal structural, so
+        # no future caller can route around the lifecycle rules.
+        # Signals that were never stamped (the trigger path's own
+        # candidates, management layers on held positions) carry
+        # no stamp and are unaffected.
+        if getattr(sig, "execution_eligible", True) is False:
+            _code = str(getattr(sig, "ineligible_reason_code", None)
+                        or "path.warmup_ineligible")
+            stats[f"ineligible::{_code}"] = stats.get(
+                f"ineligible::{_code}", 0) + 1
+            self._record_blocked(
+                f"candidate_ineligible: {_code} — provenance / "
+                "validity forbids execution (candidate_lifecycle)",
+                pb.name)
+            self.journal.log_note(
+                f"mt5: order refused {pb.name}: candidate is "
+                f"execution-ineligible ({_code}) — refused at "
+                "the order boundary (Phase 2 backstop)")
+            return
         # Market-closed guard (order placement): never place while
         # the broker is not accepting new orders — covers
         # confirm-fired orders and layers, not just the signal path.
@@ -8785,10 +9172,23 @@ class MT5Runner:
     # against the tick clock, never assumed.
     _QM_M5_STALE_AFTER_S = 900.0
 
-    def _run_qm_m5(self, m5_df, stats: dict | None = None
+    def _run_qm_m5(self, m5_df, stats: dict | None = None, *,
+                   source: str = _lifecycle.SOURCE_LIVE_CLOSE
                    ) -> list[dict]:
         """qm_m5 REAL order path on its own M5 clock (funnel §2 —
         closes the verified timeframe-wiring defect).
+
+        Phase 2 (P0-1): every candidate carries lifecycle
+        provenance (formation / touch / creation / evaluated-bar
+        / evaluation timestamps, source, instance key — see
+        candidate_lifecycle) and is execution-eligible ONLY when
+        discovered on a live close inside its validity window.
+        Warmup scans (``source="warmup_scan"``), restart catch-up
+        and replays journal their candidates as analytical
+        records and NEVER reach the order path; a durable
+        seen-instance set makes routing idempotent across
+        restarts.  This closes the EC2 burst: 32 historical
+        touches re-routed as live orders on one stale bar.
 
         Before this route existed, qm_m5 sat in the H1 roster and
         the signal loop fed it the H1 frame: its M5 pattern
@@ -8858,6 +9258,8 @@ class MT5Runner:
             ctx = EngineContext(df=m5_df, states=[], years=0.0,
                                 instrument=self.cfg.symbol)
             out: list[dict] = []
+            seen = self._load_seen_instances()
+            last_index = len(m5_df) - 1
             for cand in pb.candidates(ctx):
                 # The annotation state follows the LATEST touch,
                 # evaluated for an order or not (the old
@@ -8889,6 +9291,94 @@ class MT5Runner:
                          "r_net": float(cand.outcome.r_net),
                          "exit_reason": cand.outcome.exit_reason}
                 out.append(touch)
+                # ---- Phase 2 lifecycle: provenance + eligibility
+                # + idempotency.  The instance key is time-based
+                # (touch timestamp), so it is stable across frame
+                # rebuilds and restarts; the durable seen set is
+                # what makes "the same setup can never be routed
+                # twice" true across processes, not just scans.
+                touch_ts = touch["touch_ts"]
+                touch_age = last_index - int(cand.signal_index)
+                _p0 = lc.get("p0_index")
+                formation_ts = (
+                    m5_df.index[int(_p0)]
+                    if _p0 is not None
+                    and 0 <= int(_p0) < len(m5_df) else None)
+                level = lc.get("qm_level")
+                key = _lifecycle.instance_key(
+                    "qm_m5", pattern_ts=touch_ts,
+                    direction=int(cand.direction),
+                    level=(float(level) if level is not None
+                           else float(sig.entry_ref)))
+                if key in seen:
+                    # Already terminally disposed in an earlier
+                    # run/scan: consume silently (its record
+                    # exists in that run's journal) and advance
+                    # the cursor past it.
+                    self._qm_m5_last_logged = max(
+                        self._qm_m5_last_logged,
+                        int(cand.signal_index))
+                    continue
+                eligible, elig_code, elig_reason = \
+                    _lifecycle.assess_eligibility(
+                        source=source, touch_age_bars=touch_age,
+                        validity_window_bars=(
+                            _lifecycle.QM_VALIDITY_WINDOW_BARS))
+                prov = _lifecycle.provenance_block(
+                    key=key, formation_ts=formation_ts,
+                    touch_ts=touch_ts, created_ts=now_ref,
+                    evaluated_bar_ts=last_bar_ts,
+                    evaluation_ts=now_ref, source=source,
+                    touch_age_bars=touch_age,
+                    validity_window_bars=(
+                        _lifecycle.QM_VALIDITY_WINDOW_BARS),
+                    eligible=eligible,
+                    eligibility_code=elig_code)
+                if not eligible:
+                    # Analytical record only — NEVER the order
+                    # path.  Warmup/catch-up/replay provenance is
+                    # "not_executable" (ineligible bucket); an
+                    # expired or unageable LIVE candidate is a
+                    # refusal on a data fact (gate.data).
+                    _warm = (elig_code ==
+                             _lifecycle.CODE_WARMUP_INELIGIBLE)
+                    self._emit_eval(
+                        playbook="qm_m5",
+                        evaluation_clock="m5_close",
+                        intended_tf="M5", actual_input_tf="M5",
+                        last_bar_ts=last_bar_ts,
+                        data_freshness_s=freshness_s,
+                        outcome="candidate_emitted",
+                        reason_code=elig_code, reason=elig_reason,
+                        candidate=self._candidate_dict(sig, None,
+                                                       prov),
+                        decision={
+                            "result": ("not_executable" if _warm
+                                       else "refused"),
+                            "reason_code": elig_code,
+                            "reason": elig_reason,
+                            "execution_eligible": False,
+                            "order_result": "not_attempted",
+                            **_verdict_blocks(
+                                analytical="not_evaluated",
+                                analytical_code=None,
+                                eligible=False,
+                                execution_code=elig_code)},
+                        evidence={"route": "qm_m5_native",
+                                  "provenance": prov},
+                        source=source)
+                    self.journal.log_note(
+                        f"mt5 qm_m5 "
+                        f"{'+' if touch['direction'] > 0 else '-'}1 "
+                        f"touch {touch_ts} — NOT routed: "
+                        f"{elig_reason}")
+                    self._mark_instance_seen(
+                        key, elig_code or "ineligible")
+                    seen[key] = elig_code or "ineligible"
+                    self._qm_m5_last_logged = max(
+                        self._qm_m5_last_logged,
+                        int(cand.signal_index))
+                    continue
                 self.journal.log_note(
                     f"mt5 qm_m5 "
                     f"{'+' if touch['direction'] > 0 else '-'}1 "
@@ -8905,7 +9395,8 @@ class MT5Runner:
                     _outcome_code = self._execute_qm_m5_candidate(
                         pb, sig, m5_df, stats,
                         freshness_s=freshness_s,
-                        last_bar_ts=last_bar_ts)
+                        last_bar_ts=last_bar_ts,
+                        provenance=prov)
                 except Exception as exc:
                     self.journal.log_note(
                         f"mt5: qm_m5 order path failed for the "
@@ -8919,7 +9410,11 @@ class MT5Runner:
                         outcome="exception",
                         reason_code="path.exception",
                         reason=f"{type(exc).__name__}: {exc}",
-                        candidate=self._candidate_dict(sig))
+                        candidate=self._candidate_dict(sig, None,
+                                                       prov),
+                        source=source)
+                    self._mark_instance_seen(key, "path.exception")
+                    seen[key] = "path.exception"
                 if _outcome_code == _FRICTION_CODE:
                     # RULING 6: a friction refusal does NOT
                     # consume the setup — the dedupe cursor holds
@@ -8934,6 +9429,13 @@ class MT5Runner:
                     self._qm_m5_last_logged = max(
                         self._qm_m5_last_logged,
                         int(cand.signal_index))
+                    # Terminal disposition: this instance can
+                    # never be routed again, in this process or
+                    # any later one (durable seen set).
+                    if key not in seen:
+                        self._mark_instance_seen(
+                            key, _outcome_code or "terminal")
+                        seen[key] = _outcome_code or "terminal"
             if out:
                 stats["qm_m5_signals"] = stats.get(
                     "qm_m5_signals", 0) + len(out)
@@ -8948,7 +9450,8 @@ class MT5Runner:
                     data_freshness_s=freshness_s,
                     outcome="no_setup",
                     reason="evaluated on the M5 frame at M5 "
-                           "close — no fresh QM touch")
+                           "close — no fresh QM touch",
+                    source=source)
             return out
         except Exception as exc:
             self.journal.log_note(f"mt5: QM M5 scan failed: {exc}")
@@ -8965,6 +9468,14 @@ class MT5Runner:
         gates, RiskGuards, margin)."""
         (executed0, pending0, invalidated0, gates0, legs0,
          sizing0) = pre
+        ineligible0 = gates0.get("__ineligible__", {})
+        # Phase 2 backstop refusals classify FIRST: an ineligible
+        # candidate refused at the order boundary is a refusal
+        # with its lifecycle code, never a phantom fill.
+        for key, val in stats.items():
+            if key.startswith("ineligible::") \
+                    and val > ineligible0.get(key, 0):
+                return "refused_in_order_path", key.split("::", 1)[1]
         if stats.get("executed", 0) > executed0:
             return ("layer_filled" if holding else "filled"), None
         if len(self._pending_orders) > pending0:
@@ -8995,16 +9506,21 @@ class MT5Runner:
 
     def _order_snapshot(self, stats: dict) -> tuple:
         """Counter snapshot for :meth:`_order_outcome`."""
+        gates = {k: v for k, v in stats.items()
+                 if k.startswith("gate_")}
+        gates["__ineligible__"] = {
+            k: v for k, v in stats.items()
+            if k.startswith("ineligible::")}
         return (stats.get("executed", 0), len(self._pending_orders),
-                stats.get("invalidated", 0),
-                {k: v for k, v in stats.items()
-                 if k.startswith("gate_")},
+                stats.get("invalidated", 0), gates,
                 dict(self._blocked_leg_counts),
                 stats.get("sizing_declined", 0))
 
     def _execute_qm_m5_candidate(self, pb, sig, m5_df, stats,
                                  *, freshness_s: float,
-                                 last_bar_ts) -> str | None:
+                                 last_bar_ts,
+                                 provenance: dict | None = None
+                                 ) -> str | None:
         """One fresh qm_m5 touch through the JUDGMENT-shaped
         decision step (owner steering 2026-10-23 + directive §5C:
         "a neural trading engine", not a gate stack).
@@ -9060,6 +9576,13 @@ class MT5Runner:
         atr_m5 = float(sig.atr or atr14(m5_df))
         alert_id = f"MT5-qm_m5-{sig.index}"
         lc = dict(getattr(sig, "live_context", None) or {})
+        # Phase 2: this route only receives candidates the
+        # lifecycle assessed as execution-eligible; stamp the
+        # verdict on the signal so the shared order path's
+        # backstop can see it (an explicit False anywhere
+        # upstream refuses the order at the boundary).
+        sig.execution_eligible = True
+        _src = (provenance or {}).get("source")
         stop_dist = abs(entry - stop)
         tick = self._last_tick or {}
         spread_px = (float(tick["ask"]) - float(tick["bid"])) \
@@ -9103,29 +9626,44 @@ class MT5Runner:
         tags = list(lc.get("tags") or [])
         supporting: list[str] = []
         contradictory: list[str] = []
+        # Phase 2 (addendum C): CORRELATION GROUPING — every
+        # evidence item also records its ORIGIN GROUP.  Items
+        # from the same event (sweep_head and displacement_break
+        # are two readings of THIS pattern's one reaction) share
+        # a group and are counted ONCE as independent evidence:
+        # correlated observations must not stack as independent
+        # confirmations.  The flat lists stay (existing
+        # consumers); the groups make the correlation structure
+        # explicit on the record.
+        _groups: dict[str, list[str]] = {}
+
+        def _note(bucket: list, group: str, text: str) -> None:
+            bucket.append(text)
+            _groups.setdefault(group, []).append(text)
+
         if "sweep_head" in tags:
-            supporting.append(
-                "sweep_head: the head leg swept the prior swing "
-                "— rejection evidence at the extreme")
+            _note(supporting, "qm_pattern_event",
+                  "sweep_head: the head leg swept the prior swing "
+                  "— rejection evidence at the extreme")
         if "displacement_break" in tags:
-            supporting.append(
-                "displacement_break: the neckline break displaced "
-                "— acceptance by closes through the level")
+            _note(supporting, "qm_pattern_event",
+                  "displacement_break: the neckline break displaced "
+                  "— acceptance by closes through the level")
         bias_d1 = int(verdict["bias_d1"])
         if bias_d1 and bias_d1 == direction:
-            supporting.append(
-                f"with structural D1 bias {bias_d1:+d}")
+            _note(supporting, "htf_structure",
+                  f"with structural D1 bias {bias_d1:+d}")
         elif bias_d1:
-            contradictory.append(
-                f"against structural D1 bias {bias_d1:+d} "
-                "(weighed as evidence, not a veto)")
+            _note(contradictory, "htf_structure",
+                  f"against structural D1 bias {bias_d1:+d} "
+                  "(weighed as evidence, not a veto)")
         if bool(score.flipped):
-            contradictory.append(
-                "asymmetry score flipped: the weighed structure "
-                "funds the opposite side")
+            _note(contradictory, "asymmetry_score",
+                  "asymmetry score flipped: the weighed structure "
+                  "funds the opposite side")
         if journey.get("refusal"):
-            contradictory.append(
-                f"journey geometry: {journey['refusal']}")
+            _note(contradictory, "journey_geometry",
+                  f"journey geometry: {journey['refusal']}")
         _sess_bucket, _sess_kz = session_of(last_bar_ts)
         evidence = {
             "route": "qm_m5_native",
@@ -9166,16 +9704,55 @@ class MT5Runner:
             },
             "supporting": supporting,
             "contradictory": contradictory,
+            # Correlation structure (addendum C): the groups and
+            # the count of INDEPENDENT evidence groups — two
+            # readings of one pattern event count once.
+            "evidence_groups": _groups,
+            "independent_evidence_groups": sorted(_groups),
+            # Phase 2: the candidate's lifecycle provenance rides
+            # the evidence too — formation/touch/creation times,
+            # source, instance key, eligibility verdict.
+            "provenance": provenance,
         }
-        candidate = self._candidate_dict(sig, breakdown)
+        # COMPETING SCENARIOS (addendum C): both sides coexist on
+        # the record until the evidence resolves them — the
+        # candidate's side, and the opposite side whose funding
+        # is exactly what a score flip reports.  Neither is
+        # suppressed; the decision states which was selected and
+        # why (the weighed evidence / the flip refusal).
+        scenarios = [
+            {"scenario": f"take the {direction:+d} QM touch at "
+                         f"{entry:.2f}",
+             "status": "selected"},
+            {"scenario": f"take the {-direction:+d} side (the "
+                         "flip side)",
+             "status": ("funded by the weighed evidence — score "
+                        "flipped" if bool(score.flipped) else
+                        "not funded by the weighed evidence")},
+        ]
+        candidate = self._candidate_dict(sig, breakdown, provenance)
         targets = [float(x) for x in (sig.targets or [])]
         factors = list(getattr(sig, "factors", []) or [])
 
         def _refuse(code: str, reason: str,
-                    hard_checks: list) -> None:
+                    hard_checks: list,
+                    analytical_qualified: bool = False) -> None:
+            # Competing scenarios on a refusal: this side was
+            # NOT taken; on a flip the other side is what the
+            # weighed evidence selected.
+            _sc = [dict(s) for s in scenarios]
+            _sc[0]["status"] = f"not taken — refused ({code})"
+            if code == "direction.flip":
+                _sc[1]["status"] = ("selected by the weighed "
+                                    "evidence (score flip)")
+            # Phase 2 (P0-2): the signal record's score is the
+            # ASYMMETRY total — the computed decision score.  The
+            # sleeve base (sig.score, a 60.0 placeholder) is
+            # recorded under its own name in the candidate block,
+            # never as the headline.
             log_signal(
                 self.journal, signal_id=alert_id, playbook="qm_m5",
-                direction=direction, score=float(sig.score),
+                direction=direction, score=float(score.total),
                 decision="gated", reason=reason, bar_ts=last_bar_ts,
                 entry=entry, stop=stop, targets=targets,
                 factors=factors, score_breakdown=breakdown,
@@ -9194,8 +9771,31 @@ class MT5Runner:
                           "reason": reason,
                           "execution_eligible": False,
                           "order_result": "not_attempted",
-                          "hard_risk_checks": hard_checks},
-                evidence=evidence)
+                          "hard_risk_checks": hard_checks,
+                          "reasoning_mode": "standalone",
+                          "floor_authority":
+                              _FLOOR_AUTHORITY["native:qm_m5"],
+                          "competing_scenarios": _sc,
+                          # Two layers, distinct (owner ruling):
+                          # an analytical refusal says
+                          # not_qualified with the strategy code;
+                          # the decision-stage solvency refusal
+                          # says QUALIFIED analytically and
+                          # refused by the risk layer — the EC2
+                          # burst's 23, now readable at a glance.
+                          **_verdict_blocks(
+                              analytical=(
+                                  "qualified"
+                                  if analytical_qualified
+                                  else "not_qualified"),
+                              analytical_code=(
+                                  None if analytical_qualified
+                                  else code),
+                              eligible=False,
+                              execution_code=(
+                                  code if analytical_qualified
+                                  else None))},
+                evidence=evidence, source=_src)
 
         hard_checks: list[dict] = []
         # FACT 1 — stop geometry: a stop not beyond the entry in
@@ -9277,7 +9877,7 @@ class MT5Runner:
                     "qm_m5 (A14 override)")
             log_signal(
                 self.journal, signal_id=alert_id, playbook="qm_m5",
-                direction=direction, score=float(sig.score),
+                direction=direction, score=float(score.total),
                 decision="shadow", reason=_why, bar_ts=last_bar_ts,
                 entry=entry, stop=stop, targets=targets,
                 factors=factors, score_breakdown=breakdown,
@@ -9297,9 +9897,43 @@ class MT5Runner:
                           "reason": _why,
                           "execution_eligible": False,
                           "order_result": "not_attempted",
-                          "hard_risk_checks": hard_checks},
-                evidence=evidence)
+                          "hard_risk_checks": hard_checks,
+                          "reasoning_mode": "standalone",
+                          "floor_authority":
+                              _FLOOR_AUTHORITY["native:qm_m5"],
+                          "competing_scenarios": [
+                              {**scenarios[0],
+                               "status": "not taken — execute-list "
+                                         "narrowing (owner config)"},
+                              scenarios[1]],
+                          **_verdict_blocks(
+                              analytical="qualified",
+                              eligible=False,
+                              execution_code="path.execute_list")},
+                evidence=evidence, source=_src)
             return
+        # Phase 2 (P1-1) DECISION-STAGE SOLVENCY: the same
+        # daily-loss-room accounting the order path enforces,
+        # asked BEFORE dispatch — a candidate the room would
+        # refuse is refused here, at decision, with the guard's
+        # exact reason (the EC2 burst's 23 "accepted"-then-
+        # refused candidates are this check's reason to exist).
+        # The order path re-checks everything at placement and
+        # remains the authoritative backstop.
+        _solv_ok, _solv_reason = self._decision_solvency(
+            pb, sig, score)
+        hard_checks.append({
+            "check": "decision_solvency (RiskGuards incl. "
+                     "daily-loss room, same accounting as the "
+                     "order path)",
+            "result": "pass" if _solv_ok else "VETO",
+            "detail": _solv_reason or "solvent under the "
+                                      "effective sizing mode"})
+        if not _solv_ok:
+            _refuse("gate.solvency",
+                    f"decision-stage solvency: {_solv_reason}",
+                    hard_checks, analytical_qualified=True)
+            return "gate.solvency"
         # ACCEPT — the weighed judgment, stated with its evidence,
         # then the shared order machinery carries the risk.
         judgment = (
@@ -9314,7 +9948,7 @@ class MT5Runner:
             f"mt5 qm_m5 {'+' if direction > 0 else '-'}1 {judgment}")
         log_signal(
             self.journal, signal_id=alert_id, playbook="qm_m5",
-            direction=direction, score=float(sig.score),
+            direction=direction, score=float(score.total),
             decision="accepted", reason=judgment,
             bar_ts=last_bar_ts, entry=entry, stop=stop,
             targets=targets, factors=factors,
@@ -9371,6 +10005,15 @@ class MT5Runner:
                 "reason": judgment,
                 "execution_eligible": True, "order_result": _ores,
                 "hard_risk_checks": hard_checks,
+                "reasoning_mode": "standalone",
+                "floor_authority": _FLOOR_AUTHORITY["native:qm_m5"],
+                "competing_scenarios": scenarios,
+                **_verdict_blocks(
+                    analytical="qualified",
+                    eligible=_ores in (
+                        "filled", "placed_pending", "layer_filled",
+                        "layer_pending", "layer_no_order"),
+                    execution_code=_ocode, outcome=_ores),
                 "selected_action": "submit to the shared order "
                                    "path (order type by price vs "
                                    "the QM level, inside "
@@ -9384,10 +10027,11 @@ class MT5Runner:
                     "context is weighed evidence on this route, "
                     "not a veto (gates-vs-scores law)",
                 ]},
-            evidence=evidence)
+            evidence=evidence, source=_src)
         return _ocode
 
-    def _run_qm_d1(self, d1_df, stats: dict | None = None
+    def _run_qm_d1(self, d1_df, stats: dict | None = None, *,
+                   source: str = _lifecycle.SOURCE_LIVE_CLOSE
                    ) -> list[dict]:
         """qm_d1 REAL order path on its own D1 clock (P3 — closes
         the P1-flagged exception; A14: the demo IS the shadow).
@@ -9435,6 +10079,27 @@ class MT5Runner:
             ctx = EngineContext(df=d1_df, states=[], years=0.0,
                                 instrument=self.cfg.symbol)
             out: list[dict] = []
+            seen = self._load_seen_instances()
+            last_index = len(d1_df) - 1
+            # Freshness against the tick clock, same basis as the
+            # M5 route (recorded truthfully; the D1 route has no
+            # stale-data veto of its own — candidate AGE is the
+            # lifecycle gate below).
+            _now_ref = None
+            if self._last_tick and \
+                    self._last_tick.get("time") is not None:
+                try:
+                    _now_ref = pd.Timestamp(self._last_tick["time"])
+                except Exception:
+                    _now_ref = None
+            if _now_ref is None:
+                _now_ref = pd.Timestamp.now(tz="UTC")
+            if _now_ref.tzinfo is None:
+                _now_ref = _now_ref.tz_localize("UTC")
+            _freshness_s = max(
+                0.0, (_now_ref - (d1_df.index[-1]
+                                  + pd.Timedelta(days=1))
+                      ).total_seconds())
             for cand in pb.candidates(ctx):
                 if cand.signal_index <= self._qm_d1_last_logged:
                     continue  # already evaluated on an earlier scan
@@ -9452,6 +10117,76 @@ class MT5Runner:
                          "r_net": float(cand.outcome.r_net),
                          "exit_reason": cand.outcome.exit_reason}
                 out.append(touch)
+                # Phase 2 lifecycle (P0-1): provenance +
+                # eligibility + idempotency, same contract as
+                # the M5 route — warmup/catch-up/replay D1
+                # candidates are analytical only.
+                touch_ts = touch["touch_ts"]
+                touch_age = last_index - int(cand.signal_index)
+                _p0 = lc.get("p0_index")
+                formation_ts = (
+                    d1_df.index[int(_p0)]
+                    if _p0 is not None
+                    and 0 <= int(_p0) < len(d1_df) else None)
+                _level = lc.get("qm_level")
+                key = _lifecycle.instance_key(
+                    "qm_d1", pattern_ts=touch_ts,
+                    direction=int(cand.direction),
+                    level=(float(_level) if _level is not None
+                           else float(sig.entry_ref)))
+                if key in seen:
+                    continue  # terminally disposed in an earlier
+                    # run — its record lives in that journal.
+                eligible, elig_code, elig_reason = \
+                    _lifecycle.assess_eligibility(
+                        source=source, touch_age_bars=touch_age,
+                        validity_window_bars=(
+                            _lifecycle.QM_VALIDITY_WINDOW_BARS))
+                prov = _lifecycle.provenance_block(
+                    key=key, formation_ts=formation_ts,
+                    touch_ts=touch_ts, created_ts=_now_ref,
+                    evaluated_bar_ts=d1_df.index[-1],
+                    evaluation_ts=_now_ref, source=source,
+                    touch_age_bars=touch_age,
+                    validity_window_bars=(
+                        _lifecycle.QM_VALIDITY_WINDOW_BARS),
+                    eligible=eligible, eligibility_code=elig_code)
+                if not eligible:
+                    _warm = (elig_code ==
+                             _lifecycle.CODE_WARMUP_INELIGIBLE)
+                    self._emit_eval(
+                        playbook="qm_d1",
+                        evaluation_clock="d1_close",
+                        intended_tf="D1", actual_input_tf="D1",
+                        last_bar_ts=touch_ts,
+                        data_freshness_s=_freshness_s,
+                        outcome="candidate_emitted",
+                        reason_code=elig_code, reason=elig_reason,
+                        candidate=self._candidate_dict(sig, None,
+                                                       prov),
+                        decision={
+                            "result": ("not_executable" if _warm
+                                       else "refused"),
+                            "reason_code": elig_code,
+                            "reason": elig_reason,
+                            "execution_eligible": False,
+                            "order_result": "not_attempted",
+                            **_verdict_blocks(
+                                analytical="not_evaluated",
+                                eligible=False,
+                                execution_code=elig_code)},
+                        evidence={"route": "qm_d1_native",
+                                  "provenance": prov},
+                        source=source)
+                    self.journal.log_note(
+                        f"mt5 qm_d1 "
+                        f"{'+' if touch['direction'] > 0 else '-'}1 "
+                        f"touch {touch_ts.date()} — NOT routed: "
+                        f"{elig_reason}")
+                    self._mark_instance_seen(
+                        key, elig_code or "ineligible")
+                    seen[key] = elig_code or "ineligible"
+                    continue
                 self.journal.log_note(
                     f"mt5 qm_d1 "
                     f"{'+' if touch['direction'] > 0 else '-'}1 "
@@ -9464,11 +10199,28 @@ class MT5Runner:
                        if touch["tags"] else ""))
                 try:
                     self._execute_qm_d1_candidate(
-                        pb, sig, d1_df, ctx, stats)
+                        pb, sig, d1_df, ctx, stats, provenance=prov)
                 except Exception as exc:
                     self.journal.log_note(
                         f"mt5: qm_d1 order path failed for the "
                         f"{touch['touch_ts'].date()} touch: {exc}")
+                    # Phase 2: the failure is a funnel record,
+                    # not only a note (the M5 route already did
+                    # this; D1 silently dropped it).
+                    self._emit_eval(
+                        playbook="qm_d1",
+                        evaluation_clock="d1_close",
+                        intended_tf="D1", actual_input_tf="D1",
+                        last_bar_ts=touch_ts,
+                        data_freshness_s=_freshness_s,
+                        outcome="exception",
+                        reason_code="path.exception",
+                        reason=f"{type(exc).__name__}: {exc}",
+                        candidate=self._candidate_dict(sig, None,
+                                                       prov),
+                        source=source)
+                self._mark_instance_seen(key, "terminal")
+                seen[key] = "terminal"
             if out and stats is not None:
                 stats["qm_d1_signals"] = stats.get(
                     "qm_d1_signals", 0) + len(out)
@@ -9481,7 +10233,8 @@ class MT5Runner:
                     last_bar_ts=d1_df.index[-1],
                     outcome="no_setup",
                     reason="evaluated on the D1 frame at D1 "
-                           "close — no fresh QM touch")
+                           "close — no fresh QM touch",
+                    source=source)
             return out
         except Exception as exc:
             self.journal.log_note(
@@ -9489,10 +10242,15 @@ class MT5Runner:
             return []
 
     def _execute_qm_d1_candidate(self, pb, sig, d1_df, ctx,
-                                 stats) -> None:
+                                 stats, provenance: dict | None = None
+                                 ) -> None:
         """One fresh qm_d1 touch through the desk machinery."""
         stats = stats if stats is not None else {}
         engine = self._get_engine()
+        # Phase 2: eligibility stamp for the order-path backstop
+        # (this route only receives eligible candidates).
+        sig.execution_eligible = True
+        _src = (provenance or {}).get("source")
         direction = int(sig.direction)
         entry = float(sig.entry_ref)
         stop = float(sig.invalidation)
@@ -9526,10 +10284,15 @@ class MT5Runner:
             if sig.index < len(d1_df) else None
 
         def _journal(decision: str, reason: str,
-                     funnel_code: str | None = None) -> None:
+                     funnel_code: str | None = None,
+                     analytical_qualified: bool = False) -> None:
+            # Phase 2 (P0-2): signal-record score = the Asymmetry
+            # total (the computed decision score); the sleeve
+            # base rides under its own name in the candidate
+            # block — see _candidate_dict.
             log_signal(
                 self.journal, signal_id=alert_id, playbook="qm_d1",
-                direction=direction, score=float(sig.score),
+                direction=direction, score=float(score.total),
                 decision=decision, reason=reason, bar_ts=bar_ts,
                 entry=entry, stop=stop, targets=targets,
                 factors=factors, score_breakdown=breakdown,
@@ -9544,12 +10307,32 @@ class MT5Runner:
                     intended_tf="D1", actual_input_tf="D1",
                     last_bar_ts=bar_ts, outcome="candidate_emitted",
                     reason_code=funnel_code, reason=reason,
-                    candidate=self._candidate_dict(sig, breakdown),
+                    candidate=self._candidate_dict(
+                        sig, breakdown, provenance),
                     decision={"result": "refused",
                               "reason_code": funnel_code,
                               "reason": reason,
                               "execution_eligible": False,
-                              "order_result": "not_attempted"})
+                              "order_result": "not_attempted",
+                              "reasoning_mode": "standalone",
+                              "floor_authority":
+                                  _FLOOR_AUTHORITY["native:qm_d1"],
+                              **_verdict_blocks(
+                                  analytical=(
+                                      "qualified"
+                                      if analytical_qualified
+                                      else "not_qualified"),
+                                  analytical_code=(
+                                      None if analytical_qualified
+                                      else funnel_code),
+                                  eligible=False,
+                                  execution_code=(
+                                      funnel_code
+                                      if analytical_qualified
+                                      else None))},
+                    evidence={"route": "qm_d1_native",
+                              "provenance": provenance},
+                    source=_src)
 
         # Hard lines (spread / hunting ground / session / the
         # playbook's own live check on the D1 frame).
@@ -9610,6 +10393,20 @@ class MT5Runner:
                 "floor.total" if float(score.total)
                 < float(fl["floor"]) else "floor.component")
             return
+        # Phase 2 (P1-1) DECISION-STAGE SOLVENCY: same
+        # RiskGuards accounting as the order path, asked before
+        # dispatch (see _decision_solvency).  The order path
+        # remains the authoritative backstop.
+        _solv_ok, _solv_reason = self._decision_solvency(
+            pb, sig, score)
+        if not _solv_ok:
+            stats["gated"] = stats.get("gated", 0) + 1
+            self._record_blocked(
+                f"decision-stage solvency: {_solv_reason}", "qm_d1")
+            _journal("gated",
+                     f"decision-stage solvency: {_solv_reason}",
+                     "gate.solvency", analytical_qualified=True)
+            return
         _journal("accepted",
                  f"asymmetry {score.total:.0f} clears "
                  "MACRO_SWING_OPEN (Path B, D1 clock)")
@@ -9653,7 +10450,8 @@ class MT5Runner:
             last_bar_ts=bar_ts, outcome="candidate_emitted",
             reason=f"accepted on MACRO_SWING_OPEN; order "
                    f"outcome: {_ores}",
-            candidate=self._candidate_dict(sig, breakdown),
+            candidate=self._candidate_dict(sig, breakdown,
+                                           provenance),
             decision={"result": "accepted",
                       "reason_code": (
                           _FRICTION_CODE
@@ -9669,8 +10467,225 @@ class MT5Runner:
                           "floor": float(fl["floor"]),
                           "total": float(score.total),
                           "path": "MACRO_SWING_OPEN"},
+                      "reasoning_mode": "standalone",
+                      "floor_authority":
+                          _FLOOR_AUTHORITY["native:qm_d1"],
+                      **_verdict_blocks(
+                          analytical="qualified",
+                          eligible=_ores in (
+                              "filled", "placed_pending",
+                              "layer_no_order"),
+                          execution_code=(
+                              _FRICTION_CODE
+                              if _ores == "refused_in_order_path"
+                              and stats.get("gate_friction", 0)
+                              > _pre_order[3]
+                              else ("gate.solvency"
+                                    if _ores
+                                    == "refused_in_order_path"
+                                    and stats.get(
+                                        "sizing_declined", 0)
+                                    > _pre_order[4] else None)),
+                          outcome=_ores),
                       "execution_eligible": True,
-                      "order_result": _ores})
+                      "order_result": _ores},
+            evidence={"route": "qm_d1_native",
+                      "provenance": provenance},
+            source=_src)
+
+    # --------------------------- scheduled evaluations (P0-3)
+    # Phase 2: EVERY registered playbook evaluates on its agreed
+    # clock and journals the evaluation — the EC2 journal held 49
+    # records, all qm_m5, because the 12 pure-H1 roster playbooks
+    # only ever evaluated inside the trigger lifecycle and the
+    # range family had no scheduled route at all.  These sweeps
+    # are EVALUATIONS (scans): they journal no_setup / candidate
+    # (observed) / not_eligible / exception records on schedule,
+    # independent of the generic H1 trigger.  Order authority is
+    # unchanged: the trigger path for the roster, the native
+    # routes for qm_m5/qm_d1, and NO authority for the §G range
+    # evaluation routes (shadow until the owner promotes them).
+
+    def _sweep_blocked_reason(self) -> tuple[str, str] | None:
+        """Path-level blocks that make a scheduled scan not an
+        evaluation at all (kill states are per-playbook and are
+        checked by the caller)."""
+        if getattr(self.cfg, "paused", False):
+            return ("path.paused",
+                    "engine paused via /set — scheduled scan "
+                    "not evaluated")
+        try:
+            open_ok, open_reason = self._market_open()
+        except Exception:
+            open_ok, open_reason = True, ""
+        if not open_ok:
+            return ("path.market_closed",
+                    f"market closed ({open_reason}) — scheduled "
+                    "scan not evaluated")
+        return None
+
+    def _sweep_eval_one(self, spec, frame, *, clock: str,
+                        intended_tf: str, actual_tf: str,
+                        source: str, shadow: bool,
+                        extra_evidence: dict | None = None
+                        ) -> None:
+        """One scheduled-scan evaluation for one playbook.
+
+        A FRESH playbook instance scans only the closing bar:
+        the roster instances carry streaming cursors owned by the
+        trigger lifecycle, and letting a scan advance them would
+        eat the trigger path's signals.  Signals found are
+        journaled as OBSERVED candidates — evaluated, truthfully
+        ineligible for execution from this route (the trigger
+        path / native route remains the order authority; the §G
+        range routes are shadow)."""
+        name = spec.name
+        last_bar_ts = (frame.index[-1]
+                       if frame is not None and len(frame) else None)
+        base = dict(playbook=name, evaluation_clock=clock,
+                    intended_tf=intended_tf, actual_input_tf=actual_tf,
+                    last_bar_ts=last_bar_ts, source=source)
+        if name in (self.cfg.disabled_playbooks or ()):
+            self._emit_eval(
+                **base, outcome="not_eligible",
+                reason_code="path.kill_switch",
+                reason="disabled via /set kill switch — scheduled "
+                       "scan not evaluated")
+            return
+        blocked = self._sweep_blocked_reason()
+        if blocked is not None:
+            self._emit_eval(**base, outcome="not_eligible",
+                            reason_code=blocked[0],
+                            reason=blocked[1])
+            return
+        if frame is None or len(frame) < 30:
+            self._emit_eval(
+                **base, outcome="not_eligible",
+                reason_code="gate.data",
+                reason=f"{intended_tf} frame unavailable or "
+                       "shorter than 30 bars — scheduled scan "
+                       "not evaluated")
+            return
+        t = len(frame) - 1
+        try:
+            pb = spec.playbook_class()
+            if hasattr(pb, "set_h4_frame"):
+                pb.set_h4_frame(
+                    self._stack.frames.get("H4")
+                    if self._stack is not None else None)
+            sigs = pb.live_signal([], t, frame) or []
+            fresh = [s for s in sigs
+                     if int(getattr(s, "index", -1)) == t]
+        except Exception as exc:
+            self._emit_eval(
+                **base, outcome="exception",
+                reason_code="path.exception",
+                reason=f"scheduled scan failed: "
+                       f"{type(exc).__name__}: {exc}")
+            return
+        evidence = {"evaluation_kind": "scheduled_scan",
+                    "route": spec.route, "shadow": bool(shadow)}
+        if extra_evidence:
+            evidence.update(extra_evidence)
+        if not fresh:
+            self._emit_eval(
+                **base, outcome="no_setup",
+                reason="scheduled scan on the closing bar — no "
+                       "signal", evidence=evidence)
+            return
+        code = ("path.shadow_route" if shadow
+                else "path.trigger_not_fired")
+        why = ("§G shadow evaluation route: the candidate is "
+               "journaled for grading and holds NO order "
+               "authority in v1 (owner §G ruling)"
+               if shadow else
+               "scheduled scan found a candidate on the closing "
+               "bar; order authority on this playbook belongs to "
+               "the trigger path, which did not fire — recorded "
+               "as observed, never routed from the scan")
+        for sig in fresh:
+            prov = _lifecycle.provenance_block(
+                key=_lifecycle.instance_key(
+                    name, pattern_ts=frame.index[t],
+                    direction=int(sig.direction),
+                    level=float(sig.entry_ref)),
+                formation_ts=None, touch_ts=frame.index[t],
+                created_ts=last_bar_ts,
+                evaluated_bar_ts=last_bar_ts,
+                evaluation_ts=last_bar_ts, source=source,
+                touch_age_bars=0, validity_window_bars=0,
+                eligible=False, eligibility_code=code)
+            self._emit_eval(
+                **base, outcome="candidate_emitted",
+                reason_code=code, reason=why,
+                candidate=self._candidate_dict(sig, None, prov),
+                decision={"result": ("shadow" if shadow
+                                     else "observed"),
+                          "reason_code": code, "reason": why,
+                          "execution_eligible": False,
+                          "order_result": "not_attempted",
+                          **_verdict_blocks(
+                              analytical="not_evaluated",
+                              eligible=False,
+                              execution_code=code)},
+                evidence={**evidence, "provenance": prov})
+
+    def _run_roster_close_evals(self, stats: dict | None = None,
+                                *, source: str) -> None:
+        """The 12 pure-H1 roster playbooks evaluate on every H1
+        close (and once at warm start), independent of the
+        generic H1 trigger lifecycle."""
+        h1 = (self._stack.frames.get("H1")
+              if self._stack is not None else None)
+        for spec in ROSTER_SPECS_H1:
+            try:
+                self._sweep_eval_one(
+                    spec, h1, clock="h1_close", intended_tf="H1",
+                    actual_tf="H1", source=source, shadow=False)
+            except Exception as exc:
+                self.journal.log_note(
+                    f"mt5: roster close eval failed for "
+                    f"{spec.name}: {exc}")
+
+    def _run_range_family(self, stage: str,
+                          stats: dict | None = None, *,
+                          source: str) -> None:
+        """The range family under its §G contract.
+
+        ``stage="h4_generation"``: on an H4 close, each range
+        playbook generates scenarios — the range detector's state
+        derives exclusively from H4 closes (causally sliced by
+        the playbook itself); the scan runs on the H1 timebase
+        the playbooks are built on, at the freshest H1 bar.
+        ``stage="h1_refinement"``: on an H1 close, the same scan
+        refines entries against the current H4 context.  D1 bias
+        is recorded as CONTEXT evidence only — it is never
+        consulted as permission (D1 never vetoes; §G).  Both
+        stages are shadow: they journal, they never order.
+        """
+        h1 = (self._stack.frames.get("H1")
+              if self._stack is not None else None)
+        setup = self._live_setup or {}
+        ctx_evidence = {
+            "stage": stage,
+            "d1_bias_context": setup.get("bias_d1"),
+            "d1_role": "context only — recorded, never consulted "
+                       "as permission (owner §G: D1 never vetoes)",
+        }
+        if stage == "h4_generation":
+            clock, itf, atf = "h4_generation", "H4", "H4"
+        else:
+            clock, itf, atf = "h1_refinement", "H1", "H1"
+        for spec in RANGE_SPECS:
+            try:
+                self._sweep_eval_one(
+                    spec, h1, clock=clock, intended_tf=itf,
+                    actual_tf=atf, source=source, shadow=True,
+                    extra_evidence=ctx_evidence)
+            except Exception as exc:
+                self.journal.log_note(
+                    f"mt5: range {stage} eval failed for "
+                    f"{spec.name}: {exc}")
 
     # ------------------------------------------------- alerts + charts
     def _build_chart(self, sig, verdict: dict | None, *,

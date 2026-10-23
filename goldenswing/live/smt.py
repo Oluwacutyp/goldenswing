@@ -60,6 +60,56 @@ def _confirmed_swings(frame: pd.DataFrame, n: int = 3):
     return highs, lows
 
 
+def align_on_timestamps(gold: pd.DataFrame | None,
+                        dxy: pd.DataFrame | None
+                        ) -> tuple[pd.DataFrame | None,
+                                   pd.DataFrame | None]:
+    """Align the gold and DXY frames on BAR TIMESTAMPS.
+
+    Phase 2 census fix: :func:`detect_smt` indexes the DXY
+    arrays with GOLD-frame positions — correct only if the two
+    frames are bar-for-bar the same bars.  The correlation in
+    live/dxy.py already joins on timestamps; the SMT event read
+    did not, so a DXY frame fetched at a different moment (a
+    missing bar, a longer history) silently shifted every
+    comparison by the offset — positional candle-matching
+    across instruments is a defect, not an approximation.
+    This helper inner-joins both frames on their indexes (the
+    bar open times) so position i is the same bar in both.
+    Returns (None, None) when either frame lacks a datetime
+    index to align on — the caller then treats SMT as
+    unavailable rather than reading misaligned bars as truth.
+    """
+    if gold is None or dxy is None:
+        return None, None
+    gi, di = gold.index, dxy.index
+    if not isinstance(gi, pd.DatetimeIndex) \
+            or not isinstance(di, pd.DatetimeIndex):
+        return None, None
+    try:
+        common = gi.intersection(di)
+        if len(common) == 0 and (gi.tz is not None) != (di.tz is not None):
+            # Same instants, different tz representation (MT5
+            # gold vs a naive DXY index): retry tz-naive.
+            g2 = gold.copy()
+            d2 = dxy.copy()
+            if gi.tz is not None:
+                g2.index = gi.tz_localize(None)
+            if di.tz is not None:
+                d2.index = di.tz_localize(None)
+            common = g2.index.intersection(d2.index)
+            if len(common):
+                return (g2.loc[common].sort_index(),
+                        d2.loc[common].sort_index())
+            return None, None
+        if len(common) == 0:
+            return None, None
+        return (gold.loc[common].sort_index(),
+                dxy.loc[common].sort_index())
+    except Exception:
+        return None, None
+
+
 def detect_smt(gold: pd.DataFrame, dxy: pd.DataFrame, *,
                corr: float | None, window: int = 12) -> SmtRead:
     """Detect the SMT event on the latest bars of the frames.

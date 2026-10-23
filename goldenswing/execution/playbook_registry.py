@@ -46,6 +46,17 @@ ROUTE_H1_ROSTER = "h1_roster"
 #: Route: evaluated on its own native clock by a dedicated runner
 #: path (``_run_qm_m5`` / ``_run_qm_d1``), never through the roster.
 ROUTE_NATIVE = "native"
+#: Route (Phase 2, owner §G ruling): the range family's SCHEDULED
+#: evaluation contract — H4-close scenario generation + H1
+#: refinement.  The §G evaluation routes are SHADOW (they journal
+#: evaluations and analytical candidates; they hold no order
+#: authority).  Range playbooks ALSO remain members of the
+#: trigger-path roster below — that legacy order authority is a
+#: standing owner state (2026-10-22 promotion) and is NOT
+#: silently removed by declaring the §G contract here (rulings
+#: §G.2: no silent live-decision changes).  Promotion of the §G
+#: route itself is a separate owner decision.
+ROUTE_RANGE_H4_H1 = "range_h4_h1"
 
 
 @dataclass(frozen=True)
@@ -53,12 +64,21 @@ class PlaybookSpec:
     """One registered playbook: identity, class, native clock,
     route.  ``manageable`` is every registered playbook today (the
     kill switch is universal); the field exists so a future
-    internal-only playbook must say so explicitly, in one place."""
+    internal-only playbook must say so explicitly, in one place.
+
+    ``native_tf`` is the playbook's GENERATION clock (the frame
+    its patterns form on); ``refinement_tf`` is set only where a
+    second clock refines entries (the range family: H4 generates,
+    H1 refines).  ``shadow_evaluation`` marks a scheduled
+    evaluation route that journals but holds no order authority
+    (the §G range routes in v1)."""
     name: str
     playbook_class: type
     native_tf: str
     route: str
     manageable: bool = True
+    refinement_tf: str | None = None
+    shadow_evaluation: bool = False
 
 
 #: The registry, in canonical display order: the H1-clocked roster
@@ -87,14 +107,23 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
                  ROUTE_H1_ROSTER),
     PlaybookSpec("order_block", OrderBlockPlaybook, "H1",
                  ROUTE_H1_ROSTER),
+    # Range family (§G contract): scenarios GENERATE on H4
+    # closes, entries REFINE on H1 closes, D1 is context only.
+    # The scheduled §G evaluations are shadow in v1 (see
+    # ROUTE_RANGE_H4_H1); trigger-path membership is retained.
     PlaybookSpec("range_sweep_reclaim", RangeSweepReclaimPlaybook,
-                 "H1", ROUTE_H1_ROSTER),
-    PlaybookSpec("range_qm", RangeQMPlaybook, "H1", ROUTE_H1_ROSTER),
+                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1",
+                 shadow_evaluation=True),
+    PlaybookSpec("range_qm", RangeQMPlaybook,
+                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1",
+                 shadow_evaluation=True),
     PlaybookSpec("range_mean_reversion", RangeMeanReversionPlaybook,
-                 "H1", ROUTE_H1_ROSTER),
+                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1",
+                 shadow_evaluation=True),
     PlaybookSpec("range_compression_breakout",
-                 RangeCompressionBreakoutPlaybook, "H1",
-                 ROUTE_H1_ROSTER),
+                 RangeCompressionBreakoutPlaybook,
+                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1",
+                 shadow_evaluation=True),
     PlaybookSpec("narrative", NarrativePlaybook, "H1",
                  ROUTE_H1_ROSTER),
     # Native-clock routes: evaluated by dedicated runner paths on
@@ -111,13 +140,58 @@ _BY_NAME: dict[str, PlaybookSpec] = {s.name: s
 PLAYBOOK_NAMES: tuple[str, ...] = tuple(
     s.name for s in PLAYBOOK_REGISTRY)
 
-#: The H1-clocked roster specs (runner signal-path order).
-ROSTER_SPECS: tuple[PlaybookSpec, ...] = tuple(
+#: The pure H1-clocked roster specs (no second clock).
+ROSTER_SPECS_H1: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY if s.route == ROUTE_H1_ROSTER)
+
+#: The range-family specs (§G H4-generation / H1-refinement).
+RANGE_SPECS: tuple[PlaybookSpec, ...] = tuple(
+    s for s in PLAYBOOK_REGISTRY if s.route == ROUTE_RANGE_H4_H1)
+
+#: The trigger-path roster: every playbook the H1-clocked signal
+#: path evaluates when the trigger lifecycle fires — the pure H1
+#: roster PLUS the range family (whose scheduled §G evaluation
+#: contract above is additional, shadow, and separate).  This is
+#: the set ``_get_playbooks`` builds, in registry order.  (Named
+#: ROSTER_SPECS for continuity with the Phase 1 invariant:
+#: ROSTER_SPECS ∪ NATIVE_SPECS == the full registry.)
+ROSTER_SPECS: tuple[PlaybookSpec, ...] = tuple(
+    s for s in PLAYBOOK_REGISTRY
+    if s.route in (ROUTE_H1_ROSTER, ROUTE_RANGE_H4_H1))
 
 #: The native-clock route specs.
 NATIVE_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY if s.route == ROUTE_NATIVE)
+
+#: SCORE-FLOOR AUTHORITY, per route (Phase 2, P0-2).  Two scores
+#: exist and were conflated in Phase 1 records: the SLEEVE BASE
+#: score (a playbook-declared placeholder that ranks sleeves —
+#: e.g. QM's documented 60.0, NOT a measured quality score) and
+#: the ASYMMETRY score (the computed decision score; its
+#: breakdown total is the number decisions actually use).  The
+#: config ``min_score = 60.0`` is a legacy default that NO live
+#: route applies as a flat floor any more; the floors that DO
+#: apply, per route, are:
+FLOOR_AUTHORITY: dict[str, str] = {
+    ROUTE_H1_ROSTER:
+        "per-style Asymmetry floors: floor_for(style_key) rows "
+        "(total + component minimums) applied to the Asymmetry "
+        "total in _run_one_playbook; cfg.min_score is NOT the "
+        "roster floor (the flat floor was removed in the "
+        "confluence rework)",
+    ROUTE_RANGE_H4_H1:
+        "shadow evaluation route: no floor, no order authority. "
+        "When the legacy trigger path fires for a range "
+        "playbook, the ROUTE_H1_ROSTER floor authority applies",
+    ROUTE_NATIVE + ":qm_m5":
+        "NO score floor (judgment route): the weighed Asymmetry "
+        "evidence decides; the sleeve base score (60.0) is a "
+        "ranking placeholder and is never a floor input",
+    ROUTE_NATIVE + ":qm_d1":
+        "MACRO_SWING_OPEN Asymmetry floor (Path B): floor_for "
+        "row applied to the Asymmetry total in "
+        "_execute_qm_d1_candidate",
+}
 
 #: Names the Telegram control surface may manage (kill switch,
 #: /config, /playbooks).  Today: every registered playbook.
