@@ -162,7 +162,7 @@ def test_runner_gate_refuses_duplicate_and_cooldown(tmp_path):
     runner._check_margin = lambda *a: True
     runner._alignment = SimpleNamespace(size_multiplier=1.0,
                                         alignment_label="D1_Only")
-    runner._last_tick = {"mid": 2005.0}
+    runner._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2}
     runner._stack = SimpleNamespace(frames={"H1": [1, 2, 3]})
     sig = SimpleNamespace(direction=1, entry_ref=2005.0,
                           invalidation=1990.0, atr=10.0,
@@ -249,20 +249,20 @@ def test_friday_close_blocks_base_order_only(tmp_path):
     from types import SimpleNamespace
     # 2026-10-16 is a Friday; tick clock at 20:00 UTC.
     runner, _ = _session_runner(tmp_path)
-    runner._last_tick = {"mid": 2005.0, "time": "2026-10-16 20:00:00"}
+    runner._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2, "time": "2026-10-16 20:00:00"}
     pb = SimpleNamespace(name="sweep_reversal")
     stats: dict = {}
     runner._place_live_order(pb, _sig(), stats)
     assert stats.get("gate_friday") == 1
     assert stats.get("executed", 0) == 0
     # Thursday 20:00 UTC: not Friday, order flows.
-    runner._last_tick = {"mid": 2005.0, "time": "2026-10-15 20:00:00"}
+    runner._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2, "time": "2026-10-15 20:00:00"}
     stats2: dict = {}
     runner._place_live_order(pb, _sig(), stats2)
     assert stats2.get("gate_friday", 0) == 0
     assert stats2.get("executed") == 1
     # Friday 20:00, but a LAYER: flows (management, never blocked).
-    runner._last_tick = {"mid": 2005.0, "time": "2026-10-16 20:00:00"}
+    runner._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2, "time": "2026-10-16 20:00:00"}
     stats3: dict = {}
     runner._place_live_order(pb, _sig(entry_ref=2010.0), stats3,
                              is_layer=True, layer_lots=0.01)
@@ -275,7 +275,7 @@ def test_session_sizing_applies_overlap_multiplier(tmp_path):
     # equity 10000, risk 1% = $100; stop distance 17.5 -> 0.05 lots;
     # 1.2x -> 0.06 lots.
     runner, executor = _session_runner(tmp_path)
-    runner._last_tick = {"mid": 2005.0, "time": "2026-01-15 14:00:00"}
+    runner._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2, "time": "2026-01-15 14:00:00"}
     pb = __import__("types").SimpleNamespace(name="sweep_reversal")
     stats: dict = {}
     runner._place_live_order(pb, _sig(), stats)
@@ -325,7 +325,7 @@ def test_place_live_order_flags_scalp_playbooks(tmp_path):
     from types import SimpleNamespace
     runner, _ = _session_runner(
         tmp_path, scalp_playbooks=("sweep_reversal",))
-    runner._last_tick = {"mid": 2005.0, "time": "2026-01-15 14:00:00"}
+    runner._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2, "time": "2026-01-15 14:00:00"}
     pb = SimpleNamespace(name="sweep_reversal")
     stats: dict = {}
     runner._place_live_order(pb, _sig(), stats)
@@ -334,7 +334,7 @@ def test_place_live_order_flags_scalp_playbooks(tmp_path):
     # A non-scalp playbook is not flagged.
     runner2, _ = _session_runner(
         tmp_path, scalp_playbooks=("sweep_reversal",))
-    runner2._last_tick = {"mid": 2005.0, "time": "2026-01-15 14:00:00"}
+    runner2._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2, "time": "2026-01-15 14:00:00"}
     pb2 = SimpleNamespace(name="fvg_limit")
     stats2: dict = {}
     runner2._place_live_order(pb2, _sig(), stats2)

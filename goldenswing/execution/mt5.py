@@ -12,9 +12,10 @@ The library is imported LAZILY: this module loads fine anywhere, and
 every live call raises a precise error when the library or terminal
 is unavailable instead of failing at import time.  Tests inject a
 fake ``MetaTrader5`` module and exercise request-building, filling
--mode selection and sizing against it — the live order path itself
-is code-complete but UNVERIFIED: it has never run against a real
-terminal (there is none in the build environment).  See EXECUTION.md.
+-mode selection and sizing against it.  The live order path runs
+against a real terminal on the EC2 demo deployment (since
+2026-10-21); it is unverified only inside the build environment,
+which has no terminal.  See EXECUTION.md.
 
 Filling mode: read from the symbol's ``filling_mode`` bitmask
 (SYMBOL_FILLING_FOK=1, SYMBOL_FILLING_IOC=2) and tried in the order

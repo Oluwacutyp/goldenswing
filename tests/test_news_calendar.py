@@ -163,7 +163,7 @@ def test_news_pause_blocks_base_order_not_layer(tmp_path):
     runner._check_margin = lambda *a: True
     runner._alignment = SimpleNamespace(size_multiplier=1.0,
                                         alignment_label="D1_Only")
-    runner._last_tick = {"mid": 2005.0}
+    runner._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2}
     sig = SimpleNamespace(direction=1, entry_ref=2005.0,
                           invalidation=1990.0, atr=10.0,
                           targets=[2040.0], score=80.0, index=42,
@@ -187,7 +187,7 @@ def test_news_pause_blocks_base_order_not_layer(tmp_path):
     runner2._check_margin = lambda *a: True
     runner2._alignment = SimpleNamespace(size_multiplier=1.0,
                                         alignment_label="D1_Only")
-    runner2._last_tick = {"mid": 2005.0}
+    runner2._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2}
     runner2._stack = SimpleNamespace(frames={"H1": [1, 2, 3]})
     stats2: dict = {}
     runner2._place_live_order(pb, sig, stats2)

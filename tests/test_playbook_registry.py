@@ -1,9 +1,18 @@
 """Pin the executing-vs-shadow registry and standing rules.
 
-- Executing (14): the full roster — sweep_reversal, fvg_midline,
-  trendline_retest, fvg_limit, inversion, killzone_open,
-  judas_swing, turtle_soup, v_reversal, retracement_trap,
-  order_block, qm_m5, qm_d1 (Daily QM), narrative — live=True.
+- Executing (18): the full registry in canonical order — the 16
+  H1-roster playbooks in signal-path order (sweep_reversal,
+  fvg_midline, trendline_retest, fvg_limit, inversion,
+  killzone_open, judas_swing, turtle_soup, v_reversal,
+  retracement_trap, order_block, range_sweep_reclaim, range_qm,
+  range_mean_reversion, range_compression_breakout, narrative),
+  then the two native-clock playbooks (qm_m5, qm_d1) — live=True.
+  FUNNEL §3 (2026-10-23): EXECUTE_PLAYBOOK_NAMES is DERIVED from
+  the one playbook registry; the four range playbooks were
+  missing from the hand-maintained list (14), which made them
+  unkillable via Telegram and silently dropped their persisted
+  kill entries — the registry derivation is the fix, and this
+  test pins the full 18.
 - Shadow: NONE.  Owner directive 2026-10-22: the whole shadow
   roster was promoted to live for forward testing on the demo —
   backtests map where a setup historically worked, they are never
@@ -21,6 +30,8 @@ from goldenswing.playbooks import (
     FVGLimitPlaybook, FVGMidlinePlaybook, InversionPlaybook,
     JudasSwingPlaybook, KillzoneOpenPlaybook, NarrativePlaybook,
     OrderBlockPlaybook, QMD1Playbook, QMM5Playbook,
+    RangeCompressionBreakoutPlaybook, RangeMeanReversionPlaybook,
+    RangeQMPlaybook, RangeSweepReclaimPlaybook,
     RetracementTrapPlaybook, SweepReversalPlaybook,
     TrendlineRetestPlaybook, TurtleSoupPlaybook, VReversalPlaybook)
 from goldenswing.features.phases import _fallback_manipulation
@@ -32,12 +43,16 @@ def test_full_roster_executes_and_is_live():
         "sweep_reversal", "fvg_midline", "trendline_retest", "fvg_limit",
         "inversion", "killzone_open", "judas_swing",
         "turtle_soup", "v_reversal", "retracement_trap", "order_block",
-        "qm_m5", "qm_d1", "narrative")
+        "range_sweep_reclaim", "range_qm", "range_mean_reversion",
+        "range_compression_breakout", "narrative", "qm_m5", "qm_d1")
     for cls in (SweepReversalPlaybook, FVGMidlinePlaybook,
                 TrendlineRetestPlaybook, FVGLimitPlaybook,
                 InversionPlaybook, KillzoneOpenPlaybook,
                 JudasSwingPlaybook, TurtleSoupPlaybook, VReversalPlaybook,
                 RetracementTrapPlaybook, OrderBlockPlaybook,
+                RangeSweepReclaimPlaybook, RangeQMPlaybook,
+                RangeMeanReversionPlaybook,
+                RangeCompressionBreakoutPlaybook,
                 QMM5Playbook, QMD1Playbook, NarrativePlaybook):
         assert cls.live is True, cls.name
 

@@ -32,11 +32,18 @@ from pathlib import Path
 #: the whole roster executes on the demo; backtests map where a
 #: setup historically worked, they never gate this list.  Forward
 #: live-demo performance is the verdict.
-EXECUTE_PLAYBOOK_NAMES: tuple[str, ...] = (
-    "sweep_reversal", "fvg_midline", "trendline_retest", "fvg_limit",
-    "inversion", "killzone_open", "judas_swing",
-    "turtle_soup", "v_reversal", "retracement_trap", "order_block",
-    "qm_m5", "qm_d1", "narrative")
+#:
+#: FUNNEL PATCH §3: these lists are DERIVED from the one playbook
+#: registry (``playbook_registry.PLAYBOOK_REGISTRY``) — the runner's
+#: roster, the native-clock routes and this manageable set can no
+#: longer drift apart.  The registry carries all 18 playbooks,
+#: including the four range playbooks an earlier hand-maintained
+#: copy of this list silently omitted (they could not be killed
+#: via /set at all, and _clean dropped their persisted kill
+#: entries without a trace).
+from .playbook_registry import PLAYBOOK_NAMES as _REGISTRY_NAMES
+
+EXECUTE_PLAYBOOK_NAMES: tuple[str, ...] = _REGISTRY_NAMES
 #: Shadow playbooks: evaluated + logged, never ordered.  EMPTY since
 #: the owner directive of 2026-10-22 (the roster is live; a playbook
 #: leaves execution via the kill switch, not a shadow tier).
@@ -96,6 +103,21 @@ def _clean(values: dict) -> dict:
         out["disabled_playbooks"] = sorted(
             {str(n) for n in disabled if str(n) in ALL_PLAYBOOK_NAMES})
     return out
+
+
+def unknown_disabled_names(values) -> list[str]:
+    """Persisted ``disabled_playbooks`` entries that are NOT real
+    playbooks — the entries :func:`_clean` will drop.  Dropping is
+    correct (a typo must not invent a playbook), but it must never
+    be silent again: the runner journals this list at startup so a
+    vanished kill-switch entry is a visible fact, not a mystery."""
+    if not isinstance(values, dict):
+        return []
+    disabled = values.get("disabled_playbooks")
+    if not isinstance(disabled, list):
+        return []
+    return sorted({str(n) for n in disabled
+                   if str(n) not in ALL_PLAYBOOK_NAMES})
 
 
 def _parse_bool(raw: str) -> bool | None:

@@ -475,6 +475,18 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(f"  {fmt_none()} yet")
         for name in sorted(counts):
             lines.append(f"  🎯 `{name}`: {counts[name]}")
+    # FUNNEL (§1): the decision funnel — which playbooks were
+    # EVALUATED (per clock), where candidates disappeared, and the
+    # armed plan's last disposition.  This is the section that
+    # answers "why no trades" at the correct stage instead of by
+    # guesswork (directive §3 exit criterion).  Guarded — old
+    # runners lack it.
+    if ctrl is not None:
+        funnel = getattr(ctrl, "funnel_line", None)
+        if callable(funnel):
+            lines.append("")
+            lines.append(fmt_section("🧭", "Decision Funnel"))
+            lines.append(funnel())
     lines.append(fmt_next_cta("/playbooks", "/health", "/trades"))
     return CommandResult(text="\n".join(lines),
                          reply_markup=mt5_control_keyboard())

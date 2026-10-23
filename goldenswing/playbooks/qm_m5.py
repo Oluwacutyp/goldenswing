@@ -1,4 +1,4 @@
-"""QMM5Playbook — Quasimodo reversal on M5 (SHADOW, unvalidated).
+"""QMM5Playbook — Quasimodo reversal on M5 (LIVE on demo, unvalidated).
 
 Mined definition (practitioner QM, ICT/SMC reversal variant — NOT
 head-and-shoulders: a QM has no second shoulder):
@@ -677,7 +677,13 @@ class QMM5Playbook(QMPlaybookBase):
         "the head, first retracement touch of the QM level within 48 "
         "bars, neckline target >= 1.0R. Session-agnostic UNTIL "
         "measured — timezone/session mapping is a separate task and "
-        "must not be assumed here."
+        "must not be assumed here. "
+        "EXECUTION (funnel §2, 2026-10-23): the MT5 runner evaluates "
+        "this playbook on its native M5 route (_run_qm_m5) over the "
+        "real M5 frame — it is NOT fed H1 bars by the roster — and a "
+        "qualifying touch reaches the shared order path through a "
+        "judgment-shaped decision step (evidence weighed, hard stops "
+        "only for trade-existence facts)."
     )
     #: Session-agnostic until measured (timezone mapping is Task 2).
     session_scope = "any"

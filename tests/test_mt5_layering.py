@@ -178,7 +178,7 @@ def test_tick_manager_trim_closes_top_layer():
 def test_layer_added_only_in_profit_same_direction(tmp_path):
     runner = _runner(tmp_path)
     _base_position(runner)
-    runner._last_tick = {"mid": 2010.0}  # +0.8R: in profit
+    runner._last_tick = {"mid": 2010.0, "bid": 2009.8, "ask": 2010.2}  # +0.8R: in profit
     runner._stack = SimpleNamespace(frames={"H1": _df(OFF + ASIA)})
     stats: dict = {}
     runner._try_layer(SimpleNamespace(name="fvg_midline"),
@@ -195,14 +195,14 @@ def test_layer_added_only_in_profit_same_direction(tmp_path):
 def test_layer_skipped_when_flat_or_against(tmp_path):
     runner = _runner(tmp_path)
     _base_position(runner)
-    runner._last_tick = {"mid": 2002.0}  # +0.16R: not in profit
+    runner._last_tick = {"mid": 2002.0, "bid": 2001.8, "ask": 2002.2}  # +0.16R: not in profit
     stats: dict = {}
     runner._try_layer(SimpleNamespace(name="fvg_midline"),
                       _layer_sig(), stats)
     assert stats.get("layers", 0) == 0
     assert len(runner.tick_manager.layers(101)) == 1
     # Against the position: no layer, no flip.
-    runner._last_tick = {"mid": 2010.0}
+    runner._last_tick = {"mid": 2010.0, "bid": 2009.8, "ask": 2010.2}
     runner._try_layer(SimpleNamespace(name="fvg_midline"),
                       _layer_sig(direction=-1, entry_ref=1990.0,
                                  invalidation=2000.0), stats)
@@ -216,7 +216,7 @@ def test_layer_risk_cap_blocks(tmp_path):
     # once the first is in (budget < 0.01 lot).
     runner = _runner(tmp_path, layer_max_total_risk_mult=1.01)
     _base_position(runner)
-    runner._last_tick = {"mid": 2010.0}
+    runner._last_tick = {"mid": 2010.0, "bid": 2009.8, "ask": 2010.2}
     runner._stack = SimpleNamespace(frames={"H1": _df(OFF + ASIA)})
     stats: dict = {}
     runner._try_layer(SimpleNamespace(name="fvg_midline"),
@@ -232,7 +232,7 @@ def test_layer_risk_cap_blocks(tmp_path):
 def test_layer_max_layers(tmp_path):
     runner = _runner(tmp_path, layer_max_layers=2)
     _base_position(runner)
-    runner._last_tick = {"mid": 2010.0}
+    runner._last_tick = {"mid": 2010.0, "bid": 2009.8, "ask": 2010.2}
     runner._stack = SimpleNamespace(frames={"H1": _df(OFF + ASIA)})
     stats: dict = {}
     runner._try_layer(SimpleNamespace(name="fvg_midline"),
@@ -246,7 +246,7 @@ def test_layer_max_layers(tmp_path):
 def test_layer_stop_via_runner_closes_layer_only(tmp_path):
     runner = _runner(tmp_path)
     _base_position(runner)
-    runner._last_tick = {"mid": 2010.0}
+    runner._last_tick = {"mid": 2010.0, "bid": 2009.8, "ask": 2010.2}
     runner._stack = SimpleNamespace(frames={"H1": _df(OFF + ASIA)})
     stats: dict = {}
     # Layer with a TIGHT stop (invalidation 2005 -> stop0 2002.5), above
@@ -268,7 +268,7 @@ def test_layer_stop_via_runner_closes_layer_only(tmp_path):
 def test_trim_top_layer_via_runner(tmp_path):
     runner = _runner(tmp_path)
     _base_position(runner)
-    runner._last_tick = {"mid": 2010.0}
+    runner._last_tick = {"mid": 2010.0, "bid": 2009.8, "ask": 2010.2}
     runner._stack = SimpleNamespace(frames={"H1": _df(OFF + ASIA)})
     stats: dict = {}
     runner._try_layer(SimpleNamespace(name="fvg_midline"),
@@ -285,7 +285,7 @@ def test_pending_layer_fills_onto_position(tmp_path):
     runner = _runner(tmp_path)
     _base_position(runner)
     # A pending layer: entry behind price (pullback) -> LIMIT.
-    runner._last_tick = {"mid": 2015.0}
+    runner._last_tick = {"mid": 2015.0, "bid": 2014.8, "ask": 2015.2}
     runner._stack = SimpleNamespace(frames={"H1": _df(OFF + ASIA)})
     stats: dict = {}
     runner._try_layer(SimpleNamespace(name="fvg_midline"),
@@ -307,7 +307,7 @@ def test_pending_layer_fills_onto_position(tmp_path):
 def _signal_path_runner(tmp_path, h1):
     runner = _runner(tmp_path)
     runner._stack = SimpleNamespace(frames={"H1": h1})
-    runner._last_tick = {"mid": 102.0}
+    runner._last_tick = {"mid": 102.0, "bid": 101.95, "ask": 102.05}
     runner._build_chart = lambda *a, **k: (None, None)
     runner._send_alert = lambda *a, **k: None
     return runner

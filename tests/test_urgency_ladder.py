@@ -246,7 +246,7 @@ def _runner(tmp_path, *, ladder_enabled=True):
     runner = MT5Runner(cfg, feed=feed, executor=_Exec())
     h1 = _flat_frame(60, spread=2.0)
     runner._stack = TimeframeStack.from_frames({"H1": h1})
-    runner._last_tick = {"mid": 2010.0,  # above the POI: pullback
+    runner._last_tick = {"mid": 2010.0, "bid": 2009.8, "ask": 2010.2,  # above the POI: pullback
                          "time": pd.Timestamp(
                              "2026-01-05 10:00", tz="UTC"
                          ).to_pydatetime()}
@@ -280,7 +280,7 @@ def test_runner_ladder_places_rung_zero_and_advances_on_expiry(tmp_path):
     # Expiry: the rung cancels, the next rung is placed.
     state.expiry_bar = 59
     runner._on_h1_close(
-        {"mid": 2000.5, "time": pd.Timestamp(
+        {"mid": 2000.5, "bid": 2000.3, "ask": 2000.7, "time": pd.Timestamp(
             "2026-01-05 11:00", tz="UTC").to_pydatetime()}, {})
     assert len(runner._pending_orders) == 1
     state = next(iter(runner._pending_orders.values()))

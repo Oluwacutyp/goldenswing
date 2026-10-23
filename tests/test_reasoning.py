@@ -204,7 +204,7 @@ def test_runner_accepted_signal_carries_reasoning_and_study(tmp_path):
         index=pd.date_range("2026-01-01", periods=60, freq="h",
                             tz="UTC"))
     runner._stack = TimeframeStack.from_frames({"H1": h1})
-    runner._last_tick = {"mid": 2000.0, "spread": 30,
+    runner._last_tick = {"mid": 2000.0, "bid": 1999.8, "ask": 2000.2,
                          "time": pd.Timestamp(
                              "2026-01-05 10:00", tz="UTC"
                          ).to_pydatetime()}

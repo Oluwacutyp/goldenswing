@@ -82,18 +82,22 @@ def test_mt5_execute_set_defaults_to_all_evaluated(tmp_path):
     assert MT5RunnerConfig().execute_playbooks is None
     runner = _runner(tmp_path)
     evaluated = {pb.name for pb in runner._get_playbooks()}
+    # FUNNEL §2/§3: the H1 roster is 16 — qm_m5 left for its
+    # native M5 route (_run_qm_m5), like qm_d1 on the D1 route.
+    # Both native routes stay execute-eligible by default.
     assert evaluated == {"sweep_reversal", "fvg_midline",
                          "trendline_retest", "fvg_limit",
                          "inversion", "killzone_open", "judas_swing",
                          "turtle_soup", "v_reversal",
-                         "retracement_trap", "order_block", "qm_m5",
+                         "retracement_trap", "order_block",
                          "range_sweep_reclaim", "range_qm",
                          "range_mean_reversion",
                          "range_compression_breakout", "narrative"}
     # Evaluated set == execute set under the default config —
-    # including the playbooks the old tier kept shadow (qm_m5,
-    # turtle_soup, v_reversal, retracement_trap, order_block).
+    # including the playbooks the old tier kept shadow
+    # (turtle_soup, v_reversal, retracement_trap, order_block).
     assert all(runner._executes(name) for name in evaluated)
+    assert runner._executes("qm_m5") and runner._executes("qm_d1")
     # An explicit tuple narrows execution to exactly its members;
     # evaluation is unaffected (the kill switch is separate).
     narrowed = _runner(tmp_path, execute_playbooks=("judas_swing",))

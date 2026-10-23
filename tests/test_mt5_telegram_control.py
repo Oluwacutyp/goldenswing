@@ -1,8 +1,9 @@
 """MT5 Telegram control: inline buttons, /config /set, confirm flow,
 owner-only enforcement, blocked-leg stats, playbook wiring.
 
-Covers: _get_playbooks instantiates all 17 playbooks and (A14)
-every one of them is execute-eligible by default — the shadow tier
+Covers: _get_playbooks instantiates all 16 H1-roster playbooks
+(qm_m5/qm_d1 run on their native clocks since funnel §2/§3) and
+(A14) every one of them is execute-eligible by default — the shadow tier
 is abolished, the per-playbook kill switch is the only opt-out;
 judas_swing fires live into a real order on realistic geometry;
 callback_query handling (answer + act + message edited); Pause /
@@ -120,7 +121,12 @@ def _h1():
     return pd.DataFrame(
         {"open": [2000.0] * 40, "high": [2001.0] * 40,
          "low": [1999.0] * 40, "close": [2000.0] * 40,
-         "volume": [100.0] * 40},
+         "volume": [100.0] * 40,
+         # MT5 bar convention: spread in POINTS (30 pts = 0.30
+         # price at point 0.01) — the repo-wide test convention;
+         # required input for the ruling-6 friction gate, which
+         # reads the newest bar's spread when no tick is set.
+         "spread": [30] * 40},
         index=idx)
 
 
@@ -204,6 +210,16 @@ def _judas_frame():
 def _run_path(runner, verdict=None, stats=None, frame=None):
     h1 = frame if frame is not None else _h1()
     runner._stack = TimeframeStack.from_frames({"H1": h1})
+    if not runner._last_tick:
+        # The live desk ALWAYS has a current quote at the order
+        # boundary (ticks drive every evaluation); the harness
+        # completes that world — a 0.30 spread on this file's
+        # 2000-level geometry, the input the ruling-6 friction
+        # gate measures.  Tests that set their own tick keep it.
+        runner._last_tick = {
+            "mid": 2000.0, "bid": 1999.85, "ask": 2000.15,
+            "spread": 0.3,
+            "time": h1.index[-1] + pd.Timedelta(hours=1)}
     stats = stats if stats is not None else {
         "signals": 0, "gated": 0, "executed": 0}
     runner._run_signal_path(h1, len(h1) - 1, [], 2.0,
@@ -247,27 +263,35 @@ class FakeApi:
 
 # ------------------------------------------------------- playbook wiring
 
-def test_get_playbooks_instantiates_all_seventeen(tmp_path):
+def test_get_playbooks_instantiates_all_sixteen(tmp_path):
+    # FUNNEL §2/§3: the H1 roster is the registry's ROSTER_SPECS —
+    # 16 playbooks.  qm_m5 is NOT here any more: it left the H1
+    # roster for its native M5 route (_run_qm_m5), exactly as
+    # qm_d1 runs on the D1 route; feeding either the H1 frame was
+    # the verified timeframe defect.
     runner = _runner(tmp_path)
     names = {pb.name for pb in runner._get_playbooks()}
     assert names == {"sweep_reversal", "fvg_midline", "trendline_retest",
                      "fvg_limit", "inversion", "killzone_open",
                      "judas_swing", "turtle_soup", "v_reversal",
-                     "retracement_trap", "order_block", "qm_m5",
+                     "retracement_trap", "order_block",
                      "range_sweep_reclaim", "range_qm",
                      "range_mean_reversion",
                      "range_compression_breakout",
                      # CHUNK 3: NarrativePlaybook is wired into the
                      # runner (fill -> management plan, close ->
-                     # STATE 7), so it is the 17th playbook.
+                     # STATE 7).
                      "narrative"}
+    assert "qm_m5" not in names and "qm_d1" not in names
     # A14: the default config carries NO execute list — None means
     # every evaluated playbook executes (the shadow tier is gone);
     # the formerly-shadow names are ordinary members of the set.
     assert runner.cfg.execute_playbooks is None
     assert all(runner._executes(n) for n in names)
     assert {"turtle_soup", "v_reversal", "retracement_trap",
-            "order_block", "qm_m5"} <= names
+            "order_block"} <= names
+    # The native routes remain execute-eligible by default.
+    assert runner._executes("qm_m5") and runner._executes("qm_d1")
 
 
 def test_judas_swing_fires_live_into_real_order(tmp_path):
