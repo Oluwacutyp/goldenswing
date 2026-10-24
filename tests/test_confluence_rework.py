@@ -150,10 +150,22 @@ def test_sizing_quantization_coarse_steps():
     assert r.ok and r.lots == Decimal("0.75")  # raw 0.90 -> 0.75
 
 
-def test_sizing_subminimum_declines_never_rounds_up():
+def test_sizing_subminimum_floors_to_minimum():
+    # Owner ruling 2026-10-24 (supersedes the old decline): a
+    # setup is account-agnostic — when the stop risk exceeds the
+    # balance the engine trades the broker MINIMUM, never
+    # abandons.  risk 5 over a $10 stop -> raw 0.005 lots ->
+    # floored UP to the 0.01 minimum, flagged min_override,
+    # estimated stop exposure $10, drag -$5 (the honest
+    # arithmetic: the floor carries more than authorized).
+    # Step quantization for raw >= minimum still floors DOWN.
     r = size_for_risk(Decimal("5"), 10.0, gold_spec())
-    assert not r.ok and r.verdict == "decline_below_min"
-    assert r.lots is None
+    assert r.ok and r.verdict == "ok"
+    assert r.lots == Decimal("0.01")
+    assert r.min_override is True
+    assert r.raw_lots == Decimal("0.005")
+    assert r.estimated_stop_exposure == Decimal("10")
+    assert r.drag == Decimal("-5")
 
 
 def test_sizing_decimal_discipline_beats_float_math():

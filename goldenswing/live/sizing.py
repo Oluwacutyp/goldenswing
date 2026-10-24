@@ -5,6 +5,14 @@ never hardcoded lots.  Owner ruling 2026-10-23: dynamic risk
 sizing is the SOLE sizing path on the MT5 engine — the fixed-lots
 config mode that A13 kept as an override is revoked and removed;
 this module's ``size_for_risk`` is the production sizing core.
+Owner ruling 2026-10-24 (trader sizing doctrine): a setup is
+account-agnostic — size scales with equity, and when the stop
+risk exceeds the balance the engine trades the broker MINIMUM
+size, never abandons the trade.  The only hard number is the
+broker minimum (0.01 lot on XAUUSDm); ``decline_below_min`` and
+``risk_pct`` as a refusal gate are DEAD.  The coefficient
+``cfg.risk_pct`` (default 0.01) remains only as a sizing
+coefficient inside the formula — never a gate.
 
 Hard rules implemented here:
 - **Decimal everywhere.**  Every Decimal is constructed via
@@ -15,9 +23,17 @@ Hard rules implemented here:
   0.05 / 0.25, not only 0.01 (quantize-to-exponent is not).
 - Clamp to VOLUME_MAX; respect VOLUME_LIMIT against already-open
   volume on the symbol.
-- Floored result below VOLUME_MIN = **DECLINE** (a verdict with its
-  numbers, journaled by the caller) — never round up: rounding up
-  spends risk nobody authorized.
+- Quantized result below VOLUME_MIN = **sized at the minimum**
+  (owner ruling 2026-10-24): lots = VOLUME_MIN, verdict "ok",
+  ``min_override=True`` — journaled by the caller, never silent.
+  The old "never round up" rationale now governs step
+  quantization for raw >= minimum (still floors DOWN) and the
+  VOLUME_MAX clamp; the below-minimum floor UP to the broker
+  minimum is an owner-authorized floor, not a silent round-up,
+  because it is flagged on every record that carries it.
+  VOLUME_LIMIT and nonpositive-input declines are unchanged:
+  a limit that cannot fit the minimum is a broker constraint,
+  not a sizing choice.
 - Margin is checked by the caller before submit (it needs the live
   account); this module reports the requirement inputs.
 
@@ -93,17 +109,36 @@ def quantize_down(raw: Decimal, step: Decimal) -> Decimal:
 
 @dataclass
 class SizingResult:
-    verdict: str            # "ok" | "decline_below_min" |
-    # "decline_volume_limit" | "decline_nonpositive"
+    verdict: str            # "ok" | "decline_volume_limit" |
+    # "decline_nonpositive" (decline_below_min retired 2026-10-24:
+    # below-minimum now sizes at the minimum, see min_override)
     lots: Decimal | None    # quantized lots when verdict == "ok"
     raw_lots: Decimal       # pre-quantization size
     risk_money: Decimal     # authorized risk for this layer
     realized_risk: Decimal  # risk the quantized lots actually carry
-    drag: Decimal           # authorized - realized (>= 0)
+    # — ESTIMATED stop exposure at order time (lots * stop ticks *
+    # tick value), NOT the trade's final realized P&L, which is
+    # known only at close.  Callers journal it under that name.
+    drag: Decimal           # authorized - realized (>= 0, except
+    # exactly on a min_override, where it goes NEGATIVE: the floor
+    # carries more exposure than the authorization — the honest
+    # arithmetic, flagged by min_override, never hidden)
+    min_override: bool = False  # True exactly when raw < minimum
+    # and the result was floored UP to the broker minimum per the
+    # 2026-10-24 owner ruling.  Layers (optional additions) must
+    # still DECLINE on this flag: headroom that cannot fit the
+    # minimum is a ceiling refusal, not a base-order floor.
 
     @property
     def ok(self) -> bool:
         return self.verdict == "ok" and self.lots is not None
+
+    @property
+    def estimated_stop_exposure(self) -> Decimal:
+        """Alias for realized_risk under its honest name: the
+        exposure at the stop if the trade is placed at these lots.
+        Final loss can exceed it (gaps/slippage)."""
+        return self.realized_risk
 
 
 def size_for_risk(risk_money, stop_distance, spec, *,
@@ -114,6 +149,12 @@ def size_for_risk(risk_money, stop_distance, spec, *,
 
     ``spec`` is live/risk.py's SymbolSpec (floats) — converted via
     D() at the boundary; all arithmetic after that is Decimal.
+
+    Below-minimum rule (owner ruling 2026-10-24): when the
+    step-quantized size falls below the broker minimum, the result
+    is sized AT the minimum with ``min_override=True`` — the
+    engine trades, never abandons.  The caller journals the flag
+    and the estimated stop exposure on every such record.
     """
     cons = constraints or VolumeConstraints.from_spec(spec)
     risk_money = D(risk_money)
@@ -141,9 +182,10 @@ def size_for_risk(risk_money, stop_distance, spec, *,
                                     risk_money, realized,
                                     risk_money - realized)
     if lots < cons.min_volume:
-        realized = lots * ticks * tick_value
-        return SizingResult("decline_below_min", None, raw, risk_money,
-                            realized, risk_money - realized)
+        # Min floor (2026-10-24 ruling): trade the minimum, flag it.
+        realized = cons.min_volume * ticks * tick_value
+        return SizingResult("ok", cons.min_volume, raw, risk_money,
+                            realized, risk_money - realized, True)
     realized = lots * ticks * tick_value
     return SizingResult("ok", lots, raw, risk_money, realized,
                         risk_money - realized)

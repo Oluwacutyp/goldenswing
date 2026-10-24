@@ -437,51 +437,75 @@ def test_manifest_surfaces_effective_sizing_mode(tmp_path):
     assert roster["range_qm"]["shadow_evaluation"] is True
 
 
-def test_decision_solvency_refuses_over_budget_at_decision(tmp_path):
-    """PREMISE CORRECTION (owner ruling 2026-10-23): the original
-    test pinned the EC2 burst seam — $12 equity, fixed 0.01 lots
-    risking ~4.45 against a $0.36 daily-loss ROOM, refused at
-    decision.  Both premises are revoked: no fixed lots, no
-    daily room.  Under the dynamic rule the $12 account's budget
-    is $0.12 (1%); the strategy still QUALIFIES the setup
-    (analytical layer unchanged), decision-stage solvency passes
-    under the sizing rule, and the shared order path refuses
-    with gate.solvency because the smallest permitted order
-    exceeds the budget — a reason-coded abstention, no order."""
+def test_decision_solvency_places_minimum_under_new_ruling(tmp_path):
+    """OWNER RULING 2026-10-24 (reverses the 2026-10-23 abstention
+    this test used to pin): a setup is account-agnostic — when
+    the stop risk exceeds the balance the engine trades the
+    broker MINIMUM, never abandons.  The $12 account's sizing
+    authorization is $0.096 (1% x session 0.8); the strategy
+    still QUALIFIES the setup (analytical layer unchanged),
+    decision-stage solvency PASSES under the effective sizing
+    mode, and the shared order path PLACES 0.01 lots with
+    min_override flagged and estimated stop exposure ~$4.67
+    (drag negative — the honest arithmetic of the floor).
+    "daily loss room" stays gone (revoked premise, unchanged)."""
     runner = _small_account_runner(tmp_path)
     runner._run_qm_m5(_m5_fixture(), {})
-    assert runner.executor.orders == []
+    assert len(runner.executor.orders) == 1
+    assert runner.executor.orders[0]["volume"] == pytest.approx(0.01)
     rec = _candidate_records(runner)[0]
     dec = rec["decision"]
-    assert dec["result"] == "refused"
-    assert dec["reason_code"] == "gate.solvency"
-    assert dec["order_result"] == "refused_in_order_path"
+    assert dec["result"] == "accepted"
+    assert dec["reason_code"] is None
+    assert dec["order_result"] == "placed_pending"
     assert "daily loss room" not in dec["reason"]
     # Readable at a glance (amendment 2): the STRATEGY qualified
-    # this setup; the RISK LAYER refused it.  Not a strategy
-    # failure — the risk layer doing its job.
+    # this setup; the RISK LAYER sized it at the minimum.  Not
+    # a strategy failure — the sizing rule doing its job.
     assert dec["analytical_verdict"] == {
         "verdict": "qualified", "reason_code": None}
     assert dec["execution"] == {
-        "eligible": False, "outcome": "refused_in_order_path",
-        "reason_code": "gate.solvency"}
+        "eligible": True, "outcome": "placed_pending",
+        "reason_code": None}
+    solv = [c for c in dec["hard_risk_checks"]
+            if c["check"].startswith("decision_solvency")]
+    assert solv and solv[0]["result"] == "pass"
+    detail = next(iter(runner._sizing_detail.values()))
+    assert detail["min_override"] is True
+    assert detail["lots"] == pytest.approx(0.01)
+    assert detail["estimated_stop_exposure"] == \
+        pytest.approx(4.6714, rel=1e-3)
+    assert detail["drag"] < 0
 
 
-def test_invalid_risk_sizing_declines_never_falls_back(tmp_path):
-    """Risk mode, tiny account: the order path's risk sizing
-    declines (budget cannot fund the minimum lot) — and does
-    NOT silently rescue the trade with fixed lots."""
+def test_minimum_lot_is_not_a_fixed_lots_fallback(tmp_path):
+    """OWNER RULING 2026-10-24: risk mode, tiny account — the
+    budget cannot fund the minimum lot, so the order path sizes
+    AT the minimum (min_override) instead of declining.  That
+    floor is the owner-authorized sizing rule, NOT a silent
+    rescue with fixed lots: the fixed-lots mode stays revoked
+    (manifest carries no fixed-lots keys, sizing_mode 'risk'),
+    and no sizing_decline is recorded for the below-minimum
+    case (volume-limit / nonpositive declines are untouched)."""
     runner = _small_account_runner(tmp_path)  # no fixed_lots
     runner._run_qm_m5(_m5_fixture(), {})
-    assert runner.executor.orders == []
+    assert len(runner.executor.orders) == 1
+    assert runner.executor.orders[0]["volume"] == pytest.approx(0.01)
     sigs = [r for r in _signal_records(runner)
             if r.get("playbook") == "qm_m5"]
-    assert any("sizing_decline" in str(r.get("reason", ""))
-               for r in sigs)
+    assert not any("sizing_decline" in str(r.get("reason", ""))
+                   for r in sigs)
     rec = _candidate_records(runner)[0]
-    assert rec["decision"]["result"] == "refused"
-    assert rec["decision"]["order_result"] == "refused_in_order_path"
-    assert rec["decision"]["reason_code"] == "gate.solvency"
+    assert rec["decision"]["result"] == "accepted"
+    assert rec["decision"]["order_result"] == "placed_pending"
+    assert rec["decision"]["reason_code"] is None
+    detail = next(iter(runner._sizing_detail.values()))
+    assert detail["min_override"] is True
+    runner._journal_manifest()
+    man = [r for r in runner.journal.records()
+           if r.get("type") == "manifest"][-1]
+    assert "fixed_lots" not in man["doctrine"]
+    assert man["doctrine"]["sizing_mode"] == "risk"
 
 
 # ------------------------------------- addendum A: dynamic sizing
@@ -532,15 +556,16 @@ def _equity_runner(tmp_path, monkeypatch, equity, stop=100.34):
     return _wire(runner, _m5_fixture())
 
 
-def test_dynamic_sizing_scales_with_equity_and_stop(
+def test_dynamic_sizing_scales_with_equity_and_floors_at_minimum(
         tmp_path, monkeypatch):
     """Addendum A: the SAME eligible setup at $12 / $24 / $1,000
     / $10,000 equity — sizes follow the configured risk rule
-    mechanically (abstain below the minimum lot, round DOWN to
+    mechanically (floor at the minimum lot, round DOWN to
     the step, shrink as the stop widens); the strategy evidence
     (score, components, sleeve base) is byte-identical at every
     balance.  The balance is a test input, never a design
-    target."""
+    target.  OWNER RULING 2026-10-24: $12 / $24 no longer
+    abstain — they trade the minimum."""
     runs = {}
     for equity in (12.0, 24.0, 1000.0, 10000.0):
         sub = tmp_path / f"eq{int(equity)}"
@@ -548,26 +573,36 @@ def test_dynamic_sizing_scales_with_equity_and_stop(
         runner = _equity_runner(sub, monkeypatch, equity)
         runner._run_qm_m5(_m5_fixture(), {})
         runs[equity] = runner
-    # $12 and $24: the budget (1% x band 0.75 = $0.09 / $0.18)
-    # cannot fund the minimum 0.01 lot at a ~4.34 stop ($4.34
-    # risk) -> reason-coded ABSTENTION, never a forced lot.
+    # $12 and $24: the authorization (1% x session 0.8 = $0.096
+    # / $0.192) cannot fund the minimum 0.01 lot at the ~$4.84
+    # buffered stop ($4.84 exposure) -> owner ruling 2026-10-24:
+    # TRADE the minimum (min_override flagged, drag negative),
+    # never a forced abstention.
     for equity in (12.0, 24.0):
         runner = runs[equity]
-        assert runner.executor.orders == []
+        assert len(runner.executor.orders) == 1
+        assert runner.executor.orders[0]["volume"] == \
+            pytest.approx(0.01)
         sigs = [r for r in _signal_records(runner)
                 if r.get("playbook") == "qm_m5"]
-        assert any("sizing_decline" in str(r.get("reason", ""))
-                   for r in sigs), equity
-    # $1,000: budget $7.50 -> raw ~0.017 lots -> rounded DOWN
+        assert not any("sizing_decline" in str(r.get("reason", ""))
+                       for r in sigs), equity
+        detail = next(iter(runner._sizing_detail.values()))
+        assert detail["min_override"] is True
+        assert detail["estimated_stop_exposure"] == \
+            pytest.approx(4.84, rel=1e-3)
+        assert detail["drag"] < 0
+    # $1,000: budget $8.00 -> raw ~0.0165 lots -> rounded DOWN
     # to the 0.01 step.  $10,000: a mechanically larger size —
-    # and never more than the un-multiplied ceiling (budget $75
-    # / $4.34 risk per 0.01 lot = 0.17 lots; session/posture
-    # multipliers only shrink it).  The sizing journal proves
-    # the equation: realized risk <= authorized risk, always.
+    # raw ~0.165 lots -> floored to 0.16, under the ceiling
+    # (budget $80.00 / $4.84 risk per 0.01 lot = 0.165 lots;
+    # session/posture multipliers only shrink it).  The sizing
+    # journal proves the equation for non-floor sizes:
+    # realized risk <= authorized risk.
     assert runs[1000.0].executor.orders[0]["volume"] == \
         pytest.approx(0.01)
     v10k = runs[10000.0].executor.orders[0]["volume"]
-    assert 0.01 < v10k <= 0.17 + 1e-9
+    assert v10k == pytest.approx(0.16)
     for runner in (runs[1000.0], runs[10000.0]):
         detail = next(iter(runner._sizing_detail.values()))
         assert detail["lots"] == pytest.approx(
@@ -593,9 +628,10 @@ def test_dynamic_sizing_scales_with_equity_and_stop(
     # Amendment 2, both halves, explicitly:
     # (a) the ANALYTICAL VERDICT is identical at every balance —
     #     qualified, same (absent) analytical reason;
-    # (b) EXECUTION ELIGIBILITY differs ONLY through the risk
-    #     layer, and every difference carries its risk-layer
-    #     reason code (gate.solvency — the sizing decline).
+    # (b) EXECUTION ELIGIBILITY is True at every balance under
+    #     the 2026-10-24 ruling — the small-balance difference
+    #     is the min_override flag + negative drag in the sizing
+    #     journal, not a refusal.
     analytical = {}
     execution = {}
     for equity, runner in runs.items():
@@ -606,13 +642,11 @@ def test_dynamic_sizing_scales_with_equity_and_stop(
                 for a in analytical.values()}) == 1
     assert analytical[12.0] == {"verdict": "qualified",
                                 "reason_code": None}
-    for equity in (12.0, 24.0):
+    for equity in (12.0, 24.0, 1000.0, 10000.0):
         ex = execution[equity]
-        assert ex["eligible"] is False
-        assert ex["outcome"] == "refused_in_order_path"
-        assert ex["reason_code"] == "gate.solvency"
-    for equity in (1000.0, 10000.0):
-        assert execution[equity]["eligible"] is True
+        assert ex["eligible"] is True
+        assert ex["outcome"] == "placed_pending"
+        assert ex["reason_code"] is None
 
 
 def test_sizing_precedence_is_explicit_not_contradictory():

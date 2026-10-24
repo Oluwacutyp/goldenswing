@@ -5627,27 +5627,50 @@ class MT5Runner:
         alert_id = f"MT5-arrival_zone-{bar}"
         detail = None
         if self._sizing_mode() == "risk":
-            total = float(score.total)
-            band = 1.0 if total >= 75.0 else (
-                0.75 if total >= 60.0 else 0.5)
+            # Same formula as the base-order risk path (equity x
+            # k x C x traffic tier), C held at x1.0 — no honest
+            # confidence field exists at order time; the old
+            # score band is REMOVED (owner ruling 2026-10-24).
+            # Below-minimum floors to the broker minimum with
+            # min_override flagged (see size_for_risk).
             _tier, tier_mult, _ceil = self._traffic(zone_d)
+            _k = float(self.cfg.risk_pct)
+            _confidence_mult = 1.0  # unresolved — see base path
             risk_money = float(acct.get("equity", 0.0)) \
-                * float(self.cfg.risk_pct) * band * tier_mult
+                * _k * _confidence_mult * tier_mult
+            _stop_dist = abs(entry - stop0)
             result = size_for_risk(
-                risk_money, abs(entry - stop0), spec)
+                risk_money, _stop_dist, spec)
             if not result.ok:
                 self.journal.log_note(
                     f"mt5 resting limit: DECLINED sizing "
                     f"{result.verdict} at fresh MAJOR "
-                    f"{major.get('tf', '?')} {prox:.1f} (never "
-                    "rounded up)")
+                    f"{major.get('tf', '?')} {prox:.1f} "
+                    "(volume-limit / nonpositive refusal only — "
+                    "below-minimum now floors to the minimum)")
                 return
             lots = float(result.lots)
             detail = {"authorized_risk": float(result.risk_money),
                       "realized_risk": float(result.realized_risk),
+                      "estimated_stop_exposure":
+                          float(result.estimated_stop_exposure),
                       "drag": float(result.drag),
                       "raw_lots": float(result.raw_lots),
-                      "lots": lots}
+                      "lots": lots,
+                      "min_override": bool(result.min_override),
+                      "sizing_coefficient": _k,
+                      "confidence_mult": _confidence_mult,
+                      "scalars": {
+                          "traffic_tier": _tier,
+                          "traffic_mult": float(tier_mult)},
+                      "spec": {
+                          "symbol": self.cfg.symbol,
+                          "tick_size": float(spec.tick_size),
+                          "tick_value": float(spec.tick_value),
+                          "volume_min": float(spec.volume_min),
+                          "volume_step": float(spec.volume_step),
+                          "volume_max": float(spec.volume_max)},
+                      "stop_distance": float(_stop_dist)}
         else:
             sizing = size_position(
                 balance=float(acct.get("equity", 0.0)),
@@ -8058,14 +8081,40 @@ class MT5Runner:
                 return
             result = size_for_risk(
                 headroom, abs(float(sig.entry_ref) - stop0), spec)
+            if result.min_override:
+                # Layer-headroom refusal (2026-10-24 ruling):
+                # layers are OPTIONAL additions — headroom that
+                # cannot fit the broker minimum does NOT floor
+                # to minimum lots over the ceiling.  This is a
+                # distinct reason from a base-order sizing
+                # decline (base orders DO take the floor); the
+                # base position is unaffected.
+                self.journal.log_note(
+                    f"mt5: layer DECLINED {pb.name}: headroom "
+                    f"{headroom} over stop distance "
+                    f"{abs(float(sig.entry_ref) - stop0):.2f} gives "
+                    f"raw {result.raw_lots} lots, below the broker "
+                    "minimum — layer skipped, ceiling preserved")
+                log_signal(
+                    self.journal,
+                    signal_id=f"MT5-{pb.name}-{sig.index}-layer",
+                    playbook=pb.name, direction=int(sig.direction),
+                    score=float(sig.score), decision="gated",
+                    reason="layer_headroom: headroom cannot fit "
+                           "minimum lots",
+                    entry=float(sig.entry_ref), stop=float(stop0),
+                    score_breakdown=(score.breakdown()
+                                     if score is not None else None),
+                    trigger_source="funding_layer",
+                    pool=pool.state())
+                return
             if not result.ok:
                 self.journal.log_note(
                     f"mt5: layer DECLINED {pb.name}: sizing "
                     f"{result.verdict} — headroom {headroom} over "
                     f"stop distance "
                     f"{abs(float(sig.entry_ref) - stop0):.2f} gives "
-                    f"raw {result.raw_lots} lots, below the broker "
-                    "minimum after step flooring (never rounded up)")
+                    f"raw {result.raw_lots} lots")
                 log_signal(
                     self.journal,
                     signal_id=f"MT5-{pb.name}-{sig.index}-layer",
@@ -8082,8 +8131,13 @@ class MT5Runner:
                 f"MT5-{pb.name}-{sig.index}-layer"] = {
                     "authorized_risk": float(result.risk_money),
                     "realized_risk": float(result.realized_risk),
+                    "estimated_stop_exposure":
+                        float(result.estimated_stop_exposure),
                     "drag": float(result.drag),
-                    "raw_lots": float(result.raw_lots)}
+                    "raw_lots": float(result.raw_lots),
+                    "lots": float(result.lots),
+                    "min_override": False,
+                    "headroom": float(headroom)}
             self._place_live_order(
                 pb, sig, stats, verdict=verdict,
                 entry_bar=entry_bar, is_layer=True,
@@ -9054,44 +9108,61 @@ class MT5Runner:
             lots = float(layer_lots)
         elif self._sizing_mode() == "risk":
             # ---- A13 risk sizing (Decimal, quantized once) ------
-            # Risk money = equity x risk_pct x score band x traffic
-            # scalar x the legacy size multipliers (alignment /
-            # regime / news / session applied to the RISK, so the
-            # lot quantization happens exactly once, in Decimal).
-            total = float(score.total) if score is not None else 75.0
-            band = 1.0 if total >= 75.0 else (
-                0.75 if total >= 60.0 else 0.5)
+            # Risk money = equity x k x C x S, where k is the
+            # sizing coefficient (cfg.risk_pct — a proposed
+            # coefficient, NOT a refusal gate), C is the
+            # confidence multiplier, and S is the product of the
+            # kept non-gate scalars (traffic tier, verdict
+            # size_mult, news, posture, alignment, session),
+            # each applied to the RISK so lot quantization
+            # happens exactly once, in Decimal.
+            # C is held at x1.0: no honest confidence field
+            # exists at order time (score.total is a ranking
+            # total, not confidence — the old score band is
+            # REMOVED, owner ruling 2026-10-24).  The confidence
+            # definition is an open design task; until it lands,
+            # the formula carries C as a hook, never a fake.
             _tier, tier_mult, _ceil = self._traffic(zone_d)
-            risk_money = float(acct["equity"]) \
-                * float(self.cfg.risk_pct) * band * tier_mult
-            risk_money *= float(
+            _size_mult = float(
                 (verdict or {}).get("size_mult", 1.0) or 1.0)
+            _posture_mult = float(self._posture.size_scalar) \
+                if self._posture is not None else 1.0
+            _align_mult = float(self._alignment.size_multiplier) \
+                if self.cfg.golden_swing_sizing_enabled else 1.0
+            _session_mult = session_multiplier(
+                now_utc, self.cfg.session_multipliers)
+            _k = float(self.cfg.risk_pct)
+            _confidence_mult = 1.0  # unresolved — see above
+            risk_money = float(acct["equity"]) \
+                * _k * _confidence_mult * tier_mult
+            risk_money *= _size_mult
             risk_money *= float(news_mult)
             # P3 posture scalar (S1/S3): the scenario's size
             # expression — trend/rotation/choppy/session posture
             # priced into the risk, never a gate.
-            if self._posture is not None:
-                risk_money *= float(self._posture.size_scalar)
-            if self.cfg.golden_swing_sizing_enabled:
-                risk_money *= float(self._alignment.size_multiplier)
-            risk_money *= session_multiplier(
-                now_utc, self.cfg.session_multipliers)
+            risk_money *= _posture_mult
+            risk_money *= _align_mult
+            risk_money *= _session_mult
+            _stop_dist = abs(float(sig.entry_ref) - stop0)
             result = size_for_risk(
-                risk_money, abs(float(sig.entry_ref) - stop0), spec)
+                risk_money, _stop_dist, spec)
             if not result.ok:
                 # FUNNEL §1: a counter for the decline, so the
                 # evaluation record can classify this refusal as
                 # solvency (gate.solvency) instead of an unnamed
                 # order-path refusal.  Observation-only.
+                # Remaining declines here are broker/input
+                # constraints only (volume limit, nonpositive
+                # inputs) — below-minimum no longer declines:
+                # it floors to the broker minimum (2026-10-24).
                 stats["sizing_declined"] = stats.get(
                     "sizing_declined", 0) + 1
                 self.journal.log_note(
                     f"mt5: order DECLINED {pb.name}: sizing "
                     f"{result.verdict} — risk {risk_money:.2f} over "
                     f"stop distance "
-                    f"{abs(float(sig.entry_ref) - stop0):.2f} gives "
-                    f"raw {result.raw_lots} lots (below broker "
-                    "minimum after step flooring; never rounded up)")
+                    f"{_stop_dist:.2f} gives "
+                    f"raw {result.raw_lots} lots")
                 log_signal(
                     self.journal,
                     signal_id=f"MT5-{pb.name}-{sig.index}",
@@ -9108,9 +9179,39 @@ class MT5Runner:
             self._sizing_detail[f"MT5-{pb.name}-{sig.index}"] = {
                 "authorized_risk": float(result.risk_money),
                 "realized_risk": float(result.realized_risk),
+                # Estimated stop exposure at order time (NOT the
+                # trade's final realized P&L, known only at close).
+                "estimated_stop_exposure":
+                    float(result.estimated_stop_exposure),
                 "drag": float(result.drag),
                 "raw_lots": float(result.raw_lots),
-                "lots": lots}
+                "lots": lots,
+                # Min-floor flag (2026-10-24 ruling): True when
+                # the raw size fell below the broker minimum and
+                # the order was sized UP to the minimum.
+                "min_override": bool(result.min_override),
+                # Formula inputs, each journaled separately so
+                # the record reconstructs the size exactly.
+                "sizing_coefficient": _k,
+                "confidence_mult": _confidence_mult,
+                "scalars": {
+                    "traffic_tier": _tier,
+                    "traffic_mult": float(tier_mult),
+                    "size_mult": _size_mult,
+                    "size_mult_regime":
+                        (verdict or {}).get("regime", "trend"),
+                    "news_mult": float(news_mult),
+                    "posture_mult": _posture_mult,
+                    "alignment_mult": _align_mult,
+                    "session_mult": float(_session_mult)},
+                "spec": {
+                    "symbol": self.cfg.symbol,
+                    "tick_size": float(spec.tick_size),
+                    "tick_value": float(spec.tick_value),
+                    "volume_min": float(spec.volume_min),
+                    "volume_step": float(spec.volume_step),
+                    "volume_max": float(spec.volume_max)},
+                "stop_distance": float(_stop_dist)}
         else:
             sizing = size_position(balance=acct["equity"],
                                    risk_pct=self.cfg.risk_pct,
@@ -9342,10 +9443,13 @@ class MT5Runner:
             _pool = self._pools.get(int(res.ticket))
             self.journal.log_note(
                 f"mt5 sizing: {pb.name} authorized risk "
-                f"${_sd['authorized_risk']:.2f} -> realized "
-                f"${_sd['realized_risk']:.2f} (quantization drag "
+                f"${_sd['authorized_risk']:.2f} -> estimated stop "
+                f"exposure "
+                f"${_sd.get('estimated_stop_exposure', _sd['realized_risk']):.2f} "
+                f"(quantization drag "
                 f"${_sd['drag']:.2f}, raw {_sd['raw_lots']:.4f} "
-                f"lots) · pool "
+                f"lots"
+                f"{' · MIN-LOT FLOOR' if _sd.get('min_override') else ''}) · pool "
                 f"{_pool.state() if _pool is not None else 'n/a'}")
         # Fill chart: same levels + the actual fill price, saved
         # alongside the signal chart and attached to the fill alert.
@@ -9846,9 +9950,11 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5 sizing: {state.playbook or 'pending'} "
                 f"authorized risk ${_sd['authorized_risk']:.2f} -> "
-                f"realized ${_sd['realized_risk']:.2f} "
+                f"estimated stop exposure "
+                f"${_sd.get('estimated_stop_exposure', _sd['realized_risk']):.2f} "
                 f"(quantization drag ${_sd['drag']:.2f}, raw "
-                f"{_sd['raw_lots']:.4f} lots) · pool "
+                f"{_sd['raw_lots']:.4f} lots"
+                f"{' · MIN-LOT FLOOR' if _sd.get('min_override') else ''}) · pool "
                 f"{_pool.state() if _pool is not None else 'n/a'}")
         # Fill chart when the signal is known (placed this run);
         # adopted pendings (restart) have no signal — text only.

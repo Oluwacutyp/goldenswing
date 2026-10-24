@@ -136,8 +136,13 @@ def test_mt5_status_sections_in_order(tmp_path):
     assert "✅" in text and "`4,176.4`" in text
     assert "🟢 engine: RUNNING" in text
     # Runtime Truth item 4: /status reports the dynamic sizing
-    # rule — there is no fixed_lots key anymore.
-    assert "`sizing=`" in text and "dynamic risk 0.01/trade" in text
+    # rule — there is no fixed_lots key anymore.  Owner ruling
+    # 2026-10-24: the display renders the formula (coefficient k,
+    # confidence C, scalars S, broker-min floor), never the old
+    # "risk 0.01/trade" shorthand that presented k as a fixed
+    # per-trade risk rule.
+    assert "`sizing=`" in text and "dynamic k=0.01" in text
+    assert "C=1.0 pending" in text
     assert "fixed_lots" not in text
     assert "/playbooks" in text  # CTA
 

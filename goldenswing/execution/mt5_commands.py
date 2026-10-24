@@ -265,9 +265,10 @@ def _config_text(ctx: CommandContext) -> str:
                 "Safe keys: max_layers, manipulation_filter, "
                 "pending_expiry_bars, playbook.<name>.")
     cfg = ctrl.get_live_config()
+    _k = cfg.get('risk_pct')
     lines = [fmt_section("⚙️", "MT5 LIVE CONFIG (safe keys only):"), "",
              f"`sizing` = "
-             f"{fmt_code('dynamic — risk rule ' + (str(cfg.get('risk_pct')) if cfg.get('risk_pct') is not None else '?') + ' of equity per trade')}",
+             f"{fmt_code('dynamic: lots = max(broker min, floor((k x equity x C x S) / (stop_ticks x tick_value))); k = ' + (str(_k) if _k is not None else '?') + ' (proposed coefficient, not a gate); C = 1.0 (confidence definition pending)')} ",
              f"`max_layers` = {fmt_code(cfg.get('max_layers'))}",
              f"`manipulation_filter` = "
              f"{fmt_code('on' if cfg.get('manipulation_filter') else 'off')}",
@@ -445,7 +446,7 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
         lines.append(fmt_section("🔧", "Config"))
         lines.append(
             f"config: `sizing=`"
-            f"{fmt_code('dynamic risk ' + str(cfg.get('risk_pct')) + '/trade' if cfg.get('risk_pct') is not None else 'dynamic')} "
+            f"{fmt_code('dynamic k=' + str(cfg.get('risk_pct')) + ' x equity x C x S, floored at broker min; C=1.0 pending' if cfg.get('risk_pct') is not None else 'dynamic')} "
             f"`max_layers=`{fmt_code(cfg.get('max_layers'))} "
             f"`manipulation_filter=`"
             f"{fmt_code('on' if cfg.get('manipulation_filter') else 'off')} "

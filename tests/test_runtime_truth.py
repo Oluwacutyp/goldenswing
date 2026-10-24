@@ -299,21 +299,27 @@ def test_fixed_lots_gone_from_the_production_path(tmp_path):
     assert "fixed_lots" not in snap
 
 
-def test_dynamic_sizing_scales_with_equity_and_abstains_small():
-    """The production rule (risk_pct = 0.01 of equity) at a
-    $5.00 stop on the gold spec ($500 risk per 1.0 lot):
-    $24 abstains (smallest permitted order exceeds the budget),
-    $1,000 -> 0.02 lots, $10,000 -> 0.20 lots, floored down."""
+def test_dynamic_sizing_scales_with_equity_and_trades_minimum_small():
+    """The production rule (k = 0.01 sizing coefficient of equity)
+    at a $5.00 stop on the gold spec ($500 risk per 1.0 lot),
+    owner ruling 2026-10-24: small accounts TRADE the broker
+    minimum instead of abstaining — $24 -> 0.01 lots (min floor,
+    estimated stop exposure $5), $1,000 -> 0.02 lots, $10,000 ->
+    0.20 lots, floored down for raw >= minimum."""
     spec = gold_spec()
     small = size_for_risk(Decimal("24") * Decimal("0.01"), 5.0, spec)
-    assert not small.ok and small.lots is None
-    assert small.verdict == "decline_below_min"
+    assert small.ok and small.verdict == "ok"
+    assert small.lots == Decimal("0.01")
+    assert small.min_override is True
     assert small.raw_lots == Decimal("0.00048")
+    assert small.estimated_stop_exposure == Decimal("5")
     mid = size_for_risk(Decimal("1000") * Decimal("0.01"), 5.0, spec)
     assert mid.ok and mid.lots == Decimal("0.02")
+    assert mid.min_override is False
     big = size_for_risk(Decimal("10000") * Decimal("0.01"), 5.0, spec)
     assert big.ok and big.lots == Decimal("0.20")
-    # Floored DOWN, never up: budget for 0.029 lots -> 0.02.
+    # Floored DOWN, never up, for raw >= minimum: budget for
+    # 0.029 lots -> 0.02.
     frac = size_for_risk(Decimal("1450") * Decimal("0.01"), 5.0,
                           spec)
     assert frac.lots == Decimal("0.02")
