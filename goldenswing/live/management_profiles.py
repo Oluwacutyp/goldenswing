@@ -35,8 +35,48 @@ class ManagementProfile:
                 "trail": self.trail_method}
 
 
-_BARS_PER_H1 = {"M1": 60, "M5": 12, "M15": 4, "H1": 1, "H4": 1,
-                "D1": 1}
+#: Trigger bars per H1 bar, by clock.  Slow clocks are FRACTIONS:
+#: one H4 bar spans 4 H1 bars (1/4 H4 bars per H1 bar) and one
+#: D1 bar spans 24 (1/24).  The pre-XD-4 table mapped H4 and D1
+#: to 1 — as if a daily bar were an hourly bar — so a D1
+#: swing's progress window (e.g. 8 trigger bars) converted to
+#: 8 H1 bars (8 hours) instead of 8 days.  XD-4 repair: the
+#: conversion is wall-time faithful for every clock.
+_BARS_PER_H1 = {"M1": 60, "M5": 12, "M15": 4, "H1": 1, "H4": 1 / 4,
+                "D1": 1 / 24}
+
+#: Minutes per bar, by clock (XD-4 elapsed conversion).
+TF_MINUTES = {"M1": 1, "M5": 5, "M15": 15, "H1": 60, "H4": 240,
+              "D1": 1440}
+
+
+def mgmt_clock_due(*, clock_tf: str, last_mgmt_bar: int | None,
+                   current_mgmt_bar: int) -> bool:
+    """XD-4: is a management-clock check due for this position?
+
+    Due iff a new bar on the position's OWN clock has closed
+    since its last management pass.  ``last_mgmt_bar is None``
+    (pre-XD-4 contexts, adopted positions) is due — fail-open,
+    today's behaviour.  The caller passes bar indices on the
+    position's clock (see the runner's ``_mgmt_bar_now``); an
+    unknown clock is the caller's H1 fallback, never a skip.
+    """
+    if last_mgmt_bar is None:
+        return True
+    return int(current_mgmt_bar) > int(last_mgmt_bar)
+
+
+def elapsed_h1_bars(*, clock_tf: str, entry_mgmt_bar: int,
+                    current_mgmt_bar: int) -> int:
+    """XD-4: elapsed wall time in H1 bars, from management-clock
+    bar indices.  Floor division: a partial H1 bar does not
+    count yet (an M5 scalp 6 M5 bars in has 0 H1 bars elapsed;
+    a D1 swing 1 D1 bar in has 24).  For H1 positions this
+    reproduces the old ``cur_bar - entry_bar`` exactly.
+    """
+    bars = max(0, int(current_mgmt_bar) - int(entry_mgmt_bar))
+    minutes = TF_MINUTES.get(str(clock_tf), 60)
+    return (bars * minutes) // 60
 
 
 def profile_for(*, style: str = "intraday",

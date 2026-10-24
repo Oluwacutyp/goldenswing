@@ -86,6 +86,8 @@ from ..live.funding import (SMT_PLAYBOOKS as _SMT_PLAYBOOKS,
 from ..live.health import HealthMonitor
 from ..live.management_profiles import (
     drift_triggered as _drift_triggered,
+    elapsed_h1_bars as _mgmt_elapsed_h1,
+    mgmt_clock_due as _mgmt_clock_due,
     profile_for as _mgmt_profile_for, progress_due as _progress_due,
     tp_ladder as _tp_ladder)
 from ..live.news import preprint_action as _preprint_action
@@ -843,6 +845,10 @@ class MT5Runner:
         # it and runs finalize_exit (STATE 7).  Never consulted
         # for non-narrative tickets.
         self._narrative_states: dict[int, NarrativeState] = {}
+        # XD-4: last seen closed-frame length per slow clock,
+        # for gating the horizon-timeout evaluation to that
+        # clock's closes (D1/H4 positions only).
+        self._timeout_seen_bars: dict[str, int] = {}
         # Confluence rework (arrival pass): per-ticket RiskPool
         # ledgers (A13), the latest Asymmetry Score breakdown per
         # playbook (journal/status), funding-event keys already
@@ -2694,6 +2700,19 @@ class MT5Runner:
                     appended_counts.get(pend["entry_clock"], 0)
                 if pend["armed_bars"] >= self.cfg.armed_ttl_bars:
                     self._disarm_stale(stats)
+        # XD-4: management-clock inheritance — an M5/D1 close
+        # runs management for positions on that clock NOW, so
+        # the H1-close pass below (gated by new-bar-since-last
+        # -pass) does not double-check them.
+        _mgmt_clocks = tuple(tf for tf in ("M5", "D1")
+                             if tf in appended)
+        if _mgmt_clocks:
+            try:
+                self._manage_positions_bar_close(
+                    stats, clocks=_mgmt_clocks)
+            except Exception as exc:
+                _log.warning("mt5 bar-close management (M5/D1) "
+                             "failed: %s", exc)
         # Phase 4: H1 close — time stop, pending expiry, forming reset.
         if "H1" in appended:
             stats["bars"] = stats.get("bars", 0) + h1_accepted
@@ -4629,25 +4648,29 @@ class MT5Runner:
         return None
 
     # --------------------------------------- P3 bar-close management
-    def _manage_positions_bar_close(self, stats: dict) -> None:
-        """Manage open positions like a trader, on the H1 close.
+    def _manage_positions_bar_close(self, stats: dict,
+                                    clocks: tuple | None = None
+                                    ) -> None:
+        """Manage open positions like a trader, on bar closes.
 
-        Per position (context from _register_position_ctx), in
-        desk order: (1) defended-stop breach — a CLOSE back
-        through the pullback pivot that justified the entry ends
-        the trade before the wick stop needs to; (2) the S5
-        pre-print rule into an EXTREME print; (3) the S10
-        progress stop (R-vs-time); (4) the S10 drift exit
-        (thesis decay); (5) bank into the opposing zone (A8);
-        (6) bank the runner into ADR exhaustion (S8).  Hard
-        invalidation (stop / narrative) always owns its exits
-        elsewhere and first — nothing here widens a stop or
-        resurrects a dead thesis.
+        XD-4: a position is managed on its OWN clock's closes,
+        not on every H1 close.  ``clocks`` narrows the pass to
+        positions whose management clock is in the tuple (the
+        M5/D1 refresh invocation); ``None`` (the H1-close pass)
+        considers every position but still skips any whose
+        clock has closed no new bar since its last pass — so a
+        D1 swing is no longer drift-checked 24 times a day and
+        an M5 scalp is checked on M5 closes, not hourly.
+        Elapsed time is measured in management-clock bars and
+        converted to H1 bars for the (H1-denominated) profile
+        windows, so H1 positions behave byte-identically and
+        threshold trigger TIMES are unchanged — only the check
+        cadence moves to the owning clock.  Tick-level stop
+        enforcement is untouched (it never lived here).
         """
         h1 = self._stack.frames.get("H1") if self._stack else None
         if h1 is None or not len(h1):
             return
-        cur_bar = len(h1) - 1
         last_close = float(h1["close"].iloc[-1])
         atr_h1 = float(atr14(h1)) if len(h1) else 0.0
         mid = float((self._last_tick or {}).get("mid")
@@ -4657,9 +4680,30 @@ class MT5Runner:
             ctx = self._position_ctx.get(int(ticket))
             if pos is None or pos.closed or ctx is None:
                 continue
+            # XD-4 gate: this pass runs the position only on its
+            # own clock's closes.
+            clock_tf = str(ctx.get("management_clock")
+                           or ctx.get("clock_tf") or "H1")
+            if clocks is not None and clock_tf not in clocks:
+                continue
+            now_mgmt = self._mgmt_bar_now(clock_tf)
+            if not _mgmt_clock_due(
+                    clock_tf=clock_tf,
+                    last_mgmt_bar=ctx.get("last_mgmt_bar"),
+                    current_mgmt_bar=now_mgmt):
+                continue
+            ctx["last_mgmt_bar"] = now_mgmt
             profile = ctx["profile"]
             d = int(pos.direction)
-            elapsed = cur_bar - int(ctx["entry_bar"])
+            # XD-4 elapsed: management-clock bars -> H1 bars.
+            # H1 positions: identical to the old cur_bar -
+            # entry_bar (entry_mgmt_bar == entry_bar, now ==
+            # cur_bar); M5/D1: wall-time-faithful conversion.
+            elapsed = _mgmt_elapsed_h1(
+                clock_tf=clock_tf,
+                entry_mgmt_bar=int(ctx.get(
+                    "entry_mgmt_bar", ctx["entry_bar"])),
+                current_mgmt_bar=now_mgmt)
             # (1) defended stop: close through the defended pivot.
             defended = ctx.get("defended_stop")
             if defended is not None and atr_h1 > 0:
@@ -4870,7 +4914,32 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: regime classify failed, fixed horizon: {exc}")
         # Time stop for tracked positions (bar-defined rule).
+        # XD-4: slow-clock positions (D1/H4) get their horizon
+        # timeout evaluated on their OWN clock's closes only —
+        # the H1-bar horizon VALUE is unchanged, only the
+        # evaluation cadence moves.  Due-ness is per CLOCK per
+        # close (all D1 tickets share one D1 evaluation per
+        # D1 close), never per ticket.  Fast clocks evaluate
+        # as today (M5-close timeout evaluation needs
+        # M5-indexed signal bars in the tick manager — named
+        # XD remainder).
+        _timeout_due: dict[str, bool] = {}
+        for _clk in ("D1", "H4"):
+            _tframe = (self._stack.frames.get(_clk)
+                       if self._stack else None)
+            _tlen = len(_tframe) if _tframe is not None else 0
+            _timeout_due[_clk] = (
+                self._timeout_seen_bars.get(_clk) != _tlen)
+            if _timeout_due[_clk]:
+                self._timeout_seen_bars[_clk] = _tlen
         for ticket in list(self.tick_manager.tickets()):
+            _tctx = self._position_ctx.get(int(ticket))
+            _tclock = str((_tctx or {}).get("management_clock")
+                          or (_tctx or {}).get("clock_tf")
+                          or "H1")
+            if _tclock in ("D1", "H4") \
+                    and not _timeout_due.get(_tclock, True):
+                continue
             for action in self.tick_manager.on_bar_close(
                     ticket, last_bar_index, regime_structure):
                 res = self.executor.close_position(ticket, action.volume)
@@ -5761,13 +5830,20 @@ class MT5Runner:
 
     def _run_live_signal(self, pend: dict, tick: dict,
                          stats: dict) -> None:
-        """Entry confirmed: run the signal path on the live frame.
+        """Entry confirmed: run the signal path on CLOSED bars.
 
-        The live frame is the closed H1 bars PLUS the forming bar
-        (live values from ticks).  The verdict is built from the
-        fired trigger + the confirm tick — same shape as the
-        closed-bar verdict — so the playbooks, confluence gate, and
-        order path are unchanged.
+        XD-6: the forming bar is reaction context, labelled —
+        never a generator input.  The old code concatenated the
+        still-forming H1 bar onto the closed frame and ran the
+        playbooks, features and ATR over it, so live evaluated
+        on a bar a closed-bar backtest would never see (a
+        train/serve skew).  Now the playbooks, features and
+        score read the closed H1 frame only; the forming row
+        rides the verdict labelled ``forming: True`` plus one
+        journal note, and the confirm tick's mid is still the
+        entry price.  A setup that needs the forming bar's data
+        confirms on the next closed bar, exactly as in
+        backtest — that delay is the correction, not a loss.
         """
         # One arm per break (arming-gate fix F2): a continuation
         # setup that reaches the signal path has FIRED — spend its
@@ -5804,13 +5880,40 @@ class MT5Runner:
             "real_volume": float(forming.get("real_volume", 0.0)),
             "spread": forming.get("spread", 0)}],
             index=pd.DatetimeIndex([forming["open_time"]], tz="UTC"))
-        h1 = pd.concat([h1_closed, row])
-        states = read_and_featurize(h1, None)
-        t = len(h1) - 1
-        years = (h1.index[-1] - h1.index[0]).total_seconds() \
-            / 86400.0 / 365.25
+        # XD-6: no closed bars, no signal path — a forming bar
+        # alone is not a setup (the old code ran the path on
+        # the single forming row).
+        if not len(h1_closed):
+            self.journal.log_note(
+                "mt5: live signal dropped — no closed H1 bars; "
+                "forming bar alone is not generator input (XD-6)")
+            return
+        # XD-6: generators read the CLOSED frame only.  The
+        # forming row is reaction context, labelled, carried on
+        # the verdict — never appended to the generator frame.
+        states = read_and_featurize(h1_closed, None)
+        t = len(h1_closed) - 1
+        years = (h1_closed.index[-1] - h1_closed.index[0]) \
+            .total_seconds() / 86400.0 / 365.25
         verdict = self._live_verdict(pend, tick, h1_closed, states, t)
-        self._run_signal_path(h1, t, states, years, verdict, stats)
+        forming_record = {
+            "open": float(forming["open"]),
+            "high": float(forming["high"]),
+            "low": float(forming["low"]),
+            "close": float(tick["mid"]),
+            "volume": float(forming.get("volume", 0.0)),
+            "real_volume": float(forming.get("real_volume", 0.0)),
+            "spread": forming.get("spread", 0),
+            "open_time": str(forming["open_time"]),
+            "forming": True}
+        verdict["forming"] = forming_record
+        self.journal.log_note(
+            "mt5: XD-6 live signal — generators on closed H1 "
+            f"bars only (last closed {h1_closed.index[-1]}); "
+            f"forming bar {forming['open_time']} labelled "
+            "reaction-only")
+        self._run_signal_path(h1_closed, t, states, years, verdict,
+                              stats, forming=forming_record)
 
     def _live_verdict(self, pend: dict, tick: dict,
                       h1_closed: pd.DataFrame, states, t: int) -> dict:
@@ -6423,6 +6526,7 @@ class MT5Runner:
         bucket = parked.get("style_bucket") \
             or self._style_bucket(style_key)
         narr = self._narrative_states.get(int(ticket))
+        clock_tf = parked.get("clock_tf") or "H1"
         profile_style = "scalp" if bucket == "MICRO_SCALP" else (
             "v_reversal" if pb_name == "v_reversal" else style_key)
         profile = _mgmt_profile_for(
@@ -6434,7 +6538,7 @@ class MT5Runner:
             or (self._bedrock is not None
                 and str(self._bedrock.volatility) in
                 ("high", "spike")),
-            clock_tf=parked.get("clock_tf") or "H1")
+            clock_tf=clock_tf)
         opp = self._opposing_dict(int(direction))
         ctx = {
             "ticket": int(ticket), "alert_id": alert_id,
@@ -6445,7 +6549,17 @@ class MT5Runner:
             "floor": float(parked.get("floor", 50.0)),
             "entry_total": parked.get("entry_total"),
             "entry_bar": self._current_h1_bar(),
-            "clock_tf": parked.get("clock_tf") or "H1",
+            "clock_tf": clock_tf,
+            # XD-4: the position's management clock, inherited
+            # from its origin route (M5 scalp / D1 swing / H1
+            # roster / floated trigger clock).  entry_mgmt_bar
+            # is the forming-bar index on that clock at fill
+            # (last closed index + 1, the _current_h1_bar
+            # convention); last_mgmt_bar starts at the last
+            # closed index so the entry bar's own close is due.
+            "management_clock": clock_tf,
+            "entry_mgmt_bar": self._mgmt_bar_now(clock_tf) + 1,
+            "last_mgmt_bar": self._mgmt_bar_now(clock_tf),
             "profile": profile,
             "defended_stop": parked.get("defended_stop"),
             "invalidation": float(stop),
@@ -6550,7 +6664,8 @@ class MT5Runner:
 
     def _run_signal_path(self, h1: pd.DataFrame, t: int,
                          states, years: float, verdict: dict,
-                         stats: dict) -> None:
+                         stats: dict,
+                         forming: dict | None = None) -> None:
         """Verdict -> playbooks -> gate -> order (shared signal path).
 
         The verdict may come from a closed H1 bar (legacy) or from a
@@ -6562,6 +6677,13 @@ class MT5Runner:
         stop), position tracked by the TickManager from the fill
         tick on.  When holding, a confirming same-direction signal
         becomes a LAYER (_try_layer), never a second position.
+
+        XD-6 contract: ``h1`` is CLOSED bars only.  ``forming``
+        is reaction context (the still-open bar, labelled
+        ``forming: True`` on the verdict) — this path MUST NOT
+        append it to the frame or hand it to any generator or
+        scorer.  A caller that needs forming-bar data for
+        reaction measurement reads ``verdict["forming"]``.
         """
         # One position at a time is enforced by branching below:
         # flat -> new position, holding -> layer only.  There is no
@@ -9021,6 +9143,21 @@ class MT5Runner:
             return 0
         h1 = self._stack.frames.get("H1")
         return len(h1) if h1 is not None else 0
+
+    def _mgmt_bar_now(self, clock_tf: str) -> int:
+        """XD-4: last closed bar INDEX on the given management
+        clock (len of that clock's closed frame, minus one).
+        A clock with no frame falls back to the H1 index —
+        fail-open, today's behaviour — never a skip."""
+        frames = self._stack.frames if self._stack is not None \
+            else {}
+        frame = frames.get(clock_tf) if frames else None
+        if frame is not None and len(frame):
+            return len(frame) - 1
+        h1 = frames.get("H1") if frames else None
+        if h1 is not None and len(h1):
+            return len(h1) - 1
+        return 0
 
     def _track_pending_order(self, order: PendingOrder, *,
                              playbook: str, zone: dict | None,
