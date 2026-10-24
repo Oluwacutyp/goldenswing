@@ -293,6 +293,39 @@ class RiskGuards:
         return GuardDecision(True, "")
 
     # ---------------------------------------------------------- outcomes
+    def _drawdown_reason(self, balance: float) -> str:
+        """Max-drawdown breach reason for the current balance, or
+        "".  Shared by record_outcome and record_partial: the halt
+        is an account-state fact, and a partial leg's money is
+        real money — a partial loss that breaches drawdown latches
+        the halt even though the position is still open."""
+        st = self._state
+        peak = st["peak_balance"]
+        if peak and self.cfg.max_drawdown_pct:
+            dd = (peak - balance) / peak
+            if dd >= self.cfg.max_drawdown_pct:
+                return (f"max drawdown hit ({dd:.1%} from peak "
+                        f"{peak:.2f} >= {self.cfg.max_drawdown_pct:.0%})")
+        return ""
+
+    def record_partial(self, pnl_money: float, balance: float) -> None:
+        """Book one partial leg's realised P&L into day/week
+        totals.  NOT a closed trade: trades_today and the
+        consecutive-loss streak are untouched (the position is
+        still open — only the full close counts as a trade
+        outcome).  Without this, banked legs never entered any
+        book and day/week understated realized P&L by exactly the
+        banked amount."""
+        self.note_balance(balance)
+        st = self._state
+        st["day_realized"] += pnl_money
+        st["week_realized"] += pnl_money
+        reason = self._drawdown_reason(balance)
+        if reason and not st["halted"]:
+            st["halted"] = True
+            st["halt_reason"] = reason
+        self._save()
+
     def record_outcome(self, pnl_money: float, balance: float) -> None:
         """Book one closed trade's realised P/L.  Trips (and latches)
         the halt when max drawdown or the consecutive-loss limit is
@@ -312,12 +345,9 @@ class RiskGuards:
         # bookkeeping only.  Max drawdown is the sole account-level
         # hard halt; the consecutive-loss halt (a streak fact, not
         # a loss-room allowance) is unchanged.
-        peak = st["peak_balance"]
-        if peak and self.cfg.max_drawdown_pct:
-            dd = (peak - balance) / peak
-            if dd >= self.cfg.max_drawdown_pct:
-                reasons.append(f"max drawdown hit ({dd:.1%} from peak "
-                               f"{peak:.2f} >= {self.cfg.max_drawdown_pct:.0%})")
+        reason = self._drawdown_reason(balance)
+        if reason:
+            reasons.append(reason)
         if self.cfg.max_consecutive_losses and \
                 st["consecutive_losses"] >= self.cfg.max_consecutive_losses:
             reasons.append(f"{st['consecutive_losses']} consecutive losses "

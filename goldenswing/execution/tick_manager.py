@@ -352,13 +352,35 @@ class TickManager:
         action flow (bar-close management: progress trim, drift
         trim, zone bank, ADR bank, pre-print trim).  Keeps the
         tracked volume honest so tiers/stops stay consistent.
-        False when the ticket is unknown."""
+        False when the ticket is unknown.  Volume only — the
+        leg's P&L is recorded separately via :meth:`bank_leg`
+        (the runner owns pricing/specs, this class owns state).
+        """
         st = self._states.get(ticket)
         if st is None or st.pos.closed:
             return False
         st.pos.volume = max(0.0, st.pos.volume - float(volume))
         if st.pos.volume <= 0:
             st.pos.closed = True
+        return True
+
+    def bank_leg(self, ticket: int, *, volume: float, price: float,
+                 entry: float, stop: float, pnl_money: float) -> bool:
+        """Record one banked partial leg's realized P&L on the
+        position (live MT5 path).  The runner computes the leg
+        money (it owns the symbol spec); this only stores it, so
+        the full close can report the trade total (banked +
+        remainder) and the volume-weighted total R.  False when
+        the ticket is unknown or the position is closed — a leg
+        on a dead position is never recorded."""
+        st = self._states.get(ticket)
+        if st is None or st.pos.closed:
+            return False
+        st.pos.banked_legs.append({
+            "volume": float(volume), "price": float(price),
+            "entry": float(entry), "stop": float(stop),
+            "pnl": float(pnl_money)})
+        st.pos.banked_pnl += float(pnl_money)
         return True
 
     def check_narrative_invalidation(self, ticket: int, price: float,

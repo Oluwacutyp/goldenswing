@@ -77,6 +77,17 @@ class TrackedPosition:
     opened_at: float | None = None
     #: Min-lot profit-lock applied (one-shot).
     profit_lock_done: bool = False
+    #: Realized money banked by partial legs on the LIVE MT5 path
+    #: (paper keeps its own _meta banked_pnl).  A partial leg's P&L
+    #: is booked into day/week at partial time (RiskGuards
+    #: record_partial); the full close then books the remainder
+    #: only, and the trade total is banked + remainder.  Without
+    #: this, banked legs were invisible to every book.
+    banked_pnl: float = 0.0
+    #: Banked legs, each {"volume", "price", "entry", "stop",
+    #: "pnl"} — the audit trail for the close total and the
+    #: volume-weighted total R (live/exit.realized_r).
+    banked_legs: list = field(default_factory=list)
 
     @property
     def active_stop(self) -> float:

@@ -104,6 +104,7 @@ from ..live.hierarchy import (LEG_ORDER, TimeframeStack, TF_MINUTES,
                               live_setup_reason, log_feed_error,
                               log_hold_state, qm_annotation,
                               resolve_setup_for_touch, zones_by_side)
+from ..live.exit import partial_r, realized_r
 from ..live.multitf import atr14
 from ..live.range import RANGE_SIZE_MULT, BoundaryTracker, RangeDef
 from ..live.regime_state import (RegimeState, load_regime_state,
@@ -2082,10 +2083,25 @@ class MT5Runner:
                 elif action.kind == "partial":
                     res = self.executor.close_position(ticket, action.volume)
                     if res.ok:
+                        # PNL-PARTIAL: the leg's money is booked NOW
+                        # (day/week via record_partial + the leg
+                        # stored on the position for the close
+                        # total).  Before this, banked legs never
+                        # entered any book — the close booked the
+                        # remainder only and the banked profit was
+                        # invisible.  A FAILED partial books
+                        # nothing (below) — retry next tick.
+                        leg = 0.0
+                        if pos is not None:
+                            leg = self._book_partial_leg(
+                                ticket, pos, volume=action.volume,
+                                price=price, entry=pos.entry_price,
+                                stop=pos.stop0)
                         self.tick_manager.apply(ticket, action)
                         self.journal.log_note(
                             f"mt5 tick: ticket {ticket} partial close "
-                            f"{action.volume} lots at {price:.2f}")
+                            f"{action.volume} lots at {price:.2f} "
+                            f"(banked ${leg:+.2f})")
                         self._send_alert(
                             f"MT5 PARTIAL {pb} ticket {ticket}: banked "
                             f"{action.volume} lots @ {price:.2f} "
@@ -2096,14 +2112,33 @@ class MT5Runner:
                             f"{res.message} — retry next tick")
                 elif action.kind == "layer_stop":
                     # Added layer's own SL crossed: close just that
-                    # leg, the base rides.
+                    # leg, the base rides.  The leg's money is
+                    # measured against the LAYER's entry (looked up
+                    # before apply pops it), not the base entry.
                     res = self.executor.close_position(ticket, action.volume)
                     if res.ok:
+                        leg = 0.0
+                        if pos is not None:
+                            layer = next(
+                                (ly for ly in
+                                 self.tick_manager.layers(ticket)
+                                 if ly.volume == action.volume
+                                 and (action.level is None
+                                      or ly.sl == action.level)),
+                                None)
+                            leg = self._book_partial_leg(
+                                ticket, pos, volume=action.volume,
+                                price=price,
+                                entry=(layer.entry if layer is not None
+                                       else pos.entry_price),
+                                stop=(layer.sl if layer is not None
+                                      else pos.stop0))
                         self.tick_manager.apply(ticket, action)
                         self.journal.log_note(
                             f"mt5 tick: ticket {ticket} layer stop "
                             f"{action.volume} lots at {price:.2f} "
-                            f"(layer SL {action.level:.2f})")
+                            f"(layer SL {action.level:.2f}, "
+                            f"banked ${leg:+.2f})")
                         self._send_alert(
                             f"MT5 LAYER STOP {pb} ticket {ticket}: "
                             f"closed {action.volume} lots @ {price:.2f} "
@@ -2404,6 +2439,52 @@ class MT5Runner:
                 pass
             return None, {}
 
+    def _signed_leg_pnl(self, *, direction: int, price: float,
+                        entry: float, volume: float) -> float:
+        """Signed money of one leg: money_for_move abs()es the
+        distance, so sign it by hand — a long below entry (or a
+        short above) is a LOSS.  Booking the unsigned value would
+        count every losing leg as a win.  0.0 when the spec is
+        unreadable (fail-open: the volume bookkeeping still
+        happens; the money gap is noted by the caller path)."""
+        try:
+            spec = self.executor.symbol_spec(self.cfg.symbol)
+            pnl = spec.money_for_move(price - entry, volume)
+            if direction * (price - entry) < 0:
+                pnl = -pnl
+            return float(pnl)
+        except Exception:
+            return 0.0
+
+    def _book_partial_leg(self, ticket: int, pos, *, volume: float,
+                          price: float, entry: float,
+                          stop: float) -> float:
+        """Book one executed partial leg: its money into day/week
+        (RiskGuards record_partial — NOT a closed trade, so
+        trades_today / the loss streak are untouched) and onto
+        the position for the close total.  Never breaks the
+        caller: a booking failure is noted, the volume reduction
+        still applies.  Returns the leg money."""
+        leg = self._signed_leg_pnl(direction=pos.direction, price=price,
+                                   entry=entry, volume=volume)
+        try:
+            self.tick_manager.bank_leg(
+                ticket, volume=volume, price=price, entry=entry,
+                stop=stop, pnl_money=leg)
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: leg store failed for ticket {ticket}: {exc}")
+        try:
+            balance = float(self.feed.account_state().get("balance", 0.0)) \
+                if self.feed is not None else 0.0
+            if balance > 0:
+                self.guards.record_partial(float(leg), balance)
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: partial P&L not booked for ticket {ticket}: "
+                f"{exc}")
+        return leg
+
     def _record_close(self, ticket: int, price: float, reason: str,
                       stats: dict) -> None:
         pos = self.tick_manager.position(ticket)
@@ -2412,7 +2493,12 @@ class MT5Runner:
         d = pos.direction
         pnl_r = d * (price - pos.entry_price) / pos.risk_price \
             if pos.risk_price > 0 else 0.0
-        pnl_money = 0.0
+        # Remainder leg's money (pos.volume is the volume LEFT
+        # after every partial reduced it).  The trade total adds
+        # the banked legs — PNL-PARTIAL: before this fix the
+        # close booked the remainder only and the banked legs
+        # vanished from every book.
+        remainder_pnl = 0.0
         try:
             spec = self.executor.symbol_spec(self.cfg.symbol)
             # money_for_move abs()es the distance, so sign it by
@@ -2420,54 +2506,87 @@ class MT5Runner:
             # Booking the unsigned value would count every losing
             # long as a win — in the journal, the recaps, and the
             # RiskGuards outcome feed.
-            pnl_money = spec.money_for_move(
+            remainder_pnl = spec.money_for_move(
                 price - pos.entry_price, pos.volume)
             if d * (price - pos.entry_price) < 0:
-                pnl_money = -pnl_money
+                remainder_pnl = -remainder_pnl
         except Exception:
             pass
+        pnl_money = float(getattr(pos, "banked_pnl", 0.0) or 0.0) \
+            + float(remainder_pnl)
+        # Volume-weighted total R (live/exit.realized_r — the same
+        # formula the paper path uses): banked fractions at their
+        # leg R plus the remainder fraction at the final R.
+        # Fractions are taken against the FINAL orig_volume (legs
+        # + remainder sum to it exactly), so the sum can never
+        # exceed 1.0.  Any failure falls back to the remainder R
+        # — the money total above stays exact regardless.
+        total_r = float(pnl_r)
+        partials: list = []
+        try:
+            legs = getattr(pos, "banked_legs", None) or []
+            orig = float(getattr(pos, "orig_volume", 0.0) or 0.0)
+            if orig > 0 and legs:
+                partials = [{
+                    "fraction": float(leg["volume"]) / float(orig),
+                    "r": float(partial_r(
+                        entry_price=float(leg["entry"]),
+                        stop=float(leg["stop"]), direction=d,
+                        exit_price=float(leg["price"])))}
+                    for leg in legs]
+                total_r = float(realized_r(partials, float(pnl_r)))
+        except Exception:
+            total_r = float(pnl_r)
+            partials = []
         # Classify BEFORE remove(): the classifier reads the live
         # effective stop from the TickManager.
         display = self._classify_close(pos, price, reason)
         self.journal.log_close(
             alert_id=pos.alert_id, ticket=ticket, exit_price=price,
-            reason=reason, pnl_money=float(pnl_money), r_net=float(pnl_r),
+            reason=reason, pnl_money=float(pnl_money), r_net=float(total_r),
             hold_bars=0, partial_taken=pos.partial_done)
         self._det_journal("trade_closed", {
             "alert_id": pos.alert_id, "ticket": ticket,
             "exit": price, "reason": reason,
-            "pnl_money": float(pnl_money), "r_net": float(pnl_r)},
+            "pnl_money": float(pnl_money), "r_net": float(total_r)},
             idempotency_key=f"close-{pos.alert_id}-{ticket}")
         self.journal.log_note(
             f"mt5 close: ticket {ticket} {display} at {price:.2f} "
-            f"({pnl_r:+.2f}R)")
+            f"({total_r:+.2f}R)")
         # Telegram follow-up — the disciplined caller's update: every
         # close is reported, wins AND losses, with the R and the
         # reason (a loss is never silently journalled).
         pb = self._playbook_from_alert_id(pos.alert_id)
         self._send_alert(
             f"MT5 CLOSE {pb} {'+' if d > 0 else '-'}1 "
-            f"{pos.volume} lots entry {pos.entry_price:.2f} -> exit "
-            f"{price:.2f} — {display} {pnl_r:+.2f}R "
+            f"{float(getattr(pos, 'orig_volume', 0.0) or pos.volume)} lots entry {pos.entry_price:.2f} -> exit "
+            f"{price:.2f} — {display} {total_r:+.2f}R "
             f"(ticket {ticket})")
         # Feed the closed trade's outcome to RiskGuards: the
         # daily/weekly/drawdown/consecutive-loss halts only work if
         # outcomes are booked.  Never breaks the close path.
-        # (Partial closes are not separately booked — the full
-        # close books the remainder volume's P&L, matching the
-        # journal's close record.)
+        # PNL-PARTIAL: the close books the REMAINDER only — the
+        # banked legs already entered day/week at partial time
+        # (record_partial).  Booking the total here would double
+        # -count every banked leg.  The journal close record above
+        # carries the trade TOTAL (banked + remainder, as the
+        # paper CloseRecord does); the ledger increment here is
+        # the remainder, so both surfaces reconcile to the total.
         try:
             balance = float(self.feed.account_state().get("balance", 0.0))
             if balance > 0:
-                self.guards.record_outcome(float(pnl_money), balance)
+                self.guards.record_outcome(float(remainder_pnl), balance)
         except Exception as exc:
             self.journal.log_note(
                 f"mt5: risk outcome not booked for ticket {ticket}: "
                 f"{exc}")
         # Feed the close to the entry gates: the loss/win cooldown
         # starts at the close.  Never breaks the close path.
+        # PNL-PARTIAL: the cooldown keys on the TRADE's total R,
+        # not the remainder leg's — a trade that banked a win then
+        # stopped the remainder at a smaller loss is a WIN.
         try:
-            self.entry_gate.record_close(time.time(), pnl_r > 0)
+            self.entry_gate.record_close(time.time(), total_r > 0)
         except Exception:
             pass
         # Narrative STATE 7: a narrative trade's close finalizes the
@@ -2495,16 +2614,17 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5 pool closed: ticket {ticket} budget "
                 f"{_pool.budget} consumed at close "
-                f"{_pool.consumption()} ({pb} {pnl_r:+.2f}R)")
+                f"{_pool.consumption()} ({pb} {total_r:+.2f}R)")
         if _narr_state is not None:
             try:
                 _idle, _entry = _finalize_narrative_exit(
                     _narr_state, reason=reason, final_r=float(pnl_r),
+                    partials=partials or None,
                     pnl_dollars=float(pnl_money), exit_price=float(price))
                 self.journal.log_note(
                     f"mt5 narrative STATE 7 EXIT: "
                     f"{_entry.get('exit_reason', reason)} "
-                    f"R={_entry.get('realized_r', pnl_r):+.2f} "
+                    f"R={_entry.get('realized_r', total_r):+.2f} "
                     f"(ticket {ticket})")
             except Exception as exc:
                 self.journal.log_note(
@@ -3207,12 +3327,18 @@ class MT5Runner:
                 f"mt5 {reason}: partial close FAILED for ticket "
                 f"{ticket} ({res.message})")
             return False
+        # PNL-PARTIAL: book the leg now (base entry — management
+        # trims are position-level, consistent with the remainder
+        # convention in _record_close), then reduce the volume.
+        leg = self._book_partial_leg(
+            ticket, pos, volume=vol, price=float(price),
+            entry=pos.entry_price, stop=pos.stop0)
         self.tick_manager.book_external_partial(int(ticket), vol)
         self._log_management(
             ticket, pos, reason,
             f"mt5 {reason}: ticket {ticket} banked "
             f"{vol:.2f} lots ({frac:.0%} of the position) @ "
-            f"{price:.2f}")
+            f"{price:.2f} (${leg:+.2f})")
         return True
 
     def _day_levels(self) -> list:
@@ -8118,6 +8244,27 @@ class MT5Runner:
         res = self.executor.close_position(ticket, action.volume)
         if not res.ok:
             return f"trim FAILED: {res.message} — retry /trim"
+        # PNL-PARTIAL: the trimmed layer's money is measured
+        # against the TOP layer's entry (looked up before apply
+        # pops it), at the last tick's mid — the market price
+        # this broker close fills near.  (action.level is the
+        # layer's STOP, never the execution price.)  With no tick
+        # seen yet there is no honest price: the leg is left
+        # unbooked and noted, never booked at a guessed price.
+        pos = self.tick_manager.position(ticket)
+        layers = self.tick_manager.layers(ticket)
+        top = layers[-1] if len(layers) > 1 else None
+        last = self._last_tick or {}
+        if pos is not None and last.get("mid"):
+            self._book_partial_leg(
+                ticket, pos, volume=action.volume,
+                price=float(last["mid"]),
+                entry=top.entry if top is not None else pos.entry_price,
+                stop=top.sl if top is not None else pos.stop0)
+        else:
+            self.journal.log_note(
+                f"mt5 trim: ticket {ticket} top layer closed with "
+                f"no tick price seen — leg P&L left unbooked")
         self.tick_manager.apply(ticket, action)
         remaining = len(self.tick_manager.layers(ticket))
         self.journal.log_note(
