@@ -59,8 +59,14 @@ def _engine(cands, risk_mode="shadow", halted=False):
     tmp = Path(tempfile.mkdtemp())
     risk = RiskGuards(tmp / "risk.json")
     if halted:
-        for _ in range(3):
-            risk.record_outcome(-100.0, 9000.0)  # trips consecutive-loss halt
+        # PREMISE CORRECTION (owner ruling 2026-10-23): three
+        # -100 losses used to trip the 3% DAILY cap (the old
+        # comment said consecutive-loss, but 3 < the limit of 6 —
+        # it was the daily room that latched).  The daily cap is
+        # revoked; trip the surviving account-level halt — max
+        # drawdown — honestly instead.
+        risk.note_balance(10_000.0)
+        risk.record_outcome(-1_600.0, 8_400.0)  # 16% drawdown halt
         assert risk.halted
     journal = TradeJournal(tmp / "j.jsonl")
     eng = ConfluenceEngine([_LivePB(cands)], risk, journal,

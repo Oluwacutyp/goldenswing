@@ -154,7 +154,11 @@ def test_paper_tap_uses_paper_book_and_skip_logs(tmp_path):
 
 def test_guard_halt_refuses_execute_and_journals_the_refusal(tmp_path):
     handler, live, _book, journal, guards = _handler(tmp_path)
-    guards.record_outcome(-350.0, 9_650.0)       # trips the 3% daily halt
+    # PREMISE CORRECTION (owner ruling 2026-10-23): -350 used to
+    # trip the 3% daily halt; that cap is revoked.  Trip the
+    # surviving account-level halt (max drawdown 15%) instead.
+    guards.note_balance(10_000.0)
+    guards.record_outcome(-1_600.0, 8_400.0)
     assert guards.halted
     alert = build_alert(_signal(), instrument="XAUUSD", mode="swing")
     msg = handler.handle(AlertAction.EXECUTE, alert)

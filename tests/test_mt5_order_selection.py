@@ -358,7 +358,7 @@ def _runner(tmp_path, **cfg_kw):
         # a real news day (e.g. PPI).  The pause itself is covered
         # by test_news_calendar.py.
         news_pause_enabled=False,
-        fixed_lots=0.01, **cfg_kw)
+**cfg_kw)  # dynamic sizing (fixed_lots revoked 2026-10-23)
     runner = MT5Runner(cfg, feed=FakeFeed(), executor=FakeExecutor())
     runner._stack = TimeframeStack.from_frames(_frames())
     return runner
@@ -589,6 +589,10 @@ def test_partial_fill_leaves_remainder_pending(tmp_path):
     stats: dict = {}
     _place(runner, _sig(), _verdict(), stats, price=2030.0)
     ticket = next(iter(runner._pending_orders))
+    # PREMISE CORRECTION (owner ruling 2026-10-23): the placed
+    # volume was 0.01 under the revoked fixed_lots override; it
+    # is now the dynamic risk size — read it, don't assume it.
+    placed = runner._pending_orders[ticket].volume
     assert runner.executor.fill_pending(ticket, 2005.0, volume=0.005)
     runner._reconcile(2005.0, stats)
     assert stats["executed"] == 1  # ACTIVE with partial volume
@@ -602,7 +606,7 @@ def test_partial_fill_leaves_remainder_pending(tmp_path):
     # Remainder stays pending (reduced volume).
     assert len(runner._pending_orders) == 1
     state = runner._pending_orders[ticket]
-    assert state.volume == pytest.approx(0.005)
+    assert state.volume == pytest.approx(placed - 0.005)
     assert "PARTIAL" in _journal(tmp_path)
 
 
@@ -614,6 +618,9 @@ def test_remainder_fill_completes_position(tmp_path):
     stats: dict = {}
     _place(runner, _sig(), _verdict(), stats, price=2030.0)
     ticket = next(iter(runner._pending_orders))
+    # Dynamic sizing (fixed_lots revoked 2026-10-23): the full
+    # order volume is whatever the risk rule produced.
+    placed = runner._pending_orders[ticket].volume
     assert runner.executor.fill_pending(ticket, 2005.0, volume=0.005)
     runner._reconcile(2005.0, stats)
     assert runner.executor.fill_pending(ticket, 2005.0)  # remainder
@@ -621,7 +628,7 @@ def test_remainder_fill_completes_position(tmp_path):
     assert runner._pending_orders == {}
     assert runner.tick_manager.tickets() == [ticket]  # one position
     pos = runner.tick_manager.position(ticket)
-    assert pos.volume == pytest.approx(0.01)  # full order volume
+    assert pos.volume == pytest.approx(placed)  # full order volume
     assert len(runner.tick_manager.layers(ticket)) == 2  # base + leg
     assert "remainder filled" in _journal(tmp_path)
 

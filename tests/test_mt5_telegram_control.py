@@ -99,7 +99,8 @@ def _runner(tmp_path, *, executor=None, **cfg_kw):
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
         poll_interval_seconds=0,
-        fixed_lots=0.01,
+        # sizing: dynamic risk rule only (the fixed_lots
+        # override was revoked by owner ruling 2026-10-23)
         # News pause OFF: the order path's news check reads the
         # REAL wall-clock calendar — these tests must not fail on
         # a real news day (e.g. PPI).  The pause itself is covered
@@ -426,7 +427,12 @@ def test_config_shows_safe_keys_only(tmp_path):
     runner = _runner(tmp_path)
     ctx = CommandContext(journal=runner.journal, mt5_control=runner)
     res, _ = mt5_router(OWNER).dispatch(_update("/config"), ctx)
-    assert "fixed_lots" in res.text and "max_layers" in res.text
+    # PREMISE CORRECTION (owner ruling 2026-10-23): /config no
+    # longer carries a fixed_lots key — sizing is dynamic-only
+    # and reported as the risk rule.
+    assert "sizing" in res.text and "dynamic" in res.text
+    assert "fixed_lots" not in res.text
+    assert "max_layers" in res.text
     assert "manipulation_filter" in res.text
     assert "pending_expiry_bars" in res.text
     assert "judas_swing: on" in res.text
@@ -449,14 +455,19 @@ def _set_and_confirm(runner, text):
 
 
 def test_set_valid_applies_and_persists(tmp_path):
+    # PREMISE CORRECTION (owner ruling 2026-10-23): the original
+    # exercised /set fixed_lots — that key is revoked (see the
+    # rejects test).  The applies-and-persists flow is pinned on
+    # max_layers, a surviving safe key.
     runner = _runner(tmp_path)
-    _set_and_confirm(runner, "/set fixed_lots 0.05")
-    assert runner.cfg.fixed_lots == 0.05
+    _set_and_confirm(runner, "/set max_layers 1")
+    assert runner.cfg.layer_max_layers == 1
     stored = json.loads((tmp_path / "mt5_config.json").read_text())
-    assert stored["fixed_lots"] == 0.05
+    assert stored["max_layers"] == 1
+    assert "fixed_lots" not in stored
     # Simulated restart: a fresh runner loads the persisted value.
     runner2 = _runner(tmp_path)
-    assert runner2.cfg.fixed_lots == 0.05
+    assert runner2.cfg.layer_max_layers == 1
 
 
 def test_set_playbook_and_filter_persist(tmp_path):
@@ -481,8 +492,9 @@ def test_set_rejects_invalid_and_dangerous(tmp_path):
     ctx = CommandContext(journal=runner.journal, mt5_control=runner)
     router = mt5_router(OWNER)
     cases = [
-        "/set fixed_lots 5",          # out of range
-        "/set fixed_lots abc",         # not a number
+        "/set fixed_lots 0.05",        # revoked key (owner ruling
+                                       # 2026-10-23): not a safe key
+        "/set fixed_lots abc",         # revoked key, any value
         "/set max_layers 9",           # out of range
         "/set pending_expiry_bars 0",  # out of range
         "/set manipulation_filter maybe",
@@ -497,7 +509,8 @@ def test_set_rejects_invalid_and_dangerous(tmp_path):
         assert "rejected" in res.text or "usage" in res.text, text
         assert res.reply_markup is None  # no confirm staged
         assert "FAKESECRET123" not in res.text  # value never echoed
-    assert runner.cfg.fixed_lots == 0.01
+    assert not hasattr(runner.cfg, "fixed_lots")
+    assert runner.cfg.layer_max_layers == 3
     assert runner.cfg.disabled_playbooks == ()
     assert runner.cfg.paused is False
 
@@ -649,9 +662,9 @@ def test_non_owner_command_silently_ignored(tmp_path):
     runner = _runner(tmp_path)
     ctx = CommandContext(journal=runner.journal, mt5_control=runner)
     res, chat = mt5_router(OWNER).dispatch(
-        _update("/set fixed_lots 0.05", chat_id="99999"), ctx)
+        _update("/set max_layers 1", chat_id="99999"), ctx)
     assert res is None and chat is None
-    assert runner.cfg.fixed_lots == 0.01
+    assert runner.cfg.layer_max_layers == 3
 
 
 def test_non_owner_status_gets_nothing(tmp_path):
@@ -738,7 +751,7 @@ def test_confirm_token_is_single_use(tmp_path):
 
 def test_set_without_live_runner_is_unavailable(tmp_path):
     ctx = CommandContext(journal=None)  # no mt5_control attached
-    res, _ = mt5_router(OWNER).dispatch(_update("/set fixed_lots 0.05"),
+    res, _ = mt5_router(OWNER).dispatch(_update("/set max_layers 1"),
                                         ctx)
     assert "unavailable" in res.text
     res, _ = mt5_router(OWNER).dispatch(_update("/pause"), ctx)

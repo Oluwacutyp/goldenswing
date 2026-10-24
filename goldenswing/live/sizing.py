@@ -1,8 +1,10 @@
 """Risk-based sizing + the RiskPool ledger (spec §4, amendment A13).
 
 Owner-designed (session 2026-10-21): sizes are computed from risk,
-never hardcoded lots.  ``fixed_lots`` survives only as an explicit
-config MODE (``sizing_mode=fixed``); risk is the MT5-path default.
+never hardcoded lots.  Owner ruling 2026-10-23: dynamic risk
+sizing is the SOLE sizing path on the MT5 engine — the fixed-lots
+config mode that A13 kept as an override is revoked and removed;
+this module's ``size_for_risk`` is the production sizing core.
 
 Hard rules implemented here:
 - **Decimal everywhere.**  Every Decimal is constructed via

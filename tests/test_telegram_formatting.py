@@ -58,7 +58,8 @@ class _FakeControl:
         self._paused = paused
 
     def get_live_config(self):
-        return {"fixed_lots": 0.01, "max_layers": 3,
+        return {"sizing_mode": "risk", "risk_pct": 0.01,
+                "max_layers": 3,
                 "manipulation_filter": True, "pending_expiry_bars": 4,
                 "paused": self._paused,
                 "playbooks": {"judas_swing": True, "turtle_soup": False}}
@@ -134,7 +135,10 @@ def test_mt5_status_sections_in_order(tmp_path):
     assert positions == sorted(positions), text
     assert "✅" in text and "`4,176.4`" in text
     assert "🟢 engine: RUNNING" in text
-    assert "`fixed_lots=`" in text
+    # Runtime Truth item 4: /status reports the dynamic sizing
+    # rule — there is no fixed_lots key anymore.
+    assert "`sizing=`" in text and "dynamic risk 0.01/trade" in text
+    assert "fixed_lots" not in text
     assert "/playbooks" in text  # CTA
 
 

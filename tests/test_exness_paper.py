@@ -208,8 +208,11 @@ def test_export_import_round_trip_preserves_position():
 def _exness_handler(tmp_path):
     paper = ExnessPaperExecutor(balance=12.0)
     guards = RiskGuards(tmp_path / "risk.json",
-                        RiskConfig(daily_loss_pct=0.0, weekly_loss_pct=0.0,
-                                   max_drawdown_pct=0.0,
+                        # daily/weekly cap kwargs removed: the caps
+                        # themselves were revoked (owner ruling
+                        # 2026-10-23) — they were 0.0 (disabled)
+                        # here, so behavior is identical.
+                        RiskConfig(max_drawdown_pct=0.0,
                                    max_consecutive_losses=0,
                                    max_positions=1,
                                    max_total_risk_pct=0.0,
@@ -254,8 +257,7 @@ def test_exposure_cap_zero_disables_while_default_still_caps(tmp_path):
     # Full Exness config: every R-limit 0 (disabled) — only kill
     # switch / require_stops / max_positions still gate.
     disabled = RiskGuards(tmp_path / "r0.json",
-                          RiskConfig(daily_loss_pct=0.0, weekly_loss_pct=0.0,
-                                     max_drawdown_pct=0.0,
+                          RiskConfig(max_drawdown_pct=0.0,
                                      max_consecutive_losses=0,
                                      max_positions=1,
                                      max_total_risk_pct=0.0),

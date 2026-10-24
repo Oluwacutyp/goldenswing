@@ -18,6 +18,17 @@ Breaches are reported as a set of keys — the runner journals only
 NEW breaches (a stuck breach gets one note, not one per order).
 Nothing here gates or blocks: health degrades loudly, never
 silently, and never stops the gold path.
+
+Runtime Truth (2026-10-23): a stale tick is only a BREACH when
+the market is supposed to be open.  The runner feeds the broker's
+market state in via :meth:`note_market_open`; while the market is
+KNOWN closed, an old tick is the expected calendar pause — it is
+described as exactly that, never flagged ``tick_stale``, so the
+/status Feed and Health sections cannot contradict each other
+again (EC2: ``feed: OK`` beside ``BREACH: tick_stale`` for a
+2501s-old tick on a closed market).  An UNKNOWN market state
+keeps the fail-loud reading: stale is a breach until the feed
+proves the closure was expected.
 """
 from __future__ import annotations
 
@@ -46,6 +57,9 @@ class HealthMonitor:
         self.latency_warn_sec = float(latency_warn_sec)
         self.slippage_warn_atr = float(slippage_warn_atr)
         self._last_tick: datetime | None = None
+        # Broker market state as last reported by the runner:
+        # True = open, False = KNOWN closed, None = unknown.
+        self._market_open: bool | None = None
         self._latencies: deque[float] = deque(maxlen=MAX_SAMPLES)
         self._slippages: deque[float] = deque(maxlen=MAX_SAMPLES)
         self.orders_placed = 0
@@ -59,6 +73,18 @@ class HealthMonitor:
             self._last_tick = pd.Timestamp(tick_time).to_pydatetime()
         except Exception:
             pass
+
+    def note_market_open(self, is_open) -> None:
+        """Record the broker's market state (True = open, False =
+        known closed, None = unknown).  The runner refreshes this
+        from the feed's own market check — the same answer the
+        order path gates on, so health and execution never read
+        two different markets."""
+        self._market_open = None if is_open is None else bool(is_open)
+
+    @property
+    def market_open_state(self) -> bool | None:
+        return self._market_open
 
     def note_order(self, latency_sec: float) -> None:
         self.orders_placed += 1
@@ -82,6 +108,30 @@ class HealthMonitor:
             last = last.replace(tzinfo=timezone.utc)
         return max(0.0, (now - last).total_seconds())
 
+    def tick_state(self, now: datetime | None = None) -> str:
+        """The tick freshness class — ONE vocabulary for the Feed
+        line, the Health line and the breach set, so they cannot
+        disagree:
+
+        - ``live``: a tick inside the stale threshold;
+        - ``stale``: older than the threshold while the market is
+          open or its state is unknown — a genuine feed failure
+          class (fail loud);
+        - ``closed_expected``: older than the threshold (or never
+          arrived) while the market is KNOWN closed — the
+          calendar pause, not a failure;
+        - ``no_ticks``: nothing has ever arrived and the market
+          is not known closed.
+        """
+        age = self.tick_age_sec(now)
+        if age is None:
+            return ("closed_expected" if self._market_open is False
+                    else "no_ticks")
+        if age <= self.tick_stale_sec:
+            return "live"
+        return ("closed_expected" if self._market_open is False
+                else "stale")
+
     def latency_stats(self) -> dict:
         vals = list(self._latencies)
         return {"n": len(vals),
@@ -95,12 +145,13 @@ class HealthMonitor:
                 "max_atr": max(vals) if vals else None}
 
     def breaches(self, now: datetime | None = None) -> set[str]:
-        """Current breach keys: tick_stale / latency / slippage."""
+        """Current breach keys: tick_stale / latency / slippage.
+
+        ``tick_stale`` fires only for the ``stale`` / ``no_ticks``
+        classes (see :meth:`tick_state`): a tick pause on a KNOWN
+        closed market is expected and is never a breach."""
         out: set[str] = set()
-        age = self.tick_age_sec(now)
-        if age is None:
-            out.add("tick_stale")
-        elif age > self.tick_stale_sec:
+        if self.tick_state(now) in ("stale", "no_ticks"):
             out.add("tick_stale")
         lat = self.latency_stats()["max"]
         if lat is not None and lat > self.latency_warn_sec:
@@ -113,7 +164,16 @@ class HealthMonitor:
     def describe(self, now: datetime | None = None) -> str:
         """One line for /status."""
         age = self.tick_age_sec(now)
-        tick = "no ticks yet" if age is None else f"tick {age:.0f}s ago"
+        state = self.tick_state(now)
+        if state == "closed_expected":
+            tick = (f"tick {age:.0f}s ago — market closed, quote "
+                    f"pause expected (not a feed failure)"
+                    if age is not None else
+                    "no ticks yet — market closed (expected)")
+        elif age is None:
+            tick = "no ticks yet"
+        else:
+            tick = f"tick {age:.0f}s ago"
         lat = self.latency_stats()
         lat_txt = ("latency n/a" if lat["mean"] is None
                    else f"latency mean {lat['mean']:.2f}s "

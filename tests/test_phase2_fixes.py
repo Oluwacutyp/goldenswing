@@ -414,18 +414,21 @@ def _small_account_runner(tmp_path, feed_kw=None, **cfg_kw):
 
 
 def test_manifest_surfaces_effective_sizing_mode(tmp_path):
-    """fixed_lots=0.01 AND sizing_mode='risk' is A13 precedence,
-    not a contradiction — the manifest now prints the EFFECTIVE
-    mode and the override fact alongside the raw fields."""
-    runner = _small_account_runner(tmp_path, fixed_lots=0.01)
+    """PREMISE CORRECTION (owner ruling 2026-10-23): this test
+    pinned A13 precedence (fixed_lots=0.01 overriding
+    sizing_mode='risk').  A13 is REVOKED — fixed lots are gone
+    from the production path; the manifest now reports the
+    dynamic rule and carries no fixed-lots keys at all."""
+    runner = _small_account_runner(tmp_path)
     runner._journal_manifest()
     man = [r for r in runner.journal.records()
            if r.get("type") == "manifest"][-1]
     doc = man["doctrine"]
-    assert doc["fixed_lots"] == 0.01
+    assert "fixed_lots" not in doc
+    assert "fixed_lots_override" not in doc
     assert doc["sizing_mode"] == "risk"
-    assert doc["sizing_mode_effective"] == "fixed"
-    assert doc["fixed_lots_override"] is True
+    assert doc["sizing_mode_effective"] == "risk"
+    assert doc["risk_pct"] == 0.01
     roster = {row["name"]: row for row in man["roster"]}
     assert roster["range_qm"]["clock"] == "H4"
     assert roster["range_qm"]["refinement_clock"] == "H1"
@@ -433,27 +436,32 @@ def test_manifest_surfaces_effective_sizing_mode(tmp_path):
 
 
 def test_decision_solvency_refuses_over_budget_at_decision(tmp_path):
-    """THE EC2 burst math, reproduced: $12 equity -> daily
-    room 0.36 (3%); the fixture's trade risks ~4.5 at 0.01 lots.
-    Phase 1 accepted this at decision and refused it in the
-    order path; Phase 2 refuses AT DECISION with the guard's
-    reason and never reaches the order path."""
-    runner = _small_account_runner(tmp_path, fixed_lots=0.01)
+    """PREMISE CORRECTION (owner ruling 2026-10-23): the original
+    test pinned the EC2 burst seam — $12 equity, fixed 0.01 lots
+    risking ~4.45 against a $0.36 daily-loss ROOM, refused at
+    decision.  Both premises are revoked: no fixed lots, no
+    daily room.  Under the dynamic rule the $12 account's budget
+    is $0.12 (1%); the strategy still QUALIFIES the setup
+    (analytical layer unchanged), decision-stage solvency passes
+    under the sizing rule, and the shared order path refuses
+    with gate.solvency because the smallest permitted order
+    exceeds the budget — a reason-coded abstention, no order."""
+    runner = _small_account_runner(tmp_path)
     runner._run_qm_m5(_m5_fixture(), {})
     assert runner.executor.orders == []
     rec = _candidate_records(runner)[0]
     dec = rec["decision"]
     assert dec["result"] == "refused"
     assert dec["reason_code"] == "gate.solvency"
-    assert dec["order_result"] == "not_attempted"  # never dispatched
-    assert "daily loss room" in dec["reason"]
+    assert dec["order_result"] == "refused_in_order_path"
+    assert "daily loss room" not in dec["reason"]
     # Readable at a glance (amendment 2): the STRATEGY qualified
     # this setup; the RISK LAYER refused it.  Not a strategy
     # failure — the risk layer doing its job.
     assert dec["analytical_verdict"] == {
         "verdict": "qualified", "reason_code": None}
     assert dec["execution"] == {
-        "eligible": False, "outcome": "not_attempted",
+        "eligible": False, "outcome": "refused_in_order_path",
         "reason_code": "gate.solvency"}
 
 
@@ -606,13 +614,13 @@ def test_dynamic_sizing_scales_with_equity_and_stop(
 
 
 def test_sizing_precedence_is_explicit_not_contradictory():
-    """Addendum A: fixed_lots vs sizing_mode — the code defines
-    ONE explicit precedence (A13: an explicit fixed_lots always
-    wins; the configured mode applies only when it is unset),
-    and _sizing_mode reports it truthfully."""
+    """PREMISE CORRECTION (owner ruling 2026-10-23): Addendum A
+    pinned A13 precedence (an explicit fixed_lots always wins).
+    A13 is REVOKED: there is no fixed_lots field at all and the
+    configured mode is the only mode — dynamic risk sizing."""
     from goldenswing.execution.mt5_runner import MT5RunnerConfig
     assert MT5RunnerConfig().sizing_mode == "risk"
-    assert MT5RunnerConfig().fixed_lots is None
+    assert not hasattr(MT5RunnerConfig(), "fixed_lots")
 
 
 # -------------------------------- addendum C: reasoning records
@@ -803,20 +811,21 @@ def test_lifecycle_future_touch_fails_closed():
 # ------------------------------------------------- P1-2 owner numbers
 
 def test_owner_numbers_untouched():
-    """This pass changed NO owner number: friction bound, the
-    daily-loss percentage behind the room, the min_score value,
-    the QM validity window — pinned exactly as found."""
+    """Owner numbers this pass did NOT change: the friction
+    bound, the min_score value, the QM validity window.
+    PREMISE CORRECTION (owner ruling 2026-10-23): the original
+    test also pinned daily_loss_pct == 0.03 and the $0.36/$0.72
+    room math — the owner explicitly killed both ("drop the
+    stupid fixed lots… who needs that stupid 0.36 nonsense");
+    the fields are GONE, and max drawdown (0.15) stands as the
+    sole account-level hard halt."""
     assert FRICTION_RATIO_LIMIT == 0.10
-    assert RiskConfig().daily_loss_pct == 0.03
+    assert not hasattr(RiskConfig(), "daily_loss_pct")
+    assert not hasattr(RiskConfig(), "weekly_loss_pct")
+    assert RiskConfig().max_drawdown_pct == pytest.approx(0.15)
     assert mr.MT5RunnerConfig().min_score == 60.0
-    assert mr.MT5RunnerConfig().fixed_lots is None
+    assert not hasattr(mr.MT5RunnerConfig(), "fixed_lots")
     assert lifecycle.QM_VALIDITY_WINDOW_BARS == 1
-    # The room math, from the code rule (3% of day-start
-    # balance): $12 -> 0.36 (the EC2 journal's number) and,
-    # mechanically, $24 -> 0.72.  Stated, not resolved — the
-    # sizing doctrine behind it is the owner's open ruling.
-    assert 12.0 * RiskConfig().daily_loss_pct == pytest.approx(0.36)
-    assert 24.0 * RiskConfig().daily_loss_pct == pytest.approx(0.72)
 
 
 # --------------------------------------- Amendment 3: assessment shape

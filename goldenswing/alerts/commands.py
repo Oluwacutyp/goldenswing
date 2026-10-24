@@ -148,10 +148,36 @@ def fmt_next_cta(*commands: str) -> str:
 
 
 def fmt_feed_line(fs: dict | None, last_bar_time, last_price,
-                  *, label: str = "feed") -> str:
-    """Feed status line with ✅/⚠️ and monospace values."""
+                  *, label: str = "feed", market_open=None,
+                  tick_state: str | None = None,
+                  tick_age_s: float | None = None) -> str:
+    """Feed status line with ✅/⚠️ and monospace values.
+
+    Runtime Truth item 1: when the caller supplies the reconciled
+    tick/market truth (the MT5 runner's ``feed_truth()``), the
+    line must agree with the Health line by construction:
+
+    - market KNOWN closed + terminal connected -> OK, with the
+      closure stated (``market CLOSED — quotes paused,
+      expected``) instead of a bare OK that a tick_stale BREACH
+      line then contradicts;
+    - market open/unknown + stale tick -> STALE, even when the
+      terminal itself is connected: connected-but-not-quoting is
+      not an OK feed.
+    """
     fs = fs or {}
-    if fs.get("ok"):
+    if tick_state == "closed_expected" and fs.get("ok"):
+        line = (f"{label}: OK ✅ (MT5 terminal connected) · market "
+                f"CLOSED — quotes paused, expected")
+    elif tick_state in ("stale", "no_ticks") and fs.get("ok"):
+        age = (f"{tick_age_s:.0f}s ago" if tick_age_s is not None
+               else "never")
+        why = ("market open" if market_open
+               else "market state unverified")
+        line = (f"{label}: STALE ⚠️ — terminal connected but ticks "
+                f"are stale (last tick {age}; {why} — see "
+                f"Health)")
+    elif fs.get("ok"):
         line = f"{label}: OK ✅ (MT5 terminal connected)"
     else:
         line = (f"{label}: STALE ⚠️ — "

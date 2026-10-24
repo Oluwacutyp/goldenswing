@@ -75,22 +75,24 @@ def test_guard_max_positions_and_unstopped(tmp_path):
     assert not _check(g, unstopped_positions=1).allowed
 
 
-def test_daily_loss_limit_trips_and_latches_across_instances(tmp_path):
-    g = _guards(tmp_path, daily_loss_pct=0.02)       # limit $200
-    g.record_outcome(-250.0, 9_750.0)
-    assert g.halted
-    d = _check(g, balance=9_750.0)
-    assert not d.allowed and "halt" in d.reason
-    # a fresh instance on the same state file sees the latched halt:
-    g2 = _guards(tmp_path, daily_loss_pct=0.02)
-    assert g2.halted
-    g2.reset_halt()
-    # the halt is cleared, but the day itself is still spent:
-    d2 = _check(g2, balance=9_750.0)
-    assert not d2.allowed and "daily loss room" in d2.reason
-    # ...and a fresh day trades again:
-    g3 = _guards(tmp_path, today=date(2026, 10, 11), daily_loss_pct=0.02)
-    assert _check(g3, balance=9_750.0).allowed
+def test_daily_loss_limit_revoked_by_owner_ruling(tmp_path):
+    # PREMISE CORRECTION (owner ruling 2026-10-23): the daily
+    # loss cap this test pinned was REMOVED — daily/weekly caps
+    # are gone as halt constraints; max drawdown is the sole
+    # account-level hard halt.  The field itself no longer
+    # exists, and a day loss past the old cap books as realised
+    # P/L without halting or refusing anything.
+    with pytest.raises(TypeError):
+        RiskConfig(daily_loss_pct=0.02)
+    g = _guards(tmp_path)
+    g.record_outcome(-250.0, 9_750.0)   # past the old $200 cap
+    assert not g.halted
+    assert g.state["day_realized"] == pytest.approx(-250.0)
+    assert _check(g, balance=9_750.0).allowed
+    # a fresh instance on the same state file: still no halt.
+    g2 = _guards(tmp_path)
+    assert not g2.halted
+    assert _check(g2, balance=9_750.0).allowed
 
 
 def test_consecutive_losses_halt(tmp_path):
@@ -121,12 +123,16 @@ def test_day_rollover_resets_daily_totals(tmp_path):
     assert nxt.state["day_start_balance"] == pytest.approx(9_950.0)
 
 
-def test_weekly_room_shrinks_with_losses(tmp_path):
-    # Lose $90/day Mon-Fri (each day inside its own $~200 daily
-    # limit): by Saturday the $500 weekly room has only $50 left, so
-    # a $100-risk trade is refused on the WEEKLY limit specifically.
+def test_weekly_losses_book_but_never_refuse(tmp_path):
+    # PREMISE CORRECTION (owner ruling 2026-10-23): the weekly
+    # loss room this test pinned was REMOVED with the daily cap.
+    # Week realised P/L still books (reporting), but no weekly
+    # limit refuses a trade anymore — only max drawdown halts,
+    # and 4.5% is far under its 15%.
+    with pytest.raises(TypeError):
+        RiskConfig(weekly_loss_pct=0.05)
     balance = 10_000.0
-    kw = dict(weekly_loss_pct=0.05, max_consecutive_losses=0)
+    kw = dict(max_consecutive_losses=0)
     for day in range(5, 10):                          # Oct 5..9, one ISO week
         g = _guards(tmp_path, today=date(2026, 10, day), **kw)
         g.record_outcome(-90.0, balance - 90.0)
@@ -134,6 +140,5 @@ def test_weekly_room_shrinks_with_losses(tmp_path):
         balance -= 90.0
     sat = _guards(tmp_path, today=date(2026, 10, 10), **kw)
     assert sat.state["week_realized"] == pytest.approx(-450.0)
-    d = _check(sat, balance=balance, new_risk_money=100.0)
-    assert not d.allowed and "weekly" in d.reason
+    assert _check(sat, balance=balance, new_risk_money=100.0).allowed
     assert _check(sat, balance=balance, new_risk_money=40.0).allowed

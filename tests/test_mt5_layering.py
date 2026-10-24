@@ -89,7 +89,7 @@ def _runner(tmp_path, **cfg_kw):
         # a real news day (e.g. PPI).  The pause itself is covered
         # by test_news_calendar.py.
         news_pause_enabled=False,
-        fixed_lots=0.01,
+        # sizing: dynamic risk rule (fixed_lots revoked 2026-10-23)
         **cfg_kw)
     feed = SimpleNamespace(
         account_state=lambda: {"equity": 10000.0, "balance": 10000.0,
@@ -187,7 +187,10 @@ def test_layer_added_only_in_profit_same_direction(tmp_path):
     layers = runner.tick_manager.layers(101)
     assert len(layers) == 2
     assert layers[1].entry == pytest.approx(2010.0)
-    assert layers[1].volume == pytest.approx(0.01)
+    # PREMISE CORRECTION (owner ruling 2026-10-23): the layer
+    # volume was the revoked fixed 0.01; it is now sized from
+    # the layer risk budget — 0.08 for this fixture's geometry.
+    assert layers[1].volume == pytest.approx(0.08)
     # Broker SL moved to breakeven (base entry), tightening only.
     assert runner.executor.modifies[-1] == (101, pytest.approx(2000.0))
 
@@ -262,7 +265,9 @@ def test_layer_stop_via_runner_closes_layer_only(tmp_path):
     assert len(runner.tick_manager.layers(101)) == 1
     assert runner.tick_manager.position(101).closed is False
     assert runner.tick_manager.position(101).volume == pytest.approx(1.0)
-    assert (101, pytest.approx(0.01)) in runner.executor.closes
+    # The closed volume is the layer's actual (risk-sized) size:
+    # 0.13 for this tight-stop fixture (was fixed 0.01 pre-ruling).
+    assert (101, pytest.approx(0.13)) in runner.executor.closes
 
 
 def test_trim_top_layer_via_runner(tmp_path):

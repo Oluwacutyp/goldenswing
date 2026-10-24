@@ -64,6 +64,79 @@ def is_shadow_record(record: dict) -> bool:
     return "path.shadow_route" in codes
 
 
+def record_provenance(record: dict) -> dict:
+    """The candidate provenance block a record carries (evidence
+    block first, then the candidate's own — the two shapes the
+    routes emit), or {} when the record carries none."""
+    if not isinstance(record, dict):
+        return {}
+    ev = record.get("evidence") or {}
+    if isinstance(ev, dict) and isinstance(ev.get("provenance"),
+                                           dict):
+        return ev["provenance"]
+    cand = record.get("candidate") or {}
+    if isinstance(cand, dict) and isinstance(
+            cand.get("provenance"), dict):
+        return cand["provenance"]
+    return {}
+
+
+def freshness_lines(record: dict) -> list[str]:
+    """Runtime Truth item 3: the per-candidate freshness facts —
+    source bar, pattern touch, creation, evaluated bar, age vs
+    the validity window (the expiry), and the eligibility reason
+    — rendered from the record's own provenance, never invented.
+    An EXPIRED verdict leads the section: a historical record
+    must not read as the current market assessment."""
+    rec = record or {}
+    prov = record_provenance(rec)
+    fresh = rec.get("data_freshness_s")
+    if not prov and fresh is None:
+        return []
+    a = rec.get("assessment") or {}
+    dec = rec.get("decision") or {}
+    lines = ["Freshness & provenance:"]
+    if str(a.get("verdict") or "") == "expired":
+        lines.append("  ⌛ EXPIRED — historical record; NOT a "
+                     "current actionable setup")
+    if prov.get("evaluated_bar_ts") is not None:
+        lines.append(f"  source bar (evaluated): "
+                     f"{prov['evaluated_bar_ts']}")
+    if prov.get("pattern_touch_ts") is not None:
+        bits = f"  pattern touch: {prov['pattern_touch_ts']}"
+        if prov.get("pattern_formation_ts") is not None:
+            bits += f" · formed {prov['pattern_formation_ts']}"
+        lines.append(bits)
+    if prov.get("candidate_created_ts") is not None \
+            or prov.get("source") is not None:
+        bits = "  candidate created: " \
+            f"{prov.get('candidate_created_ts') or 'not recorded'}"
+        if prov.get("source") is not None:
+            bits += f" · source {prov['source']}"
+        lines.append(bits)
+    age = prov.get("touch_age_bars")
+    window = prov.get("validity_window_bars")
+    if age is not None and window is not None:
+        state = ("EXPIRED — touch is past the validity window"
+                 if int(age) > int(window) else
+                 "inside the validity window")
+        lines.append(f"  age: touch {age} bar(s) before the "
+                     f"evaluated bar · validity window {window} "
+                     f"bar(s) → {state}")
+    if "execution_eligible" in prov:
+        if prov.get("execution_eligible"):
+            lines.append("  execution eligibility: eligible")
+        else:
+            code = prov.get("eligibility_code") or "no code"
+            reason = dec.get("reason") or ""
+            lines.append(f"  execution eligibility: REFUSED "
+                         f"({code})"
+                         + (f" — {reason}" if reason else ""))
+    if fresh is not None:
+        lines.append(f"  data freshness: {fresh}s")
+    return lines
+
+
 def latest_evaluations(records) -> dict:
     """Latest playbook_eval record per playbook, in journal
     order (later records win).  Trigger-lifecycle records are
@@ -175,15 +248,9 @@ def render_assessment(record: dict, *,
     if route:
         head += f" · route {route}"
     lines.append(head)
-    prov = {}
+    prov = record_provenance(rec)
     ev = rec.get("evidence") or {}
-    if isinstance(ev, dict) and isinstance(ev.get("provenance"),
-                                          dict):
-        prov = ev["provenance"]
     cand = rec.get("candidate") or {}
-    if isinstance(cand, dict) and isinstance(
-            cand.get("provenance"), dict):
-        prov = prov or cand["provenance"]
     evaluated = rec.get("ts") or prov.get("evaluation_ts") \
         or "not recorded"
     bar_ts = rec.get("last_bar_ts") or "bar ts not recorded"
@@ -285,6 +352,12 @@ def render_assessment(record: dict, *,
         lines.append(
             f"Decision: {dec.get('result', '?')} · "
             f"order result: {dec.get('order_result', 'not_attempted')}")
+
+    # --- freshness & provenance (Runtime Truth item 3) ----------
+    _fresh = freshness_lines(rec)
+    if _fresh:
+        lines.append("")
+        lines += _fresh
 
     # --- structure read + HTF context ---------------------------
     lines.append("")

@@ -23,7 +23,7 @@ gets a chart PNG (data/mt5_charts/) attached to its Telegram alert.
 Examples:
   python scripts/run_mt5.py                 # demo, runs forever
   python scripts/run_mt5.py --max-ticks 1000  # rehearsal: 1000 ticks
-  python scripts/run_mt5.py --fixed-lots 0.01  # $12-style demo sizing
+  python scripts/run_mt5.py --risk-pct 0.01   # dynamic risk sizing rule
   python scripts/run_mt5.py --no-poll-commands  # overlap: OANDA still polls
 """
 from __future__ import annotations
@@ -182,7 +182,6 @@ def main(argv: list[str] | None = None) -> int:
                          "different MT5 install than the one on "
                          "screen)")
     ap.add_argument("--max-ticks", type=int, default=None)
-    ap.add_argument("--fixed-lots", type=float, default=None)
     ap.add_argument("--risk-pct", type=float, default=None)
     ap.add_argument("--tick-interval", type=float, default=0.25)
     ap.add_argument("--allow-live", action="store_true",
@@ -220,7 +219,6 @@ def main(argv: list[str] | None = None) -> int:
         tick_interval=args.tick_interval)
     cfg = MT5RunnerConfig.from_env(
         symbol=symbol,
-        fixed_lots=args.fixed_lots,
         allow_live=args.allow_live,
         tick_interval=args.tick_interval)
     cfg.terminal_path = terminal_path
@@ -253,12 +251,6 @@ def main(argv: list[str] | None = None) -> int:
         # never claim "configured" while staying mute.
         print(_telegram_outbox_text(), flush=True)
     runner = MT5Runner(cfg, feed=MT5Feed(feed_cfg), senders=senders)
-    # An explicit --fixed-lots wins over the persisted Telegram
-    # config (data/mt5_config.json) the runner just loaded, and is
-    # itself persisted for the next start.
-    if args.fixed_lots is not None:
-        runner.set_live_config(
-            {"field": "fixed_lots", "value": args.fixed_lots})
     stats = runner.run(max_ticks=args.max_ticks)
     print(f"MT5 engine stopped: {stats}")
     return 0

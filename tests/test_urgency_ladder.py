@@ -233,7 +233,7 @@ def _runner(tmp_path, *, ladder_enabled=True):
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
         execute_playbooks=("fvg_midline",),
-        fixed_lots=0.03,
+        # sizing: dynamic risk rule (fixed_lots revoked 2026-10-23)
         ladder_enabled=ladder_enabled,
         # News pause OFF: the order path's news check reads the
         # REAL wall-clock calendar — these tests must not fail on
@@ -272,9 +272,13 @@ def test_runner_ladder_places_rung_zero_and_advances_on_expiry(tmp_path):
     assert len(runner._pending_orders) == 1
     state = next(iter(runner._pending_orders.values()))
     assert state.level == pytest.approx(2000.0)
-    assert state.volume == pytest.approx(0.015)
+    # PREMISE CORRECTION (owner ruling 2026-10-23): rung sizes
+    # are fractions of the DYNAMIC base volume (0.08 for this
+    # fixture), not of the revoked fixed 0.03: rung 0 = 50%,
+    # remaining rungs 30% / 20%.
+    assert state.volume == pytest.approx(0.04)
     assert state.ladder_levels == [1995.0, 1990.0]
-    assert state.ladder_lots == pytest.approx([0.009, 0.006])
+    assert state.ladder_lots == pytest.approx([0.024, 0.016])
     # One live pending at a time.
     assert len(runner.executor.placed) == 1
     # Expiry: the rung cancels, the next rung is placed.
@@ -285,7 +289,7 @@ def test_runner_ladder_places_rung_zero_and_advances_on_expiry(tmp_path):
     assert len(runner._pending_orders) == 1
     state = next(iter(runner._pending_orders.values()))
     assert state.level == pytest.approx(1995.0)
-    assert state.volume == pytest.approx(0.009)
+    assert state.volume == pytest.approx(0.024)
     assert state.ladder_levels == [1990.0]
     assert len(runner.executor.placed) == 2
 
@@ -294,7 +298,9 @@ def test_runner_ladder_off_places_single_pending(tmp_path):
     runner = _runner(tmp_path, ladder_enabled=False)
     _order(runner)
     state = next(iter(runner._pending_orders.values()))
-    assert state.volume == pytest.approx(0.03)
+    # The full DYNAMIC base volume (0.08 here; was the revoked
+    # fixed 0.03 before the 2026-10-23 ruling).
+    assert state.volume == pytest.approx(0.08)
     assert state.ladder_levels == []
 
 

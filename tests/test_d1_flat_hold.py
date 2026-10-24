@@ -125,7 +125,7 @@ def _runner(tmp_path, frames):
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
         execute_playbooks=(),
-        fixed_lots=0.01,
+        # sizing: dynamic risk rule (fixed_lots revoked 2026-10-23)
         news_pause_enabled=False,
         golden_swing_confirm_enabled=False)
     runner = MT5Runner(cfg, feed=_FakeFeed(), executor=_FakeExecutor())

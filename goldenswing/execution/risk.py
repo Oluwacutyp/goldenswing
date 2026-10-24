@@ -7,13 +7,22 @@ closes a trade; it answers two questions and remembers the answers:
   systems quietly risk more.  If the allowed risk cannot buy the
   minimum lot, the answer is 0 lots plus a human-readable reason.)
 - ``RiskGuards.check_new_trade(...)`` -> may a new trade open at all?
-  (ATS day/drawdown/exposure guards, in Python: daily + weekly loss
-  limits, a max-drawdown halt, a consecutive-loss halt, a cap on open
-  positions and on total money-at-stops exposure.)
+  (ATS day/drawdown/exposure guards, in Python: a max-drawdown halt,
+  a consecutive-loss halt, a cap on open positions and on total
+  money-at-stops exposure.)
+
+Owner ruling 2026-10-23: maximum drawdown is THE account-level
+hard halt.  The former daily and weekly loss caps are REMOVED —
+they were halt constraints whose configured percentages produced
+an arbitrary fixed-dollar "daily room" that moved with the
+balance and vetoed analytically-qualified trades; they no longer
+exist in the config, the checks, or the latch.  Day/week realised
+P/L is still BOOKED (state + status facts), it just never halts
+or refuses anything.
 
 Guard state is PERSISTED as JSON on disk (the ATS library uses MT5
 GlobalVariables for the same reason): a process or terminal restart
-can never reset a loss limit that was already hit.  Day/week periods
+can never reset a halt that was already latched.  Day/week periods
 roll over by calendar date (an injectable clock keeps the rollover
 testable), and a tripped halt LATCHES — it stays tripped, with its
 reason, until a human clears it via :meth:`RiskGuards.reset_halt`.
@@ -120,11 +129,12 @@ class RiskConfig:
     # Calibrated 2026-10-11 from the anchor book's loss clusters
     # (scripts/risk_calibration.py): guards protect the TAIL, not the
     # normal.  A halt that fires in normal operation is a bug.
-    daily_loss_pct: float = 0.03       # of day-start balance (worst
-                                       # in-sample day -2.2% at 1% risk)
-    daily_loss_money: float | None = None   # if set, the SMALLER wins (ATS)
-    weekly_loss_pct: float = 0.05      # of week-start balance (worst -3.1%)
-    weekly_loss_money: float | None = None
+    #
+    # Owner ruling 2026-10-23: max_drawdown_pct is the SOLE
+    # account-level hard halt.  The daily/weekly loss caps that
+    # used to live here (daily_loss_pct 0.03 / weekly_loss_pct
+    # 0.05, with optional money overrides) are REMOVED — not
+    # zeroed, gone: no config field, no room check, no latch.
     max_drawdown_pct: float = 0.15     # from peak balance -> latched halt
                                        # (1.5x in-sample max 10.38%)
     max_consecutive_losses: int = 6    # -> latched halt (3-runs hit 14x
@@ -226,23 +236,6 @@ class RiskGuards:
         return self.kill_switch_path is not None \
             and self.kill_switch_path.exists()
 
-    def _limit(self, pct: float, money: float | None,
-               start_balance: float | None) -> float | None:
-        limits = []
-        if pct and start_balance:
-            limits.append(pct * start_balance)
-        if money:
-            limits.append(money)
-        return min(limits) if limits else None
-
-    def _daily_limit(self) -> float | None:
-        return self._limit(self.cfg.daily_loss_pct, self.cfg.daily_loss_money,
-                           self._state["day_start_balance"])
-
-    def _weekly_limit(self) -> float | None:
-        return self._limit(self.cfg.weekly_loss_pct, self.cfg.weekly_loss_money,
-                           self._state["week_start_balance"])
-
     # ------------------------------------------------------------ checks
     def note_balance(self, balance: float) -> None:
         """Feed the current balance: anchors day/week starts and the
@@ -283,7 +276,7 @@ class RiskGuards:
             return GuardDecision(
                 False, f"max positions reached ({open_count}/{self.cfg.max_positions})")
         # max_total_risk_pct == 0 disables the exposure cap, matching
-        # the other 0-disables in this file (daily / weekly / drawdown /
+        # the other 0-disables in this file (drawdown /
         # consecutive-loss). The Exness $12 loop sets it to 0 because
         # margin + equity stop-out are its real constraint, not R.
         if self.cfg.max_total_risk_pct and \
@@ -294,26 +287,16 @@ class RiskGuards:
                 False, f"exposure cap: open risk {open_risk_money:.2f} + new "
                        f"{new_risk_money:.2f} > {cap:.2f} "
                        f"({self.cfg.max_total_risk_pct:.0%} of balance)")
-        day_limit = self._daily_limit()
-        if day_limit is not None:
-            room = day_limit + st["day_realized"]
-            if new_risk_money > room:
-                return GuardDecision(
-                    False, f"daily loss room {max(room, 0.0):.2f} left of "
-                           f"{day_limit:.2f}; trade risks {new_risk_money:.2f}")
-        week_limit = self._weekly_limit()
-        if week_limit is not None:
-            room = week_limit + st["week_realized"]
-            if new_risk_money > room:
-                return GuardDecision(
-                    False, f"weekly loss room {max(room, 0.0):.2f} left of "
-                           f"{week_limit:.2f}; trade risks {new_risk_money:.2f}")
+        # Owner ruling 2026-10-23: NO daily/weekly loss-room check
+        # exists here anymore — max drawdown (latched in
+        # record_outcome) is the sole account-level hard halt.
         return GuardDecision(True, "")
 
     # ---------------------------------------------------------- outcomes
     def record_outcome(self, pnl_money: float, balance: float) -> None:
         """Book one closed trade's realised P/L.  Trips (and latches)
-        the halt when a limit is breached."""
+        the halt when max drawdown or the consecutive-loss limit is
+        breached."""
         self.note_balance(balance)
         st = self._state
         st["day_realized"] += pnl_money
@@ -324,14 +307,11 @@ class RiskGuards:
         elif pnl_money > 0:
             st["consecutive_losses"] = 0
         reasons = []
-        day_limit = self._daily_limit()
-        if day_limit is not None and st["day_realized"] <= -day_limit:
-            reasons.append(f"daily loss limit hit "
-                           f"({st['day_realized']:.2f} <= -{day_limit:.2f})")
-        week_limit = self._weekly_limit()
-        if week_limit is not None and st["week_realized"] <= -week_limit:
-            reasons.append(f"weekly loss limit hit "
-                           f"({st['week_realized']:.2f} <= -{week_limit:.2f})")
+        # Owner ruling 2026-10-23: daily/weekly loss limits no
+        # longer latch a halt — day/week realised P/L above is
+        # bookkeeping only.  Max drawdown is the sole account-level
+        # hard halt; the consecutive-loss halt (a streak fact, not
+        # a loss-room allowance) is unchanged.
         peak = st["peak_balance"]
         if peak and self.cfg.max_drawdown_pct:
             dd = (peak - balance) / peak

@@ -231,7 +231,6 @@ def _tick_now_utc(last_tick: dict | None) -> datetime | None:
 class MT5RunnerConfig:
     symbol: str = "XAUUSD"
     risk_pct: float = 0.01
-    fixed_lots: float | None = None  # when set, every trade uses it
     magic: int = 260101
     # A14 UNSHADOW (owner addendum 2026-10-21): the shadow tier is
     # abolished on the MT5 path — a log-only signal can never be
@@ -240,17 +239,22 @@ class MT5RunnerConfig:
     # decision flow (score floors, RiskPool, hard lines).  An
     # explicit tuple remains possible as a config override.
     # Capital protection is NOT this list: it is the RiskPool
-    # ceiling + StyleBook per-style caps + the RiskGuards daily
-    # cap (spec §11 A14).  The per-playbook kill switch is
+    # ceiling + StyleBook per-style caps + the RiskGuards
+    # max-drawdown halt (spec §11 A14).  The per-playbook kill switch is
     # ``disabled_playbooks`` below (default: all enabled).
     execute_playbooks: tuple | None = None
     min_score: float = 60.0
     # --- Confluence rework (spec v2, arrival pass) ------------------
-    # Sizing mode (A13): "risk" = sizes computed from risk money in
-    # Decimal (live/sizing.py), ledgered per position in a
-    # RiskPool; risk is the MT5-path default.  "fixed" is the
-    # legacy behaviour and is selected by setting fixed_lots (the
-    # EC2 --fixed-lots flag), which always wins when present.
+    # Sizing (owner ruling 2026-10-23, REVOKING A13's fixed-lots
+    # override): dynamic risk sizing is the SOLE sizing path.
+    # "risk" = sizes computed from risk money in Decimal
+    # (live/sizing.py), ledgered per position in a RiskPool; the
+    # legacy float path (risk.py size_position, same risk rule)
+    # remains selectable as sizing_mode="legacy" for A/B forensics.
+    # There is NO fixed-lots mode and no fixed_lots field: a size
+    # always derives from risk_pct x equity x stop distance x
+    # contract specs, floored to the broker step; a budget that
+    # cannot buy the broker minimum DECLINES, never rounds up.
     sizing_mode: str = "risk"
     # A6: resting limits at FRESH MAJOR POIs, placed ahead of
     # arrival at the zone's proximal edge.
@@ -444,8 +448,6 @@ class MT5RunnerConfig:
         cfg = cls(
             symbol=os.environ.get("GS_SYMBOL", "XAUUSD"),
             risk_pct=float(os.environ.get("GS_RISK_PCT", "0.01")),
-            fixed_lots=float(os.environ["GS_FIXED_LOTS"])
-            if os.environ.get("GS_FIXED_LOTS") else None,
             allow_live=os.environ.get("GS_MT5_ALLOW_LIVE", "0") == "1",
             poll_commands=os.environ.get("GS_MT5_POLL_COMMANDS", "1") != "0",
             poll_interval_seconds=float(
@@ -665,8 +667,10 @@ class MT5Runner:
         # (same documented reason the paper loop sets it to 0 in
         # risk.py).  The margin check in _place_live_order is the
         # binding pre-trade constraint; the guards supply the
-        # daily/weekly/drawdown/consecutive-loss halts, the max
-        # position cap and the unstopped-position refusal.
+        # max-drawdown halt (the sole account-level hard halt —
+        # owner ruling 2026-10-23: daily/weekly caps removed),
+        # the consecutive-loss halt, the max position cap and the
+        # unstopped-position refusal.
         self.guards = RiskGuards(
             self.cfg.risk_state_path,
             RiskConfig(max_total_risk_pct=0.0),
@@ -947,6 +951,10 @@ class MT5Runner:
         # new-breach-only (a stuck breach gets one note).
         self._health = HealthMonitor()
         self._health_last_breaches: set[str] = set()
+        # Runtime Truth item 1: when the health monitor's market
+        # state was last refreshed from the feed (monotonic clock;
+        # the refresh is cached — symbol_info is a terminal call).
+        self._health_market_ts: float = 0.0
         # Staged Golden Swing orders awaiting a Confirm tap:
         # order key -> {playbook, sig, verdict, entry_bar}.  The
         # token in _confirm_tokens (action "place_order") is the
@@ -1102,7 +1110,6 @@ class MT5Runner:
             "disabled_playbooks": sorted(
                 cfg.disabled_playbooks or ()),
             "min_score": cfg.min_score,
-            "fixed_lots": cfg.fixed_lots,
             "sizing_mode": cfg.sizing_mode,
             "risk_pct": cfg.risk_pct,
             "paused": cfg.paused,
@@ -1220,7 +1227,8 @@ class MT5Runner:
             slot = self._funnel_counts.setdefault(playbook, {
                 "evaluations": 0, "no_setup": 0, "candidates": 0,
                 "refused": 0, "ordered": 0, "ineligible": 0,
-                "no_order": 0, "unresolved": 0})
+                "no_order": 0, "unresolved": 0,
+                "ineligible_codes": {}, "qualified": 0})
             slot["evaluations"] += 1
             if outcome == "no_setup":
                 slot["no_setup"] += 1
@@ -1244,10 +1252,28 @@ class MT5Runner:
                     slot["ordered"] += 1
                 elif bucket == "ineligible":
                     slot["ineligible"] += 1
+                    # Runtime Truth item 2: an ineligible count
+                    # with its reasons NOWHERE was the EC2
+                    # discrepancy (31/31 + 10/10 "ineligible",
+                    # blocked legs empty).  The eligibility code
+                    # rides the decision (execution layer) or the
+                    # record; count it per playbook so /status can
+                    # name WHY every candidate was ineligible.
+                    code = dec.get("reason_code") or reason_code \
+                        or "no_code_recorded"
+                    codes = slot["ineligible_codes"]
+                    codes[code] = codes.get(code, 0) + 1
                 elif bucket == "no_order":
                     slot["no_order"] += 1
                 else:
                     slot["unresolved"] += 1
+                # Analytical layer (two-layer verdict law): the
+                # strategy layer's own verdict, counted separately
+                # from the terminal bucket.
+                _av = dec.get("analytical_verdict") or {}
+                if isinstance(_av, dict) \
+                        and _av.get("verdict") == "qualified":
+                    slot["qualified"] += 1
         return record
 
     # --------------------------------- candidate instances (P0-1)
@@ -1440,26 +1466,41 @@ class MT5Runner:
                     "execute_playbooks": self.cfg.execute_playbooks,
                     "disabled_playbooks": sorted(
                         self.cfg.disabled_playbooks or ()),
-                    "fixed_lots": self.cfg.fixed_lots,
                     "sizing_mode": self.cfg.sizing_mode,
-                    # Phase 2 (P1-1): the manifest previously
-                    # printed fixed_lots AND sizing_mode raw,
-                    # which read as a contradiction on EC2
-                    # (fixed_lots=0.01 AND sizing_mode="risk").
-                    # The truth is A13 precedence (see
-                    # _sizing_mode): an explicit fixed_lots ALWAYS
-                    # wins; sizing_mode is the configured mode
-                    # used only when fixed_lots is unset.  Print
-                    # the EFFECTIVE mode + the override fact, so
-                    # the conflict is surfaced, not implied.
+                    # Owner ruling 2026-10-23: dynamic risk
+                    # sizing is the sole path (the A13 fixed_lots
+                    # override is revoked and the field is gone).
+                    # The manifest prints the EFFECTIVE mode + the
+                    # configured risk rule, so what sized the
+                    # trades is a journal fact, never an implication.
                     "sizing_mode_effective": self._sizing_mode(),
-                    "fixed_lots_override": (
-                        self.cfg.fixed_lots is not None),
+                    "risk_pct": self.cfg.risk_pct,
                     "min_score": self.cfg.min_score,
                     "floor_authority": dict(_FLOOR_AUTHORITY),
                 }})
         except Exception:
             pass
+
+    def funnel_totals(self) -> dict:
+        """Run-level funnel totals (Runtime Truth item 2): every
+        candidate counted exactly once in a terminal bucket, the
+        ineligible reason codes aggregated, and the analytical
+        qualified count kept separate (two-layer verdict law).
+        The /status blocked-legs section cross-reads this so the
+        two sections can never tell different stories again."""
+        totals = {"candidates": 0, "ordered": 0, "refused": 0,
+                  "ineligible": 0, "no_order": 0, "unresolved": 0,
+                  "qualified": 0, "ineligible_codes": {}}
+        for c in self._funnel_counts.values():
+            for key in ("candidates", "ordered", "refused",
+                        "ineligible", "no_order", "unresolved",
+                        "qualified"):
+                totals[key] += int(c.get(key, 0) or 0)
+            for code, n in (c.get("ineligible_codes")
+                            or {}).items():
+                totals["ineligible_codes"][code] = \
+                    totals["ineligible_codes"].get(code, 0) + n
+        return totals
 
     def funnel_line(self) -> str:
         """The /status funnel section: provenance + the armed
@@ -1501,6 +1542,17 @@ class MT5Runner:
             if c.get("unresolved"):
                 line += f" · UNRESOLVED {c['unresolved']}"
             lines.append(line)
+            # Runtime Truth item 2: the ineligible count carries
+            # its reason codes inline — a bare "ineligible N"
+            # beside an empty blocked-legs list was the EC2
+            # discrepancy this pass closes.
+            codes = c.get("ineligible_codes") or {}
+            if codes:
+                top = sorted(codes.items(),
+                             key=lambda kv: -kv[1])[:3]
+                lines.append(
+                    "    ineligible reasons: " + " · ".join(
+                        f"{code} ×{n}" for code, n in top))
         _not_evaluated = [s.name for s in PLAYBOOK_REGISTRY
                           if s.name not in self._funnel_counts]
         if _not_evaluated:
@@ -1512,6 +1564,21 @@ class MT5Runner:
                          key=lambda kv: -kv[1])[:5]
             lines.append("top refusals: " + " · ".join(
                 f"{code} ×{n}" for code, n in top))
+        # Runtime Truth item 2: the run-level reconciliation —
+        # candidates must equal the sum of the terminal buckets,
+        # printed in the directive's classes (submitted =
+        # ordered, risk-refused = refused) with the analytical
+        # qualified count beside them, never blended in.
+        totals = self.funnel_totals()
+        if totals["candidates"]:
+            lines.append(
+                f"reconcile: candidates {totals['candidates']} = "
+                f"submitted {totals['ordered']} + risk-refused "
+                f"{totals['refused']} + ineligible "
+                f"{totals['ineligible']} + no-order "
+                f"{totals['no_order']} + unresolved "
+                f"{totals['unresolved']} · analytically qualified "
+                f"{totals['qualified']}")
         return "\n".join(lines)
 
     # -------------------------------------------- deterministic engine
@@ -2587,9 +2654,47 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: macro alignment -> {new.describe()}")
 
+    def _refresh_health_market(self) -> None:
+        """Runtime Truth item 1: feed the health monitor the
+        broker's market state, from the SAME check the order path
+        gates on (:meth:`_market_open`) — one market truth for
+        execution and for status.  Cached 30s (the check is a
+        terminal call).  A feed whose market state cannot be read
+        leaves the state UNKNOWN (None): tick staleness then
+        keeps its fail-loud breach reading rather than being
+        excused by a guess."""
+        now = time.monotonic()
+        if now - self._health_market_ts < 30.0 \
+                and self._health.market_open_state is not None:
+            return
+        self._health_market_ts = now
+        fn = getattr(self.feed, "market_open", None) \
+            if self.feed is not None else None
+        if fn is None:
+            self._health.note_market_open(None)
+            return
+        try:
+            is_open, _reason = fn()
+            self._health.note_market_open(bool(is_open))
+        except Exception:
+            self._health.note_market_open(None)
+
+    def feed_truth(self) -> dict:
+        """The reconciled feed picture for /status (Runtime Truth
+        item 1): market state + tick state + tick age from the
+        health monitor — the Feed line and the Health line are
+        rendered from this one source, so they cannot disagree
+        (``feed: OK`` beside ``BREACH: tick_stale`` on a closed
+        market was the defect)."""
+        self._refresh_health_market()
+        return {"market_open": self._health.market_open_state,
+                "tick_state": self._health.tick_state(),
+                "tick_age_s": self._health.tick_age_sec()}
+
     def _journal_new_breaches(self) -> None:
         """Journal health breaches that were not breaching before —
         a stuck breach gets one note, not one per order."""
+        self._refresh_health_market()
         current = self._health.breaches()
         new = current - self._health_last_breaches
         self._health_last_breaches = current
@@ -2599,6 +2704,7 @@ class MT5Runner:
 
     def health_line(self) -> str:
         """One-line execution health for /status (see mt5_commands)."""
+        self._refresh_health_market()
         return self._health.describe()
 
     def _refresh_dxy(self) -> None:
@@ -5196,8 +5302,6 @@ class MT5Runner:
                       "drag": float(result.drag),
                       "raw_lots": float(result.raw_lots),
                       "lots": lots}
-        elif self.cfg.fixed_lots is not None:
-            lots = float(self.cfg.fixed_lots)
         else:
             sizing = size_position(
                 balance=float(acct.get("equity", 0.0)),
@@ -5786,11 +5890,11 @@ class MT5Runner:
         return pb_name in self.cfg.execute_playbooks
 
     def _sizing_mode(self) -> str:
-        """Effective sizing mode (A13): an explicit fixed_lots
-        always wins (the EC2 --fixed-lots flag is the owner's
-        deliberate override); otherwise the configured mode."""
-        if self.cfg.fixed_lots is not None:
-            return "fixed"
+        """Effective sizing mode (owner ruling 2026-10-23): dynamic
+        risk sizing is the ONLY sizing family — the configured
+        mode selects between the Decimal RiskPool path ("risk")
+        and the legacy float path; there is no fixed-lots mode
+        (the A13 override is revoked, the field is gone)."""
         return str(self.cfg.sizing_mode or "risk")
 
     def _zone_dict_for(self, verdict: dict | None,
@@ -6327,10 +6431,8 @@ class MT5Runner:
             # The order already filled (the pool is created at
             # fill time) — the ledger must book reality, so widen
             # the budget to the layer's realized risk and journal
-            # it.  In fixed mode this is expected (owner-explicit
-            # lots; RiskGuards gated the order).  In risk mode it
-            # means placement sized past the envelope — visible,
-            # never silent.
+            # it.  It means placement sized past the envelope —
+            # visible, never silent.
             try:
                 realized = float(spec.money_for_move(
                     abs(float(entry) - float(stop)), float(lots)))
@@ -7468,8 +7570,9 @@ class MT5Runner:
         funding ladder — a NEW funding event (structure shift /
         displacement / CHoCH-MSB / FVG / sweep / absorption) with
         the stop at breakeven, or the legacy in-profit path — and
-        sized from the RiskPool's headroom in risk mode.  Fixed
-        mode keeps the legacy arithmetic, unchanged."""
+        sized from the RiskPool's headroom in risk mode.  The
+        legacy fallback path sizes by the same dynamic risk rule
+        (owner ruling 2026-10-23: no fixed-lots sizing exists)."""
         tickets = self.tick_manager.tickets()
         if len(tickets) != 1:
             self.journal.log_note(
@@ -7589,7 +7692,7 @@ class MT5Runner:
                 funding_events=new_events,
                 score=score, zone_d=zone_d)
             return
-        # ---- legacy / fixed-mode arithmetic (unchanged) ---------
+        # ---- legacy fallback arithmetic (dynamic sizing) --------
         base = layers[0]
         base_risk = spec.money_for_move(
             abs(base.entry - base.sl), base.volume)
@@ -7608,22 +7711,20 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: layer skipped {pb.name}: zero risk per lot")
             return
-        # Size: same sizing as a base order, floored to 0.01 and
-        # capped by the remaining risk budget.
-        if self.cfg.fixed_lots is not None:
-            lots = float(self.cfg.fixed_lots)
-        else:
-            acct = self.feed.account_state()
-            sizing = size_position(balance=acct["equity"],
-                                   risk_pct=self.cfg.risk_pct,
-                                   entry=sig.entry_ref, stop=stop0,
-                                   spec=spec)
-            if sizing.lots <= 0:
-                self.journal.log_note(
-                    f"mt5: layer sizing refused {pb.name}: "
-                    f"{sizing.reason}")
-                return
-            lots = sizing.lots
+        # Size: dynamic risk sizing (the same risk rule as a base
+        # order), floored to 0.01 and capped by the remaining risk
+        # budget.
+        acct = self.feed.account_state()
+        sizing = size_position(balance=acct["equity"],
+                               risk_pct=self.cfg.risk_pct,
+                               entry=sig.entry_ref, stop=stop0,
+                               spec=spec)
+        if sizing.lots <= 0:
+            self.journal.log_note(
+                f"mt5: layer sizing refused {pb.name}: "
+                f"{sizing.reason}")
+            return
+        lots = sizing.lots
         lots = min(lots, int(budget / risk_per_lot / 0.01) * 0.01)
         if lots < 0.01:
             self.journal.log_note(
@@ -7777,9 +7878,7 @@ class MT5Runner:
         journals.  Returns (ok, message)."""
         field = change.get("field")
         value = change.get("value")
-        if field == "fixed_lots":
-            self.cfg.fixed_lots = value
-        elif field == "max_layers":
+        if field == "max_layers":
             self.cfg.layer_max_layers = int(value)
         elif field == "manipulation_filter":
             self.cfg.manipulation_filter = bool(value)
@@ -8173,16 +8272,16 @@ class MT5Runner:
         remains the authoritative backstop (it re-checks
         everything, including margin, at placement time).
 
-        Sizing truth (A13, see _sizing_mode): an explicit
-        fixed_lots always wins — the intended size is then known
-        exactly.  In risk mode the intended size is derived from
-        the risk budget, so the candidate's worst-case new risk
-        IS the budget itself (equity x risk_pct x score band,
-        pre-multiplier): if the BUDGET cannot fit the room, no
+        Sizing truth (owner ruling 2026-10-23): dynamic risk
+        sizing is the sole path — the intended size is derived
+        from the risk budget, so the candidate's worst-case new
+        risk IS the budget itself (equity x risk_pct x score
+        band, pre-multiplier): if the BUDGET cannot fit, no
         size the order path could compute fits either.  No
-        silent fallback exists on either branch: invalid risk
-        sizing declines inside the order path (sizing_declined)
-        and is never rescued by fixed lots.
+        silent fallback exists: invalid risk sizing declines
+        inside the order path (sizing_declined) and is never
+        rescued by a fixed lot count (the mode no longer
+        exists).
 
         Fail closed: if the check itself cannot run (no spec,
         no account state), the candidate is refused at decision
@@ -8198,21 +8297,14 @@ class MT5Runner:
                              volume=0.0,
                              stop_loss=float(sig.invalidation),
                              atr=float(sig.atr or 0.0)))
-            mode = self._sizing_mode()
-            if mode == "fixed":
-                lots = float(self.cfg.fixed_lots)
-                new_risk = spec.money_for_move(
-                    abs(float(sig.entry_ref) - stop0), lots)
-                sizing_desc = f"fixed {lots:.2f} lots"
-            else:
-                total = float(score.total) \
-                    if score is not None else 75.0
-                band = 1.0 if total >= 75.0 else (
-                    0.75 if total >= 60.0 else 0.5)
-                new_risk = float(acct.get("equity", 0.0)) \
-                    * float(self.cfg.risk_pct) * band
-                sizing_desc = (f"risk budget {new_risk:.2f} "
-                               f"(band {band})")
+            total = float(score.total) \
+                if score is not None else 75.0
+            band = 1.0 if total >= 75.0 else (
+                0.75 if total >= 60.0 else 0.5)
+            new_risk = float(acct.get("equity", 0.0)) \
+                * float(self.cfg.risk_pct) * band
+            sizing_desc = (f"risk budget {new_risk:.2f} "
+                           f"(band {band})")
             open_risk, unstopped = self._open_risk_state(spec)
             decision = self.guards.check_new_trade(
                 balance=float(acct.get("balance", 0.0)),
@@ -8540,8 +8632,6 @@ class MT5Runner:
         if is_layer:
             # Layer size was pre-capped by _try_layer (total risk cap).
             lots = float(layer_lots)
-        elif self.cfg.fixed_lots is not None:
-            lots = float(self.cfg.fixed_lots)
         elif self._sizing_mode() == "risk":
             # ---- A13 risk sizing (Decimal, quantized once) ------
             # Risk money = equity x risk_pct x score band x traffic
@@ -8612,17 +8702,14 @@ class MT5Runner:
                     f"mt5: sizing refused {pb.name}: {sizing.reason}")
                 return
             # MacroTrend alignment sizing (base orders only): Golden
-            # Swing 1.5x, D1/W1 conflict 0.5x.  fixed_lots is an
-            # explicit override and is never multiplied; layers are
+            # Swing 1.5x, D1/W1 conflict 0.5x.  Layers are
             # NOT multiplied here — they scale via the layer risk
             # budget, which derives from the (multiplied) base risk.
             lots = self._apply_alignment_multiplier(lots, spec, pb.name)
             # Regime sizing (base orders only): RANGE regime trades
             # at 0.5x (choppy regime = smaller).  Same no-multiply
-            # rules as alignment: fixed_lots is an explicit
-            # override and is never multiplied; layers scale via
-            # the layer risk budget, which derives from the
-            # (multiplied) base risk.
+            # rules as alignment: layers scale via the layer risk
+            # budget, which derives from the (multiplied) base risk.
             lots = self._apply_size_multiplier(
                 lots, spec,
                 float((verdict or {}).get("size_mult", 1.0) or 1.0),
@@ -10169,8 +10256,8 @@ class MT5Runner:
                 evidence=evidence, source=_src)
             return
         # Phase 2 (P1-1) DECISION-STAGE SOLVENCY: the same
-        # daily-loss-room accounting the order path enforces,
-        # asked BEFORE dispatch — a candidate the room would
+        # RiskGuards accounting the order path enforces,
+        # asked BEFORE dispatch — a candidate the guards would
         # refuse is refused here, at decision, with the guard's
         # exact reason (the EC2 burst's 23 "accepted"-then-
         # refused candidates are this check's reason to exist).
@@ -10179,9 +10266,8 @@ class MT5Runner:
         _solv_ok, _solv_reason = self._decision_solvency(
             pb, sig, score)
         hard_checks.append({
-            "check": "decision_solvency (RiskGuards incl. "
-                     "daily-loss room, same accounting as the "
-                     "order path)",
+            "check": "decision_solvency (RiskGuards, same "
+                     "accounting as the order path)",
             "result": "pass" if _solv_ok else "VETO",
             "detail": _solv_reason or "solvent under the "
                                       "effective sizing mode"})

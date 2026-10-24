@@ -223,13 +223,29 @@ def test_alignment_sizing_disabled_is_noop(tmp_path):
                                               "x") == pytest.approx(0.10)
 
 
-def test_fixed_lots_not_multiplied(tmp_path):
-    runner = _ready_runner(tmp_path, fixed_lots=0.01)
-    runner._alignment = _golden()
+def test_dynamic_lots_are_alignment_multiplied(tmp_path):
+    # PREMISE CORRECTION (owner ruling 2026-10-23): the original
+    # test pinned "fixed lots are never multiplied" — the
+    # fixed_lots override is REVOKED.  On the sole dynamic path
+    # the alignment multiplier DOES apply to the risk-sized
+    # base lots (floored to the broker step, never up).
+    plain_dir = tmp_path / "plain"
+    plain_dir.mkdir()
+    plain = _ready_runner(plain_dir)          # neutral alignment
     stats: dict = {"executed": 0}
-    runner._place_live_order(_pb(), _sig(), stats)
-    assert len(runner.executor.orders) == 1
-    assert runner.executor.orders[0]["volume"] == pytest.approx(0.01)
+    plain._place_live_order(_pb(), _sig(), stats)
+    assert len(plain.executor.orders) == 1
+    base = plain.executor.orders[0]["volume"]
+
+    golden_dir = tmp_path / "golden"
+    golden_dir.mkdir()
+    golden = _ready_runner(golden_dir)
+    golden._alignment = _golden()           # Golden Swing 1.5x
+    stats2: dict = {"executed": 0}
+    golden._place_live_order(_pb(), _sig(), stats2)
+    assert len(golden.executor.orders) == 1
+    assert golden.executor.orders[0]["volume"] == \
+        pytest.approx(base * 1.5)
 
 
 # -------------------------------------------------------------- confirm

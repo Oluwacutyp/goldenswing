@@ -213,7 +213,7 @@ def _runner(tmp_path, frames, *, playbook=None):
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
         execute_playbooks=("stub",),
-        fixed_lots=0.01,
+        # sizing: dynamic risk rule (fixed_lots revoked 2026-10-23)
         news_pause_enabled=False,
         golden_swing_confirm_enabled=False)
     runner = MT5Runner(cfg, feed=FakeFeed(), executor=FakeExecutor())
@@ -330,7 +330,9 @@ def test_live_clock_pullback_reaches_order(tmp_path):
     assert len(runner.executor.orders) == 1
     order = runner.executor.orders[0]
     assert order["direction"] == -1
-    assert order["volume"] == pytest.approx(0.01)
+    # Dynamic sizing (fixed_lots revoked 2026-10-23): a real
+    # risk-sized volume at or above the broker minimum.
+    assert order["volume"] >= 0.01
     assert stats.get("signals", 0) == 1
     journal = (tmp_path / "mt5_journal.jsonl").read_text()
     assert "accepted" in journal

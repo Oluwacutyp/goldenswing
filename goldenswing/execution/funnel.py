@@ -499,6 +499,16 @@ def summarize_evaluations(records: list[dict],
             "outcomes": {outcome: n},
             "candidates": n,                 # candidate_emitted
             "refusals_by_code": {code: n},   # decision reason codes
+            "terminal_by_code": {bucket: {code: n}},
+                        # EVERY terminal bucket's reason codes —
+                        # Runtime Truth item 2: ineligible /
+                        # no-order / unresolved candidates carry
+                        # their codes too, so no candidate class
+                        # is a bare count with its reasons nowhere
+            "qualified": n,   # candidates whose ANALYTICAL verdict
+                        # was "qualified" (strategy layer) —
+                        # readable separately from the terminal
+                        # bucket, per the two-layer verdict law
             "reached_execution": n,          # execution_eligible
             "orders": {order_result: n}}},
          "not_called": [names with ZERO evaluations — synthesized
@@ -508,7 +518,9 @@ def summarize_evaluations(records: list[dict],
          "trigger_events": {stage: n}}
 
     Counts reconcile by construction: for every playbook,
-    evaluations == sum(outcomes.values()).
+    evaluations == sum(outcomes.values()) and
+    candidates == sum(terminal.values()) ==
+    sum over buckets of sum(terminal_by_code[bucket].values()).
     """
     by_playbook: dict[str, dict] = {}
     not_called: list[str] = []
@@ -524,6 +536,7 @@ def summarize_evaluations(records: list[dict],
             "evaluations": 0, "by_clock": {}, "outcomes": {},
             "candidates": 0, "refusals_by_code": {},
             "refusals_by_category": {},
+            "terminal_by_code": {}, "qualified": 0,
             "reached_execution": 0, "orders": {},
             "terminal": {"ordered": 0, "refused": 0, "ineligible": 0,
                          "no_order": 0, "unresolved": 0}})
@@ -540,7 +553,26 @@ def summarize_evaluations(records: list[dict],
             dec = terminal_decision(r.get("decision")) or {}
             # Terminal bucket: candidates reconcile in ONE view —
             # candidates == sum(terminal.values()), always.
-            slot["terminal"][decision_bucket(dec)] += 1
+            bucket = decision_bucket(dec)
+            slot["terminal"][bucket] += 1
+            # EVERY bucket's reason code (Runtime Truth item 2):
+            # the terminal decision's code wins; the record-level
+            # code is the fallback (the native routes stamp the
+            # eligibility code at record level).  A candidate with
+            # no code anywhere is counted under an explicit
+            # "no_code_recorded" key — visible, never silent.
+            code = dec.get("reason_code") or r.get("reason_code") \
+                or "no_code_recorded"
+            by_code = slot["terminal_by_code"].setdefault(
+                bucket, {})
+            by_code[code] = by_code.get(code, 0) + 1
+            # Analytical layer (two-layer verdict law): how many
+            # candidates the STRATEGY layer qualified, whatever
+            # the risk layer then did with them.
+            av = dec.get("analytical_verdict") or {}
+            if isinstance(av, dict) \
+                    and av.get("verdict") == "qualified":
+                slot["qualified"] += 1
             code = dec.get("reason_code")
             if decision_bucket(dec) == "refused" and code:
                 slot["refusals_by_code"][code] = \
@@ -560,7 +592,22 @@ def summarize_evaluations(records: list[dict],
     for name in registered_names:
         if name not in by_playbook:
             not_called.append(str(name))
+    totals = {"candidates": 0, "qualified": 0,
+              "terminal": {"ordered": 0, "refused": 0,
+                           "ineligible": 0, "no_order": 0,
+                           "unresolved": 0},
+              "terminal_by_code": {}}
+    for slot in by_playbook.values():
+        totals["candidates"] += slot["candidates"]
+        totals["qualified"] += slot["qualified"]
+        for bucket, n in slot["terminal"].items():
+            totals["terminal"][bucket] += n
+        for bucket, codes in slot["terminal_by_code"].items():
+            agg = totals["terminal_by_code"].setdefault(bucket, {})
+            for code, n in codes.items():
+                agg[code] = agg.get(code, 0) + n
     return {"by_playbook": by_playbook,
             "not_called": not_called,
             "frame_mismatches": frame_mismatches,
-            "trigger_events": trigger_events}
+            "trigger_events": trigger_events,
+            "totals": totals}

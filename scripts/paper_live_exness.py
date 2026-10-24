@@ -110,10 +110,11 @@ def build_runner() -> LiveRunner:
         fixed_lots=FIXED_LOTS,
         # Exness timing model: margin + stop-out are the constraint.
         # R-based guards disabled (all 0); kill switch, require_stops
-        # and max_positions=1 still enforced.
+        # and max_positions=1 still enforced.  (Daily/weekly loss
+        # caps no longer exist in RiskConfig — owner ruling
+        # 2026-10-23: max drawdown is the sole account-level halt,
+        # and it is 0 = disabled here.)
         risk=RiskConfig(
-            daily_loss_pct=0.0,
-            weekly_loss_pct=0.0,
             max_drawdown_pct=0.0,
             max_consecutive_losses=0,
             max_positions=1,

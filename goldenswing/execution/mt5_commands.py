@@ -159,6 +159,22 @@ def _control(ctx: CommandContext):
     return getattr(ctx, "mt5_control", None)
 
 
+def _feed_truth(ctx: CommandContext) -> dict:
+    """The runner's reconciled feed truth (Runtime Truth item 1),
+    or {} when no runner / an old runner is attached — the feed
+    line then falls back to the raw poll status."""
+    ctrl = _control(ctx)
+    if ctrl is None:
+        return {}
+    fn = getattr(ctrl, "feed_truth", None)
+    if not callable(fn):
+        return {}
+    try:
+        return fn() or {}
+    except Exception:
+        return {}
+
+
 def _confirm_result(ctx: CommandContext, action: str, label: str,
                     arg=None) -> CommandResult:
     """Ask for confirmation before a mutating action (never acts here)."""
@@ -246,12 +262,12 @@ def _config_text(ctx: CommandContext) -> str:
     ctrl = _control(ctx)
     if ctrl is None:
         return ("live config unavailable (no live runner attached).\n"
-                "Safe keys: fixed_lots, max_layers, manipulation_filter, "
+                "Safe keys: max_layers, manipulation_filter, "
                 "pending_expiry_bars, playbook.<name>.")
     cfg = ctrl.get_live_config()
     lines = [fmt_section("⚙️", "MT5 LIVE CONFIG (safe keys only):"), "",
-             f"`fixed_lots` = "
-             f"{fmt_code('auto (risk-% sizing)') if cfg.get('fixed_lots') is None else fmt_code(cfg.get('fixed_lots'))}",
+             f"`sizing` = "
+             f"{fmt_code('dynamic — risk rule ' + (str(cfg.get('risk_pct')) if cfg.get('risk_pct') is not None else '?') + ' of equity per trade')}",
              f"`max_layers` = {fmt_code(cfg.get('max_layers'))}",
              f"`manipulation_filter` = "
              f"{fmt_code('on' if cfg.get('manipulation_filter') else 'off')}",
@@ -338,9 +354,18 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
     cfg = ctrl.get_live_config() if ctrl is not None else None
 
     lines = [fmt_section("📊", "MT5 ENGINE STATUS"), ""]
-    # Feed
+    # Feed — reconciled with the Health section below from ONE
+    # source (Runtime Truth item 1): the runner's feed_truth()
+    # carries market state + tick state, so this line can no
+    # longer claim a bare OK while Health reports a stale-tick
+    # breach on a closed market.  Guarded — old runners lack it.
     lines.append(fmt_section("📡", "Feed"))
-    lines.append(fmt_feed_line(fs, ctx.last_bar_time, ctx.last_price))
+    _truth = _feed_truth(ctx)
+    lines.append(fmt_feed_line(
+        fs, ctx.last_bar_time, ctx.last_price,
+        market_open=_truth.get("market_open"),
+        tick_state=_truth.get("tick_state"),
+        tick_age_s=_truth.get("tick_age_s")))
     if ctrl is not None:
         # Per-TF last closed bars (guarded — old runners lack it).
         # The old /status showed only the H1 last bar, which read
@@ -419,8 +444,8 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
     if cfg is not None:
         lines.append(fmt_section("🔧", "Config"))
         lines.append(
-            f"config: `fixed_lots=`"
-            f"{fmt_code('auto' if cfg.get('fixed_lots') is None else cfg.get('fixed_lots'))} "
+            f"config: `sizing=`"
+            f"{fmt_code('dynamic risk ' + str(cfg.get('risk_pct')) + '/trade' if cfg.get('risk_pct') is not None else 'dynamic')} "
             f"`max_layers=`{fmt_code(cfg.get('max_layers'))} "
             f"`manipulation_filter=`"
             f"{fmt_code('on' if cfg.get('manipulation_filter') else 'off')} "
@@ -467,6 +492,25 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(f"  ⛔ `manipulation_filter`: "
                          f"{stats['manipulation_blocked']}")
         lines.append(f"  last blocked: {stats.get('last') or '(none)'}")
+        # Runtime Truth item 2: when the order path blocked
+        # nothing but the funnel shows candidates ending earlier,
+        # SAY SO here — the EC2 status showed "31/31 + 10/10
+        # ineligible" in one section and "(nothing blocked)" in
+        # this one, with no bridge between them.
+        if not legs:
+            _ftot = getattr(ctrl, "funnel_totals", None)
+            if callable(_ftot):
+                try:
+                    _t = _ftot() or {}
+                except Exception:
+                    _t = {}
+                if _t.get("ineligible") or _t.get("refused"):
+                    lines.append(
+                        f"  ➖ order path blocked nothing — "
+                        f"candidates ended earlier: "
+                        f"{_t.get('ineligible', 0)} ineligible · "
+                        f"{_t.get('refused', 0)} risk-refused "
+                        f"(reason codes in Decision Funnel below)")
         counts = stats.get("signal_counts") or {}
         lines.append("")
         lines.append(fmt_section("🎯", "Per-Playbook Signals"))
@@ -505,6 +549,7 @@ def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
     would exceed a Telegram message, the /recap pattern)."""
     from .assessment_render import (is_shadow_record,
                                     latest_evaluations,
+                                    record_provenance,
                                     render_assessment)
     if ctx.journal is None:
         return CommandResult(text="no journal attached.")
@@ -529,8 +574,25 @@ def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
         a = rec.get("assessment") or {}
         verdict = str(a.get("verdict") or "?").upper()
         mark = " (SHADOW)" if is_shadow_record(rec) else ""
-        return (f"  {name}: {verdict}{mark} · "
+        line = (f"  {name}: {verdict}{mark} · "
                 f"bar {rec.get('last_bar_ts') or '?'}")
+        # Runtime Truth item 3: the index carries the freshness
+        # facts too — a record whose bar is an old touch must read
+        # as history on the index itself, not as the playbook's
+        # current read (the qm_d1 2025-07-30 defect).
+        prov = record_provenance(rec)
+        if prov:
+            bits = []
+            if prov.get("touch_age_bars") is not None:
+                bits.append(f"touch age {prov['touch_age_bars']} "
+                            f"bar(s)")
+            if prov.get("source"):
+                bits.append(f"source {prov['source']}")
+            if bits:
+                line += " · " + " · ".join(bits)
+        if verdict == "EXPIRED":
+            line += " — STALE history, not a current setup"
+        return line
 
     arg = (args[0].lower() if args else "")
     if arg and arg != "all":
@@ -618,9 +680,11 @@ def _mt5_set(ctx: CommandContext, args: list[str]) -> CommandResult:
     if len(args) < 2:
         return CommandResult(
             text="usage: /set <key> <value>\n"
-                 "safe keys: fixed_lots (0.01–1.0 | auto), max_layers (0–3), "
+                 "safe keys: max_layers (0–3), "
                  "manipulation_filter (on/off), pending_expiry_bars (1–24), "
-                 "playbook.<name> (on/off).  Pause is not a /set key.")
+                 "playbook.<name> (on/off).  Sizing is dynamic-only "
+                 "(risk rule) — there is no lots key.  Pause is not "
+                 "a /set key.")
     if len(args) > 2:
         return CommandResult(text="/set takes exactly one key and one value.")
     key, raw = args[0], args[1]
@@ -1056,9 +1120,13 @@ def _mt5_reconcile(ctx: CommandContext, args: list[str]) -> CommandResult:
 @mt5_command("/health", "feed + journal + open positions health")
 def _mt5_health(ctx: CommandContext, args: list[str]) -> CommandResult:
     fs = ctx.feed_status or {}
+    _truth = _feed_truth(ctx)
     lines = [fmt_section("❤️", "MT5 HEALTH"), "",
              fmt_section("📡", "Feed"),
-             fmt_feed_line(fs, ctx.last_bar_time, ctx.last_price)]
+             fmt_feed_line(fs, ctx.last_bar_time, ctx.last_price,
+                           market_open=_truth.get("market_open"),
+                           tick_state=_truth.get("tick_state"),
+                           tick_age_s=_truth.get("tick_age_s"))]
     if ctx.journal is not None:
         try:
             lines += ["", fmt_section("📓", "Journal"),

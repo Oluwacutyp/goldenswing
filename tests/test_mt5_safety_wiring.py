@@ -155,11 +155,14 @@ def test_risk_guard_latched_halt_blocks_live_order(tmp_path):
     runner = _runner(tmp_path, feed=_open_feed(),
                      executor=FakeExecutor())
     _stack(runner)
-    # Trip the halt honestly: anchor the day, then book a loss past
-    # the 3% daily limit.
+    # Trip the halt honestly: anchor the peak, then book a loss
+    # past the max-drawdown halt (15%).  PREMISE CORRECTION
+    # (owner ruling 2026-10-23): this test originally tripped
+    # the 3% DAILY loss cap — that cap is revoked; max drawdown
+    # is the sole account-level hard halt.
     runner.guards.check_new_trade(balance=10000.0, open_risk_money=0.0,
                                   new_risk_money=0.0, open_count=0)
-    runner.guards.record_outcome(-400.0, 9600.0)
+    runner.guards.record_outcome(-1600.0, 8400.0)
     assert runner.guards.halted
     _place(runner)
     assert runner.executor.orders == []

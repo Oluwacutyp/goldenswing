@@ -8,10 +8,16 @@ it, and the error message never echoes the supplied value (a
 
 File format (all keys optional; missing keys fall back to defaults)::
 
-    {"fixed_lots": null | 0.01-1.0, "max_layers": 0-3,
+    {"max_layers": 0-3,
      "manipulation_filter": true | false,
      "pending_expiry_bars": 1-24,
      "disabled_playbooks": ["<name>", ...], "paused": true | false}
+
+Sizing is NOT a key: owner ruling 2026-10-23 revoked the fixed_lots
+override — position size comes only from the dynamic risk rule
+(``MT5RunnerConfig.risk_pct``), so there is nothing sizing-shaped
+for /set to change.  A persisted ``fixed_lots`` key from before
+the ruling is dropped by the cleaner like any other unknown key.
 
 The runner loads this file at startup (when it exists) and
 ``/set`` applies + persists in-process — the file is the durable
@@ -51,21 +57,19 @@ SHADOW_PLAYBOOK_NAMES: tuple[str, ...] = ()
 ALL_PLAYBOOK_NAMES: tuple[str, ...] = (
     EXECUTE_PLAYBOOK_NAMES + SHADOW_PLAYBOOK_NAMES)
 
-FIXED_LOTS_MIN = 0.01
-FIXED_LOTS_MAX = 1.0
 MAX_LAYERS_MIN = 0
 MAX_LAYERS_MAX = 3
 PENDING_EXPIRY_MIN = 1
 PENDING_EXPIRY_MAX = 24
 
 #: Keys ``/set`` accepts (``playbook.<name>`` handled separately).
-SAFE_SCALAR_KEYS = ("fixed_lots", "max_layers", "manipulation_filter",
+SAFE_SCALAR_KEYS = ("max_layers", "manipulation_filter",
                     "pending_expiry_bars")
 
 
 def defaults() -> dict:
-    """Default live config (fixed_lots None = risk-% sizing)."""
-    return {"fixed_lots": None, "max_layers": 3,
+    """Default live config (sizing is dynamic-only — no key)."""
+    return {"max_layers": 3,
             "manipulation_filter": True, "pending_expiry_bars": 4,
             "disabled_playbooks": [], "paused": False}
 
@@ -75,15 +79,6 @@ def _clean(values: dict) -> dict:
     out = defaults()
     if not isinstance(values, dict):
         return out
-    if values.get("fixed_lots") is None:
-        out["fixed_lots"] = None
-    else:
-        try:
-            lots = float(values.get("fixed_lots"))
-        except (TypeError, ValueError):
-            lots = None
-        if lots is not None and FIXED_LOTS_MIN <= lots <= FIXED_LOTS_MAX:
-            out["fixed_lots"] = lots
     for key in ("max_layers", "pending_expiry_bars"):
         try:
             val = int(values.get(key))
@@ -155,20 +150,8 @@ def parse_set(key: str, raw_value: str) -> tuple[dict | None, str | None]:
         return {"field": "playbook", "name": name, "value": enabled}, None
     if key not in SAFE_SCALAR_KEYS:
         return None, (f"{key!r} is not a safe /set key.  Safe keys: "
-                      f"fixed_lots, max_layers, manipulation_filter, "
+                      f"max_layers, manipulation_filter, "
                       f"pending_expiry_bars, playbook.<name>.")
-    if key == "fixed_lots":
-        low = raw_value.strip().lower()
-        if low in ("auto", "none", "off"):
-            return {"field": "fixed_lots", "value": None}, None
-        try:
-            lots = float(raw_value)
-        except ValueError:
-            return None, "fixed_lots takes a number (0.01–1.0) or auto."
-        if not FIXED_LOTS_MIN <= lots <= FIXED_LOTS_MAX:
-            return None, (f"fixed_lots out of range "
-                          f"({FIXED_LOTS_MIN}–{FIXED_LOTS_MAX}).")
-        return {"field": "fixed_lots", "value": lots}, None
     if key == "max_layers":
         try:
             val = int(raw_value)
@@ -200,9 +183,6 @@ def describe_change(change: dict) -> str:
     if change.get("field") == "playbook":
         return (f"playbook.{change['name']} = "
                 f"{'on' if change['value'] else 'off'}")
-    if change.get("field") == "fixed_lots":
-        return ("fixed_lots = auto (risk-% sizing)" if change["value"] is None
-                else f"fixed_lots = {change['value']}")
     return f"{change.get('field')} = {change.get('value')}"
 
 
@@ -239,7 +219,6 @@ class LiveConfigStore:
     def apply_to(self, cfg) -> None:
         """Apply persisted values onto an ``MT5RunnerConfig``."""
         values = self.load()
-        cfg.fixed_lots = values["fixed_lots"]
         cfg.layer_max_layers = values["max_layers"]
         cfg.manipulation_filter = values["manipulation_filter"]
         cfg.pending_expiry_bars = values["pending_expiry_bars"]
@@ -247,10 +226,15 @@ class LiveConfigStore:
         cfg.paused = values["paused"]
 
     def snapshot_from(self, cfg) -> dict:
-        """Current live values from an ``MT5RunnerConfig``."""
+        """Current live values from an ``MT5RunnerConfig``.
+
+        Sizing truth (owner ruling 2026-10-23): dynamic risk
+        sizing is the sole path — the snapshot reports the
+        configured risk rule (``risk_pct``), never a lot count."""
         disabled = set(getattr(cfg, "disabled_playbooks", ()) or ())
         return {
-            "fixed_lots": getattr(cfg, "fixed_lots", None),
+            "sizing_mode": "risk",
+            "risk_pct": getattr(cfg, "risk_pct", None),
             "max_layers": getattr(cfg, "layer_max_layers", 3),
             "manipulation_filter": getattr(
                 cfg, "manipulation_filter", True),
