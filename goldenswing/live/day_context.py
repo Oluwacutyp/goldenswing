@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from .multitf import atr14
 from .volume_profile import volume_profile
 
 NY_TZ = "America/New_York"
@@ -377,11 +378,16 @@ def compute_day_context(frames: dict, now=None,
     # (broken/stub D1 sample), and a gauge that cannot be read is
     # never priced (adr_days = 0 disarms every consumer).
     if ctx.adr > 0:
-        try:
-            from ..features.indicators import atr14 as _atr14
-            _a = float(_atr14(h1)) if h1 is not None else 0.0
-        except Exception:
-            _a = 0.0
+        # Guard source is live.multitf.atr14, the engine's own
+        # ATR.  A previous revision imported it from
+        # features.indicators — a module that never existed —
+        # and the bare except below it swallowed the
+        # ModuleNotFoundError, so this guard silently NEVER ran
+        # and a stub D1 sample read thousands of percent
+        # consumed.  The import is now top-level, so any future
+        # breakage fails loudly at module load instead of
+        # disarming the guard quietly.
+        _a = float(atr14(h1)) if h1 is not None else 0.0
         if _a > 0 and ctx.adr < 0.5 * _a:
             ctx.adr_days = 0
     day_range = ctx.day_high - ctx.day_low
