@@ -93,6 +93,43 @@ def _amd_cfg():
     return FeatureConfig(amd_range_bars=20, amd_prior_bars=40)
 
 
+def _amd_fixture():
+    """The exact real-data slice the missed-sweep test asserts on.
+
+    Pinned as a committed fixture (real GC=F H1 bars, 2026-04-06 06:00
+    -> 2026-04-13 20:00 UTC) instead of ``load_gold_h1().iloc[-3000:…]``:
+    that window is anchored to the END of a growing, git-ignored
+    cache, so it slid 199 bars as the cache grew and the slice moved
+    off the 2026-04-13 event the test describes (the test then failed
+    with out[114] == 'consolidation', while the detector still fires
+    the fallback on the April-13 bars themselves). The detector is
+    unchanged; only the test's data source is pinned.
+    """
+    import pandas as pd
+    from pathlib import Path
+
+    path = Path(__file__).parent / "fixtures" \
+        / "amd_missed_sweep_h1_20260413.csv"
+    sl = pd.read_csv(path, index_col=0, parse_dates=True)
+    sl.index = pd.to_datetime(sl.index, utc=True)
+    return sl
+
+
+def test_amd_fixture_pinned():
+    """The fixture the missed-sweep tests assert on must stay exactly
+    the 130 real bars it was cut from — a silent fixture edit would
+    change what the fallback tests prove."""
+    import pandas as pd
+
+    sl = _amd_fixture()
+    assert len(sl) == 130
+    assert list(sl.columns) == ["open", "high", "low", "close", "volume"]
+    assert str(sl.index[0]) == "2026-04-06 06:00:00+00:00"
+    assert str(sl.index[-1]) == "2026-04-13 20:00:00+00:00"
+    assert sl.index.is_monotonic_increasing
+    assert not sl[["open", "high", "low", "close"]].isna().any().any()
+
+
 def test_amd_clean_sequence_manipulation_then_expansion():
     rows = _amd_rows()
     rows.append((2020.0, 2021.0, 2012.0, 2020.5))   # sweep lows, close in
@@ -138,10 +175,10 @@ def test_amd_missed_sweep_fallback_real_data():
     """Real XAUUSD H1 (2026-04-13): BOS + sweep + FVG coincide in a
     base, but the direct check misses (sweep_age 8 > 0). The fallback
     must label manipulation with fallback provenance, and must never
-    reach expansion without displacement."""
-    from goldenswing.backtest.data import load_gold_h1
-
-    sl = load_gold_h1().iloc[-3000:-3000 + 130].copy()
+    reach expansion without displacement. Data is the pinned fixture
+    (see _amd_fixture) — the live-cache -3000 window slid off this
+    event as the cache grew."""
+    sl = _amd_fixture().copy()
     states = MarketReader().read(sl)
     out = phases.compute(sl, states, FeatureConfig())
     fb = out[114]
@@ -171,9 +208,9 @@ def test_amd_phase_state_provenance_and_determinism():
     # compute is a pure function of its inputs: same input, same
     # output (no cursor to rewind — the FVG-bug class). NaN-aware
     # compare: dataclass __eq__ treats NaN != NaN.
-    from goldenswing.backtest.data import load_gold_h1
-
-    sl = load_gold_h1().iloc[-3000:-3000 + 130].copy()
+    # Input is the pinned fixture (see _amd_fixture), so the
+    # determinism claim is stable across cache growth.
+    sl = _amd_fixture().copy()
     states = MarketReader().read(sl)
     o1 = phases.compute(sl, states, FeatureConfig())
     o2 = phases.compute(sl, states, FeatureConfig())
