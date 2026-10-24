@@ -21,6 +21,40 @@ from typing import Iterable
 TICK_CSV_COLUMNS = ("time", "bid", "ask", "tick_volume", "real_volume",
                     "spread")
 
+#: Default tick-CSV retention: 30 UTC days of tick files.  A month
+#: of replay/backtest material; positions held longer are protected
+#: separately by TickLogger.prune's keep_since_day (their open day
+#: onward is never evicted while they are open).
+TICK_CSV_RETAIN_DAYS = 30
+
+
+def tick_csv_day(name: str) -> str | None:
+    """UTC day (``YYYYMMDD``) of a tick-CSV filename, else None.
+
+    Only the logger's own ``mt5_ticks_YYYYMMDD.csv`` shape matches;
+    anything else is never a prune candidate.
+    """
+    if not name.startswith("mt5_ticks_") or not name.endswith(".csv"):
+        return None
+    day = name[len("mt5_ticks_"):-len(".csv")]
+    if len(day) == 8 and day.isdigit():
+        try:
+            datetime.strptime(day, "%Y%m%d")
+        except ValueError:
+            return None
+        return day
+    return None
+
+
+def _shift_day(day: str, delta_days: int) -> str | None:
+    """``YYYYMMDD`` shifted by ``delta_days`` (negative = earlier)."""
+    try:
+        d = datetime.strptime(day, "%Y%m%d").date()
+    except ValueError:
+        return None
+    from datetime import timedelta
+    return (d + timedelta(days=delta_days)).strftime("%Y%m%d")
+
 
 def tick_csv_name(day: str) -> str:
     """File name for one UTC day (``day`` = ``YYYYMMDD``)."""
@@ -33,11 +67,22 @@ class TickLogger:
     One open handle per day, rotated on date change, flushed per
     write.  Logging never raises into the tick loop — callers wrap
     in try/except and the logger itself guards the write.
+
+    Retention: the warehouse is BOUNDED, not append-forever.  The
+    runner calls :meth:`prune` on UTC day rollover and at startup
+    (never implicitly here, so the runner's open-position guard is
+    always applied): the newest ``retain_days`` days are kept
+    (today included), except today's file and every file from
+    ``keep_since_day`` onward (the earliest open position's open
+    day — a live position's ticks are never evicted while it is
+    open).
     """
 
-    def __init__(self, directory: str | Path):
+    def __init__(self, directory: str | Path, *,
+                 retain_days: int = TICK_CSV_RETAIN_DAYS):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
+        self.retain_days = max(0, int(retain_days))
         self._day: str | None = None
         self._fh = None
         self._writer = None
@@ -89,6 +134,57 @@ class TickLogger:
     def log_many(self, ticks: Iterable[dict]) -> int:
         """Log an iterable of ticks; returns rows written."""
         return sum(1 for t in ticks if self.log(t))
+
+    def prune(self, *, keep_since_day: str | None = None,
+              today: str | None = None) -> list[str]:
+        """Delete tick-CSV day files older than retention.
+
+        Keeps: today's file (always — the live record, and the
+        currently open handle), every file from ``keep_since_day``
+        onward (a live position's open day onward), and the newest
+        ``retain_days`` days (today included) otherwise.  A malformed
+        ``keep_since_day`` skips pruning entirely (fail-closed:
+        never evict on a guessed span).  Never raises; returns the
+        deleted filenames for journaling.  Non-tick files are never
+        touched.
+        """
+        try:
+            if today is None:
+                today = datetime.now(timezone.utc).strftime("%Y%m%d")
+            if tick_csv_day(f"mt5_ticks_{today}.csv") is None:
+                return []
+            if keep_since_day is not None and \
+                    tick_csv_day(f"mt5_ticks_{keep_since_day}.csv") \
+                    is None:
+                return []
+            cutoff = _shift_day(today, -(self.retain_days - 1))
+            if cutoff is None:
+                return []
+            protected = {today}
+            if self._day is not None:
+                protected.add(self._day)
+            deleted = []
+            for path in sorted(self.directory.glob("mt5_ticks_*.csv")):
+                day = tick_csv_day(path.name)
+                if day is None or day in protected:
+                    continue
+                # Either protection keeps the file: within
+                # retention, or at/after the earliest open
+                # position's day.  keep_since_day only ever
+                # EXTENDS retention backward, never shrinks it.
+                if day >= cutoff:
+                    continue
+                if keep_since_day is not None \
+                        and day >= keep_since_day:
+                    continue
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
+                deleted.append(path.name)
+            return deleted
+        except Exception:
+            return []
 
     def close(self) -> None:
         if self._fh is not None:

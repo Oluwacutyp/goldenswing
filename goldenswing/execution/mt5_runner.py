@@ -298,6 +298,12 @@ class MT5RunnerConfig:
     poll_interval_seconds: float = 30.0
     # Tick CSV logging (per-day CSVs next to the journal).
     tick_log: bool = True
+    # Tick-CSV retention (UTC days): day files older than this are
+    # pruned on day rollover and at startup — EXCEPT every file from
+    # the earliest open position's open day onward, which is never
+    # evicted while that position is open.  0 = keep only today +
+    # open-position days.
+    tick_csv_retain_days: int = 30
     charts_dir: Path | None = None  # default: <journal parent>/mt5_charts
     chart_style: str = "classic"  # MT5 chart class: classic | blueprint
     # Pending-order expiry: a pending LIMIT / STOP that has not
@@ -907,7 +913,9 @@ class MT5Runner:
         # second run() call on the same runner never double-pings.
         self._startup_ping_sent = False
         # Per-day tick CSV logger (next to the journal; None = disabled).
-        self._tick_logger = TickLogger(self.cfg.journal_path.parent) \
+        self._tick_logger = TickLogger(
+            self.cfg.journal_path.parent,
+            retain_days=self.cfg.tick_csv_retain_days) \
             if self.cfg.tick_log else None
         self._charts_dir = self.cfg.charts_dir or (
             self.cfg.journal_path.parent / "mt5_charts")
@@ -1843,6 +1851,11 @@ class MT5Runner:
             # a restart must not orphan a resting limit/stop.
             self._adopt_existing_pending(executor)
 
+            # Bound the tick warehouse now that positions are known:
+            # aged day files go, open-position days never do (see
+            # _prune_tick_csvs).  Never raises into startup.
+            self._prune_tick_csvs()
+
             # Startup ping: ONE Telegram "engine started" message, after
             # feed connect + runner start, independent of command polling
             # (it fires even with --no-poll-commands).  Never raises.
@@ -1959,7 +1972,14 @@ class MT5Runner:
             self._health.note_tick(tick.get("time"))
             # Day rollover -> the honest recap for the day/week that
             # just ended (wins AND losses).  Never breaks the loop.
+            _day_before = self._last_tick_date
             self._maybe_send_rollover_recap(tick)
+            if (_day_before is not None
+                    and self._last_tick_date is not None
+                    and self._last_tick_date != _day_before):
+                # New UTC day: bound the tick warehouse (aged day
+                # files go; open-position days never do).
+                self._prune_tick_csvs()
             # Friday close (action "close" only): existing positions
             # + pendings are closed at the Friday hour, once per day.
             # Default action "hold" is a no-op here.  A COMPLETE
@@ -2529,6 +2549,55 @@ class MT5Runner:
         except Exception as exc:
             self.journal.log_note(
                 f"mt5 friday close failed (loop continues): {exc}")
+
+    def _prune_tick_csvs(self) -> list[str]:
+        """Bound the tick-CSV warehouse (rollover + startup hook).
+
+        Deletes day files older than ``tick_csv_retain_days``,
+        except every file from the earliest open position's open
+        day onward — a live position's ticks are never evicted
+        while it is open.  Fail-closed: an open position with an
+        unknown open time (adopted positions carry
+        ``opened_at=None``) skips pruning entirely rather than
+        evicting on a guessed span; the skip is journaled.
+        Never raises into the tick loop or startup.
+        """
+        if self._tick_logger is None:
+            return []
+        try:
+            keep_since = None
+            for ticket in self.tick_manager.tickets():
+                pos = self.tick_manager.position(ticket)
+                if pos is None:
+                    continue
+                opened = getattr(pos, "opened_at", None)
+                if opened is None:
+                    self.journal.log_note(
+                        "mt5: tick-CSV prune SKIPPED — open position "
+                        f"(ticket {ticket}) has unknown open time "
+                        "(adopted); no day files evicted")
+                    return []
+                from datetime import datetime, timezone
+                day = datetime.fromtimestamp(
+                    float(opened), tz=timezone.utc).strftime("%Y%m%d")
+                keep_since = day if keep_since is None \
+                    else min(keep_since, day)
+            deleted = self._tick_logger.prune(
+                keep_since_day=keep_since)
+            if deleted:
+                self.journal.log_note(
+                    "mt5: tick-CSV prune deleted "
+                    f"{len(deleted)} aged day file(s): "
+                    f"{', '.join(deleted)}")
+            return deleted
+        except Exception as exc:
+            try:
+                self.journal.log_note(
+                    f"mt5: tick-CSV prune failed (loop continues): "
+                    f"{exc}")
+            except Exception:
+                pass
+            return []
 
     def _maybe_send_rollover_recap(self, tick: dict) -> None:
         """UTC day rollover -> Telegram recap(s) for what just ended.
@@ -4096,8 +4165,19 @@ class MT5Runner:
             return "day: — (no frames yet)"
         parts = [f"day: {d.day_type}"]
         if d.adr > 0:
-            parts.append(f"ADR {d.adr_consumed_pct:.0f}% "
-                         f"({d.adr_state})")
+            if d.adr_days < 10:
+                # Disarmed gauge (stub D1 sample, or a thin sample
+                # under the standing >=10-day guard): never print a
+                # pct no decision may price.  The numeric adr_pct
+                # stays in the journal context / summary dict
+                # untouched — only this human-facing string changes.
+                # (The magnitude leg of _adr_gauge_valid needs a
+                # signal ATR the day line does not carry, so the
+                # render gates on the sample guard alone.)
+                parts.append("ADR — (disarmed)")
+            else:
+                parts.append(f"ADR {d.adr_consumed_pct:.0f}% "
+                             f"({d.adr_state})")
         if d.ib_width > 0:
             parts.append(
                 f"IB {'set' if d.ib_complete else 'forming'} "
