@@ -234,20 +234,119 @@ def verdict_blocks(*, analytical: str,
 #: classifies as NOT live must be marked on the record itself —
 #: absent / stale / not-integrated — never silently omitted.
 #: Values are census facts (capability-census.md), not opinions.
+#:
+#: Census-wiring pass (2026-10-23): the unwired families are
+#: now consumed on the live MT5 path as RECORDED EVIDENCE via
+#: live/census_evidence.py, so the static texts below state the
+#: post-wiring fact for a record that carries no census
+#: snapshot of its own; when a snapshot IS on the record,
+#: :func:`_census_markers` replaces these with the per-record
+#: recorded reads.  Nothing here claims decision weight — the
+#: detectors are evidence sources; promotion is the owner's
+#: shadow-first gate.
 ASSESSMENT_CAPABILITY_MARKERS = {
     "named_candlestick_taxonomy":
-        "absent — no named-pattern candlestick detector (hammer / "
-        "doji / engulfing-by-name) exists in the live decision "
-        "path; candle evidence reaches decisions only as QM "
-        "pattern tags and bar geometry",
+        "integrated — live/candle_taxonomy.py named patterns "
+        "are recorded as candle evidence on live-path "
+        "evaluation records (no decision weight); no census "
+        "snapshot on this record",
     "premium_discount":
-        "not_integrated — computed by live/patterns.py "
-        "premium_discount(); no live consumer reads it",
+        "integrated — live/patterns.py premium_discount() is "
+        "consumed on the live path as recorded evidence (no "
+        "decision weight); no census snapshot on this record",
     "legacy_smc_block":
-        "not_integrated — live/patterns.py structure/order-block/"
-        "breaker/FVG helpers have no live consumer; the live SMC "
-        "evidence comes from the playbooks and live/zones.py",
+        "partially_integrated — live/patterns.py breaker/"
+        "mitigation helpers are consumed on the live path as "
+        "recorded evidence; the structure/order-block/FVG "
+        "helpers remain unconsumed legacy duplicates (the live "
+        "SMC evidence comes from the playbooks and "
+        "live/zones.py); no census snapshot on this record",
+    "chart_patterns":
+        "integrated — features/patterns.py double top/bottom "
+        "+ head-and-shoulders are recorded on live-path "
+        "evaluation records (no decision weight); no census "
+        "snapshot on this record",
+    "relative_strength":
+        "integrated — features/relstrength.py vs the DXY "
+        "tracker frame is recorded on live-path evaluation "
+        "records (no decision weight); no census snapshot on "
+        "this record",
+    "engulfing":
+        "integrated — the revival/experiments engulfing read "
+        "is recorded on live-path evaluation records (no "
+        "decision weight); no census snapshot on this record",
 }
+
+
+def _census_markers(census: dict) -> dict:
+    """Per-record capability markers when the record carries a
+    census-evidence snapshot (live/census_evidence.py): each
+    wired capability reports what THIS record recorded — the
+    flipped, truthful counterpart of the pre-wiring census
+    facts.  A snapshot that is present but not recorded
+    (warmup/replay, no frame in scope) marks every wired
+    capability not_recorded WITH its reason."""
+    keys = ("named_candlestick_taxonomy", "premium_discount",
+            "legacy_smc_block", "chart_patterns",
+            "relative_strength", "engulfing")
+    if census.get("status") != "recorded":
+        reason = census.get("reason") or "census unavailable"
+        return {k: f"not_recorded — {reason}" for k in keys}
+    out: dict[str, str] = {}
+    candles = census.get("candles") or {}
+    tax = candles.get("taxonomy") or []
+    names = ", ".join(
+        f"{p.get('name')} ({p.get('bars_ago')} bar(s) ago)"
+        for p in tax) or "none in the last 10 bars"
+    out["named_candlestick_taxonomy"] = (
+        "recorded — named candlestick patterns on this record "
+        f"(evidence only, no decision weight): {names}")
+    pd_read = census.get("premium_discount") or {}
+    if pd_read.get("status") == "recorded":
+        out["premium_discount"] = (
+            "recorded — premium/discount on this record: "
+            f"{pd_read.get('zone')} (EQ {pd_read.get('eq')}); "
+            "evidence only, no decision weight")
+    else:
+        out["premium_discount"] = (
+            "recorded as unavailable — "
+            f"{pd_read.get('reason') or 'no read'}")
+    brk = census.get("breaker_blocks") or {}
+    mit = census.get("mitigation_blocks") or {}
+    out["legacy_smc_block"] = (
+        "partially_integrated — breaker "
+        f"({brk.get('count', 0)}) + mitigation "
+        f"({mit.get('count', 0)}) blocks recorded on this "
+        "record from live/patterns.py helpers; the structure/"
+        "order-block/FVG helpers remain unconsumed legacy "
+        "duplicates (live SMC evidence comes from the "
+        "playbooks and live/zones.py)")
+    cp = census.get("chart_patterns") or {}
+    active = cp.get("active") or []
+    kinds = ", ".join(
+        f"{p.get('kind')} ({p.get('status')})"
+        for p in active) or "none active"
+    out["chart_patterns"] = (
+        "recorded — classical chart patterns on this record: "
+        f"{kinds}; evidence only, no decision weight")
+    rs = census.get("relative_strength") or {}
+    if rs.get("status") == "recorded":
+        dol = rs.get("dollar") or {}
+        out["relative_strength"] = (
+            "recorded — relative strength vs DXY (H1) on this "
+            f"record: trend {dol.get('trend')}, percentile "
+            f"{dol.get('percentile')}; evidence only, no "
+            "decision weight")
+    else:
+        out["relative_strength"] = (
+            "recorded as unavailable — "
+            f"{rs.get('reason') or 'no peer read'}")
+    eng = candles.get("engulfing") or {}
+    out["engulfing"] = (
+        "recorded — engulfing direction "
+        f"{eng.get('direction')} on the last two bars of this "
+        "record's frame; evidence only, no decision weight")
+    return out
 
 #: The owner's assessment verdict vocabulary (Amendment 3).
 ASSESSMENT_VERDICTS = ("signal", "watch", "no-setup", "rejected",
@@ -386,9 +485,23 @@ def assessment_block(*, outcome: str,
             "note": "this route produces no competing scenarios"}
     # --- capability / freshness markers --------------------------
     markers = dict(ASSESSMENT_CAPABILITY_MARKERS)
+    census = ev.get("census")
+    if isinstance(census, dict):
+        # Census-wiring pass: the record carries the wired
+        # detectors' snapshot — markers report THIS record's
+        # reads, flipped truthfully from the pre-wiring facts.
+        markers.update(_census_markers(census))
     if not evidence:
         markers["evidence"] = ("absent — this evaluation produced "
                                "no evidence block")
+    elif not {k: v for k, v in evidence.items() if k != "census"}:
+        # Census-wiring pass: a record whose evidence block is
+        # ONLY the census snapshot still produced no ROUTE
+        # evidence — this marker speaks about the route's own
+        # evidence; the census reads carry their own markers.
+        markers["evidence"] = ("absent — this evaluation produced "
+                               "no route evidence block (census "
+                               "snapshot only)")
     if data_freshness_s is None:
         markers["data_freshness"] = ("not_recorded — no freshness "
                                      "measurement on this record")

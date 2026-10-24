@@ -1149,6 +1149,19 @@ class MT5Runner:
         self._funnel_seq += 1
         if not getattr(self.cfg, "funnel_enabled", True):
             return None
+        # Census-wiring pass: the previously unwired detector
+        # families (chart patterns, premium/discount, breaker/
+        # mitigation, relative strength, engulfing, named
+        # candlestick taxonomy) are read causally off the frames
+        # in scope and recorded on the record as evidence.
+        # Observation-only: this never feeds a decision, and a
+        # failure degrades to no snapshot (the assessment then
+        # marks the wiring without a per-record read).
+        census = self._census_for_record(
+            intended_tf=intended_tf,
+            actual_input_tf=actual_input_tf, source=source)
+        if census is not None:
+            evidence = {**(evidence or {}), "census": census}
         if decision is not None:
             decision = _terminal_decision(decision)
         if decision is not None and "reason_category" not in decision:
@@ -1275,6 +1288,64 @@ class MT5Runner:
                         and _av.get("verdict") == "qualified":
                     slot["qualified"] += 1
         return record
+
+    def _census_for_record(self, *, intended_tf, actual_input_tf,
+                           source) -> dict | None:
+        """The census-evidence snapshot for ONE evaluation
+        record (live/census_evidence.py), cached per frame
+        state so the ~20 records of one bar share one read.
+
+        Live evaluations (live_close / trigger path / native
+        routes) record the snapshot off the stack frames as
+        held NOW; warmup/replay evaluations explicitly record
+        NOTHING (their evaluated bar is historical — a
+        last-bar read stamped on them would misdescribe the
+        evidence), and records with no frame in scope say so.
+        Never raises; never a decision input."""
+        try:
+            from ..live.census_evidence import (
+                census_snapshot, census_unavailable)
+            if source == "warmup_scan":
+                return census_unavailable(
+                    "warmup/replay evaluation — census "
+                    "evidence is recorded on live evaluations "
+                    "only")
+            stack = getattr(self, "_stack", None)
+            frames = getattr(stack, "frames", None) or {}
+            tf = actual_input_tf or intended_tf or "H1"
+            frame = frames.get(tf)
+            if frame is None:
+                frame = frames.get("H1")
+                tf = "H1"
+            if frame is None or not len(frame):
+                return census_unavailable(
+                    "no live frame in scope at emit time")
+            h1_frame = frames.get("H1")
+            dxy = getattr(self, "_dxy", None)
+            dxy_frame = getattr(dxy, "frame", None) \
+                if dxy is not None else None
+
+            def _key(fr):
+                if fr is None or not len(fr):
+                    return None
+                return (len(fr), str(fr.index[-1]))
+
+            key = (tf, _key(frame), _key(h1_frame),
+                   _key(dxy_frame))
+            cache = getattr(self, "_census_cache", None)
+            if cache is None:
+                cache = self._census_cache = {}
+            if key in cache:
+                return cache[key]
+            snap = census_snapshot(
+                frame=frame, tf=tf, h1_frame=h1_frame,
+                dxy_frame=dxy_frame)
+            if len(cache) > 64:
+                cache.clear()
+            cache[key] = snap
+            return snap
+        except Exception:
+            return None
 
     # --------------------------------- candidate instances (P0-1)
     def _load_seen_instances(self) -> dict[str, str]:

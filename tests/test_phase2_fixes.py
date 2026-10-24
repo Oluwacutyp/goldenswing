@@ -868,10 +868,15 @@ def test_assessment_shape_on_native_candidate(tmp_path):
     assert "qm_pattern_event" in groups
     assert a["competing_scenarios"][0]["status"] in (
         "selected",) or a["competing_scenarios"]
-    # Absent / not-integrated capabilities are MARKED.
+    # Wired capabilities are MARKED with their recorded reads
+    # (census-wiring pass premise correction: premium/discount
+    # and the named taxonomy are consumed on the live path as
+    # recorded evidence — the pre-wiring census facts
+    # "not_integrated"/"absent" no longer hold for this live
+    # record, which carries the reads themselves).
     marks = a["capability_markers"]
-    assert marks["premium_discount"].startswith("not_integrated")
-    assert marks["named_candlestick_taxonomy"].startswith("absent")
+    assert marks["premium_discount"].startswith("recorded")
+    assert marks["named_candlestick_taxonomy"].startswith("recorded")
 
 
 def test_assessment_marks_absent_fields_explicitly(tmp_path):

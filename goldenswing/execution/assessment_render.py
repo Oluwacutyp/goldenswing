@@ -208,6 +208,98 @@ def _context_section(title: str, block, absent_label: str) -> list[str]:
     return [f"{title}:"] + lines
 
 
+def _census_section(record: dict) -> list[str]:
+    """The wired census evidence (live/census_evidence.py) the
+    record carries in its evidence block: the previously
+    unwired detector families, printed as the recorded reads
+    they are — or one explicit not-recorded line when the
+    record carries no snapshot.  Recorded evidence only; the
+    section never claims decision weight for it."""
+    ev = record.get("evidence") or {}
+    census = ev.get("census") if isinstance(ev, dict) else None
+    if not isinstance(census, dict):
+        return ["Wired census evidence: not recorded on this "
+                "record"]
+    if census.get("status") != "recorded":
+        reason = census.get("reason") or "unavailable"
+        return [f"Wired census evidence: not recorded — {reason}"]
+    lines = ["Wired census evidence (recorded, no decision "
+             f"weight; frame {census.get('frame')}, bar "
+             f"{census.get('bar_ts')}):"]
+    cp = census.get("chart_patterns") or {}
+    active = cp.get("active") or []
+    if active:
+        bits = []
+        for p in active:
+            side = ("long" if (p.get("direction") or 0) > 0
+                    else "short")
+            bits.append(
+                f"{p.get('kind')} ({side}, {p.get('status')}, "
+                f"neckline {_fmt_price(p.get('neckline'))}, "
+                f"target {_fmt_price(p.get('target'))})")
+        lines.append("  chart patterns: " + "; ".join(bits))
+    else:
+        lines.append("  chart patterns: none active")
+    if cp.get("event"):
+        ev_p = cp["event"]
+        lines.append(f"  chart pattern event this bar: "
+                     f"{ev_p.get('kind')} ({ev_p.get('status')})")
+    pd_read = census.get("premium_discount") or {}
+    if pd_read.get("status") == "recorded":
+        lines.append(
+            f"  premium/discount: {pd_read.get('zone')} — "
+            f"{pd_read.get('detail')} · OTE "
+            f"{_fmt_price(pd_read.get('ote_low'))}–"
+            f"{_fmt_price(pd_read.get('ote_high'))}")
+    else:
+        lines.append(
+            "  premium/discount: unavailable — "
+            f"{pd_read.get('reason') or 'no read'}")
+    for key, label in (("breaker_blocks", "breaker blocks"),
+                       ("mitigation_blocks", "mitigation blocks")):
+        blk = census.get(key) or {}
+        freshest = blk.get("freshest") or []
+        bit = f"  {label}: {blk.get('count', 0)}"
+        if freshest:
+            f0 = freshest[0]
+            bit += (f" (freshest: {f0.get('kind')} "
+                    f"{_fmt_price(f0.get('bottom'))}–"
+                    f"{_fmt_price(f0.get('top'))}, bar "
+                    f"{f0.get('bar_ts')})")
+        lines.append(bit)
+    rs = census.get("relative_strength") or {}
+    if rs.get("status") == "recorded":
+        dol = rs.get("dollar") or {}
+        lines.append(
+            "  relative strength (H1 vs DXY): trend "
+            f"{dol.get('trend')}, percentile "
+            f"{_fmt_num(dol.get('percentile'))}, ratio "
+            f"{_fmt_num(dol.get('ratio'))} · silver: no live "
+            "feed (unavailable)")
+    else:
+        lines.append(
+            "  relative strength: unavailable — "
+            f"{rs.get('reason') or 'no peer read'}")
+    candles = census.get("candles") or {}
+    eng = candles.get("engulfing") or {}
+    lines.append(
+        "  engulfing (last two bars): direction "
+        f"{eng.get('direction')}")
+    tax = candles.get("taxonomy") or []
+    if tax:
+        bits = ", ".join(
+            f"{p.get('name')} ({p.get('direction'):+d}, "
+            f"{p.get('bars_ago')} bar(s) ago)"
+            if isinstance(p.get("direction"), int) else
+            f"{p.get('name')} ({p.get('bars_ago')} bar(s) ago)"
+            for p in tax)
+        lines.append(f"  named candles: {bits}")
+    else:
+        lines.append("  named candles: none in the last "
+                     "10 bars")
+    return lines
+
+
 def _evidence_section(title: str, items: list[dict]) -> list[str]:
     """Itemized evidence for one stance: each item carries its
     detector and source-bar timestamp; items sharing a
@@ -438,6 +530,10 @@ def render_assessment(record: dict, *,
         lines.append(f"Rejected alternative: {alt}")
     if dec.get("floor_authority"):
         lines.append(f"Floor authority: {dec['floor_authority']}")
+
+    # --- wired census evidence (census-wiring pass) -------------
+    lines.append("")
+    lines += _census_section(rec)
 
     # --- capability markers: explicit, never omitted --------------
     lines.append("")

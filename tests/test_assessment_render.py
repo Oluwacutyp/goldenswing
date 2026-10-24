@@ -234,9 +234,14 @@ def test_render_absent_sections_are_explicit_never_invented():
     assert "Supporting evidence:" in text
     assert "➖ none recorded" in text
     # Census-backed capability markers render as explicit lines.
-    assert "named_candlestick_taxonomy: absent" in text
-    assert "premium_discount: not_integrated" in text
-    assert "legacy_smc_block: not_integrated" in text
+    # Census-wiring pass premise correction: the taxonomy and
+    # premium/discount are now INTEGRATED as recorded evidence
+    # on the live path (legacy SMC partially); this hand-built
+    # record carries no census snapshot, so the markers state
+    # the wiring, not the retired absent/not_integrated facts.
+    assert "named_candlestick_taxonomy: integrated" in text
+    assert "premium_discount: integrated" in text
+    assert "legacy_smc_block: partially_integrated" in text
 
 
 def test_render_record_without_assessment_block_is_honest():
@@ -434,7 +439,10 @@ def test_e2e_native_m5_signal_assessment(tmp_path):
     assert "VERDICT: SIGNAL" in text
     assert "qm_m5 · M5 · m5_close" in text
     assert "displacement_break" in text
-    assert "named_candlestick_taxonomy: absent" in text
+    # Census-wiring pass premise correction: this live record
+    # now carries the wired taxonomy read — the marker flipped
+    # from the pre-wiring "absent" census fact to "recorded".
+    assert "named_candlestick_taxonomy: recorded" in text
 
 
 def test_e2e_h1_roster_no_setup_assessment(tmp_path):
