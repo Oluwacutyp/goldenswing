@@ -58,6 +58,32 @@ def test_detector_incremental_chunks_match_full():
     assert inc.atr == pytest.approx(stateless.atr, rel=1e-6)
 
 
+def test_detector_warmup_refeeds_match_oneshot():
+    # PIN (gs-clock pass): the runner warmup re-feeds the FULL
+    # frames on every bar (update(full_h4, h1_prefix) per H1 bar).
+    # The searchsorted jump must produce byte-identical detector
+    # state to a single full feed — the old full-frame scan loop
+    # made that pattern O(n^2) and stalled the startup tests past
+    # 300s.  State compared, not just detect(): swings, H1 tail,
+    # ATR count and EMA must all agree.
+    h1, h4 = _frames()
+    one = RangeDetector()
+    one.update(h4, h1)
+    warm = RangeDetector()
+    for j in range(30, len(h1)):
+        h1_close = h1.index[j] + pd.Timedelta(minutes=60)
+        h4_closed = h4[h4.index <= h1_close - pd.Timedelta(minutes=240)]
+        warm.update(h4_closed, h1.iloc[:j + 1])
+    for attr in ("_h4_high", "_h4_low", "_swing_highs", "_swing_lows",
+                 "_h1", "_trs"):
+        assert getattr(warm, attr) == getattr(one, attr)
+    assert warm._atr_count == one._atr_count
+    assert warm._ema == pytest.approx(one._ema, rel=1e-9)
+    assert warm.detect() is not None
+    assert warm.detect().high == pytest.approx(one.detect().high, rel=1e-9)
+    assert warm.detect().low == pytest.approx(one.detect().low, rel=1e-9)
+
+
 def test_detector_none_when_trending():
     idx = pd.date_range("2026-01-01", periods=240, freq="h", tz="UTC")
     close = 4000.0 + 5.0 * np.arange(240)

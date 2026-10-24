@@ -141,8 +141,24 @@ class _RangeBase(Playbook):
         if self._h4 is None:
             return None
         h1_close = df.index[j] + pd.Timedelta(minutes=60)
-        h4_closed = self._h4[self._h4.index
-                              <= h1_close - pd.Timedelta(minutes=240)]
+        # CAUSAL SLICE (gs-clock pass): only H4 bars CLOSED by H1
+        # bar ``j`` (open-stamped: index + 240min <= H1 close)
+        # feed the detector — no lookahead.  The old boolean
+        # mask rebuilt a ~4200-row COPY on every recompute, so a
+        # full-history scan paid O(H4) per _range_upto call
+        # (24k calls / ~95M rows seen in the startup sweep path).
+        # searchsorted gives the identical cut as an O(1) slice
+        # view; non-monotonic frames fall back to the mask.
+        cutoff = h1_close - pd.Timedelta(minutes=240)
+        try:
+            if self._h4.index.is_monotonic_increasing:
+                pos = int(self._h4.index.searchsorted(cutoff,
+                                                      side="right"))
+                h4_closed = self._h4.iloc[:pos]
+            else:
+                h4_closed = self._h4[self._h4.index <= cutoff]
+        except Exception:
+            h4_closed = self._h4[self._h4.index <= cutoff]
         self._detector.update(h4_closed, df.iloc[:j + 1])
         return self._detector.detect()
 

@@ -384,6 +384,14 @@ def test_recap_command_daily_and_usage(tmp_path):
 
 
 def test_recap_command_long_week_goes_to_file(tmp_path):
+    # CLOCK ISOLATION (gs-clock pass): the weekly recap covers
+    # the TRAILING 7 days from the wall clock, so trades hardcoded
+    # to 2026-10-13 fell out of the window after 2026-10-20 and
+    # the report came back empty (document None).  The fixture
+    # dates are anchored to run time instead — the test's point
+    # is a LONG report going to a file, not a calendar date.
+    from datetime import datetime, timedelta, timezone
+    ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     journal = TradeJournal(tmp_path / "j.jsonl")
     for i in range(60):
         aid = f"t{i}"
@@ -391,11 +399,11 @@ def test_recap_command_long_week_goes_to_file(tmp_path):
                         "instrument": "XAUUSD", "playbook": "fvg_limit",
                         "direction": 1, "entry": 2005.0, "stop": 1990.0,
                         "volume": 0.01, "risk_money": 17.5,
-                        "ts": "2026-10-13T10:00:00+00:00"})
+                        "ts": ts})
         journal.append({"type": "close", "alert_id": aid, "ticket": 1,
                         "exit": 2031.0, "reason": "target",
                         "pnl_money": 26.25, "r_net": 1.5, "hold_bars": 3,
-                        "ts": "2026-10-13T10:00:00+00:00"})
+                        "ts": ts})
     ctx = CommandContext(journal=journal, reports_dir=tmp_path)
     res = MT5_COMMANDS["/recap"][1](ctx, ["weekly"])
     assert res.document is not None

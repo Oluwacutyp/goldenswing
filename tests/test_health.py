@@ -126,6 +126,11 @@ def test_runner_records_latency_and_slippage_on_fill(tmp_path):
     feed = MT5Feed(MT5FeedConfig(), mt5_module=FakeMT5())
     feed.connect()
     runner = MT5Runner(cfg, feed=feed, executor=_Exec())
+    # Pinned Wednesday tick: a timeless/absent tick makes the order
+    # path fall back to the wall clock, so this test fails on
+    # Fridays after 20:00 UTC (Friday-close gate).
+    runner._last_tick = {"mid": 2000.0, "bid": 1999.8, "ask": 2000.2,
+                         "time": "2026-10-14 12:00:00"}
     h1 = pd.DataFrame(
         {"open": [2000.0] * 30, "high": [2001.0] * 30,
          "low": [1999.0] * 30, "close": [2000.5] * 30,

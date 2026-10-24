@@ -11319,7 +11319,20 @@ class MT5Runner:
             mode = acct.get("trade_mode")
             mode_txt = ("demo" if mode == 0 else
                         "live" if mode == 2 else f"mode={mode}")
-            executing = [p for p in self.cfg.execute_playbooks
+            # PRODUCTION FIX (gs-clock pass): execute_playbooks
+            # defaults to None (= every evaluated playbook, see
+            # _executes) — iterating it directly raised TypeError
+            # ('NoneType' object is not iterable), the send failed,
+            # and the startup ping NEVER fired on a default config
+            # (the EC2 startup-ping bug: silent, no crash).  None
+            # now resolves to the roster names, exactly as _executes
+            # treats it; an explicit tuple still narrows it.
+            if self.cfg.execute_playbooks is None:
+                _executing_names = [pb.name
+                                    for pb in self._get_playbooks()]
+            else:
+                _executing_names = list(self.cfg.execute_playbooks)
+            executing = [p for p in _executing_names
                          if p not in self.cfg.disabled_playbooks]
             state = "PAUSED" if self.cfg.paused else "RUNNING"
             polling = ("ON" if self.cfg.poll_commands else

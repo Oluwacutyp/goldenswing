@@ -247,6 +247,37 @@ def test_range_compression_breakout_fires():
     assert sigs[0].targets[0] > 4200.0  # measured move above high
 
 
+def test_range_upto_causal_cut_ignores_future_h4():
+    # PIN (gs-clock pass): _range_upto's H4 cut must exclude bars
+    # not yet closed at H1 bar j — the searchsorted slice replaced
+    # the boolean mask, and this pins the causality property the
+    # mask existed for (no lookahead through the slice).
+    _, h1 = _range_def()
+    h4 = _h4_of(h1)
+    future_idx = pd.date_range(h1.index[-1] + pd.Timedelta(hours=4),
+                                periods=4, freq="4h", tz="UTC")
+    future = pd.DataFrame({"open": 5000.0, "high": 5100.0, "low": 4900.0,
+                           "close": 5000.0, "volume": 100,
+                           "real_volume": 0, "spread": 30},
+                          index=future_idx)
+    h4_future = pd.concat([h4, future])
+    pb = RangeSweepReclaimPlaybook()
+    pb.set_h4_frame(h4_future)
+    j = len(h1) - 1
+    rng = pb._range_upto(h1, j)
+    cutoff = (h1.index[j] + pd.Timedelta(minutes=60)
+              - pd.Timedelta(minutes=240))
+    expected = int((h4.index <= cutoff).sum())
+    assert len(pb._detector._h4_high) == expected
+    # The wild future bars (4900-5100) must not move the range.
+    pb2 = RangeSweepReclaimPlaybook()
+    pb2.set_h4_frame(h4)
+    rng2 = pb2._range_upto(h1, j)
+    assert rng is not None and rng2 is not None
+    assert rng.high == pytest.approx(rng2.high)
+    assert rng.low == pytest.approx(rng2.low)
+
+
 # --------------------------------------------------------- regime gating
 def _engine(tmp_path):
     return ConfluenceEngine(

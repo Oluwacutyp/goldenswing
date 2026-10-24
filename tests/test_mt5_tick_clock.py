@@ -111,7 +111,7 @@ def _setup():
 def _tick(when, mid):
     return {"time": pd.Timestamp(when, tz="UTC").to_pydatetime(),
             "mid": mid, "bid": mid, "ask": mid + 0.30,
-            "tick_volume": 5, "real_volume": 0, "spread": 30}
+            "tick_volume": 5, "real_volume": 0, "spread": 0.30}  # ask-bid, price units (real-feed convention)
 
 
 class FakeExecutor:
@@ -187,6 +187,20 @@ def _journal_text(tmp_path):
 
 
 # ------------------------------------------------------------- live_setup
+def _eval(runner, tick, stats):
+    """Live-loop contract: _last_tick is the tick under evaluation.
+
+    CLOCK ISOLATION (gs-clock pass): _on_tick sets _last_tick
+    before evaluating, but direct _evaluate_live_tick callers
+    left it None — the order path then fell back to the wall
+    clock and the Friday-close gate refused orders on Friday
+    evenings (2026-10-23).  Every direct evaluation goes
+    through here so the engine clock is always the tick clock.
+    """
+    runner._last_tick = tick
+    runner._evaluate_live_tick(tick, stats)
+
+
 def test_live_setup_armed_from_closed_bars():
     setup = _setup()
     assert setup["direction"] == 1
@@ -323,7 +337,7 @@ def test_runner_touch_arms_on_tick_not_h1_close(tmp_path):
     runner = _runner(tmp_path)
     stats: dict = {}
     # No H1 close, no refresh: a tick AT the zone arms the pending.
-    runner._evaluate_live_tick(_tick("2026-10-14 10:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 10:05", 2000.3), stats)
     assert runner._pending is not None
     assert runner._pending["armed"] is True
     assert runner._pending["trigger"] == "zone_touch"
@@ -333,7 +347,7 @@ def test_runner_touch_arms_on_tick_not_h1_close(tmp_path):
     assert runner.executor.orders == []
     assert "trigger fired" not in _journal_text(tmp_path)
     # Next tick: still armed (no composing bars yet, no confirm).
-    runner._evaluate_live_tick(_tick("2026-10-14 10:06", 2001.8), stats)
+    _eval(runner, _tick("2026-10-14 10:06", 2001.8), stats)
     assert runner._pending is not None
     assert runner._pending["armed"] is True
     assert stats.get("triggers", 0) == 0
@@ -344,8 +358,8 @@ def test_runner_entry_confirms_on_m15_close(tmp_path):
     # session entry clock is M15 (at 10:00 it would be M30).
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
-    runner._evaluate_live_tick(_tick("2026-10-14 08:06", 2001.8), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:06", 2001.8), stats)
     assert runner._pending is not None
     assert runner._pending["armed"] is True
     assert runner._pending["entry_clock"] == "M15"
@@ -385,8 +399,8 @@ def test_runner_entry_confirms_on_m15_close_at_h1_boundary(tmp_path):
     """
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
-    runner._evaluate_live_tick(_tick("2026-10-14 08:06", 2001.8), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:06", 2001.8), stats)
     assert runner._pending is not None
     assert runner._pending["armed"] is True
     assert runner._pending["entry_clock"] == "M15"
@@ -435,20 +449,20 @@ def test_runner_second_touch_same_h1_bar_does_not_refire(tmp_path):
     runner._run_live_signal = lambda pend, tick, st: fired.append(
         pend["trigger"])
     # First touch fires on the already-closed breaker bar.
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert fired == ["bos"]
     assert stats["triggers"] == 1
     assert runner._pending is None  # consumed by the confirmation
     assert runner._fired_h1_bar == pd.Timestamp(
         "2026-10-14 08:00", tz="UTC")
     # Second touch, same H1 bar, still in the zone: no re-arm.
-    runner._evaluate_live_tick(_tick("2026-10-14 08:06", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:06", 2000.3), stats)
     assert fired == ["bos"]  # no second fire
     assert stats["triggers"] == 1
     assert runner._pending is None
     # Next H1 bar: fresh window — the touch re-arms (the composing
     # bars for 09:00 haven't closed yet, so no confirm yet).
-    runner._evaluate_live_tick(_tick("2026-10-14 09:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 09:05", 2000.3), stats)
     assert runner._pending is not None
     assert runner._pending["armed"] is True
     assert runner._pending["h1_open"] == pd.Timestamp(
@@ -468,11 +482,11 @@ def test_runner_wick_beyond_level_does_not_invalidate(tmp_path):
     # confirmation, which is a fire, not an invalidation.)
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
     inv = runner._pending["invalidation_level"]
     # Tick wick through the level: still armed.
-    runner._evaluate_live_tick(_tick("2026-10-14 08:06", 1997.0), stats)
+    _eval(runner, _tick("2026-10-14 08:06", 1997.0), stats)
     assert runner._pending is not None
     assert stats.get("invalidated", 0) == 0
     # Bar wick: low 1996.5 sweeps beyond the level (inv ≈ 1997.68)
@@ -499,7 +513,7 @@ def test_runner_close_beyond_level_invalidates_on_bar_close(tmp_path):
     # zone does not re-arm.
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
     inv = runner._pending["invalidation_level"]
     zone = runner._live_setup["zone"]
@@ -517,7 +531,7 @@ def test_runner_close_beyond_level_invalidates_on_bar_close(tmp_path):
     assert "trigger fired" not in journal
     # The failed zone is terminated: re-touch does not re-arm.
     assert runner._invalidated_zone == (1, zone["bottom"], zone["top"])
-    runner._evaluate_live_tick(_tick("2026-10-14 08:20", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:20", 2000.3), stats)
     assert runner._pending is None
     assert stats["invalidated"] == 1  # no second invalidation
 
@@ -561,10 +575,10 @@ def test_runner_left_zone_disarms_pending(tmp_path):
     # passed — disarm, don't wait forever on a stale arm.
     runner = _runner(tmp_path)
     stats: dict = {}
-    runner._evaluate_live_tick(_tick("2026-10-14 10:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 10:05", 2000.3), stats)
     assert runner._pending is not None
     # Above zone top + buf (≈ 2002.32): left the zone.
-    runner._evaluate_live_tick(_tick("2026-10-14 10:06", 2003.0), stats)
+    _eval(runner, _tick("2026-10-14 10:06", 2003.0), stats)
     assert runner._pending is None
     assert stats["invalidated"] == 1
     assert "trigger invalidated (left_zone)" in _journal_text(tmp_path)
@@ -576,9 +590,9 @@ def test_runner_confirm_after_exit_does_not_fire(tmp_path):
     # Confirmation must arrive while price is still in/near the zone.
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
-    runner._evaluate_live_tick(_tick("2026-10-14 08:06", 2003.0), stats)
+    _eval(runner, _tick("2026-10-14 08:06", 2003.0), stats)
     assert runner._pending is None  # disarmed on exit
     fired = []
     runner._run_live_signal = lambda pend, tick, st: fired.append(
@@ -596,7 +610,7 @@ def test_runner_confirm_after_exit_does_not_fire(tmp_path):
     runner.feed = FakeFeed()
     # Entry-close tick OUTSIDE the zone: no re-arm, no fire.
     runner._refresh_bars(_tick("2026-10-14 08:45", 2003.0), stats)
-    runner._evaluate_live_tick(_tick("2026-10-14 08:45", 2003.0), stats)
+    _eval(runner, _tick("2026-10-14 08:45", 2003.0), stats)
     assert fired == []
     assert runner._pending is None
 
@@ -607,7 +621,7 @@ def test_runner_confirm_after_window_lapse_does_not_fire(tmp_path):
     # re-touch is a NEW setup, not this one.
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
     runner._on_h1_close(_tick("2026-10-14 09:00", 2003.0), stats)
     assert runner._pending is None  # window lapsed
@@ -627,7 +641,7 @@ def test_runner_confirm_after_window_lapse_does_not_fire(tmp_path):
 
     runner.feed = FakeFeed()
     runner._refresh_bars(_tick("2026-10-14 09:00", 2003.0), stats)
-    runner._evaluate_live_tick(_tick("2026-10-14 09:00", 2003.0), stats)
+    _eval(runner, _tick("2026-10-14 09:00", 2003.0), stats)
     assert fired == []
     assert runner._pending is None
 
@@ -663,7 +677,7 @@ def test_runner_armed_setup_expires_after_ttl_without_confirmation(tmp_path):
     # (above invalidation, below the zone).
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
     assert runner._pending["armed_bars"] == 0
     flat = _quiet_bars(pd.date_range("2026-10-14 08:00", periods=2,
@@ -689,7 +703,7 @@ def test_runner_confirm_after_ttl_expiry_does_not_fire(tmp_path):
     # if the pending were still armed.)
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
     flat = _quiet_bars(pd.date_range("2026-10-14 08:00", periods=2,
                                      freq="15min", tz="UTC"))
@@ -702,7 +716,7 @@ def test_runner_confirm_after_ttl_expiry_does_not_fire(tmp_path):
     breaker = _frames(m15_n=24, shift_hours=-2)["M15"].iloc[22:23]
     runner.feed = _flat_m15_feed(breaker)
     runner._refresh_bars(_tick("2026-10-14 08:45", 2003.0), stats)
-    runner._evaluate_live_tick(_tick("2026-10-14 08:45", 2003.0), stats)
+    _eval(runner, _tick("2026-10-14 08:45", 2003.0), stats)
     assert fired == []
     assert runner._pending is None
 
@@ -713,7 +727,7 @@ def test_runner_rearm_only_after_exit_and_reentry(tmp_path):
     # lifts the block.
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
     flat = _quiet_bars(pd.date_range("2026-10-14 08:00", periods=2,
                                      freq="15min", tz="UTC"))
@@ -722,15 +736,15 @@ def test_runner_rearm_only_after_exit_and_reentry(tmp_path):
     assert runner._pending is None  # stale
     assert runner._stale_zone is not None
     # Still inside the zone: no re-arm.
-    runner._evaluate_live_tick(_tick("2026-10-14 08:35", 2000.5), stats)
+    _eval(runner, _tick("2026-10-14 08:35", 2000.5), stats)
     assert runner._pending is None
     assert runner._stale_zone is not None
     # Exit the zone: the block lifts (no arm — price is outside).
-    runner._evaluate_live_tick(_tick("2026-10-14 08:36", 2003.0), stats)
+    _eval(runner, _tick("2026-10-14 08:36", 2003.0), stats)
     assert runner._pending is None
     assert runner._stale_zone is None
     # Re-enter: arms again as a NEW touch.
-    runner._evaluate_live_tick(_tick("2026-10-14 08:37", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:37", 2000.3), stats)
     assert runner._pending is not None
     assert runner._pending["armed"] is True
     assert runner._pending["armed_bars"] == 0
@@ -744,7 +758,7 @@ def test_runner_ttl_counts_one_bar_at_a_time(tmp_path):
     # armed.  The TTL binds at the SECOND close, not the first.
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
     flat = _quiet_bars(pd.date_range("2026-10-14 08:00", periods=1,
                                      freq="15min", tz="UTC"))
@@ -766,7 +780,7 @@ def test_runner_ttl_counts_one_bar_at_a_time(tmp_path):
 def test_runner_h1_close_expires_pending_without_erasing(tmp_path):
     runner = _runner(tmp_path)
     stats: dict = {}
-    runner._evaluate_live_tick(_tick("2026-10-14 10:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 10:05", 2000.3), stats)
     assert runner._pending is not None
     assert runner._pending["armed"] is True
     runner._on_h1_close(_tick("2026-10-14 11:00", 2001.5), stats)
@@ -782,7 +796,7 @@ def test_runner_h1_close_expires_pending_without_erasing(tmp_path):
     # Volume starts at zero: the tick evaluator owns accumulation,
     # so the boundary tick is counted exactly once (there).
     assert runner._forming["volume"] == 0.0
-    runner._evaluate_live_tick(_tick("2026-10-14 11:00", 2001.5), stats)
+    _eval(runner, _tick("2026-10-14 11:00", 2001.5), stats)
     assert runner._forming["volume"] == pytest.approx(5.0)
 
 
@@ -793,8 +807,8 @@ def test_runner_h1_close_does_not_gate_evaluation(tmp_path):
     runner._on_h1_close(_tick("2026-10-14 11:00", 2000.3), stats)
     assert runner._pending is None
     # Evaluation continues on the NEW bar: the touch arms mid-bar.
-    runner._evaluate_live_tick(_tick("2026-10-14 11:05", 2000.3), stats)
-    runner._evaluate_live_tick(_tick("2026-10-14 11:06", 2001.8), stats)
+    _eval(runner, _tick("2026-10-14 11:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 11:06", 2001.8), stats)
     assert runner._pending is not None
     assert runner._pending["armed"] is True
     assert runner._pending["trigger"] == "zone_touch"
@@ -814,8 +828,8 @@ def test_runner_forming_bar_tracks_while_holding(tmp_path):
                        targets=[2030.0], atr=10.0, bar_index=5)
     runner.tick_manager.open(ticket=101, request=req, fill_price=2000.0,
                              entry_bar=6)
-    runner._evaluate_live_tick(_tick("2026-10-14 10:05", 2000.3), stats)
-    runner._evaluate_live_tick(_tick("2026-10-14 10:06", 2001.8), stats)
+    _eval(runner, _tick("2026-10-14 10:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 10:06", 2001.8), stats)
     # Forming bar tracked the excursion; the touch armed into the
     # layering pipeline — but no second position opened.
     assert runner._forming["high"] == pytest.approx(2001.8)
@@ -827,7 +841,7 @@ def test_runner_forming_bar_tracks_while_holding(tmp_path):
     # Position closes: the armed touch is still live and can
     # confirm into a fresh position.
     runner.tick_manager.remove(101)
-    runner._evaluate_live_tick(_tick("2026-10-14 10:07", 2001.9), stats)
+    _eval(runner, _tick("2026-10-14 10:07", 2001.9), stats)
     assert runner._pending is not None
     assert runner._pending["armed"] is True
     assert runner._pending["trigger"] == "zone_touch"
@@ -836,7 +850,7 @@ def test_runner_forming_bar_tracks_while_holding(tmp_path):
 def test_runner_bias_flip_invalidates_pending(tmp_path):
     runner = _runner(tmp_path)
     stats: dict = {}
-    runner._evaluate_live_tick(_tick("2026-10-14 10:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 10:05", 2000.3), stats)
     assert runner._pending is not None
     # D1/H4 close flips the bias: the pending premise is gone.
     runner._live_setup = {**runner._live_setup, "direction": -1}
@@ -917,7 +931,7 @@ def test_runner_full_live_path_places_order(tmp_path):
     # not a market fill.  ``executed`` counts fills only (market
     # fills + pending fills); a resting STOP increments
     # ``pending`` and fills only when the market reaches it.
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", 2000.3), stats)
+    _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert stats["triggers"] == 1
     assert stats["signals"] == 1
     assert stats.get("pending") == 1

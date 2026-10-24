@@ -276,25 +276,63 @@ class RangeDetector:
         """Append newly closed bars from full ``h4`` / ``h1`` frames."""
         if h4 is not None and len(h4):
             idx = h4.index
-            for pos in range(len(h4)):
-                ts = idx[pos]
+            # INCREMENTAL JUMP (gs-clock pass): the old loop walked
+            # the WHOLE frame on every call to find the few new
+            # bars — O(n) per call with pandas scalar indexing, so
+            # a full-history fast-forward was O(n^2) and the
+            # runner warmup (2000 H1 bars x 4 range playbooks)
+            # stalled past 300s in this VM.  searchsorted finds
+            # the first bar newer than the last seen timestamp in
+            # O(log n); semantics are identical (bars with
+            # ts <= last_ts are skipped, in order).  Non-monotonic
+            # frames fall back to the full scan.  Values come from
+            # numpy slices, not per-bar iloc: a fresh full feed
+            # (the sweep-eval path re-feeds ~6000 bars per scan)
+            # paid ~80us per iloc in this VM.
+            start = 0
+            if self._h4_last_ts is not None:
+                try:
+                    if idx.is_monotonic_increasing:
+                        start = int(idx.searchsorted(
+                            self._h4_last_ts, side="right"))
+                    else:
+                        start = 0
+                except Exception:
+                    start = 0
+            new = h4.iloc[start:]
+            highs = new["high"].to_numpy(dtype=float)
+            lows = new["low"].to_numpy(dtype=float)
+            for ts, hi, lo in zip(new.index, highs, lows):
                 if self._h4_last_ts is not None and ts <= self._h4_last_ts:
                     continue
                 self._h4_last_ts = ts
-                self._h4_high.append(float(h4.iloc[pos]["high"]))
-                self._h4_low.append(float(h4.iloc[pos]["low"]))
+                self._h4_high.append(float(hi))
+                self._h4_low.append(float(lo))
             self._confirm_new_swings()
         if h1 is not None and len(h1):
             idx = h1.index
-            for pos in range(len(h1)):
-                ts = idx[pos]
+            start = 0
+            if self._h1_last_ts is not None:
+                try:
+                    if idx.is_monotonic_increasing:
+                        start = int(idx.searchsorted(
+                            self._h1_last_ts, side="right"))
+                    else:
+                        start = 0
+                except Exception:
+                    start = 0
+            new = h1.iloc[start:]
+            highs = new["high"].to_numpy(dtype=float)
+            lows = new["low"].to_numpy(dtype=float)
+            closes = new["close"].to_numpy(dtype=float)
+            for ts, high, low, close in zip(new.index, highs, lows,
+                                            closes):
                 if self._h1_last_ts is not None and ts <= self._h1_last_ts:
                     continue
                 self._h1_last_ts = ts
-                row = h1.iloc[pos]
-                high = float(row["high"])
-                low = float(row["low"])
-                close = float(row["close"])
+                high = float(high)
+                low = float(low)
+                close = float(close)
                 self._h1.append((high, low, close))
                 if self._prev_close is None:
                     tr = high - low

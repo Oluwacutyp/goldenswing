@@ -75,7 +75,14 @@ def _runner(tmp_path, *, feed=None, executor=None, **cfg_kw):
         # by test_news_calendar.py.
         news_pause_enabled=False,
         **cfg_kw)
-    return MT5Runner(cfg, feed=feed, executor=executor)
+    runner = MT5Runner(cfg, feed=feed, executor=executor)
+    # Pinned Wednesday tick: with no tick the order path falls back
+    # to the wall clock, so these tests fail on Fridays after
+    # 20:00 UTC (Friday-close gate).  No test in this file sets its
+    # own tick, so the helper default covers all of them.
+    runner._last_tick = {"mid": 2000.0, "bid": 1999.8, "ask": 2000.2,
+                         "time": "2026-10-14 12:00:00"}
+    return runner
 
 
 def _open_feed(**fake_kw):

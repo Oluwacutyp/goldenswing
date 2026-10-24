@@ -390,9 +390,19 @@ def _journal(tmp_path):
     return path.read_text() if path.exists() else ""
 
 
-def _place(runner, sig, verdict, stats, price):
-    runner._last_tick = {"mid": price, "bid": price, "ask": price + 0.3,
-                         "tick_volume": 1, "real_volume": 0, "spread": 30}
+def _place(runner, sig, verdict, stats, price, tick_time=None):
+    # CLOCK ISOLATION (gs-clock pass): the engine's clock is the
+    # tick clock — _place_live_order falls back to the WALL clock
+    # when _last_tick carries no time, so on Friday at/after
+    # 20:00 UTC the Friday-close gate refused every order in this
+    # file (17 reds, 2026-10-23).  The tick therefore always
+    # carries an explicit time: Wednesday 2026-10-14 12:00 UTC by
+    # default (midweek, matching the frame dates); boundary tests
+    # pass their own tick_time.
+    runner._last_tick = {"time": pd.Timestamp(
+        tick_time or "2026-10-14 12:00", tz="UTC").to_pydatetime(),
+        "mid": price, "bid": price, "ask": price + 0.3,
+        "tick_volume": 1, "real_volume": 0, "spread": 30}
     runner._place_live_order(SimpleNamespace(name="fvg_midline"), sig,
                              stats, verdict=verdict, entry_bar=29)
 
@@ -444,6 +454,39 @@ def test_runner_zone_failed_places_nothing(tmp_path):
     assert runner._pending_orders == {}
     assert stats["invalidated"] == 1
     assert "order invalidated" in _journal(tmp_path)
+
+
+def test_friday_close_boundary_just_before_places(tmp_path):
+    # Friday-close gate boundary (is_friday_close: Friday AND
+    # hour >= 20 UTC): 19:59 UTC on a Friday is still open.
+    runner = _runner(tmp_path)
+    stats: dict = {}
+    _place(runner, _sig(), _verdict(), stats, price=2005.0,
+           tick_time="2026-10-16 19:59")
+    assert runner.executor.sent_kinds == ["market"]
+    assert stats.get("gate_friday", 0) == 0
+
+
+def test_friday_close_boundary_at_hour_refuses(tmp_path):
+    # At the boundary itself — Friday 20:00:00 UTC sharp — the
+    # gate refuses: no order, gate_friday counted, journal says so.
+    runner = _runner(tmp_path)
+    stats: dict = {}
+    _place(runner, _sig(), _verdict(), stats, price=2005.0,
+           tick_time="2026-10-16 20:00")
+    assert runner.executor.sent_kinds == []
+    assert stats.get("gate_friday", 0) == 1
+    assert "friday close" in _journal(tmp_path)
+
+
+def test_friday_close_boundary_just_past_refuses(tmp_path):
+    # Just past the boundary — Friday 20:00:01 UTC — same refusal.
+    runner = _runner(tmp_path)
+    stats: dict = {}
+    _place(runner, _sig(), _verdict(), stats, price=2005.0,
+           tick_time="2026-10-16 20:00:01")
+    assert runner.executor.sent_kinds == []
+    assert stats.get("gate_friday", 0) == 1
 
 
 def test_no_second_pending_while_one_active(tmp_path):

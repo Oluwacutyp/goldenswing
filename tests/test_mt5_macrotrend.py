@@ -125,6 +125,15 @@ def _ready_runner(tmp_path, **cfg_kw):
                      senders=[FakeSender()], **cfg_kw)
     runner._stack = TimeframeStack.from_frames(feed.warm_start_all())
     runner._live_setup = {"direction": 1}
+    # Pinned Wednesday tick: with no tick the order path falls back
+    # to the wall clock, so these tests fail on Fridays after
+    # 20:00 UTC (Friday-close gate).  08:00 UTC in October is the
+    # London session (multiplier 1.0, sizing-neutral): 12:00 UTC
+    # would land in the 1.2x overlap and break the alignment test's
+    # base x 1.5 expectation through step-flooring (0.096 -> 0.09
+    # plain vs 0.144 -> 0.14 golden).
+    runner._last_tick = {"mid": 2000.0, "bid": 1999.8, "ask": 2000.2,
+                         "time": "2026-10-14 08:00:00"}
     return runner
 
 

@@ -379,7 +379,9 @@ def test_qm_d1_native_route_record_shape(tmp_path, monkeypatch):
         frames={"D1": d1, "H1": _flat_h1(30, 4100.0)})
     runner._last_tick = {"mid": 4100.0, "bid": 4099.8,
                          "ask": 4100.2, "spread": 30,
-                         "time": datetime.now(timezone.utc)}
+                         # Pinned Wednesday: a wall-clock tick makes
+                         # this fail on Fridays after 20:00 UTC.
+                         "time": "2026-10-14 12:00:00"}
     out = runner._run_qm_d1(d1, {}, source="live_close")
     assert len(out) == 1 and len(runner.executor.orders) == 1
     rec = _candidate_records(runner, "qm_d1")[0]

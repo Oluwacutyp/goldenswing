@@ -16,6 +16,14 @@ from types import SimpleNamespace
 import pytest
 
 from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
+# Roster truth for the warmup-count assertions below: the H1 warmup
+# warms exactly the H1-clocked registry (qm_m5/qm_d1 run on their
+# native clocks, not here).  The count was hardcoded as 17 when the
+# test was written (2026-10-17); Phase 2's clock split left 16, and
+# the hardcoded count went stale.  Deriving it from the registry
+# asserts the real invariant — warmup covers the whole H1 roster —
+# and cannot drift again.
+from goldenswing.execution.playbook_registry import ROSTER_SPECS
 from goldenswing.feed.mt5 import MT5Feed, MT5FeedConfig
 from mt5_fakes import FakeMT5
 
@@ -96,7 +104,7 @@ def test_progress_content(tmp_path):
     zones = texts[_idx(texts, "MT5 engine: zones built")]
     assert "zones)" in zones
     pb = texts[_idx(texts, "MT5 engine: playbooks warmed")]
-    assert "(17 playbooks)" in pb
+    assert f"({len(ROSTER_SPECS)} playbooks)" in pb
     # Final "started" ping still exactly once.
     assert sum(1 for t in texts if t.startswith("MT5 engine started")) == 1
 
@@ -122,7 +130,7 @@ def test_no_senders_no_crash_console_progress(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "MT5 startup: MT5 engine starting" in out
     assert "MT5 startup: building zones" in out
-    assert "MT5 startup: warming 17 playbooks" in out
+    assert f"MT5 startup: warming {len(ROSTER_SPECS)} playbooks" in out
 
 
 def test_replay_logs_each_playbook_on_console(tmp_path, capsys):

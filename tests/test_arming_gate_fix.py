@@ -153,6 +153,20 @@ def _overhead_poi(h4):
 
 
 # ------------------------------------------------------------- F1: selection
+def _eval(runner, tick, stats):
+    """Live-loop contract: _last_tick is the tick under evaluation.
+
+    CLOCK ISOLATION (gs-clock pass): _on_tick sets _last_tick
+    before evaluating, but direct _evaluate_live_tick callers
+    left it None — the order path then fell back to the wall
+    clock and the Friday-close gate refused orders on Friday
+    evenings (2026-10-23).  Every direct evaluation goes
+    through here so the engine clock is always the tick clock.
+    """
+    runner._last_tick = tick
+    runner._evaluate_live_tick(tick, stats)
+
+
 def test_poi_for_direction_picks_freshest_overhead():
     h4 = _h4_live_backdrop()
     zone = poi_for_direction(h4, -1)
@@ -443,7 +457,7 @@ class StubPlaybook:
 def _tick(when, mid):
     return {"time": pd.Timestamp(when, tz="UTC").to_pydatetime(),
             "mid": mid, "bid": mid, "ask": mid + 0.30,
-            "tick_volume": 5, "real_volume": 0, "spread": 30}
+            "tick_volume": 5, "real_volume": 0, "spread": 0.30}  # ask-bid, price units (real-feed convention)
 
 
 def _stats():
@@ -520,7 +534,7 @@ def test_e_continuation_fires_once_per_break(tmp_path):
     stats = _stats()
     # Tick back at the broken level: retest touch + M15 confirm ->
     # fires through the standard pending -> signal path -> order.
-    runner._evaluate_live_tick(_tick("2026-10-14 08:05", mid), stats)
+    _eval(runner, _tick("2026-10-14 08:05", mid), stats)
     assert stats.get("triggers", 0) == 1
     assert len(runner.executor.orders) == 1
     assert runner.executor.orders[0]["direction"] == -1
@@ -537,6 +551,6 @@ def test_e_continuation_fires_once_per_break(tmp_path):
     runner._refresh_live_setup()
     assert runner._live_setup is None
     assert runner._live_setup_reason.startswith("continuation_spent")
-    runner._evaluate_live_tick(_tick("2026-10-14 09:05", mid), stats)
+    _eval(runner, _tick("2026-10-14 09:05", mid), stats)
     assert stats.get("triggers", 0) == 1
     assert len(runner.executor.orders) == 1

@@ -162,7 +162,12 @@ def test_runner_gate_refuses_duplicate_and_cooldown(tmp_path):
     runner._check_margin = lambda *a: True
     runner._alignment = SimpleNamespace(size_multiplier=1.0,
                                         alignment_label="D1_Only")
-    runner._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2}
+    runner._last_tick = {"mid": 2005.0, "bid": 2004.8, "ask": 2005.2,
+                        # Pinned Wednesday tick: the order path falls
+                        # back to the wall clock for a timeless tick,
+                        # so a timeless tick makes this test fail on
+                        # Fridays after 20:00 UTC (Friday-close gate).
+                        "time": "2026-10-14 12:00:00"}
     runner._stack = SimpleNamespace(frames={"H1": [1, 2, 3]})
     sig = SimpleNamespace(direction=1, entry_ref=2005.0,
                           invalidation=1990.0, atr=10.0,

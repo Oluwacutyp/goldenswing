@@ -639,6 +639,12 @@ def _runner(tmp_path, **cfg_kw):
                        news_calendar=news_calendar)
     runner._send_alert = lambda *a, **k: None
     runner._build_chart = lambda *a, **k: (None, None)
+    # Pinned Wednesday tick default: with no tick the order path
+    # falls back to the wall clock, so order-path tests fail on
+    # Fridays after 20:00 UTC (Friday-close gate).  Tests that set
+    # their own _last_tick keep it; this is only the default.
+    runner._last_tick = {"mid": 2000.0, "bid": 1999.8, "ask": 2000.2,
+                         "time": "2026-10-14 12:00:00"}
     return runner
 
 
@@ -852,7 +858,9 @@ def test_qm_d1_real_order_path_on_d1_clock(tmp_path, monkeypatch):
     runner._stack = SimpleNamespace(frames={"H1": h1, "D1": d1})
     runner._last_tick = {"mid": 4100.0, "bid": 4099.8,
                          "ask": 4100.2, "spread": 30,
-                         "time": datetime.now(timezone.utc)}
+                         # Pinned Wednesday: a wall-clock tick makes
+                         # this fail on Fridays after 20:00 UTC.
+                         "time": "2026-10-14 12:00:00"}
     runner._score_for = lambda **kw: _FakeScore(70.0, 25.0, 15.0)
     runner._get_engine = lambda: _StubEngine()
     out = runner._run_qm_d1(d1, {})
