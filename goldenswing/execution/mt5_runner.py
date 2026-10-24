@@ -6611,9 +6611,21 @@ class MT5Runner:
 
             def _emit_sig(*, result, reason_code="", reason="",
                           floor_result=None, execution_eligible=None,
-                          order_result=None):
+                          order_result=None, selected_action=None,
+                          rejected_alternatives=None):
                 """FUNNEL §1.1: this signal's terminal decision
-                record (mirrors the log_signal beside it)."""
+                record (mirrors the log_signal beside it).
+
+                Burn-down #1: the record carries the full
+                assessment objects the native routes produce —
+                the evidence the decider actually weighed for
+                THIS candidate (signal factors, the asymmetry
+                score's stance, HTF hierarchy agreement, zone
+                context, journey geometry, funding events), with
+                correlation groups, plus the two competing
+                scenarios.  Built from closure state at emit
+                time; observation-only — no value here is read
+                by any decision."""
                 dec = {"result": result,
                        "reason_code": reason_code or None,
                        "reason": reason}
@@ -6650,6 +6662,113 @@ class MT5Runner:
                 dec.setdefault(
                     "floor_authority",
                     _FLOOR_AUTHORITY["h1_roster"])
+                # --- assessment objects (burn-down #1) --------
+                _dir = int(sig.direction)
+                _entry = float(sig.entry_ref)
+                _stop = float(sig.invalidation)
+                _sup: list[str] = []
+                _con: list[str] = []
+                _groups: dict[str, list[str]] = {}
+
+                def _note(bucket, group, text):
+                    bucket.append(text)
+                    _groups.setdefault(group, []).append(text)
+
+                for _f in (getattr(sig, "factors", None)
+                           or []):
+                    _note(_sup, f"{pb.name}_signal",
+                          f"signal factor: {_f}")
+                if bool(score.flipped):
+                    _note(_con, "asymmetry_score",
+                          "asymmetry score flipped: the weighed "
+                          "structure funds the opposite side")
+                else:
+                    _note(_sup, "asymmetry_score",
+                          f"asymmetry score {score.total:.0f} "
+                          f"for the {_dir:+d} side")
+                _bias_d1 = (verdict or {}).get("bias_d1")
+                if _bias_d1:
+                    if int(_bias_d1) == _dir:
+                        _note(_sup, "htf_structure",
+                              f"with structural D1 bias "
+                              f"{int(_bias_d1):+d}")
+                    else:
+                        _note(_con, "htf_structure",
+                              f"against structural D1 bias "
+                              f"{int(_bias_d1):+d} (weighed as "
+                              "evidence, not a veto)")
+                if zone_d is not None:
+                    _lc = str(zone_d.get("lifecycle") or "")
+                    _zt = "zone context: "
+                    if _lc:
+                        _zt += f"{_lc} "
+                    _zt += (f"zone [{zone_d.get('bottom')}, "
+                            f"{zone_d.get('top')}]")
+                    _note(_con if _lc == "used_up" else _sup,
+                          "zone_context", _zt)
+                if journey.get("refusal"):
+                    _note(_con, "journey_geometry",
+                          f"journey geometry: "
+                          f"{journey['refusal']}")
+                if funding is not None:
+                    for _e in (funding.events or []):
+                        _note(_sup, "funding_events",
+                              f"funding event: {_e.kind}"
+                              + (f" — {_e.detail}"
+                                 if getattr(_e, "detail", "")
+                                 else ""))
+                    if funding.runaway:
+                        _note(_con, "funding_events",
+                              "funding runaway: confirmation "
+                              "said price ran from the zone")
+                _observed = {
+                    "entry": _entry, "stop": _stop,
+                    "stop_dist": stop_dist,
+                    "bias_d1": (verdict or {}).get("bias_d1"),
+                    "bias_h4": (verdict or {}).get("bias_h4")}
+                if t < len(h1):
+                    try:
+                        _observed["session_bucket"] = \
+                            session_of(h1.index[t])[0]
+                    except Exception:
+                        pass
+                _inferred = {
+                    "score_total": float(score.total),
+                    "score_components": breakdown,
+                    "score_flipped": bool(score.flipped),
+                    "regime": (verdict or {}).get("regime"),
+                    "posture": (self._posture.name
+                                if self._posture is not None
+                                else None),
+                    "alignment": getattr(
+                        self._alignment, "alignment_label",
+                        None),
+                    "journey_state": journey.get("state"),
+                    "room_r": journey.get("room_r")}
+                dec["competing_scenarios"] = [
+                    {"scenario": f"take the {_dir:+d} "
+                                 f"{pb.name} setup at "
+                                 f"{_entry:.2f}",
+                     "status": (
+                         "selected" if result == "accepted"
+                         else "parked — PullbackWatch armed (§5)"
+                         if result == "watch"
+                         else f"not taken — {result}"
+                         + (f" ({reason_code})"
+                            if reason_code else ""))},
+                    {"scenario": f"take the {-_dir:+d} side",
+                     "status": (
+                         "funded by the weighed evidence — the "
+                         "asymmetry score flipped to this side"
+                         if bool(score.flipped) else
+                         "not funded — no opposite-side "
+                         "candidate from this playbook at this "
+                         "bar; the score did not flip")}]
+                if selected_action:
+                    dec["selected_action"] = selected_action
+                if rejected_alternatives:
+                    dec["rejected_alternatives"] = list(
+                        rejected_alternatives)
                 return self._emit_eval(
                     playbook=pb.name,
                     evaluation_clock="h1_trigger",
@@ -6666,8 +6785,22 @@ class MT5Runner:
                     # record, but never reached the FUNNEL
                     # record — HTF disagreement is now explicit
                     # evidence there too, never a silent factor.
+                    # Burn-down #1 completes the object: observed
+                    # geometry + bias/session, the inferred
+                    # structure read (score/regime/posture/
+                    # alignment/journey), itemized supporting vs
+                    # contradictory evidence with correlation
+                    # groups — the same shape the native routes
+                    # journal.
                     evidence={"route": "h1_trigger",
-                              "hierarchy": hier_rec},
+                              "hierarchy": hier_rec,
+                              "observed": _observed,
+                              "inferred": _inferred,
+                              "supporting": _sup,
+                              "contradictory": _con,
+                              "evidence_groups": _groups,
+                              "independent_evidence_groups":
+                                  sorted(_groups)},
                     source="trigger_path")
 
             hier_rec = {
@@ -7000,7 +7133,11 @@ class MT5Runner:
                                "PullbackWatch armed (§5)",
                         floor_result={
                             "floor": float(fl["floor"]),
-                            "total": float(score.total), "path": path})
+                            "total": float(score.total), "path": path},
+                        selected_action="park the setup in "
+                                        "PullbackWatch (§5) and "
+                                        "await the pullback — do "
+                                        "not chase the runaway")
                     continue
                 self._record_blocked(
                     f"min_score: {reason}", pb.name)
@@ -7105,7 +7242,12 @@ class MT5Runner:
                                  "excludes this playbook "
                                  "(A14 override)",
                           execution_eligible=False,
-                          order_result="not_attempted")
+                          order_result="not_attempted",
+                          selected_action="journal the evaluated "
+                                          "signal only — the "
+                                          "owner's execute list "
+                                          "keeps it from ordering "
+                                          "(A14 override)")
                 continue
             # Chart: H4 zone + entry/stop/targets + verdict, saved
             # next to the journal and attached to the alert.
@@ -7240,7 +7382,26 @@ class MT5Runner:
                 floor_result={"floor": float(fl["floor"]),
                               "total": float(score.total),
                               "path": path},
-                reason=f"accepted on {path}; order outcome: {_ores}")
+                reason=f"accepted on {path}; order outcome: {_ores}",
+                selected_action=(
+                    "stage the base order for the owner's "
+                    "Confirm tap (Golden Swing ceremony)"
+                    if _branch == "confirm" else
+                    "layer onto the held position through the "
+                    "funding ladder (_try_layer)"
+                    if _branch == "layer" else
+                    "submit to the shared order path "
+                    "(setup-dependent order type inside "
+                    "_place_live_order)"),
+                rejected_alternatives=[
+                    "take the opposite side — rejected: no "
+                    "opposite-side candidate from this playbook "
+                    "at this bar; the asymmetry score did not "
+                    "flip",
+                    "abstain and wait for a later bar — "
+                    "rejected: the setup qualified on this "
+                    "bar's weighed evidence (score, floor and "
+                    "hard facts all passed)"])
             # Visible market reading: a live signal/watch verdict
             # announces its rendered assessment (the helper's
             # guards keep refusals, scans and shadow records
@@ -7251,14 +7412,46 @@ class MT5Runner:
         # by the signal-gap dedupe before reaching a decision.
         # Evaluated-and-empty is a record, not a silence.
         if self._funnel_seq == _funnel_seq0:
+            # Burn-down #1: the evaluated-and-empty record
+            # carries the structure/HTF snapshot that was
+            # present on the fired trigger and states why no
+            # scenario qualified — it no longer renders as
+            # "not produced" on every section.
+            _fb_ts = h1.index[t] if t < len(h1) else None
+            _fb_ev = {"route": "h1_trigger",
+                      "hierarchy": {
+                          "bias_d1": (verdict or {}).get(
+                              "bias_d1"),
+                          "bias_h4": (verdict or {}).get(
+                              "bias_h4"),
+                          "trigger": (verdict or {}).get(
+                              "trigger"),
+                          "entry_clock": (verdict or {}).get(
+                              "entry_clock")}}
+            _fb_ev.update(self._desk_context_evidence(
+                last_bar_ts=_fb_ts))
+            _fb_regime = (verdict or {}).get("regime")
+            if _fb_regime is not None:
+                _fb_inf = dict(_fb_ev.get("inferred") or {})
+                _fb_inf.setdefault("regime", _fb_regime)
+                _fb_ev["inferred"] = _fb_inf
             self._emit_eval(
                 playbook=pb.name, evaluation_clock="h1_trigger",
                 intended_tf=_native_tf(pb.name) or "H1",
                 actual_input_tf="H1",
-                last_bar_ts=h1.index[t] if t < len(h1) else None,
+                last_bar_ts=_fb_ts,
                 outcome="no_setup",
                 reason="evaluated on the fired trigger — no "
-                       "candidate reached a decision")
+                       "candidate reached a decision",
+                evidence=_fb_ev,
+                assessment={"competing_scenarios": [
+                    {"scenario": f"a {pb.name} candidate on "
+                                 "the fired trigger",
+                     "status": "not formed — the playbook "
+                               "emitted no signal at this bar, "
+                               "or every signal was skipped by "
+                               "the signal-gap dedupe before "
+                               "reaching a decision"}]})
 
     # ------------------------------------------------------------- layering
     # Scale-in onto ONE position: a confirming setup in the same
@@ -10571,6 +10764,50 @@ class MT5Runner:
     # routes for qm_m5/qm_d1, and NO authority for the §G range
     # evaluation routes (shadow until the owner promotes them).
 
+    def _desk_context_evidence(self, *,
+                               last_bar_ts=None) -> dict:
+        """The desk's current causal context as assessment
+        evidence (burn-down #1): the structure / HTF snapshot
+        the native routes stamp on their records, read from the
+        SAME live state — the refreshed setup dict (D1/H4 bias,
+        regime), the composed posture, the alignment read, the
+        session bucket of the evaluated bar — for evaluation
+        routes that weigh no candidate of their own (scheduled
+        scans, kill-switch skips, the trigger path's
+        evaluated-and-empty fallback), so their records state
+        what structure was present instead of "not produced".
+        Observation-only: values are copied onto the record,
+        never consulted by any decision.  None-safe throughout:
+        an unpopulated snapshot yields an empty dict and the
+        record keeps its honest absent markers."""
+        setup = self._live_setup or {}
+        observed: dict = {}
+        for key in ("bias_d1", "bias_h4"):
+            if setup.get(key) is not None:
+                observed[key] = setup.get(key)
+        if last_bar_ts is not None:
+            try:
+                observed["session_bucket"] = \
+                    session_of(last_bar_ts)[0]
+            except Exception:
+                pass
+        inferred: dict = {}
+        if setup.get("regime") is not None:
+            inferred["regime"] = setup.get("regime")
+        post = self._posture
+        if post is not None and getattr(post, "name", None):
+            inferred["posture"] = post.name
+        alignment = getattr(self._alignment,
+                            "alignment_label", None)
+        if alignment is not None:
+            inferred["alignment"] = alignment
+        out: dict = {}
+        if observed:
+            out["observed"] = observed
+        if inferred:
+            out["inferred"] = inferred
+        return out
+
     def _sweep_blocked_reason(self) -> tuple[str, str] | None:
         """Path-level blocks that make a scheduled scan not an
         evaluation at all (kill states are per-playbook and are
@@ -10610,6 +10847,20 @@ class MT5Runner:
         base = dict(playbook=name, evaluation_clock=clock,
                     intended_tf=intended_tf, actual_input_tf=actual_tf,
                     last_bar_ts=last_bar_ts, source=source)
+        # Burn-down #1: every EVALUATED scheduled-scan record
+        # (no-setup and candidate outcomes below) carries the
+        # desk's structure/HTF snapshot, so /assess shows what
+        # the market looked like when this playbook was scanned,
+        # not "not produced".  The not-evaluated exits above
+        # (kill switch / paused / market closed / no frame)
+        # deliberately keep NO evidence block — an evaluation
+        # that never ran must not wear a structure read
+        # (Amendment 3 absent-marking, test-pinned).
+        context = self._desk_context_evidence(
+            last_bar_ts=last_bar_ts)
+        scan_evidence = {"evaluation_kind": "scheduled_scan",
+                         "route": spec.route,
+                         "shadow": bool(shadow), **context}
         if name in (self.cfg.disabled_playbooks or ()):
             self._emit_eval(
                 **base, outcome="not_eligible",
@@ -10648,15 +10899,25 @@ class MT5Runner:
                 reason=f"scheduled scan failed: "
                        f"{type(exc).__name__}: {exc}")
             return
-        evidence = {"evaluation_kind": "scheduled_scan",
-                    "route": spec.route, "shadow": bool(shadow)}
+        evidence = dict(scan_evidence)
         if extra_evidence:
             evidence.update(extra_evidence)
         if not fresh:
+            # No scenario formed: the record says what structure
+            # was present (the context snapshot above) AND why
+            # no scenario qualified — the detector emitted no
+            # signal on the closing bar (burn-down #1).
             self._emit_eval(
                 **base, outcome="no_setup",
                 reason="scheduled scan on the closing bar — no "
-                       "signal", evidence=evidence)
+                       "signal", evidence=evidence,
+                assessment={"competing_scenarios": [
+                    {"scenario": f"a {name} candidate at the "
+                                 "closing bar",
+                     "status": "not formed — the playbook's "
+                               "detector emitted no signal on "
+                               "the closing bar; no scenario "
+                               "qualified"}]})
             return
         code = ("path.shadow_route" if shadow
                 else "path.trigger_not_fired")
@@ -10680,6 +10941,42 @@ class MT5Runner:
                 evaluation_ts=last_bar_ts, source=source,
                 touch_age_bars=0, validity_window_bars=0,
                 eligible=False, eligibility_code=code)
+            # Burn-down #1: an observed candidate carries the
+            # same assessment objects the native routes produce
+            # — itemized evidence with correlation groups (the
+            # detector's own factors; the candidate's stance vs
+            # the structural D1 bias, weighed as context) and
+            # the two competing scenarios (this side observed,
+            # the other side unfunded by this bar).
+            _dir = int(sig.direction)
+            _entry = float(sig.entry_ref)
+            _stop = float(sig.invalidation)
+            _sup: list[str] = []
+            _con: list[str] = []
+            _groups: dict[str, list[str]] = {}
+
+            def _note(bucket, group, text):
+                bucket.append(text)
+                _groups.setdefault(group, []).append(text)
+
+            for _f in (getattr(sig, "factors", None) or []):
+                _note(_sup, f"{name}_signal",
+                      f"signal factor: {_f}")
+            _d1 = (self._live_setup or {}).get("bias_d1")
+            if _d1:
+                _suffix = (" (context only — §G: D1 never "
+                           "vetoes)" if shadow else "")
+                if int(_d1) == _dir:
+                    _note(_sup, "htf_structure",
+                          f"with structural D1 bias "
+                          f"{int(_d1):+d}{_suffix}")
+                else:
+                    _note(_con, "htf_structure",
+                          f"against structural D1 bias "
+                          f"{int(_d1):+d}{_suffix}")
+            _obs = dict(evidence.get("observed") or {})
+            _obs.update({"entry": _entry, "stop": _stop,
+                         "stop_dist": abs(_entry - _stop)})
             self._emit_eval(
                 **base, outcome="candidate_emitted",
                 reason_code=code, reason=why,
@@ -10689,11 +10986,36 @@ class MT5Runner:
                           "reason_code": code, "reason": why,
                           "execution_eligible": False,
                           "order_result": "not_attempted",
+                          "competing_scenarios": [
+                              {"scenario": f"take the {_dir:+d} "
+                                           f"{name} setup at "
+                                           f"{_entry:.2f}",
+                               "status": (
+                                   "observed, not routed — §G "
+                                   "shadow evaluation: journaled "
+                                   "for grading, this route "
+                                   "holds no order authority"
+                                   if shadow else
+                                   "observed, not routed — "
+                                   "order authority belongs to "
+                                   "the trigger path, which did "
+                                   "not fire")},
+                              {"scenario": f"take the "
+                                           f"{-_dir:+d} side",
+                               "status": "not funded — no "
+                                         "opposite-side signal "
+                                         "at the closing bar"}],
                           **_verdict_blocks(
                               analytical="not_evaluated",
                               eligible=False,
                               execution_code=code)},
-                evidence={**evidence, "provenance": prov})
+                evidence={**evidence, "observed": _obs,
+                          "supporting": _sup,
+                          "contradictory": _con,
+                          "evidence_groups": _groups,
+                          "independent_evidence_groups":
+                              sorted(_groups),
+                          "provenance": prov})
 
     def _run_roster_close_evals(self, stats: dict | None = None,
                                 *, source: str) -> None:
