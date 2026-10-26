@@ -151,9 +151,13 @@ class RunnerConfig:
                                      # dead-man's outbox, bar buffer
     min_gap_bars: int = 0   # min bars between live signals (live loop)
     fixed_lots: float | None = None  # when set, the callback handler
-                                     # sizes EVERY trade at this fixed
+                                     # sizes PAPER trades at this fixed
                                      # volume (Exness $12 loop: 0.01),
-                                     # ignoring risk_pct + forecaster
+                                     # ignoring risk_pct + forecaster.
+                                     # PAPER ONLY: live (execute)
+                                     # orders ignore fixed lots
+                                     # (journal-noted) and always use
+                                     # the dynamic rule.
                                      # dial — no R-grinding, no scaling.
     hierarchy_required: bool = False  # when True, a signal fires ONLY
                                      # with a hierarchy verdict (the

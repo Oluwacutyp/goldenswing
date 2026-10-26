@@ -164,7 +164,7 @@ from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
                                 ROSTER_SPECS, ROSTER_SPECS_H1,
                                 native_tf_of as _native_tf)
-from .risk import RiskConfig, RiskGuards, size_position
+from .risk import RiskConfig, RiskGuards
 from .tick_manager import (DEFAULT_TIME_EXIT_BARS, TickAction, TickConfig,
                           TickManager)
 from ..feed.mt5 import TRADE_MODE_REAL, MT5Feed, TickPump
@@ -249,12 +249,14 @@ class MT5RunnerConfig:
     min_score: float = 60.0
     # --- Confluence rework (spec v2, arrival pass) ------------------
     # Sizing (owner ruling 2026-10-23, REVOKING A13's fixed-lots
-    # override; floor rule per owner ruling 2026-10-24): dynamic
-    # risk sizing is the SOLE sizing path.
+    # override; floor rule per owner ruling 2026-10-24; legacy
+    # fence per owner rulings enforcement 2026-10-25): dynamic
+    # risk sizing is the SOLE sizing path for orders.
     # "risk" = sizes computed from risk money in Decimal
     # (live/sizing.py), ledgered per position in a RiskPool; the
-    # legacy float path (risk.py size_position, same risk rule)
-    # remains selectable as sizing_mode="legacy" for A/B forensics.
+    # legacy float path (risk.py sizer) remains ONLY for
+    # evaluation/forensics — every order path refuses a non-risk
+    # sizing mode with a journal note instead of placing an order.
     # There is NO fixed-lots mode and no fixed_lots field: a size
     # always derives from (k x equity x C x S) / (stop ticks x
     # tick value), step-quantized down; a step-quantized size below
@@ -5674,13 +5676,15 @@ class MT5Runner:
                           "volume_max": float(spec.volume_max)},
                       "stop_distance": float(_stop_dist)}
         else:
-            sizing = size_position(
-                balance=float(acct.get("equity", 0.0)),
-                risk_pct=self.cfg.risk_pct, entry=entry, stop=stop0,
-                spec=spec)
-            if sizing.lots <= 0:
-                return
-            lots = float(sizing.lots)
+            # ENFORCEMENT (owner rulings): a non-risk sizing mode may
+            # evaluate but NEVER places an order. A stale config
+            # selecting legacy mode refuses here, loudly, instead of
+            # silently restoring retired behavior.
+            self.journal.log_note(
+                "mt5 resting limit REFUSED: sizing_mode is not "
+                "'risk' — legacy sizing cannot place orders "
+                "(evaluation/forensics only)")
+            return
         from types import SimpleNamespace
         pb_stub = SimpleNamespace(name="arrival_zone")
         sig_stub = SimpleNamespace(
@@ -6296,10 +6300,13 @@ class MT5Runner:
 
     def _sizing_mode(self) -> str:
         """Effective sizing mode (owner ruling 2026-10-23): dynamic
-        risk sizing is the ONLY sizing family — the configured
-        mode selects between the Decimal RiskPool path ("risk")
-        and the legacy float path; there is no fixed-lots mode
-        (the A13 override is revoked, the field is gone)."""
+        risk sizing is the ONLY sizing family for orders — the
+        configured mode selects between the Decimal RiskPool path
+        ("risk") and the legacy float path for evaluation/forensics
+        only; every order path refuses a non-risk mode (see the
+        enforcement notes at the order sites). There is no
+        fixed-lots mode (the A13 override is revoked, the field
+        is gone)."""
         return str(self.cfg.sizing_mode or "risk")
 
     def _zone_dict_for(self, verdict: dict | None,
@@ -8170,16 +8177,20 @@ class MT5Runner:
         # order), floored to 0.01 and capped by the remaining risk
         # budget.
         acct = self.feed.account_state()
-        sizing = size_position(balance=acct["equity"],
-                               risk_pct=self.cfg.risk_pct,
-                               entry=sig.entry_ref, stop=stop0,
-                               spec=spec)
-        if sizing.lots <= 0:
+        # Layer fallback sizing uses the live dynamic rule (the same
+        # risk rule as a base order): below-minimum floors to 0.01,
+        # then the budget cap below may still cut it under 0.01 and
+        # skip (ceiling preserved). The retired legacy sizer must
+        # never size a layer order (owner rulings).
+        result = size_for_risk(
+            float(acct["equity"]) * float(self.cfg.risk_pct),
+            abs(float(sig.entry_ref) - stop0), spec)
+        if not result.ok:
             self.journal.log_note(
                 f"mt5: layer sizing refused {pb.name}: "
-                f"{sizing.reason}")
+                f"{result.verdict}")
             return
-        lots = sizing.lots
+        lots = float(result.lots)
         lots = min(lots, int(budget / risk_per_lot / 0.01) * 0.01)
         if lots < 0.01:
             self.journal.log_note(
@@ -9215,47 +9226,15 @@ class MT5Runner:
                     "volume_max": float(spec.volume_max)},
                 "stop_distance": float(_stop_dist)}
         else:
-            sizing = size_position(balance=acct["equity"],
-                                   risk_pct=self.cfg.risk_pct,
-                                   entry=sig.entry_ref, stop=stop0,
-                                   spec=spec)
-            lots = sizing.lots
-            if lots <= 0:
-                self.journal.log_note(
-                    f"mt5: sizing refused {pb.name}: {sizing.reason}")
-                return
-            # MacroTrend alignment sizing (base orders only): Golden
-            # Swing 1.5x, D1/W1 conflict 0.5x.  Layers are
-            # NOT multiplied here — they scale via the layer risk
-            # budget, which derives from the (multiplied) base risk.
-            lots = self._apply_alignment_multiplier(lots, spec, pb.name)
-            # Regime sizing (base orders only): RANGE regime trades
-            # at 0.5x (choppy regime = smaller).  Same no-multiply
-            # rules as alignment: layers scale via the layer risk
-            # budget, which derives from the (multiplied) base risk.
-            lots = self._apply_size_multiplier(
-                lots, spec,
-                float((verdict or {}).get("size_mult", 1.0) or 1.0),
-                f"regime {(verdict or {}).get('regime', 'trend')} "
-                f"{pb.name}")
-            # News-adaptive sizing: shrink entries in the post-news
-            # cooldown blend (1.0 far from news).  Same no-multiply
-            # rules as alignment (risk-% base orders only).
-            lots = self._apply_size_multiplier(
-                lots, spec, news_mult, f"news {pb.name}")
-            # Session sizing: the session multiplier for the tick
-            # clock (killzone sessions are the overlap bucket,
-            # off-session is reduced).  Same no-multiply rules.
-            lots = self._apply_size_multiplier(
-                lots, spec,
-                session_multiplier(now_utc, self.cfg.session_multipliers),
-                f"session {pb.name}")
-            # P3 posture scalar (S1/S3): same treatment as the
-            # other sizing expressions on this legacy path.
-            if self._posture is not None:
-                lots = self._apply_size_multiplier(
-                    lots, spec, float(self._posture.size_scalar),
-                    f"posture {self._posture.name} {pb.name}")
+            # ENFORCEMENT (owner rulings): a non-risk sizing mode may
+            # evaluate but NEVER places an order. A stale config
+            # selecting legacy mode refuses here, loudly, instead of
+            # silently restoring retired behavior.
+            self.journal.log_note(
+                f"mt5: order REFUSED {pb.name}: sizing_mode is not "
+                "'risk' — legacy sizing cannot place orders "
+                "(evaluation/forensics only)")
+            return
         # Safety gates (order time, never silent): RiskGuards, then
         # margin + swing margin shield.  Both must pass — a refusal
         # is journalled + counted by leg.

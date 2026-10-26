@@ -39,15 +39,28 @@ broker minimum.
 - **Demo authority stays OFF. No real-money routing.** The RiskPool
   ceiling stands.
 
-## 2. Fixed-lots mode revoked (owner ruling 2026-10-23, revoking A13)
+## 2. Fixed-lots mode revoked from every EXECUTION path (owner ruling 2026-10-23, revoking A13; enforcement 2026-10-25)
 
-There is NO fixed-lots mode and no `fixed_lots` field anywhere in the
-engine. Dynamic risk sizing (`live/sizing.py`) is the SOLE sizing path;
-the legacy float path (`execution/risk.py::size_position`, same risk
-rule) remains selectable as `sizing_mode="legacy"` for A/B forensics
-only. There is no `--fixed-lots` command-line flag. Any document, table,
-or example still showing `--fixed-lots`, a `fixed_lots` config key, or a
-fixed-lot demo command is stale — see §5.
+No order placed by any executing runner may use fixed lots or the
+retired legacy sizer. Dynamic risk sizing (`live/sizing.py`) is the
+SOLE sizing path for orders:
+
+- The MT5 runner's three order paths (base, layer, resting-limit)
+  refuse any non-`risk` sizing mode with a journal note instead of
+  placing an order. A stale config selecting legacy mode can evaluate
+  and journal, but it cannot trade.
+- The legacy runner's callback handler refuses fixed lots for live
+  (`execute`) orders and sizes them with the dynamic rule instead.
+- There is no `--fixed-lots` command-line flag and no `fixed_lots`
+  key on the MT5 config.
+
+Simulation-only exceptions (fenced, never execution): the Exness $12
+paper simulator models its account at fixed 0.01 lot, and the legacy
+paper path keeps its legacy sizer — both are simulation models, both
+are fenced off live orders by the rules above, and neither may be
+described as an execution mode. Any document, table, or example still
+showing `--fixed-lots`, a `fixed_lots` MT5 config key, or a fixed-lot
+demo command is stale — see §5.
 
 ## 3. Forecast / ensemble: shadow until validated (owner ruling 2026-10-24)
 
@@ -92,14 +105,48 @@ The visual layer must never invent evidence the engine never calculated.
   clause — corrected in-repo to the §1 floor rule.
 - Any score-band sizing, `decline_below_min` verdict, or fixed-lots
   sizing found anywhere else: retired, not an alternative.
+- `goldenswing/execution/mt5_runner.py` sizing comment (2026-10-23
+  wording): "legacy remains selectable for A/B forensics" — corrected
+  in-repo: selectable for evaluation/forensics only; order paths
+  refuse non-risk modes.
+- `goldenswing/execution/callbacks.py` / `runner.py` fixed-lots
+  comments ("sizes EVERY trade"): corrected in-repo — paper
+  simulation only; live orders refuse fixed lots.
 
 ## 6. How this file is enforced
 
 `tests/test_owner_rulings.py` pins the load-bearing parts: no
 `--fixed-lots` flag on the real CLI, no below-minimum abandonment, no
-score parameter in the sizing API, and this file's presence with its
-supersession section. The older doctrine pins live in
+score parameter in the sizing API, this file's presence with its
+supersession section, no legacy-sizer call in the MT5 runner, and the
+callback handler refusing fixed lots (and flooring below-minimum
+sizes) on live orders. The older doctrine pins live in
 `tests/test_sizing_min_floor.py` (minimum floor), and balance-independence
 plus the 15% drawdown halt are pinned in `tests/test_phase2_fixes.py`.
 If a future change breaks one of these pins, the change is wrong, not
 the pin — unless the owner issues a new ruling that updates this file.
+
+## 7. Enforcement fences (2026-10-25)
+
+- MT5 order paths (base, layer, resting-limit) refuse a non-`risk`
+  sizing mode with a journal note and place no order.
+- The legacy runner's callback handler sizes live (`execute`) orders
+  only with the dynamic rule; fixed lots and the legacy sizer are
+  refused for live orders.
+- The legacy sizer (`execution/risk.py`) is retained ONLY for
+  backtest/forensic code and paper simulation. It must never appear
+  on an MT5 order path — enforced by the wiring test.
+- Paper simulation fences: the Exness fixed-0.01 model and the legacy
+  paper sizer cannot reach a live executor (callback fence above).
+
+## 8. Dormant paths audited (2026-10-25)
+
+- `live/entry.py` + `live/min_lot.py` 50%-equity skip rule: NO
+  production importer exists; the MT5 runner does not use it, so it
+  cannot affect any active execution workflow today. If it is ever
+  wired in, the 50% skip contradicts §1 (never abandon) and must be
+  reworked first — never wired as-is.
+- `scripts/train_forecast.py` still trains on the external hourly
+  frame. That is NOT compliant with §3 for deployment; the
+  engine-side MT5-history trainer is the pending ensemble-build item
+  (§4.1), not something this fix claims done.

@@ -26,6 +26,7 @@ from ..alerts.callbacks import AlertAction
 from .executor import Executor, OrderRequest
 from .learning import TradeJournal
 from .risk import RiskGuards, SizingResult, SymbolSpec, size_position
+from ..live.sizing import size_for_risk
 
 #: alert.kind -> playbook when no richer context was registered.
 _KIND_TO_PLAYBOOK = {
@@ -49,10 +50,13 @@ class ExecutionCallbackHandler:
         self.journal = journal
         self.risk_pct = float(risk_pct)
         self.magic = int(magic)
-        # Fixed-size mode (Exness $12 loop): every trade at exactly
-        # ``fixed_lots`` (0.01), ignoring risk_pct AND the forecaster
-        # sizing dial. None = the normal risk_pct sizer. The executor
-        # underneath still enforces margin (Exness) / its own rules.
+        # Fixed-size mode (Exness $12 paper loop): every paper trade
+        # at exactly ``fixed_lots`` (0.01), ignoring risk_pct AND the
+        # forecaster sizing dial. None = the normal risk_pct sizer.
+        # PAPER SIMULATION ONLY: _place ignores fixed lots for live
+        # (execute) orders (journal-noted) and sizes them with the
+        # dynamic rule. The executor underneath still enforces margin
+        # (Exness) / its own rules.
         self.fixed_lots = None if fixed_lots is None else float(fixed_lots)
         self._context: dict[str, dict] = {}
 
@@ -110,7 +114,31 @@ class ExecutionCallbackHandler:
                                 "alert carries no valid stop distance")
         acct = executor.account_state()
         ctx = self._context_for(alert)
-        if self.fixed_lots is not None:
+        if source == "execute":
+            # ENFORCEMENT (owner rulings): a live order NEVER uses
+            # fixed lots or the retired legacy sizer — only the
+            # live dynamic rule, which floors below-minimum sizes
+            # at the broker minimum instead of abandoning. A stale
+            # fixed-lots knob is IGNORED (journal-noted), never
+            # applied and never a reason to miss the trade. Paper
+            # simulation keeps its own models in the branches below.
+            # The forecaster dial stays a scalar (never a veto).
+            if self.fixed_lots is not None:
+                self.journal.log_note(
+                    f"EXECUTE: fixed lots {self.fixed_lots} ignored — "
+                    "live orders use dynamic sizing",
+                    alert_id=alert.alert_id, instrument=alert.instrument,
+                    action="execute")
+            size_mult = ctx.get("forecast_size_mult", 1.0) or 1.0
+            result = size_for_risk(
+                float(acct.balance) * float(self.risk_pct)
+                * float(size_mult),
+                float(risk_distance), self.spec)
+            if not result.ok:
+                return self._refuse(alert, label, result.verdict)
+            sizing = SizingResult(float(result.lots),
+                                  float(result.realized_risk), "")
+        elif self.fixed_lots is not None:
             # Fixed-size mode: no risk_pct math, no forecaster dial.
             # Floor to the volume step (never round up); the broker
             # minimum still applies.
