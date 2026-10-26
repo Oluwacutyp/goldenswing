@@ -69,9 +69,18 @@ SYMBOL_TRADE_MODE_FULL = 4
 #: returns fewer bars than requested, :meth:`MT5Feed.bars_for`
 #: logs a WARNING with the bars returned — never silently uses a
 #: short history.
+#:
+#: M5/M15 are deepened past the 2000-bar default for the forecast:
+#: usable MTF rows are bounded by the SHALLOWEST TF's coverage
+#: (rows missing any present TF are dropped), and 2000 M5 bars
+#: cover only ~7 days ≈ 162 usable H1 rows — below the trainer's
+#: 500-row floor. M5 10000 (~35 days) and M15 3000 (~31 days) clear
+#: it with margin; the zone book also sees the deeper history
+#: (nearby selection is price-proximity-based, so live decisions
+#: still key off nearest levels).
 _WARM_BARS: dict[str, int] = {
-    "D1": 2000, "H4": 4200, "H1": 2000, "M15": 2000, "M30": 2000,
-    "M5": 2000, "W1": 500, "MN1": 300,
+    "D1": 2000, "H4": 4200, "H1": 2000, "M15": 3000, "M30": 2000,
+    "M5": 10000, "W1": 500, "MN1": 300,
 }
 
 

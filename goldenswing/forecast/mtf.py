@@ -50,9 +50,16 @@ _TF_WINDOWS = {"pct": 50, "range": 20, "ema_fast": 9, "ema_slow": 21}
 # the cost (minutes of background fitting) is paid roughly monthly.
 MIN_NEW_BARS_RETRAIN = 500
 
-# Minimum raw H1 bars before a training thread even starts:
-# 63 days of D1 warmup (≈1512 H1 bars) + 500 usable rows.
-MIN_H1_BARS_TRAIN = 2012
+# Minimum usable MTF rows before a training thread even starts —
+# the same floor the trainer itself enforces. This is deliberately a
+# USABLE-row floor, not a raw-H1-bar floor: the old 2012 raw-bar
+# number assumed every TF's window starts cold (63 days of D1 warmup
+# ≈ 1512 H1 bars + 500 usable), but the live stack's D1/H4 frames
+# run years deep, so only H1's own 63-bar warmup binds there and a
+# 1999-bar H1 stack already yields ~1900 usable rows. Measuring
+# usable rows keeps the statistical floor intact without refusing a
+# trainable stack.
+MIN_USABLE_ROWS_TRAIN = 500
 
 
 def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -301,9 +308,10 @@ def train_from_frames(frames: dict, out_path: str | Path) -> dict:
         if col not in h1.columns:
             raise ValueError(f"cannot train: H1 frame lacks '{col}'")
     X = build_mtf_frame(frames)
-    if len(X) < 500:
+    if len(X) < MIN_USABLE_ROWS_TRAIN:
         raise ValueError(
-            f"cannot train: too few usable MTF rows ({len(X)} < 500)")
+            f"cannot train: too few usable MTF rows "
+            f"({len(X)} < {MIN_USABLE_ROWS_TRAIN})")
     h1 = h1.sort_index()
     atr = _atr(h1).to_numpy(dtype=float)
     # Labels align to H1 bars; reindex to the MTF frame's rows.

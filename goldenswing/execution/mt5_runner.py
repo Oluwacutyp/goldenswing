@@ -2875,7 +2875,8 @@ class MT5Runner:
         explicit lever, not the only way a fresh install gets a model."""
         try:
             frames = self._stack.frames if self._stack is not None else None
-            if not frames or not frames.get("H1"):
+            h1 = frames.get("H1") if isinstance(frames, dict) else None
+            if h1 is None or len(h1) == 0:
                 return ("forecast_train: no H1 frame available — "
                         "engine not warm-started?")
             _thread, note = self._forecaster.maybe_train(frames)

@@ -117,6 +117,15 @@ demo command is stale — see §5.
   A rank sitting above threshold does not re-alert; dropping below
   re-arms the crossing. The stack frames are the model's input; only
   the alert cadence is daily.
+- **Training readiness is usable rows, not raw bars (fix
+  2026-10-26):** usable MTF rows are bounded by the SHALLOWEST TF's
+  coverage (rows missing any present TF are dropped), so the gate
+  measures usable rows against the trainer's 500-row floor — a raw
+  H1 count misleads (the live stack's 1999 H1 bars yielded only 162
+  usable rows under 2000-bar M5 history). M5/M15 history requests
+  were deepened (M5 10000, M15 3000) so the live stack clears the
+  floor (~735 usable rows); short terminal history still refuses
+  honestly via the same gate, never silently.
 
 ## 4. Chart studies and terminal (owner direction 2026-10-24, build order)
 

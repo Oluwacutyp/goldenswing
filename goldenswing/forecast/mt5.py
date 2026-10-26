@@ -31,7 +31,8 @@ import pandas as pd
 
 from .mtf import (
     BUNDLE_VERSION,
-    MIN_H1_BARS_TRAIN,
+    MIN_USABLE_ROWS_TRAIN,
+    build_mtf_frame,
     needs_training,
     score_last_row,
     train_from_frames,
@@ -162,8 +163,9 @@ class MT5Forecaster:
 
         Returns (thread, note). ``thread`` is None when no training is
         needed, one is already running, or history is too short for
-        MTF training (under MIN_H1_BARS_TRAIN raw H1 bars: 63 days of
-        D1 warmup + 500 usable rows). The outcome lands in
+        MTF training (under MIN_USABLE_ROWS_TRAIN usable MTF rows —
+        the same floor the trainer enforces, measured on the actual
+        stacked frame rather than a raw H1 count). The outcome lands in
         ``_train_result`` for the runner to journal on the tick
         thread; the worker thread never touches the journal. A failed
         train leaves the old bundle untouched (atomic swap) and
@@ -177,10 +179,14 @@ class MT5Forecaster:
         h1 = frames.get("H1") if isinstance(frames, dict) else None
         if h1 is None or len(h1) == 0:
             return None, "no H1 frame — cannot train"
-        if len(h1) < MIN_H1_BARS_TRAIN:
+        try:
+            usable = len(build_mtf_frame(frames))
+        except Exception as exc:  # noqa: BLE001 — gate honesty
+            return None, f"cannot build MTF frame: {exc}"
+        if usable < MIN_USABLE_ROWS_TRAIN:
             return None, (
-                f"too few H1 bars for MTF training "
-                f"({len(h1)} < {MIN_H1_BARS_TRAIN})")
+                f"too few usable MTF rows for training "
+                f"({usable} < {MIN_USABLE_ROWS_TRAIN})")
         need, reason = needs_training(self.bundle_path, h1)
         if not need:
             return None, f"bundle current: {reason}"

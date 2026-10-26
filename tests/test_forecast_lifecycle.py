@@ -100,7 +100,7 @@ def test_insufficient_history_never_claims_operational(tmp_path):
     short = {"H1": _frames()["H1"].iloc[:100]}
     thread, note = fc.maybe_train(short)
     assert thread is None
-    assert "too few H1 bars" in note
+    assert "too few usable MTF rows" in note
     st = fc.status_dict(h1_bars=100)
     assert st["ready"] is False
     assert st["alerts_enabled"] is False

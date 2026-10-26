@@ -18,7 +18,7 @@ import pytest
 
 from goldenswing.forecast.mtf import (
     BUNDLE_VERSION,
-    MIN_H1_BARS_TRAIN,
+    MIN_USABLE_ROWS_TRAIN,
     _purge_mask,
     _validate_bundle,
     build_mtf_frame,
@@ -237,8 +237,8 @@ def test_train_writes_atomically_and_maybe_train_background(tmp_path):
     # Too few bars: no thread, truthful note.
     short = {"H1": _frame(100, "h", 13)}
     thread3, note3 = fc.maybe_train(short)
-    assert thread3 is None and "too few H1 bars" in note3
-    assert MIN_H1_BARS_TRAIN == 2012
+    assert thread3 is None and "too few usable MTF rows" in note3
+    assert MIN_USABLE_ROWS_TRAIN == 500
 
 
 def test_train_frame_validation_errors(tmp_path):
