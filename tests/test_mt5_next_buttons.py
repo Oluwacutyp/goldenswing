@@ -21,17 +21,24 @@ import json
 from datetime import datetime, timezone
 
 from goldenswing.alerts.commands import (
+    BacktestJob,
     CommandContext,
+    _finish_backtest_job,
     _reconcile,
     _snapshot,
+    build_backtest_export_result,
     fmt_next_keyboard,
     next_button_rows,
     start_backtest_from_args,
 )
+from goldenswing.execution import mt5_commands as _mc
 from goldenswing.execution.mt5_commands import (
     MENU_KEYBOARD,
     _mt5_assess,
     _mt5_config,
+    _mt5_d1,
+    _mt5_db,
+    _mt5_harvest,
     _mt5_health,
     _mt5_help,
     _mt5_journal,
@@ -40,8 +47,10 @@ from goldenswing.execution.mt5_commands import (
     _mt5_playbooks,
     _mt5_position,
     _mt5_recap,
+    _mt5_report,
     _mt5_start,
     _mt5_status,  # noqa: F401  (imported for registry completeness)
+    _mt5_ticks,
     _mt5_trades,
     mt5_back_keyboard,
     mt5_control_keyboard,
@@ -51,7 +60,7 @@ from goldenswing.execution.mt5_commands import (
 )
 from test_mt5_nav_buttons import _Journal, _record
 from test_mt5_telegram_control import OWNER, _callback, _runner, FakeApi
-from test_telegram_formatting import _journal, _mt5_text
+from test_telegram_formatting import _journal, _mt5_ctx, _mt5_text
 
 
 def _datas(kb):
@@ -130,6 +139,119 @@ def test_control_and_nav_merges_keep_base_rows():
     assert "« Back to Status" not in _texts(nav)
     assert mt5_back_keyboard()["inline_keyboard"] == [
         [{"text": "« Back to Status", "callback_data": "mt5:cmd:/status"}]]
+
+
+def test_document_results_carry_next_keyboards(tmp_path):
+    """Audit check 3: document results used to go out with zero
+    buttons on both paths.  Every file result now carries the same
+    kind of Next keyboard as the text screens — and never a button
+    to its own command."""
+    j = _journal(tmp_path)
+    ctx = _mt5_ctx(j, tmp_path)
+    res = _mt5_db(ctx, [])
+    assert res.document is not None
+    assert _datas(res.reply_markup) == ["mt5:cmd:/status",
+                                        "mt5:cmd:/journal",
+                                        "mt5:cmd:/report"]
+    res = _mt5_report(ctx, [])
+    assert res.document is not None
+    assert _datas(res.reply_markup) == ["mt5:cmd:/status",
+                                        "mt5:cmd:/trades",
+                                        "mt5:cmd:/recap"]
+    # Long weekly recap goes out as a file, not text — same buttons
+    # as the short-recap text branch.
+    for i in range(80):
+        j.log_open(alert_id=f"MT5-x-{i}", instrument="XAUUSD",
+                   mode="MT5", playbook="x", phase="live", direction=1,
+                   score=70, source="mt5", ticket=100 + i, entry=4000.0,
+                   stop=3990.0, volume=0.01, risk_money=10.0)
+        j.log_close(alert_id=f"MT5-x-{i}", ticket=100 + i,
+                    exit_price=4010.0, reason="tp", pnl_money=10.0,
+                    r_net=1.0, hold_bars=3)
+    res = _mt5_recap(ctx, ["weekly"])
+    assert res.document is not None
+    assert _datas(res.reply_markup) == ["mt5:cmd:/status",
+                                        "mt5:cmd:/trades",
+                                        "mt5:cmd:/report"]
+    res = _mt5_harvest(ctx, ["journal"])
+    assert res.document is not None
+    assert _datas(res.reply_markup) == ["mt5:cmd:/status",
+                                        "mt5:cmd:/trades",
+                                        "mt5:cmd:/report"]
+    res = build_backtest_export_result(ctx)
+    assert res.document is not None
+    assert _datas(res.reply_markup) == ["mt5:cmd:/status",
+                                        "mt5:cmd:/backtest",
+                                        "mt5:cmd:/report"]
+
+
+def test_feed_export_documents_carry_next_keyboards(tmp_path, monkeypatch):
+    """Ticks + D1 exports are feed-gated; stub the feed edge only,
+    the handler's document + keyboard code runs for real."""
+    j = _journal(tmp_path)
+    ctx = _mt5_ctx(j, tmp_path)
+
+    def _fake_export(feed, start, end, out_path):
+        out_path.write_text("time,bid,ask\n")
+        return out_path, 123
+
+    monkeypatch.setattr(_mc, "export_tick_history", _fake_export)
+    ctx.feed = object()
+    res = _mt5_ticks(ctx, ["1"])
+    assert res.document is not None
+    assert _datas(res.reply_markup) == ["mt5:cmd:/status",
+                                        "mt5:cmd:/marketread"]
+
+    import pandas as pd
+    from datetime import timezone
+    idx = pd.date_range("2026-10-01", periods=5, freq="D",
+                        tz=timezone.utc)
+    frame = pd.DataFrame(
+        {"open": 4000.0, "high": 4010.0, "low": 3990.0,
+         "close": 4005.0, "volume": 100, "real_volume": 100,
+         "spread": 20}, index=idx)
+
+    class _FakeFeed:
+        def bars(self, tf, n):
+            return frame
+
+    ctx.feed = _FakeFeed()
+    res = _mt5_d1(ctx, ["5"])
+    assert res.document is not None
+    assert _datas(res.reply_markup) == ["mt5:cmd:/status",
+                                        "mt5:cmd:/marketread"]
+
+
+def test_async_backtest_delivery_carries_next_keyboard(tmp_path):
+    """The async backtest report is delivered via ctx.deliver — it
+    used to arrive with no buttons either."""
+    import goldenswing.alerts.commands as _ac
+
+    j = _journal(tmp_path)
+    ctx = _mt5_ctx(j, tmp_path)
+    got = []
+    ctx.deliver = got.append
+    out = tmp_path / "reports"
+    out.mkdir(parents=True)
+    old = _ac._BACKTEST_RUNNER_OVERRIDE
+    _ac._BACKTEST_RUNNER_OVERRIDE = lambda job: {
+        "window": {},
+        "trades": {"closed": 2, "win_rate": 0.5, "total_r": 1.0,
+                   "total_dollar": 20.0, "profit_factor": 1.5,
+                   "max_drawdown_r": 0.5},
+        "per_playbook": {}}
+    try:
+        job = BacktestJob(days=7, playbook=None, drop_back=False,
+                          out_dir=out)
+        _finish_backtest_job(job, ctx, False)
+    finally:
+        _ac._BACKTEST_RUNNER_OVERRIDE = old
+    assert job.status == "done"
+    res = got[0]
+    assert res.document is not None
+    assert _datas(res.reply_markup) == ["mt5:cmd:/backtest_export",
+                                        "mt5:cmd:/status",
+                                        "mt5:cmd:/health"]
 
 
 def test_status_screen_never_shows_back_to_itself():

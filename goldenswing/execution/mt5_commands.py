@@ -838,9 +838,12 @@ def _mt5_db(ctx: CommandContext, args: list[str]) -> CommandResult:
     size_mb = path.stat().st_size / 1e6
     note = (f" — {size_mb:.1f}MB; Telegram bot documents cap at 50MB"
             if size_mb > 40 else "")
+    # Documents carry navigation too (audit check 3): a bare file
+    # leaves the user with no inline path onward.
     return CommandResult(
         document=path,
-        caption=f"📓 MT5 journal ({path.name}){note}")
+        caption=f"📓 MT5 journal ({path.name}){note}",
+        reply_markup=fmt_next_keyboard("/status", "/journal", "/report"))
 
 
 @mt5_command("/report", "send the latest MT5 results as a file")
@@ -857,7 +860,8 @@ def _mt5_report(ctx: CommandContext, args: list[str]) -> CommandResult:
             text=f"report build failed: {type(exc).__name__}: {exc}")
     return CommandResult(
         document=path,
-        caption="📊 MT5 engine report (fresh from the MT5 journal)")
+        caption="📊 MT5 engine report (fresh from the MT5 journal)",
+        reply_markup=fmt_next_keyboard("/status", "/trades", "/recap"))
 
 
 @mt5_command("/recap", "daily / weekly recap — every closed trade, "
@@ -901,9 +905,12 @@ def _mt5_recap(ctx: CommandContext, args: list[str]) -> CommandResult:
     path = Path(ctx.reports_dir) / f"mt5-recap-{period}-{stamp}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+    # Same buttons as the text branch: one screen, one keyboard,
+    # whether the recap fits in a message or needs a file.
     return CommandResult(
         document=path,
-        caption=f"📅 MT5 {period} recap (every closed trade, wins and losses)")
+        caption=f"📅 MT5 {period} recap (every closed trade, wins and losses)",
+        reply_markup=fmt_next_keyboard("/status", "/trades", "/report"))
 
 
 @mt5_command("/ticks", "export the last N days of MT5 tick history as CSV (default 1, max 7)")
@@ -930,7 +937,8 @@ def _mt5_ticks(ctx: CommandContext, args: list[str]) -> CommandResult:
     return CommandResult(
         document=path,
         caption=f"📈 MT5 tick history, last {days} day(s): {rows} ticks "
-                f"(exactly as seen — no resampling)")
+                f"(exactly as seen — no resampling)",
+        reply_markup=fmt_next_keyboard("/status", "/marketread"))
 
 
 #: /d1 defaults — mirror the feed's warm-start bar count for D1.
@@ -979,7 +987,8 @@ def _mt5_d1(ctx: CommandContext, args: list[str]) -> CommandResult:
     return CommandResult(
         document=out_path,
         caption=f"📅 MT5 D1 bars: {len(out)} closed bars, {span} "
-                f"(real MT5 bars — no resampling)")
+                f"(real MT5 bars — no resampling)",
+        reply_markup=fmt_next_keyboard("/status", "/marketread"))
 
 
 # ------------------------------------------------------------------ /harvest
@@ -1157,7 +1166,9 @@ def _mt5_harvest(ctx: CommandContext, args: list[str]) -> CommandResult:
     caption = (f"📦 MT5 harvest {scope} — {n_trades} trades{total_r}, "
                f"{len(files)} files, {manifest['zip_bytes'] // 1024}KB — "
                f"RESULTS.md inside has the full breakdown")
-    return CommandResult(document=zip_path, caption=caption)
+    return CommandResult(
+        document=zip_path, caption=caption,
+        reply_markup=fmt_next_keyboard("/status", "/trades", "/report"))
 
 
 # ------------------------------------------------- engine / backtest commands

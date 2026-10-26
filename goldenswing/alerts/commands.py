@@ -848,7 +848,10 @@ def build_backtest_export_result(ctx: CommandContext, *,
     # Caption limit is 1024 chars in the sender; keep it concise.
     if len(caption) > 1000:
         caption = caption[:997] + "…"
-    return CommandResult(document=path, caption=caption)
+    # Documents carry navigation too (audit check 3).
+    return CommandResult(
+        document=path, caption=caption,
+        reply_markup=fmt_next_keyboard("/status", "/backtest", "/report"))
 
 
 # Backwards-compatible alias (old name); new code uses the export name.
@@ -1049,7 +1052,11 @@ def _finish_backtest_job(job: BacktestJob, ctx: CommandContext,
         job.report_path = path
         job.status = "done"
         caption = summary if len(summary) <= 1000 else summary[:997] + "…"
-        result = CommandResult(document=path, caption=caption)
+        # Mirror the backtest ack's buttons on the delivered file.
+        result = CommandResult(
+            document=path, caption=caption,
+            reply_markup=fmt_next_keyboard("/backtest_export", "/status",
+                                           "/health"))
     except Exception as exc:  # noqa: BLE001 — a failed run still reports
         job.status = "failed"
         job.error = f"{type(exc).__name__}: {exc}"
