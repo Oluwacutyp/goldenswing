@@ -735,6 +735,103 @@ def _mt5_panel_ylim(view, *, entry: float, stop: float,
     return lo_v - pad, hi_v + pad
 
 
+def zones_to_study_dicts(zones, entry: float, signal_zone, cap: int = 8) -> list[dict]:
+    """ZoneCache zones -> chart-ready dicts, nearest-first, capped.
+
+    Zones whose level falls inside the signal zone's band are skipped
+    (the band already shows that ground). Only dicts come out, so the
+    renderer never imports the cache's types.
+    """
+    sig_lo = sig_hi = 0.0
+    if signal_zone:
+        try:
+            sig_lo = float(signal_zone.get("bottom", 0) or 0)
+            sig_hi = float(signal_zone.get("top", 0) or 0)
+        except Exception:
+            sig_lo = sig_hi = 0.0
+    out = []
+    for z in zones or []:
+        try:
+            lvl = float(getattr(z, "level", 0) or 0)
+        except Exception:
+            continue
+        if not lvl:
+            continue
+        if sig_lo and sig_hi and sig_lo <= lvl <= sig_hi:
+            continue
+        out.append({"level": lvl,
+                    "tier": str(getattr(z, "tier", "") or ""),
+                    "side": str(getattr(z, "side", "") or "")})
+    out.sort(key=lambda d: abs(d["level"] - entry))
+    return out[:cap]
+
+
+def _mt5_sessions(ax, view, theme) -> None:
+    """Killzone shading for one panel, from its own bar timestamps."""
+    ts = view.index
+    run_start = None
+    n = len(view)
+    for i in range(n):
+        try:
+            _name, kz = sessions.session_of(ts[i])
+        except Exception:
+            continue
+        if kz and run_start is None:
+            run_start = i
+        if (not kz or i == n - 1) and run_start is not None:
+            run_end = i if not kz else i + 1
+            ax.axvspan(run_start - 0.5, run_end - 0.5,
+                       color="#f7b924", alpha=0.07, zorder=0)
+            run_start = None
+
+
+def _mt5_premium_discount(ax, x_lo, x_hi, range_low, range_high, theme) -> None:
+    """Dealing-range premium/discount shading + equilibrium line."""
+    eq = 0.5 * (range_low + range_high)
+    ax.axhspan(eq, range_high, color="#ef5350", alpha=0.045, zorder=0)
+    ax.axhspan(range_low, eq, color="#26a69a", alpha=0.045, zorder=0)
+    ax.axhline(eq, color=theme["text"], linewidth=0.7,
+               linestyle=(0, (4, 3)), alpha=0.45, zorder=1)
+    ax.text(x_lo + 0.4, range_high, " PREMIUM", va="top", fontsize=7.5,
+            color="#ef5350", alpha=0.8)
+    ax.text(x_lo + 0.4, eq, " EQ", va="bottom", fontsize=7.5,
+            color=theme["text"], alpha=0.7)
+    ax.text(x_lo + 0.4, range_low, " DISCOUNT", va="bottom", fontsize=7.5,
+            color="#26a69a", alpha=0.8)
+
+
+def _mt5_nearby_lines(ax, x_hi, nearby_zones, theme) -> None:
+    """Cache zone levels as horizontal lines (MAJOR solid, rest dashed)."""
+    for z in nearby_zones or []:
+        lvl = float(z["level"])
+        side = z.get("side", "")
+        tier = z.get("tier", "")
+        col = (theme["up"] if side == "support"
+               else theme["down"] if side == "resistance"
+               else theme["text"])
+        major = tier == "MAJOR"
+        ax.axhline(lvl, color=col, linewidth=1.0 if major else 0.6,
+                   linestyle="-" if major else (0, (6, 3)),
+                   alpha=0.8, zorder=2)
+        ax.text(x_hi - 0.3, lvl, f" {tier} {lvl:.1f} ", ha="right",
+                va="bottom", fontsize=7.5, color=col)
+
+
+def _mt5_fib(ax, x_hi, fib_levels, ote_band, theme) -> None:
+    """Auto-Fib retracement lines + the OTE band, on the H1 panel."""
+    for frac, price in fib_levels or []:
+        ax.axhline(price, color="#8d6e00", linewidth=0.6,
+                   linestyle=(0, (4, 3)), zorder=2)
+        ax.text(x_hi - 0.3, price, f" {frac:.3f} ", ha="right",
+                va="bottom", fontsize=7.5, color="#8d6e00")
+    if ote_band is not None:
+        lo, hi = ote_band
+        if hi > lo:
+            ax.axhspan(lo, hi, color="#8d6e00", alpha=0.10, zorder=1)
+            ax.text(x_hi - 0.3, hi, " OTE ", ha="right", va="bottom",
+                    fontsize=7.5, color="#8d6e00", fontweight="bold")
+
+
 def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                        entry: float, stop: float,
                        targets: list[float] | None = None,
@@ -748,7 +845,11 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                        entry_clock: str | None = None,
                        style: str = "classic",
                        h4_window: int = 60,
-                       entry_window: int = 60) -> bytes:
+                       entry_window: int = 60,
+                       nearby_zones: list[dict] | None = None,
+                       fib_levels: list[tuple[float, float]] | None = None,
+                       fib_range: tuple[float, float] | None = None,
+                       ote_band: tuple[float, float] | None = None) -> bytes:
     """Render the MT5 multi-timeframe signal chart to PNG bytes.
 
     Three stacked panels (H4 structure / H1 trigger / entry-TF entry),
@@ -759,6 +860,15 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
     ``style`` is ``"classic"`` or ``"blueprint"`` (the two MT5 chart
     classes).  Every level drawn comes from the caller — nothing is
     inferred, estimated, or defaulted.
+
+    Studies (at most four, all caller-supplied except sessions,
+    which shade the panels' own bar timestamps):
+    - signal zone band (H4 panel) + ``nearby_zones`` cache levels
+      (all panels);
+    - ``fib_levels`` auto-Fib retracements + ``ote_band`` (H1 panel),
+      computed by the engine's feature pipeline on the H1 frame;
+    - ``fib_range`` dealing-range premium/discount shading (H1 panel);
+    - killzone session shading (all panels, from bar timestamps).
     """
     if style not in _MT5_STYLES:
         raise ValueError(
@@ -787,16 +897,17 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
     axes = [fig.add_subplot(gs[i]) for i in range(3)]
 
     panels = [
-        # (frame, window, title, zone band?, marker label)
+        # (frame, window, title, zone band?, marker label, is H1 panel?)
         (h4, h4_window,
          f"H4 — structure · D1 bias {bias_d1:+d} · H4 bias {bias_h4:+d}",
-         True, None),
+         True, None, False),
         (h1, window, f"H1 — trigger: {trigger}", False,
-         f"TRIGGER {trigger}"),
-        (entry_frame, entry_window, f"{clock} — entry", False, "ENTRY"),
+         f"TRIGGER {trigger}", True),
+        (entry_frame, entry_window, f"{clock} — entry", False, "ENTRY",
+         False),
     ]
     verdict_box_done = False
-    for ax, (frame, win, title, show_zone, marker) in zip(axes, panels):
+    for ax, (frame, win, title, show_zone, marker, is_h1) in zip(axes, panels):
         ax.set_facecolor(theme["bg"])
         ax.tick_params(colors=theme["text"], labelsize=8)
         for spine in ax.spines.values():
@@ -819,6 +930,7 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
         x_lo, x_hi = -0.6, len(view) - 1 + 12.4
         ax.set_xlim(x_lo, x_hi)
         _mt5_candles(ax, view, xs, theme)
+        _mt5_sessions(ax, view, theme)
         if show_zone and zone is not None:
             ztop = float(zone.get("top", 0) or 0)
             zbot = float(zone.get("bottom", 0) or 0)
@@ -834,6 +946,12 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                         f"{_fmt(zbot)}–{_fmt(ztop)}",
                         va="bottom", fontsize=8.5, color="#8a6d00",
                         fontweight="bold")
+        _mt5_nearby_lines(ax, x_hi, nearby_zones, theme)
+        if is_h1:
+            if fib_range is not None:
+                _mt5_premium_discount(ax, x_lo, x_hi, fib_range[0],
+                                      fib_range[1], theme)
+            _mt5_fib(ax, x_hi, fib_levels, ote_band, theme)
         _mt5_trade_levels(ax, x_hi, entry=entry, stop=stop,
                           targets=targets, direction=direction, risk=risk,
                           fill_price=fill_price, theme=theme)

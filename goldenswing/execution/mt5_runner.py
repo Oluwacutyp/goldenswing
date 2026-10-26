@@ -68,7 +68,7 @@ import pandas as pd
 
 from ..alerts.commands import CommandContext, is_owner_callback
 from ..backtest.data import REPO_ROOT
-from ..charts.engine import render_mt5_signal
+from ..charts.engine import render_mt5_signal, zones_to_study_dicts
 from ..confluence import ConfluenceEngine
 from ..features.engine import read_and_featurize
 from ..feed.tick_log import TickLogger
@@ -11906,10 +11906,15 @@ class MT5Runner:
                      fill_price: float | None = None,
                      suffix: str = "") -> tuple[bytes | None, Path | None]:
         """Chart PNG for a signal/fill: the WHOLE hierarchy stack
-        (H4 structure / H1 trigger / entry-TF entry) + levels + verdict.
+        (H4 structure / H1 trigger / entry-TF entry) + levels + verdict
+        + the studies the reasoning used: nearby cache zones, the
+        feature pipeline's auto-Fib + dealing range on H1, and
+        killzone session shading.
 
-        Never breaks the signal path: on any failure returns
-        (None, None) and logs a note; the text alert still goes out.
+        Studies are best-effort: any study that fails to compute is
+        left off, never invented. Never breaks the signal path: on
+        any failure returns (None, None) and logs a note; the text
+        alert still goes out.
         """
         try:
             frames = self._stack.frames if self._stack else {}
@@ -11918,8 +11923,35 @@ class MT5Runner:
                 return None, None
             zone = (verdict or {}).get("zone")
             entry_clock = (verdict or {}).get("entry_clock") or "M15"
+            entry = float(sig.entry_ref)
+            nearby = []
+            try:
+                atr = float(getattr(sig, "atr", 0.0) or 0.0)
+                _v, cache_zones = self._zone_cache.nearby(entry, atr)
+                nearby = zones_to_study_dicts(cache_zones, entry, zone)
+            except Exception:
+                nearby = []
+            fib_levels = fib_range = ote_band = None
+            try:
+                states = read_and_featurize(h1, None)
+                last = states[-1]
+                fib = last.features.fib
+                if fib.levels:
+                    fib_levels = [(float(f), float(p))
+                                  for f, p in fib.levels]
+                    if (math.isfinite(fib.ote_low)
+                            and math.isfinite(fib.ote_high)):
+                        ote_band = (float(fib.ote_low),
+                                    float(fib.ote_high))
+                if (math.isfinite(last.range_high)
+                        and math.isfinite(last.range_low)
+                        and last.range_high > last.range_low):
+                    fib_range = (float(last.range_low),
+                                 float(last.range_high))
+            except Exception:
+                fib_levels = fib_range = ote_band = None
             png = render_mt5_signal(
-                h1, zone=zone, entry=float(sig.entry_ref),
+                h1, zone=zone, entry=entry,
                 stop=float(sig.invalidation),
                 targets=[float(x) for x in (sig.targets or [])],
                 direction=int(sig.direction), verdict=verdict,
@@ -11929,7 +11961,9 @@ class MT5Runner:
                 h4=frames.get("H4"),
                 entry_frame=frames.get(entry_clock),
                 entry_clock=entry_clock,
-                style=self.cfg.chart_style)
+                style=self.cfg.chart_style,
+                nearby_zones=nearby, fib_levels=fib_levels,
+                fib_range=fib_range, ote_band=ote_band)
             path = self._charts_dir / f"{alert_id}{suffix}.png"
             path.write_bytes(png)
             return png, path

@@ -128,9 +128,11 @@ demo command is stale — see §5.
    render `closed_expected`, never a breach, via `live/health.py`
    tick_state; feed-vs-calendar disagreement surfaces explicitly
    in the health line).
-3. Full chart studies (≤4 real overlays, exactly what the reasoning
-   used — zones, Fib, and all) attached to signals/alerts, not just the
-   minimal phone chart.
+3. Full chart studies — DONE 2026-10-25 (≤4 real overlays on the MT5
+   signal chart: signal zone band + nearby cache zone levels,
+   feature-pipeline auto-Fib + OTE band, dealing-range
+   premium/discount shading, killzone session shading; every level
+   caller-supplied, nothing inferred).
 4. Interactive multi-timeframe terminal (switch timeframes like
    TradingView, on the engine's own timestamped data).
 
