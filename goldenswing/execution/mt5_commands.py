@@ -582,6 +582,25 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
                          reply_markup=mt5_control_keyboard())
 
 
+@mt5_command("/marketread", "standing market read: trend + key zones + scenarios (same read as the /status section, on its own)")
+def _mt5_marketread(ctx: CommandContext, args: list[str]) -> CommandResult:
+    """Standalone Market Read (owner refinement, 2026-10-26): the
+    read does not have to ride inside /status — this command
+    returns it on its own, rendered from the same zone book + D1
+    structure state, under the same honesty contract (missing
+    inputs render as explicit not-produced lines)."""
+    ctrl = _control(ctx)
+    read = getattr(ctrl, "market_read_line", None) if ctrl is not None else None
+    if not callable(read):
+        return CommandResult(
+            text="Market Read needs the live MT5 engine — "
+                 "no runner attached to this chat.")
+    lines = [fmt_section("🔭", "Market Read"), "", read()]
+    lines.append(fmt_next_cta("/status", "/assess", "/playbooks"))
+    return CommandResult(text="\n".join(lines),
+                         reply_markup=mt5_control_keyboard())
+
+
 @mt5_command("/assess", "the engine's latest market assessment: /assess [playbook|all]")
 def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
     """Visible market reading (owner milestone, 2026-10-23):

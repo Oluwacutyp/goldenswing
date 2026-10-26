@@ -204,3 +204,25 @@ def test_status_wiring_skips_old_controllers(tmp_path):
     router = mt5_router(OWNER)
     res, _ = router.dispatch(_update("/status"), ctx)
     assert "Market Read" not in res.text
+
+
+def test_marketread_standalone_command(tmp_path):
+    ctx = CommandContext(journal=None, journal_path=None,
+                         reports_dir=tmp_path / "reports")
+    ctx.mt5_control = SimpleNamespace(
+        market_read_line=lambda: "trend: bearish — test read")
+    router = mt5_router(OWNER)
+    res, _ = router.dispatch(_update("/marketread"), ctx)
+    assert "Market Read" in res.text
+    assert "trend: bearish — test read" in res.text
+    # The standalone read carries no status sections.
+    assert "MT5 ENGINE STATUS" not in res.text
+
+
+def test_marketread_without_runner_is_graceful(tmp_path):
+    ctx = CommandContext(journal=None, journal_path=None,
+                         reports_dir=tmp_path / "reports")
+    ctx.mt5_control = SimpleNamespace()
+    router = mt5_router(OWNER)
+    res, _ = router.dispatch(_update("/marketread"), ctx)
+    assert "needs the live MT5 engine" in res.text
