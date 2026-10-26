@@ -287,7 +287,8 @@ class TelegramSender:
         return SendResult("telegram", ok, "live", detail)
 
     def send_document(self, path: str | Path, *,
-                      caption: str | None = None) -> SendResult:
+                      caption: str | None = None,
+                      reply_markup: dict | None = None) -> SendResult:
         """Send a file as a Telegram document (reports, the journal DB).
 
         Same retry/backoff contract as the other sends.  Bot API limit
@@ -315,6 +316,8 @@ class TelegramSender:
         if caption:
             data["caption"] = caption[:_CAPTION_LIMIT - 1] + "…" \
                 if len(caption) > _CAPTION_LIMIT else caption
+        if reply_markup is not None:
+            data["reply_markup"] = json.dumps(reply_markup)
         with p.open("rb") as fh:
             content = fh.read()
         ok, detail = self._post_with_retry(

@@ -62,7 +62,7 @@ described as an execution mode. Any document, table, or example still
 showing `--fixed-lots`, a `fixed_lots` MT5 config key, or a fixed-lot
 demo command is stale — see §5.
 
-## 3. Forecast / ensemble: it forecasts and alerts — it never trades (owner direction 2026-10-24; correction 2026-10-25)
+## 3. Forecast / ensemble: it forecasts and alerts — it never trades (owner direction 2026-10-24; corrections 2026-10-25)
 
 - The ensemble forecasts BIG MOVES before they happen, horizons 1 day
   and above, from actual market data.
@@ -77,16 +77,45 @@ demo command is stale — see §5.
 - Ensemble outputs are uncalibrated ranking scores. Cite them as RANKS
   ("big-move rank high @1d and @3d"), never as probabilities — honesty
   about what the numbers are, not a parking gate.
-- **No bundled model ships.** The engine carries the training code and
-  trains on its own MT5 data on install / first run, retraining as its
-  own history grows (owner correction 2026-10-25). No external hourly
-  frame is the training source, and no pre-trained artifact is ferried
-  between machines.
+- **Genuine multi-timeframe input (owner correction 2026-10-25):**
+  the forecast's features come from the engine's ACTUAL M5/M15/H1/H4/
+  D1 closed bars, as-of aligned to H1 row times, trailing-only (no
+  feature ever reads a future bar — proven by test, not asserted).
+  The earlier H1-only design is RETIRED: H1 bars cannot reconstruct
+  M5/M15 candle detail, and H4/D1 context resampled out of H1 is not
+  the engine's real H4/D1 frames. Bundle format v2, feature set
+  mtf-v1. Ranks are percentiles of a fresh score against the
+  training rows' score distribution (reference quantiles in the
+  bundle), so a single fresh row scores without a history frame.
+- **No bundled model ships.** The engine trains ITSELF: at warm start
+  when untrained or invalid, and again when 500+ new H1 bars arrive
+  since the last training (checked on D1 closes). Training runs in
+  the background from its own MT5 stack frames — ticks never wait
+  for it, a failed train leaves the old bundle untouched (atomic
+  swap) and retries on the next D1 close. Nobody runs a command and
+  nobody tells it: the engine knows it needs training because the
+  check runs on its own (owner correction 2026-10-25). No external
+  hourly frame is the training source, and no pre-trained artifact is
+  ferried between machines. `/forecast_train` exists as the
+  operator's explicit lever, not the only way a fresh install gets a
+  model.
+- **Validation without lookahead (audit fix 2026-10-25):** the
+  chronological holdout purges training rows whose label window
+  crosses into the holdout (a bar at index i with horizon h trains
+  only when i + h < cut) — otherwise training labels near the split
+  read holdout-period outcomes and the reported AUCs lie.
+  Validation failure records missing AUCs; it never fails training.
+- **Readiness is full bundle validation (audit fix 2026-10-25):** a
+  bundle is READY only when version, symbol, feature set, feature
+  list, up/dn models, all five horizons, trained stamps, and
+  reference quantiles all validate. A dict with a `features` key
+  alone proves nothing. Old-format bundles fail validation and are
+  retrained automatically.
 - **Cadence (owner correction 2026-10-25):** the forecast is scored on
   D1 closes — a days-ahead forecast is daily news, not hourly noise —
   and alerts fire ONLY when a gating rank (1d/3d) crosses into notable.
   A rank sitting above threshold does not re-alert; dropping below
-  re-arms the crossing. The H1 frame remains the model's input; only
+  re-arms the crossing. The stack frames are the model's input; only
   the alert cadence is daily.
 
 ## 4. Chart studies and terminal (owner direction 2026-10-24, build order)
@@ -125,6 +154,10 @@ The visual layer must never invent evidence the engine never calculated.
 - `goldenswing/execution/callbacks.py` / `runner.py` fixed-lots
   comments ("sizes EVERY trade"): corrected in-repo — paper
   simulation only; live orders refuse fixed lots.
+- OWNER_RULINGS.md §3's former "no training command exists" wording
+  and its former "H1 frame remains the model's input" wording —
+  superseded 2026-10-25: `/forecast_train` exists as the operator
+  lever, and the forecast input is the full MTF stack (v2 bundles).
 
 ## 6. How this file is enforced
 

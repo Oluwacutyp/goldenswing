@@ -1,32 +1,42 @@
-"""MT5 forecast service: the engine's own data -> forecast alerts.
+"""MT5 forecast service: the engine's own stack frames -> forecast alerts.
 
 Owner rulings §3: the ensemble forecasts big moves (horizons 1 day and
 above) and the engine ALERTS those forecasts. It NEVER trades, never
 sizes, never gates, never vetoes an order. Forecast output and order
 decisions are separate by construction.
 
-- Training runs on the engine's own MT5 history (the H1 frame from the
-  runner's bar stack), on install / first run, retraining as history
-  grows. No external frame, no shipped bundle.
-- Loading is honest: no bundle -> an "untrained" note, never a crash.
-- Outputs are RANKS (uncalibrated scores), never probabilities, and
-  every alert says so and says it is not a trade signal.
+The forecast is genuinely multi-timeframe (see forecast/mtf.py): its
+features come from the engine's actual M5/M15/H1/H4/D1 closed bars,
+as-of aligned, trailing-only — never from one H1 frame with higher
+timeframes resampled out of it. The H1-only trainer is retired; it
+lives in git history, not in this path.
+
+Lifecycle: the engine trains itself (warm start when untrained or
+invalid, D1 closes when 500+ new H1 bars arrived), in the background,
+atomically — nobody runs a command, nobody tells it. /forecast_train
+exists as the operator's explicit lever, not the only way a fresh
+install gets a model. Readiness is full bundle validation, never a
+single-key sniff test. Ranks are percentiles against the training
+distribution, never probabilities, and every alert says so.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from ..features import FeatureEngine
-from ..reader.reader import MarketReader
-from .api import MultiHorizonScorer
-from .features import build_feature_frame
-from .labels import HORIZONS, build_labels_for_horizon, spec_for
-from .walkforward import make_models
+from .mtf import (
+    BUNDLE_VERSION,
+    MIN_H1_BARS_TRAIN,
+    needs_training,
+    score_last_row,
+    train_from_frames,
+    _validate_bundle,
+)
 
 # Alert gate (build default, tunable — not an owner ruling): a forecast
 # alerts when a 1d or 3d big-move rank reaches this percentile.
@@ -37,7 +47,7 @@ ALERT_HORIZONS = (24, 72)
 
 @dataclass
 class ForecastRanks:
-    """Ranks at the last bar of a scored frame, per horizon."""
+    """Ranks at the last scored row, per horizon."""
 
     bar_time: object
     close: float
@@ -46,65 +56,6 @@ class ForecastRanks:
 
     def rank(self, horizon: int, direction: str) -> float:
         return float(self.ranks.get(horizon, {}).get(direction, float("nan")))
-
-
-def build_states(df: pd.DataFrame, peers: dict | None = None):
-    """MarketReader states + attached features for one OHLC frame."""
-    df = df.sort_index()
-    states = MarketReader().read(df)
-    FeatureEngine().attach(df, states, peers)
-    return states
-
-
-def _ranks_from_scorer(scorer, df: pd.DataFrame) -> ForecastRanks:
-    """Ranks at the last bar from a constructed scorer."""
-    t = len(df) - 1
-    ranks: dict[int, dict[str, float]] = {}
-    for h in sorted(scorer.table_scores):
-        up = scorer.table_scores[h].rank(1, t)
-        dn = scorer.table_scores[h].rank(-1, t)
-        ranks[h] = {"up": float(up), "dn": float(dn)}
-    return ForecastRanks(
-        bar_time=df.index[-1],
-        close=float(df["close"].iloc[-1]),
-        ranks=ranks,
-        horizons=tuple(sorted(ranks)),
-    )
-
-
-def score_last_bar_bundle(
-    df: pd.DataFrame, bundle: dict, *, peers: dict | None = None
-) -> tuple[ForecastRanks | None, str]:
-    """Score the last bar of ``df`` against an already-loaded bundle."""
-    df = df.sort_index()
-    if len(df) < 50:
-        return None, f"too few bars to score ({len(df)} < 50)"
-    states = build_states(df, peers)
-    if not states:
-        return None, "no market states from frame"
-    scorer = MultiHorizonScorer(bundle, states)
-    return _ranks_from_scorer(scorer, df), "forecast scored"
-
-
-def score_last_bar(
-    df: pd.DataFrame, bundle_path: str | Path, *, peers: dict | None = None
-) -> tuple[ForecastRanks | None, str]:
-    """Score the last bar of ``df`` against the bundle at ``bundle_path``.
-
-    Returns (ranks, note). ``ranks`` is None whenever scoring is
-    impossible (too few bars, no bundle, unloadable bundle) — the note
-    says why, and the caller must surface it, never crash on it.
-    """
-    df = df.sort_index()
-    if len(df) < 50:
-        return None, f"too few bars to score ({len(df)} < 50)"
-    states = build_states(df, peers)
-    if not states:
-        return None, "no market states from frame"
-    scorer, why = MultiHorizonScorer.try_load(bundle_path, states)
-    if scorer is None:
-        return None, why
-    return _ranks_from_scorer(scorer, df), f"forecast scored ({why})"
 
 
 def notable(
@@ -154,91 +105,12 @@ def format_forecast_alert(ranks: ForecastRanks,
     )
 
 
-def _fit_entry(df: pd.DataFrame, Xv, atr, horizon: int) -> dict:
-    """One horizon's ensemble, fitted on the full frame — the same
-    shape as scripts/train_forecast.py, driven by the caller's frame
-    (the engine's own MT5 history) instead of an external feed."""
-    spec = spec_for(horizon)
-    labels = build_labels_for_horizon(df, atr, horizon)
-    known = labels["y_up"].notna().to_numpy()
-    models: dict[str, dict] = {}
-    base_rates: dict[str, float] = {}
-    for dname, col in (("up", "y_up"), ("dn", "y_dn")):
-        y = labels[col].to_numpy(dtype=float)[known]
-        models[dname] = {}
-        for name, model in make_models(0).items():
-            model.fit(Xv[known], y)
-            models[dname][name] = model
-        base_rates[dname] = float(y.mean())
-    return {
-        "models": models,
-        "base_rates": base_rates,
-        "spec": asdict(spec),
-        "labelled_bars": int(known.sum()),
-        "definition": (f"big move = favourable excursion >= "
-                       f"{spec.fav_mult:g}x ATR before adverse >= "
-                       f"{spec.adv_mult:g}x ATR within "
-                       f"{spec.horizon} H1 bars"),
-    }
-
-
-def train_from_frame(
-    df: pd.DataFrame, out_path: str | Path, *, peers: dict | None = None
-) -> dict:
-    """Train a bundle from the engine's own frame and save it.
-
-    Returns a summary (horizons, labelled bars, trained_through).
-    The bundle is a host artifact (data/ is git-ignored): it is
-    produced on the machine that runs the engine, never shipped.
-    """
-    import joblib
-
-    df = df.sort_index()
-    states = build_states(df, peers)
-    atr = np.array([s.atr for s in states], dtype=float)
-    X = build_feature_frame(states)
-    # HistGradientBoosting bins each column at fit time and crashes on
-    # a column with fewer than 2 distinct values. On MT5 history there
-    # are no peers, so the relative-strength columns are constant by
-    # construction — drop constant/all-NaN columns and record the kept
-    # set in the bundle, so scoring selects exactly these columns.
-    keep = [c for c in X.columns
-            if X[c].notna().sum() > 0 and X[c].dropna().nunique() >= 2]
-    if not keep:
-        raise ValueError("no varying features in frame — cannot train")
-    Xv = X[keep].to_numpy(dtype=float)
-    horizons = {h: _fit_entry(df, Xv, atr, h) for h in HORIZONS}
-    legacy = horizons[72]
-    last_known_bar = int(np.where(
-        build_labels_for_horizon(df, atr, 72)["y_up"].notna()
-        .to_numpy())[0][-1])
-    bundle = {
-        "models": legacy["models"],
-        "features": keep,
-        "base_rates": legacy["base_rates"],
-        "trained_through": str(df.index[last_known_bar]),
-        "definition": legacy["definition"],
-        "horizons": horizons,
-        "train_frame": "mt5_history",
-    }
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(bundle, out_path)
-    return {
-        "saved": str(out_path),
-        "trained_through": bundle["trained_through"],
-        "horizons": {h: horizons[h]["labelled_bars"] for h in HORIZONS},
-        "base_rates": legacy["base_rates"],
-        "dropped_constant_features": [c for c in X.columns if c not in keep],
-    }
-
-
 @dataclass
 class MT5Forecaster:
     """Runner-side forecast service: score daily closes, alert crossings.
 
     The runner calls :meth:`maybe_alert` on each closed D1 bar with
-    the stack's H1 frame (the H1 frame is the model's input; the D1
+    the stack's frames (the frames are the model's input; the D1
     close is the cadence — a days-ahead forecast is daily news, not
     hourly noise). Alerts fire ONLY when a gating rank crosses from
     below to at/above threshold: a rank sitting above threshold does
@@ -248,8 +120,7 @@ class MT5Forecaster:
 
     The bundle dict is cached and reloaded only when its file mtime
     changes (a retrain), so scoring a new bar does not re-read a
-    multi-hundred-MB file. The scorer itself is rebuilt per bar —
-    it is constructed from the states, which grow every bar.
+    multi-hundred-MB file.
     """
 
     bundle_path: str | Path
@@ -258,6 +129,12 @@ class MT5Forecaster:
         default_factory=dict, repr=False)
     _bundle: dict | None = field(default=None, repr=False)
     _bundle_mtime: float | None = field(default=None, repr=False)
+    _train_result: tuple[bool, str] | None = field(
+        default=None, repr=False)
+    _training: bool = field(default=False, repr=False)
+    _last_evaluation: tuple[object, "ForecastRanks"] | None = field(
+        default=None, repr=False)
+    _last_error: str | None = field(default=None, repr=False)
 
     def _load_bundle(self) -> tuple[dict | None, str]:
         import joblib
@@ -272,10 +149,61 @@ class MT5Forecaster:
             bundle = joblib.load(path)
         except Exception as exc:  # noqa: BLE001 — loader honesty
             return None, f"bundle unloadable: {exc}"
-        if not isinstance(bundle, dict) or "features" not in bundle:
-            return None, f"bundle at {path} is not a forecast bundle"
+        valid, reason = _validate_bundle(bundle)
+        if not valid:
+            return None, f"bundle invalid: {reason}"
         self._bundle, self._bundle_mtime = bundle, mtime
         return bundle, "bundle loaded"
+
+    def maybe_train(
+        self, frames: dict
+    ) -> tuple[threading.Thread | None, str]:
+        """Start background training if the bundle needs it.
+
+        Returns (thread, note). ``thread`` is None when no training is
+        needed, one is already running, or history is too short for
+        MTF training (under MIN_H1_BARS_TRAIN raw H1 bars: 63 days of
+        D1 warmup + 500 usable rows). The outcome lands in
+        ``_train_result`` for the runner to journal on the tick
+        thread; the worker thread never touches the journal. A failed
+        train leaves the old bundle untouched (atomic swap) and
+        records the failure — the next D1 close retries. Nothing here
+        needs an owner command: the engine knows it needs training
+        because this method is called on every D1 close and at warm
+        start; /forecast_train is the operator's explicit lever.
+        """
+        if self._training:
+            return None, "training already running"
+        h1 = frames.get("H1") if isinstance(frames, dict) else None
+        if h1 is None or len(h1) == 0:
+            return None, "no H1 frame — cannot train"
+        if len(h1) < MIN_H1_BARS_TRAIN:
+            return None, (
+                f"too few H1 bars for MTF training "
+                f"({len(h1)} < {MIN_H1_BARS_TRAIN})")
+        need, reason = needs_training(self.bundle_path, h1)
+        if not need:
+            return None, f"bundle current: {reason}"
+        self._training = True
+        self._train_result = None
+        frames_copy = dict(frames)
+
+        def _run() -> None:
+            try:
+                summary = train_from_frames(
+                    frames_copy, self.bundle_path)
+                self._train_result = (
+                    True,
+                    f"trained through {summary['trained_through']}")
+            except Exception as exc:  # noqa: BLE001 — recorded, retried
+                self._train_result = (False, f"training failed: {exc}")
+            finally:
+                self._training = False
+
+        thread = threading.Thread(
+            target=_run, name="forecast-train", daemon=True)
+        thread.start()
+        return thread, f"training started: {reason}"
 
     def _decide(self, ranks: ForecastRanks) -> tuple[str | None, str]:
         """Crossing-only alert decision for one scored close."""
@@ -294,13 +222,61 @@ class MT5Forecaster:
         return format_forecast_alert(ranks, headline=top), "forecast alert"
 
     def maybe_alert(
-        self, df: pd.DataFrame, *, peers: dict | None = None
+        self, frames: dict
     ) -> tuple[str | None, str]:
-        """(alert_text | None, note). ``note`` explains every None."""
+        """(alert_text | None, note). ``note`` explains every None.
+        Successful scorings update the last evaluation (for /status);
+        failures record the last error."""
         bundle, note = self._load_bundle()
         if bundle is None:
+            self._last_error = note
             return None, note
-        ranks, note = score_last_bar_bundle(df, bundle, peers=peers)
+        ranks, note = score_last_row(frames, bundle)
         if ranks is None:
+            self._last_error = note
             return None, note
+        self._last_error = None
+        self._last_evaluation = (ranks.bar_time, ranks)
         return self._decide(ranks)
+
+    def status_dict(self, *, h1_bars: int | None = None) -> dict:
+        """Real runtime forecast status for /status. Every value is
+        read from the live bundle / live state — nothing hard-coded.
+        ``ready`` is True only when a fully validated bundle is
+        present; an untrained, unloadable, corrupt, or old-format
+        bundle reports ready False with the precise reason."""
+        bundle, note = self._load_bundle()
+        ready = bundle is not None
+        meta = bundle if isinstance(bundle, dict) else {}
+        last_eval = None
+        if self._last_evaluation is not None:
+            bar_time, ranks = self._last_evaluation
+            last_eval = {
+                "bar_time": str(bar_time),
+                "ranks": {h: ranks.ranks[h] for h in ranks.horizons},
+            }
+        return {
+            "ready": ready,
+            "reason": note,
+            "bundle_path": str(self.bundle_path),
+            "model_loaded": ready,
+            "version": meta.get("version"),
+            "feature_set": meta.get("feature_set"),
+            "symbol": meta.get("symbol"),
+            "trained_at": meta.get("trained_at"),
+            "trained_through": meta.get("trained_through"),
+            "train_bars": meta.get("train_bars"),
+            "h1_bars": h1_bars,
+            "labelled_bars": {
+                h: (meta.get("horizons", {}).get(h)
+                    or meta.get("horizons", {}).get(str(h), {})).get(
+                        "labelled_bars")
+                for h in (12, 24, 72, 168, 360)} if ready else None,
+            "validation": meta.get("validation"),
+            "last_evaluation": last_eval,
+            "last_error": self._last_error,
+            "training_running": self._training,
+            "last_train_result": self._train_result,
+            "alerts_enabled": ready,
+            "threshold": self.threshold,
+        }

@@ -96,6 +96,24 @@ def mt5_confirm_keyboard(token: str) -> dict:
     ]]}
 
 
+def mt5_nav_keyboard() -> dict:
+    """Read-only navigation for assess / health / forecast messages.
+
+    Separate from mt5_control_keyboard (pinned by tests, and a
+    message carries exactly one markup): control messages keep
+    theirs; these read-only messages get Status / Assess all /
+    Health / Train forecast. Tapping re-renders in place for text
+    results, or sends the document for /assess all.
+    """
+    return {"inline_keyboard": [
+        [{"text": "📊 Status", "callback_data": "mt5:status"},
+         {"text": "🧭 Assess all", "callback_data": "mt5:assess_all"}],
+        [{"text": "❤️ Health", "callback_data": "mt5:health"},
+         {"text": "🔮 Train forecast",
+          "callback_data": "mt5:forecast_train"}],
+    ]}
+
+
 # ------------------------------------------------- persistent reply menu
 # The always-visible bottom menu (reply keyboard, not inline): sent
 # on /start and /menu, then KEPT by Telegram (is_persistent) across
@@ -374,6 +392,13 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
         stack_line = getattr(ctrl, "stack_line", None)
         if callable(stack_line):
             lines.append(stack_line())
+        # Per-TF freshness (guarded — old runners lack it): age of
+        # each TF's last closed bar vs the engine clock, judged
+        # against the XAUUSD calendar. "Feed OK" (terminal
+        # connected) must never again stand in for fresh data.
+        freshness_line = getattr(ctrl, "freshness_line", None)
+        if callable(freshness_line):
+            lines.append(freshness_line())
     lines.append("")
     # Live setup: armed / not-armed + why.  Guarded — old runners
     # lack it.  This is the answer to "why no trades" when no
@@ -441,6 +466,16 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
         if callable(health):
             lines.append(fmt_section("❤️", "Health"))
             lines.append(health())
+            lines.append("")
+    # Forecast subsystem (owner rulings §3): real runtime values from
+    # the runner's forecast_line — readiness, version, training time,
+    # coverage, validation, last evaluation, errors, alert state.
+    # Guarded — old runners lack it.
+    if ctrl is not None:
+        forecast = getattr(ctrl, "forecast_line", None)
+        if callable(forecast):
+            lines.append(fmt_section("🔮", "Forecast"))
+            lines.append(forecast())
             lines.append("")
     if cfg is not None:
         lines.append(fmt_section("🔧", "Config"))
@@ -606,21 +641,24 @@ def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
                      f"usage: /assess [playbook|all]")
         return CommandResult(
             text=_text_of(rec)
-            + "\n" + fmt_next_cta("/assess all", "/status"))
+            + "\n" + fmt_next_cta("/assess all", "/status"),
+            reply_markup=mt5_nav_keyboard())
     if arg == "all":
         blocks = [_text_of(latest[name]) for name in sorted(latest)]
         text = ("\n\n" + "—" * 24 + "\n\n").join(blocks)
         if len(text) <= 3500 or not ctx.reports_dir:
             return CommandResult(
-                text=text + "\n" + fmt_next_cta("/assess", "/status"))
+                text=text + "\n" + fmt_next_cta("/assess", "/status"),
+                reply_markup=mt5_nav_keyboard())
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         path = Path(ctx.reports_dir) / f"mt5-assess-{stamp}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+        path.write_text(text, encoding="utf-8")
         return CommandResult(
             document=path,
             caption=f"🧭 MT5 market assessments — latest per "
-                    f"playbook ({len(blocks)} playbooks)")
+                    f"playbook ({len(blocks)} playbooks)",
+            reply_markup=mt5_nav_keyboard())
     newest_name = max(latest, key=lambda n: latest[n].get("ts") or "")
     lines = [_text_of(latest[newest_name]), "",
              fmt_section("🧭", "Latest per playbook")]
@@ -628,7 +666,8 @@ def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
         lines.append(_index_line(name, latest[name]))
     lines.append(fmt_next_cta("/assess <playbook>", "/assess all",
                               "/status"))
-    return CommandResult(text="\n".join(lines))
+    return CommandResult(text="\n".join(lines),
+                         reply_markup=mt5_nav_keyboard())
 
 
 @mt5_command("/position", "open MT5 positions with layers")
@@ -795,7 +834,7 @@ def _mt5_recap(ctx: CommandContext, args: list[str]) -> CommandResult:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     path = Path(ctx.reports_dir) / f"mt5-recap-{period}-{stamp}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
+    path.write_text(text, encoding="utf-8")
     return CommandResult(
         document=path,
         caption=f"📅 MT5 {period} recap (every closed trade, wins and losses)")
@@ -1155,4 +1194,30 @@ def _mt5_health(ctx: CommandContext, args: list[str]) -> CommandResult:
         except Exception:
             pass
     lines.append(fmt_next_cta("/status", "/reconcile", "/journal"))
-    return CommandResult(text="\n".join(lines))
+    return CommandResult(text="\n".join(lines),
+                         reply_markup=mt5_nav_keyboard())
+
+
+@mt5_command("/forecast_train", "start forecast training now (operator lever; auto-bootstrap is primary)")
+def _mt5_forecast_train(ctx: CommandContext, args: list[str]) -> CommandResult:
+    """Operator lever for forecast training — NOT the only way a
+    fresh install gets a model (the engine auto-bootstraps at warm
+    start and retrains on D1 closes when 500+ new H1 bars arrived).
+    Delegates to the runner's forecast_train_now, which starts a
+    background train when the bundle needs it and otherwise reports
+    the truthful state (current / too few bars / already running).
+    Never blocks the tick loop; never claims success on failure.
+    """
+    ctrl = _control(ctx)
+    fn = getattr(ctrl, "forecast_train_now", None)
+    if not callable(fn):
+        return CommandResult(
+            text="forecast_train: unavailable — this runner has no "
+                 "forecast service (old build; pull for the forecast "
+                 "wiring).",
+            reply_markup=mt5_nav_keyboard())
+    try:
+        return CommandResult(text=fn(), reply_markup=mt5_nav_keyboard())
+    except Exception as exc:  # noqa: BLE001 — command honesty
+        return CommandResult(text=f"forecast_train failed: {exc}",
+                             reply_markup=mt5_nav_keyboard())

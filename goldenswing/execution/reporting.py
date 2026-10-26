@@ -335,5 +335,7 @@ def build_report_file(journal: TradeJournal, *,
     trades = iter_paper_trades(journal)
     if measured_oos is None:
         measured_oos = load_measured_oos()
-    path.write_text(render_report_markdown(stats, measured_oos, trades))
+    path.write_text(
+        render_report_markdown(stats, measured_oos, trades),
+        encoding="utf-8")
     return path

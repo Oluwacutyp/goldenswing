@@ -159,7 +159,7 @@ from .friction_gate import (
     assess_entry_friction as _assess_friction)
 from .signal_log import log_signal
 from .mt5_commands import (mt5_confirm_keyboard, mt5_control_keyboard,
-                           mt5_router, parse_mt5_callback)
+                           mt5_nav_keyboard, mt5_router, parse_mt5_callback)
 from .mt5_config import LiveConfigStore, unknown_disabled_names
 from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
@@ -663,8 +663,10 @@ class MT5Runner:
         self._tg_unavailable_logged = False
         self.journal = TradeJournal(self.cfg.journal_path)
         # Forecast service (owner rulings §3): forecasts + alerts only.
-        # The bundle is a host artifact trained from this engine's own
-        # MT5 history; until one exists, scoring reports "untrained"
+        # The engine trains itself: untrained at warm start, or stale
+        # by 500+ new H1 bars at a D1 close, it trains in the
+        # background from its own MT5 history — no command, no owner
+        # step. Until a bundle exists, scoring reports "untrained"
         # and no forecast alert fires. Order paths never read this.
         _bundle = os.environ.get("GS_FORECAST_BUNDLE") or (
             DATA_DIR / "forecast_models.joblib")
@@ -1783,16 +1785,15 @@ class MT5Runner:
             h1 = self._stack.frames.get("H1")
             if h1 is None or len(h1) == 0:
                 raise RuntimeError("MT5 runner: warm start returned no H1 bars")
-            # Forecast readiness, stated once at startup (no eager
-            # bundle load — a multi-hundred-MB file is read only when
-            # the first D1 close scores, and cached after that).
-            _bp = Path(self._forecaster.bundle_path)
-            self.journal.log_note(
-                "forecast: bundle present at "
-                f"{_bp} — scoring starts on the next D1 close"
-                if _bp.exists() else
-                "forecast: untrained — no bundle at "
-                f"{_bp}; train from MT5 history to enable forecast alerts")
+            # Forecast self-training, stated once at startup (no eager
+            # bundle load for scoring — a multi-hundred-MB file is read
+            # only when the first D1 close scores, and cached after
+            # that; the training check itself reads the bundle only
+            # when one exists, and never blocks the tick loop — the
+            # train runs on a daemon thread).
+            _thread, _note = self._forecaster.maybe_train(
+                self._stack.frames)
+            self.journal.log_note(f"forecast: {_note}")
             for tf, frame in self._stack.frames.items():
                 if len(frame):
                     # Last-processed CLOSE (= last closed bar's open + TF).
@@ -2795,19 +2796,118 @@ class MT5Runner:
                 f"mt5: rollover recap failed: {exc}")
 
     # --------------------------------------------------------------- bars
+    def forecast_line(self) -> str:
+        """One /status Forecast block from real runtime values (never
+        hard-coded): readiness, version, training time, coverage,
+        validation, last evaluation, last error, alert state."""
+        try:
+            frame = self._stack.frames.get("H1") \
+                if self._stack is not None else None
+            st = self._forecaster.status_dict(
+                h1_bars=len(frame) if frame is not None else None)
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"forecast: status unavailable ({exc})"
+        if not st["ready"]:
+            lines = [f"🔮 forecast: NOT READY — {st['reason']}"]
+            if st["training_running"]:
+                lines.append("  training: running in the background")
+            elif st["last_train_result"] is not None:
+                ok, note = st["last_train_result"]
+                lines.append(
+                    f"  last training: {'ok' if ok else 'FAILED'} — {note}")
+            if st["last_error"]:
+                lines.append(f"  last error: {st['last_error']}")
+            lines.append("  alerts: idle — no valid bundle")
+            return "\n".join(lines)
+        lines = ["🔮 forecast: READY — alerts live on 1d/3d crossings"]
+        lines.append(
+            f"  model: {st['version']} ({st['feature_set']}) · "
+            f"{st['symbol']} · trained {st['trained_at']} through "
+            f"{st['trained_through']} ({st['train_bars']} usable MTF rows)")
+        h1 = st["h1_bars"]
+        lines.append(
+            f"  coverage: {h1} H1 bars in stack"
+            if h1 is not None else "  coverage: H1 stack unavailable")
+        val = st["validation"]
+        if isinstance(val, dict) and "error" not in val:
+            parts = []
+            for h in (24, 72, 168, 360):
+                entry = val.get(h, {})
+                au, ad = entry.get("auc_up"), entry.get("auc_dn")
+                label = {24: "1d", 72: "3d", 168: "7d", 360: "15d"}[h]
+                if au is None and ad is None:
+                    parts.append(f"{label} n/a")
+                else:
+                    parts.append(f"{label} up {au} / dn {ad}")
+            lines.append(
+                "  validation (chronological holdout AUC): "
+                + " · ".join(parts))
+        elif isinstance(val, dict):
+            lines.append(f"  validation: unavailable — {val['error']}")
+        else:
+            lines.append("  validation: none recorded (old bundle)")
+        last = st["last_evaluation"]
+        if last is not None:
+            r = last["ranks"]
+            parts = []
+            for h in (24, 72):
+                if h in r:
+                    parts.append(
+                        f"{ {24: '1d', 72: '3d'}[h] } "
+                        f"up {r[h]['up']:.0f} / dn {r[h]['dn']:.0f}")
+            lines.append(
+                f"  last evaluation: {last['bar_time']} — "
+                + (" · ".join(parts) if parts else "no gating ranks"))
+        else:
+            lines.append("  last evaluation: none yet")
+        if st["training_running"]:
+            lines.append("  training: running in the background")
+        if st["last_error"]:
+            lines.append(f"  last error: {st['last_error']}")
+        return "\n".join(lines)
+
+    def forecast_train_now(self) -> str:
+        """Operator-triggered retrain (/forecast_train): starts
+        background training when the bundle needs it, else reports
+        the truthful state. Never blocks the tick loop. Auto-bootstrap
+        remains the primary path — this command is the operator's
+        explicit lever, not the only way a fresh install gets a model."""
+        try:
+            frames = self._stack.frames if self._stack is not None else None
+            if not frames or not frames.get("H1"):
+                return ("forecast_train: no H1 frame available — "
+                        "engine not warm-started?")
+            _thread, note = self._forecaster.maybe_train(frames)
+            return f"forecast_train: {note}"
+        except Exception as exc:  # noqa: BLE001 — command honesty
+            return f"forecast_train failed: {exc}"
+
     def _maybe_forecast_alert(self) -> None:
         """Score the ensemble on a newly closed D1 bar; alert a new
-        threshold crossing.
+        threshold crossing. Self-training rides along: a finished
+        background train journals here (every tick, so the outcome
+        surfaces within a tick of finishing), and a stale bundle
+        retrains on the D1 close.
 
-        Runs at most once per closed D1 bar (cursor change detection),
-        so per-tick calls cost a few dict lookups. The H1 frame is
-        scored — it is the model's input — but the D1 close sets the
-        cadence: a 1-day+ forecast re-alerting every hour while its
-        rank sits high would be spam, not signal. Any failure is
-        journaled and never raised into the tick loop — a forecast
-        problem must never stop evaluation, management, or orders.
+        Runs at most one scoring per closed D1 bar (cursor change
+        detection). The stack's frames are scored — M5/M15/H1/H4/D1
+        closed bars as-of aligned (see forecast/mtf.py) — but the
+        D1 close sets the cadence: a 1-day+ forecast re-alerting
+        every hour while its rank sits high would be spam, not
+        signal. Any failure is journaled and never raised into the
+        tick loop — a forecast problem must never stop evaluation,
+        management, or orders.
         """
         try:
+            # Finished-train outcome: journaled on the tick thread
+            # (the worker thread only records it, never journals).
+            result = self._forecaster._train_result
+            if result is not None:
+                self._forecaster._train_result = None
+                ok, note = result
+                self.journal.log_note(
+                    f"forecast training {'complete' if ok else 'FAILED'}: "
+                    f"{note}")
             d1 = self._stack.frames.get("D1")
             if d1 is None or len(d1) == 0:
                 if not self._forecast_no_d1_noted:
@@ -2819,10 +2919,13 @@ class MT5Runner:
             if day == self._forecast_last_scored_bar:
                 return
             self._forecast_last_scored_bar = day
-            frame = self._stack.frames.get("H1")
-            if frame is None or len(frame) < 50:
+            frames = self._stack.frames
+            if not frames.get("H1") or len(frames["H1"]) < 50:
                 return
-            text, note = self._forecaster.maybe_alert(frame)
+            thread, note = self._forecaster.maybe_train(frames)
+            if thread is not None:
+                self.journal.log_note(f"forecast: {note}")
+            text, note = self._forecaster.maybe_alert(frames)
             if text is not None:
                 self.journal.log_note(
                     f"forecast alert @ {day}: {note}")
@@ -4520,6 +4623,59 @@ class MT5Runner:
                 parts.append(f"{tf}: {frame.index[-1]:%m-%d %H:%M} "
                              f"×{len(frame)}")
         return "bars (last closed, UTC): " + " · ".join(parts)
+
+    def freshness_line(self) -> str:
+        """Per-TF feed freshness for /status — the audit's point 1
+        made computable. For each stack TF: age of its last closed
+        bar vs the engine's UTC clock, judged against the XAUUSD
+        calendar (live/market_hours.py). Market open + age beyond
+        2x the TF interval + 5 min grace -> STALE (fail loud, never
+        a bare OK). Market closed -> CLOSED-EXPECTED, not stale.
+        No frame -> UNKNOWN. Bar times use the engine's stored UTC
+        convention (same as stack_line); if the broker's server
+        clock disagrees with that convention, the STALE flag is what
+        surfaces the disagreement instead of hiding it.
+        """
+        from datetime import datetime, timezone
+
+        from ..live.market_hours import xauusd_market_open
+
+        if self._stack is None:
+            return "freshness: no stack"
+        now = datetime.now(timezone.utc)
+        market_open = xauusd_market_open(now)
+        intervals = {"D1": 1440, "H4": 240, "H1": 60,
+                     "M15": 15, "M30": 30, "M5": 5}
+        parts = []
+        for tf in ("D1", "H4", "H1", "M15", "M30", "M5"):
+            frame = self._stack.frames.get(tf)
+            if frame is None or len(frame) == 0:
+                parts.append(f"{tf}: UNKNOWN")
+                continue
+            last = frame.index[-1]
+            try:
+                last_utc = last.tz_localize("UTC") \
+                    if last.tzinfo is None else last.tz_convert("UTC")
+                age_min = (now - last_utc.to_pydatetime()).total_seconds() / 60
+            except Exception:
+                parts.append(f"{tf}: UNKNOWN")
+                continue
+            if age_min < 60:
+                age_txt = f"{age_min:.0f}m"
+            elif age_min < 2880:
+                age_txt = f"{age_min / 60:.1f}h"
+            else:
+                age_txt = f"{age_min / 1440:.1f}d"
+            if not market_open:
+                state = "CLOSED-EXPECTED"
+            elif age_min <= 2 * intervals[tf] + 5:
+                state = "fresh"
+            else:
+                state = "STALE ⚠️"
+            parts.append(f"{tf}: {age_txt} {state}")
+        market_txt = "OPEN" if market_open else "CLOSED (weekly close)"
+        return (f"freshness (market {market_txt}, bar times UTC "
+                f"convention): " + " · ".join(parts))
 
     def alignment_line(self) -> str:
         """One-line alignment for /status (see mt5_commands)."""
@@ -11988,8 +12144,15 @@ class MT5Runner:
             try:
                 if result.document is not None:
                     if hasattr(sender, "send_document"):
-                        sender.send_document(result.document,
-                                             caption=result.caption)
+                        try:
+                            sender.send_document(
+                                result.document,
+                                caption=result.caption,
+                                reply_markup=result.reply_markup)
+                        except TypeError:
+                            # Legacy sender without reply_markup support.
+                            sender.send_document(result.document,
+                                                 caption=result.caption)
                     else:
                         sender.send(f"{result.caption or ''} "
                                     f"({result.document})")
@@ -12241,6 +12404,31 @@ class MT5Runner:
                         "reply_markup": _json.dumps(
                             mt5_control_keyboard())})
                 _answer("config")
+                return
+            if action in ("assess_all", "health", "forecast_train"):
+                # Read-only navigation: re-render in place for text,
+                # send as a new message for documents (a document
+                # cannot edit a message in place).
+                from .mt5_commands import (
+                    _mt5_assess, _mt5_forecast_train, _mt5_health)
+                _nav = {
+                    "assess_all": lambda: _mt5_assess(
+                        self._command_context(), ["all"]),
+                    "health": lambda: _mt5_health(
+                        self._command_context(), []),
+                    "forecast_train": lambda: _mt5_forecast_train(
+                        self._command_context(), []),
+                }[action]
+                result = _nav()
+                if result.document is not None:
+                    self._reply_command(result)
+                elif message_id is not None:
+                    self._tg_api("editMessageText", {
+                        "chat_id": chat_id, "message_id": message_id,
+                        "text": result.text or "",
+                        "reply_markup": _json.dumps(
+                            result.reply_markup or mt5_nav_keyboard())})
+                _answer(action.replace("_", " "))
                 return
             _answer("unknown button")
         except Exception as exc:
