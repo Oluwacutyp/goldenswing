@@ -4286,6 +4286,31 @@ class MT5Runner:
                     f"(${abs(mid - nearest.level):.1f} away)")
         return "\n".join(lines)
 
+    def market_read_line(self) -> str:
+        """Standing market read for /status (see market_read).
+
+        Inputs are the live zone cache + D1 hold state only: the
+        trend phrase comes from confirmed swings, the key zones
+        from active zone bands, the scenario triggers from those
+        bands.  Nothing here copies an analyst's read.
+        """
+        from goldenswing.execution.market_read import render_market_read
+        last = getattr(self, "_last_tick", None) or {}
+        price = last.get("mid")
+        hold_state = getattr(self, "_live_hold_state", None)
+        hold = hold_state.to_dict() if hold_state is not None else None
+        zones = []
+        for z in getattr(self, "_structural_zones", None) or []:
+            if z.status != "active":
+                continue
+            zones.append({
+                "tf": z.tf, "side": z.side, "level": float(z.level),
+                "top": float(z.top), "bottom": float(z.bottom),
+                "score": float(z.score), "tier": z.tier,
+                "touches": int(z.touches),
+            })
+        return render_market_read(price=price, hold=hold, zones=zones)
+
     def report_feed_status(self, feed_status: dict | None) -> None:
         """Log a feed failure on the SEPARATE FEED_ERROR channel.
 

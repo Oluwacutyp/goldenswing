@@ -437,6 +437,16 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("🗓️", "Day"))
             lines.append(day_line())
             lines.append("")
+    # Standing market read (owner request 2026-10-26): the analysis
+    # message — trend + key zones + scenarios — rendered from the
+    # zone book + D1 structure state, in the same message as the
+    # status.  Guarded — old runners lack it.
+    if ctrl is not None:
+        market_read = getattr(ctrl, "market_read_line", None)
+        if callable(market_read):
+            lines.append(fmt_section("🔭", "Market Read"))
+            lines.append(market_read())
+            lines.append("")
     # Engine state
     lines.append(fmt_section("⚙️", "Engine"))
     if cfg is not None and cfg.get("paused"):
