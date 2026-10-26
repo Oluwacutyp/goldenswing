@@ -81,17 +81,30 @@ def record_provenance(record: dict) -> dict:
     return {}
 
 
+#: Evaluation sources that are analytical records only (never
+#: live decisions) — the renderer banners them so a warmup or
+#: replay record can never be read as a live call.
+_NON_LIVE_SOURCES = ("warmup_scan", "replay", "backfill")
+
+
 def freshness_lines(record: dict) -> list[str]:
     """Runtime Truth item 3: the per-candidate freshness facts —
     source bar, pattern touch, creation, evaluated bar, age vs
     the validity window (the expiry), and the eligibility reason
     — rendered from the record's own provenance, never invented.
     An EXPIRED verdict leads the section: a historical record
-    must not read as the current market assessment."""
+    must not read as the current market assessment.
+
+    Owner 2026-10-26: the section is no longer omitted when a
+    record carries no freshness measurement — an absent
+    measurement renders as an explicit not-recorded line (with
+    the bar and timeframe it was missing for), so a reader can
+    tell "not measured" from "fresh" at a glance."""
     rec = record or {}
     prov = record_provenance(rec)
     fresh = rec.get("data_freshness_s")
-    if not prov and fresh is None:
+    if not prov and fresh is None \
+            and rec.get("last_bar_ts") is None:
         return []
     a = rec.get("assessment") or {}
     dec = rec.get("decision") or {}
@@ -134,6 +147,48 @@ def freshness_lines(record: dict) -> list[str]:
                          + (f" — {reason}" if reason else ""))
     if fresh is not None:
         lines.append(f"  data freshness: {fresh}s")
+    else:
+        lines.append("  data freshness: not recorded — no "
+                     "freshness measurement on this record")
+    return lines
+
+
+def trigger_decision_lines(record: dict) -> list[str]:
+    """The complete trigger account for an observed candidate
+    (evidence["trigger_decision"], journal_audit): route
+    authority, source eligibility, the scan's explicit
+    non-evaluation of the trigger path, and the detector's own
+    facts.  Absent on records that carry no such block — the
+    section never invents a trigger verdict."""
+    ev = record.get("evidence") if isinstance(record, dict) else None
+    td = ev.get("trigger_decision") if isinstance(ev, dict) else None
+    if not isinstance(td, dict):
+        return []
+    lines = ["Trigger decision:"]
+    if td.get("route") is not None:
+        lines.append(f"  route: {td['route']}")
+    if td.get("order_authority") is not None:
+        lines.append(f"  order authority: {td['order_authority']}")
+    if td.get("source") is not None:
+        live = td.get("source_is_live_decision")
+        lines.append(f"  source: {td['source']}"
+                     + (" (live decision)" if live is True
+                        else " (analytical only)"
+                        if live is False else ""))
+    if td.get("source_eligibility") is not None:
+        lines.append(f"  source eligibility: "
+                     f"{td['source_eligibility']}")
+    if td.get("trigger_path_note") is not None:
+        lines.append(f"  trigger path: {td['trigger_path_note']}")
+    facts = td.get("detector_facts")
+    if isinstance(facts, dict) and facts:
+        lines.append("  detector facts (the playbook's own "
+                     "predicate inputs for this candidate):")
+        for key in sorted(facts):
+            lines.append(f"    {key}: {facts[key]}")
+    elif isinstance(facts, dict):
+        lines.append("  detector facts: none recorded on this "
+                     "candidate")
     return lines
 
 
@@ -343,10 +398,21 @@ def render_assessment(record: dict, *,
     prov = record_provenance(rec)
     ev = rec.get("evidence") or {}
     cand = rec.get("candidate") or {}
+    # Journal auditability (owner, 2026-10-26): the record's own
+    # evaluation timestamp first — provenance evaluation_ts is
+    # the fallback for pre-fix journal lines.  A record with
+    # neither still says so, explicitly.
     evaluated = rec.get("ts") or prov.get("evaluation_ts") \
         or "not recorded"
     bar_ts = rec.get("last_bar_ts") or "bar ts not recorded"
     lines.append(f"bar {bar_ts} · evaluated {evaluated}")
+    source = rec.get("evaluation_source") or prov.get("source") \
+        or "not recorded"
+    lines.append(f"source: {source}")
+    if source in _NON_LIVE_SOURCES:
+        lines.append("⚠️ NOT A LIVE DECISION — source "
+                     f"{source}: startup/replay scan, "
+                     "analytical only, never routed to orders")
     if shadow:
         lines.append("⚠️ SHADOW EVALUATION — journaled for "
                      "grading; this route holds NO order "
@@ -450,6 +516,12 @@ def render_assessment(record: dict, *,
     if _fresh:
         lines.append("")
         lines += _fresh
+
+    # --- trigger decision (owner, 2026-10-26) --------------------
+    _trig = trigger_decision_lines(rec)
+    if _trig:
+        lines.append("")
+        lines += _trig
 
     # --- structure read + HTF context ---------------------------
     lines.append("")

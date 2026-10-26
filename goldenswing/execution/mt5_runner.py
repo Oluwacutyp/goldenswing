@@ -155,6 +155,7 @@ from .assessment_render import (is_shadow_record as
                                 render_assessment as
                                 _render_assessment)
 from . import candidate_lifecycle as _lifecycle
+from . import journal_audit as _journal_audit
 from .friction_gate import (
     FRICTION_REASON_CODE as _FRICTION_CODE,
     assess_entry_friction as _assess_friction)
@@ -1155,6 +1156,26 @@ class MT5Runner:
             raw.encode()).hexdigest()[:16]
         return self._config_fingerprint_cache
 
+    def _evaluation_now(self):
+        """The evaluation clock for journal timestamps: the tick
+        clock when the engine has a tick, else the wall clock.
+        The same basis the QM routes use for freshness — a record
+        without a timestamp rendered "evaluated not recorded",
+        which made warmup scans and live closes indistinguishable
+        in /assess (owner, 2026-10-26).  Never raises."""
+        now_ref = None
+        try:
+            tick = getattr(self, "_last_tick", None)
+            if tick and tick.get("time") is not None:
+                now_ref = pd.Timestamp(tick["time"])
+        except Exception:
+            now_ref = None
+        if now_ref is None:
+            now_ref = pd.Timestamp.now(tz="UTC")
+        if now_ref.tzinfo is None:
+            now_ref = now_ref.tz_localize("UTC")
+        return now_ref
+
     def _emit_eval(self, *, playbook: str, evaluation_clock: str,
                    intended_tf: str | None = None,
                    actual_input_tf: str | None = None,
@@ -1205,6 +1226,11 @@ class MT5Runner:
                 decision.get("result"))
         record = {
             "type": "evaluation", "kind": kind,
+            # Journal auditability (owner, 2026-10-26): every
+            # record carries its own evaluation timestamp — the
+            # renderer reads this first, so no record can ever
+            # again render "evaluated not recorded".
+            "ts": str(self._evaluation_now()),
             "run_id": self._run_id, "commit": self._build_commit(),
             "config_fingerprint": self._config_fingerprint(),
             "playbook": playbook,
@@ -11711,9 +11737,23 @@ class MT5Runner:
         name = spec.name
         last_bar_ts = (frame.index[-1]
                        if frame is not None and len(frame) else None)
+        # Journal auditability (owner, 2026-10-26): the sweep
+        # used to emit records with no freshness measurement at
+        # all, so /assess could not demonstrate feed age for any
+        # roster/range record.  Freshness here is the QM routes'
+        # basis — seconds from the last closed bar's close to
+        # the evaluation clock — computed once per scan and
+        # carried on every record the scan emits, evaluated or
+        # not (a feed-age measurement is not a structure read,
+        # so it does not break the not-evaluated absent-marking
+        # rule below).
+        _eval_now = self._evaluation_now()
+        _fresh_s = _journal_audit.freshness_seconds(
+            _eval_now, last_bar_ts, intended_tf)
         base = dict(playbook=name, evaluation_clock=clock,
                     intended_tf=intended_tf, actual_input_tf=actual_tf,
-                    last_bar_ts=last_bar_ts, source=source)
+                    last_bar_ts=last_bar_ts, source=source,
+                    data_freshness_s=_fresh_s)
         # Burn-down #1: every EVALUATED scheduled-scan record
         # (no-setup and candidate outcomes below) carries the
         # desk's structure/HTF snapshot, so /assess shows what
@@ -11793,19 +11833,37 @@ class MT5Runner:
                "authority in v1 (owner §G ruling)"
                if shadow else
                "scheduled scan found a candidate on the closing "
-               "bar; order authority on this playbook belongs to "
-               "the trigger path, which did not fire — recorded "
-               "as observed, never routed from the scan")
+               "bar; this scan route holds no order authority "
+               "and does not run the h1_trigger streaming "
+               "evaluation — recorded as observed, never routed "
+               "from the scan (see Trigger decision)")
         for sig in fresh:
+            # Journal auditability (owner, 2026-10-26): the old
+            # provenance stamped the BAR time as created AND
+            # evaluated, so /assess printed the bar time as the
+            # evaluation time.  Creation/evaluation are the scan
+            # clock (_eval_now); formation is the pattern's own
+            # bar when the detector records it (inversion-style
+            # live_context indices mapped through the frame).
+            _lc = getattr(sig, "live_context", None) or {}
+            _formation_ts = None
+            if isinstance(_lc, dict):
+                for _fk in ("zone_formed_idx", "formed_idx",
+                            "formation_idx"):
+                    _fi = _lc.get(_fk)
+                    if isinstance(_fi, int) and not isinstance(
+                            _fi, bool) and 0 <= _fi < len(frame):
+                        _formation_ts = frame.index[_fi]
+                        break
             prov = _lifecycle.provenance_block(
                 key=_lifecycle.instance_key(
                     name, pattern_ts=frame.index[t],
                     direction=int(sig.direction),
                     level=float(sig.entry_ref)),
-                formation_ts=None, touch_ts=frame.index[t],
-                created_ts=last_bar_ts,
+                formation_ts=_formation_ts, touch_ts=frame.index[t],
+                created_ts=_eval_now,
                 evaluated_bar_ts=last_bar_ts,
-                evaluation_ts=last_bar_ts, source=source,
+                evaluation_ts=_eval_now, source=source,
                 touch_age_bars=0, validity_window_bars=0,
                 eligible=False, eligibility_code=code)
             # Burn-down #1: an observed candidate carries the
@@ -11882,7 +11940,20 @@ class MT5Runner:
                           "evidence_groups": _groups,
                           "independent_evidence_groups":
                               sorted(_groups),
-                          "provenance": prov})
+                          "provenance": prov,
+                          # Journal auditability (owner,
+                          # 2026-10-26): the complete trigger
+                          # account — route authority, source
+                          # eligibility, the scan's explicit
+                          # non-evaluation of the trigger path,
+                          # and the detector's own facts.
+                          "trigger_decision":
+                              _journal_audit.trigger_decision_block(
+                                  route=spec.route, source=source,
+                                  reason_code=code, shadow=shadow,
+                                  detector_facts=
+                                  _journal_audit.detector_facts(
+                                      sig, frame))})
 
     def _run_roster_close_evals(self, stats: dict | None = None,
                                 *, source: str) -> None:

@@ -422,12 +422,15 @@ def test_journal_records_carry_rendered_assessment_text(tmp_path):
         assert "VERDICT:" in text
         # The stored text is exactly the renderer's output for
         # the record as emitted (journal and bot can never
-        # diverge).  The journal stamps ``ts`` at append time —
-        # after the render — so the comparison nulls it out;
-        # the renderer then uses the same provenance evaluation
-        # timestamp the stored render used.
+        # diverge).  Since the 2026-10-26 journal auditability
+        # change, _emit_eval stamps the record's own ``ts``
+        # BEFORE rendering, so the stored record re-renders
+        # identically as stored — no ts-nulling (the old
+        # append-time stamping the nulling assumed is gone;
+        # provenance evaluation_ts remains the fallback for
+        # pre-fix journal lines only).
         assert text == render_assessment(
-            {**rec, "ts": None}, symbol=runner.cfg.symbol)
+            rec, symbol=runner.cfg.symbol)
 
 
 def test_e2e_native_m5_signal_assessment(tmp_path):
