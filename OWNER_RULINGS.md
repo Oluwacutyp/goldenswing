@@ -62,15 +62,21 @@ described as an execution mode. Any document, table, or example still
 showing `--fixed-lots`, a `fixed_lots` MT5 config key, or a fixed-lot
 demo command is stale — see §5.
 
-## 3. Forecast / ensemble: shadow until validated (owner ruling 2026-10-24)
+## 3. Forecast / ensemble: it forecasts and alerts — it never trades (owner direction 2026-10-24; correction 2026-10-25)
 
 - The ensemble forecasts BIG MOVES before they happen, horizons 1 day
   and above, from actual market data.
-- It stays SHADOW / RESEARCH until validated out-of-sample with a
-  locked holdout (baseline-first, chronological walk-forward, no
-  exceptions). The judgment core stays shadow-first under the same rule.
+- Its output is FORECAST ALERTS: when the forecast is notable, the
+  engine alerts it (ranks per horizon), clearly labeled as a forecast
+  — not a trade signal and not an order. "Shadow mode" was never the
+  owner's word and is not the design: the forecast is a live alerting
+  feature, not a parked experiment.
+- It NEVER trades, NEVER sizes, NEVER gates, and NEVER vetoes an
+  order. The owner never said it should trade or anything of the sort.
+  Forecast output and order decisions are separate by construction.
 - Ensemble outputs are uncalibrated ranking scores. Cite them as RANKS
-  ("big-move rank high @1d and @3d"), never as probabilities.
+  ("big-move rank high @1d and @3d"), never as probabilities — honesty
+  about what the numbers are, not a parking gate.
 - **No bundled model ships.** The engine carries the training code and
   trains on its own MT5 data on install / first run, retraining as its
   own history grows (owner correction 2026-10-25). No external hourly
@@ -79,8 +85,9 @@ demo command is stale — see §5.
 
 ## 4. Chart studies and terminal (owner direction 2026-10-24, build order)
 
-1. Ensemble live wiring as shadow/research + calibration/validation
-   honesty (the main build).
+1. Ensemble forecasting + forecast alerts (the main build): MT5 data
+   to training to live forecast alerts, labeled as forecasts, never
+   touching orders.
 2. Saturday calendar fix (the engine carries its own XAUUSD calendar;
    known-closed periods render `closed_expected`, never a breach;
    feed-vs-calendar disagreement surfaces explicitly).

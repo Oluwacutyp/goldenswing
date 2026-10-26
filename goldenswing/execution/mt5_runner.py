@@ -95,6 +95,7 @@ from ..live.smt import detect_smt as _detect_smt
 from ..live.opposing import risk_tier as _zone_risk_tier, \
     tier_spec as _tier_spec
 from ..live.sizing import RiskPool, size_for_risk
+from ..forecast.mt5 import MT5Forecaster
 from ..live.urgency import urgency_score
 from ..live.volume_profile import volume_profile
 from ..live.hierarchy import (LEG_ORDER, TimeframeStack, TF_MINUTES,
@@ -661,6 +662,14 @@ class MT5Runner:
         # printed once per process start, never every 30s poll.
         self._tg_unavailable_logged = False
         self.journal = TradeJournal(self.cfg.journal_path)
+        # Forecast service (owner rulings §3): forecasts + alerts only.
+        # The bundle is a host artifact trained from this engine's own
+        # MT5 history; until one exists, scoring reports "untrained"
+        # and no forecast alert fires. Order paths never read this.
+        _bundle = os.environ.get("GS_FORECAST_BUNDLE") or (
+            DATA_DIR / "forecast_models.joblib")
+        self._forecaster = MT5Forecaster(bundle_path=_bundle)
+        self._forecast_last_scored_bar = None
         # Deterministic engine runtime (bridge).  Best-effort: if it
         # fails to initialise, the legacy journal path continues and
         # the failure is noted — the live loop never dies on it.
@@ -1773,6 +1782,16 @@ class MT5Runner:
             h1 = self._stack.frames.get("H1")
             if h1 is None or len(h1) == 0:
                 raise RuntimeError("MT5 runner: warm start returned no H1 bars")
+            # Forecast readiness, stated once at startup (no eager
+            # bundle load — a multi-hundred-MB file is read only when
+            # the first H1 close scores, and cached after that).
+            _bp = Path(self._forecaster.bundle_path)
+            self.journal.log_note(
+                "forecast: bundle present at "
+                f"{_bp} — scoring starts on the next H1 close"
+                if _bp.exists() else
+                "forecast: untrained — no bundle at "
+                f"{_bp}; train from MT5 history to enable forecast alerts")
             for tf, frame in self._stack.frames.items():
                 if len(frame):
                     # Last-processed CLOSE (= last closed bar's open + TF).
@@ -2010,6 +2029,11 @@ class MT5Runner:
                 if self._regime_pause != "paused_complete":
                     self._reconcile(price, stats)
             self._refresh_bars(tick, stats)
+            # Forecast alerts (owner rulings §3): a newly closed H1
+            # bar scores the ensemble; a notable forecast alerts.
+            # Forecasts never touch orders — this call reads bars and
+            # sends an alert, nothing else.
+            self._maybe_forecast_alert()
             # Live evaluation clock: touch arms, family confirms on
             # entry-TF closes.  H1 closes never gate evaluation.
             self._evaluate_live_tick(tick, stats)
@@ -2769,6 +2793,31 @@ class MT5Runner:
                 f"mt5: rollover recap failed: {exc}")
 
     # --------------------------------------------------------------- bars
+    def _maybe_forecast_alert(self) -> None:
+        """Score a newly closed H1 bar; alert a notable forecast.
+
+        Runs at most once per closed H1 bar (cursor change detection),
+        so per-tick calls cost one dict lookup. Any failure is
+        journaled and never raised into the tick loop — a forecast
+        problem must never stop evaluation, management, or orders.
+        """
+        try:
+            frame = self._stack.frames.get("H1")
+            if frame is None or len(frame) < 50:
+                return
+            bar_time = frame.index[-1]
+            if bar_time == self._forecast_last_scored_bar:
+                return
+            self._forecast_last_scored_bar = bar_time
+            text, note = self._forecaster.maybe_alert(frame)
+            if text is not None:
+                self.journal.log_note(
+                    f"forecast alert @ {bar_time}: {note}")
+                self._send_alert(text)
+        except Exception as exc:  # noqa: BLE001 — tick-loop guard
+            self.journal.log_note(
+                f"forecast alert failed (loop continues): {exc}")
+
     def _refresh_bars(self, tick: dict, stats: dict) -> None:
         """Tick time crossing a bar boundary -> refresh that TF's bars.
 
