@@ -1,5 +1,12 @@
 # EC2 MT5 Engine — Runbook
 
+> AUTHORITATIVE RULINGS: `OWNER_RULINGS.md` (repo root) is the tiebreaker.
+> Where this runbook disagrees with it, this runbook is stale. In
+> particular: there is NO fixed-lots mode, NO `fixed_lots` field, and NO
+> `--fixed-lots` flag (revoked 2026-10-23); dynamic risk sizing is the
+> sole sizing path, and a below-minimum size floors at the 0.01 broker
+> minimum instead of abandoning (ruling 2026-10-24).
+
 One Windows EC2 host. One engine. MT5 is the source of truth for
 EVERYTHING: prices, bars, ticks, volumes, spread, account state,
 open positions. No OANDA cross-check, no second source. (OANDA stays
@@ -41,10 +48,11 @@ The engine attaches to the terminal as-is — no credentials needed.
 .\.venv\Scripts\python.exe scripts\run_mt5.py
 ```
 
-For the $12 demo sizing:
+For the $12 demo sizing (dynamic risk sizing is the sole path — no
+fixed-lots flag exists):
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\run_mt5.py --fixed-lots 0.01
+.\.venv\Scripts\python.exe scripts\run_mt5.py
 ```
 
 Rehearsal (1000 ticks, then stops):
@@ -133,11 +141,10 @@ signal counts.
 `/config` shows the live config.  `/set <key> <value>` changes one
 safe key at runtime (confirm required) and persists it to
 `data/mt5_config.json` — it survives a restart (the runner loads
-the file at startup; an explicit `--fixed-lots` on the command line
-wins over the file and is itself persisted):
+the file at startup):
 
 ```
-fixed_lots           0.01–1.0, or auto (risk-% sizing)
+sizing               dynamic risk sizing only (no fixed-lots mode exists)
 max_layers           0–3
 manipulation_filter  on/off (the liquidity-test entry filter)
 pending_expiry_bars  1–24 (applies to pendings placed after the change)

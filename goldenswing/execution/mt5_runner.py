@@ -249,15 +249,17 @@ class MT5RunnerConfig:
     min_score: float = 60.0
     # --- Confluence rework (spec v2, arrival pass) ------------------
     # Sizing (owner ruling 2026-10-23, REVOKING A13's fixed-lots
-    # override): dynamic risk sizing is the SOLE sizing path.
+    # override; floor rule per owner ruling 2026-10-24): dynamic
+    # risk sizing is the SOLE sizing path.
     # "risk" = sizes computed from risk money in Decimal
     # (live/sizing.py), ledgered per position in a RiskPool; the
     # legacy float path (risk.py size_position, same risk rule)
     # remains selectable as sizing_mode="legacy" for A/B forensics.
     # There is NO fixed-lots mode and no fixed_lots field: a size
-    # always derives from risk_pct x equity x stop distance x
-    # contract specs, floored to the broker step; a budget that
-    # cannot buy the broker minimum DECLINES, never rounds up.
+    # always derives from (k x equity x C x S) / (stop ticks x
+    # tick value), step-quantized down; a step-quantized size below
+    # the broker minimum FLOORS at the minimum with min_override
+    # (trade, never abandon); sizes quantize down, never round up.
     sizing_mode: str = "risk"
     # A6: resting limits at FRESH MAJOR POIs, placed ahead of
     # arrival at the zone's proximal edge.

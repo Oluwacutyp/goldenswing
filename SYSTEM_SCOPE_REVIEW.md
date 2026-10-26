@@ -1,5 +1,12 @@
 # GoldenSwing — Full-Scope System Review
 
+> AUTHORITATIVE RULINGS: `OWNER_RULINGS.md` (repo root) is the tiebreaker.
+> Where this review disagrees with it, this review is stale. In
+> particular, §5.1's old sizing sentences (zero lots for an unaffordable
+> broker minimum; `risk_pct` restricted to (0, 0.25]) were retired by the
+> 2026-10-24 sizing ruling: below-minimum sizes floor at the 0.01 broker
+> minimum and trade, and `risk_pct` is a sizing coefficient, not a gate.
+
 **Date:** 2026-10-13 · **Repo:** `~/workspace/goldenswing` (local only)
 **Purpose:** One document the owner can read to review the whole engine:
 architecture, every strategy and its exact rules, every sensor, entry /
@@ -874,9 +881,12 @@ away. (`SYSTEM.md` §12 lists this as still weak.)
 ### 5.1 Guard layer (`execution/risk.py`) — pure guards, never places trades
 
 **Sizing (`size_position`):** lots are FLOORED to the volume step,
-never rounded up. If the risk budget cannot buy the broker minimum,
-answer is 0 lots + a human-readable reason. `risk_pct` must be in
-(0, 0.25]. `gold_spec()`: XAUUSD, tick_value $1.00, tick_size $0.01,
+never rounded up. If the step-quantized size falls below the broker
+minimum, the engine trades AT the minimum with `min_override` flagged
+and the estimated stop exposure journaled — never abandons (owner
+ruling 2026-10-24; the old zero-lots answer is retired). `risk_pct`
+is the sizing coefficient `k` (default 0.01), never a refusal gate.
+`gold_spec()`: XAUUSD, tick_value $1.00, tick_size $0.01,
 volume_min 0.01, volume_max 50.0, volume_step 0.01.
 
 **Guards (`RiskConfig`, calibrated 2026-10-11 from the anchor book's
