@@ -127,16 +127,20 @@ def mt5_back_keyboard() -> dict:
     ]}
 
 
-def mt5_control_with_next(*commands: str) -> dict:
+def mt5_control_with_next(*commands: str, back: bool = True) -> dict:
     """Control rows + next-action buttons + Back, one markup.
 
     mt5_control_keyboard itself stays pinned exactly; the merge
     happens here so control messages keep their actions AND gain
     the next navigation the old ``➡️ Next:`` text line named.
+    ``back=False`` is for the hub screen itself (/status): a
+    screen never shows a button to itself (owner complaint
+    2026-10-26 — the status page carried a « Back to Status »
+    row pointing at itself).
     """
     rows = [list(row) for row in
             mt5_control_keyboard()["inline_keyboard"]]
-    rows += next_button_rows(*commands)
+    rows += next_button_rows(*commands, back=back)
     return {"inline_keyboard": rows}
 
 
@@ -611,8 +615,13 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append("")
             lines.append(fmt_section("🧭", "Decision Funnel"))
             lines.append(funnel())
+    # The status screen IS the hub: it never carries a Back row
+    # to itself (back=False) — a « Back to Status » button on
+    # the status page is a button to the page you're already on.
     return CommandResult(text="\n".join(lines),
-                         reply_markup=mt5_control_with_next("/playbooks", "/health", "/trades"))
+                         reply_markup=mt5_control_with_next(
+                             "/playbooks", "/health", "/trades",
+                             back=False))
 
 
 @mt5_command("/marketread", "standing market read: trend + key zones + scenarios (same read as the /status section, on its own)")

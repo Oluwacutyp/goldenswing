@@ -408,8 +408,10 @@ def test_counter_bias_signal_scored_by_floor_counted_in_status(tmp_path):
     assert "min_score" in res.text         # the floor leg, counted
     assert "judas_swing" in res.text       # last-blocked names it
     assert "d1_bias" not in res.text       # no hierarchy leg exists
+    # The status screen IS the hub: no self-Back row (owner
+    # complaint 2026-10-26 — the old pin carried the bug).
     assert res.reply_markup == mt5_control_with_next(
-        "/playbooks", "/health", "/trades")
+        "/playbooks", "/health", "/trades", back=False)
 
 
 def test_pause_blocks_orders_and_counts_paused_leg(tmp_path):

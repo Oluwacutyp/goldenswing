@@ -132,6 +132,25 @@ def test_control_and_nav_merges_keep_base_rows():
         [{"text": "« Back to Status", "callback_data": "mt5:cmd:/status"}]]
 
 
+def test_status_screen_never_shows_back_to_itself():
+    """Owner complaint 2026-10-26: the status page carried a
+    « Back to Status » row pointing at itself.  A screen never
+    shows a button to itself: the hub screen's merge passes
+    back=False, and the /status result itself carries no
+    self-Back button.  The default merge (back=True) is
+    unchanged — other screens still get their Back row."""
+    merged = mt5_control_with_next("/playbooks", "/health",
+                                   "/trades", back=False)
+    assert "« Back to Status" not in _texts(merged)
+    assert "mt5:cmd:/playbooks" in _datas(merged)
+    res = _mt5_status(CommandContext(feed_status={}), [])
+    kb = res.reply_markup or {}
+    assert "« Back to Status" not in _texts(kb)
+    assert "mt5:cmd:/playbooks" in _datas(kb)
+    assert "mt5:cmd:/health" in _datas(kb)
+    assert "mt5:cmd:/trades" in _datas(kb)
+
+
 # ------------------------------------------------------------ MT5 handlers
 
 def test_start_drops_next_line_keeps_menu():
