@@ -133,8 +133,14 @@ demo command is stale — see §5.
    feature-pipeline auto-Fib + OTE band, dealing-range
    premium/discount shading, killzone session shading; every level
    caller-supplied, nothing inferred).
-4. Interactive multi-timeframe terminal (switch timeframes like
-   TradingView, on the engine's own timestamped data).
+4. Interactive multi-timeframe terminal — DONE 2026-10-25 as
+   per-signal HTML views (the owner's shape): one self-contained
+   page per signal, baked at signal time, with timeframe switching
+   (D1/H4/H1/M30/M15/M5 as available), a canvas chart per timeframe,
+   overlay toggles for the four studies, zoom/pan/crosshair, and a
+   per-timeframe analysis panel; attached to signal/fill/pending
+   alerts as a document next to the PNG chart. No server, no port,
+   no network needed to open it. Analysis frozen at signal time.
 
 The visual layer must never invent evidence the engine never calculated.
 

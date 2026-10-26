@@ -69,6 +69,7 @@ import pandas as pd
 from ..alerts.commands import CommandContext, is_owner_callback
 from ..backtest.data import REPO_ROOT
 from ..charts.engine import render_mt5_signal, zones_to_study_dicts
+from ..charts.signal_view import build_signal_view_html
 from ..confluence import ConfluenceEngine
 from ..features.engine import read_and_featurize
 from ..feed.tick_log import TickLogger
@@ -8004,13 +8005,15 @@ class MT5Runner:
             # next to the journal and attached to the alert.
             png, _path = self._build_chart(
                 sig, verdict, alert_id=alert_id, playbook=pb.name)
+            _, view_path = self._build_signal_view(
+                sig, verdict, alert_id=alert_id, playbook=pb.name)
             self._send_alert(
                 f"MT5 [{tag}] {pb.name} "
                 f"{'+' if sig.direction > 0 else '-'}1 "
                 f"entry~{sig.entry_ref:.1f} stop~{sig.invalidation:.1f} "
                 f"conf={conf:.0f}"
                 + (f"\n\n{reasoning}" if reasoning else ""),
-                chart_png=png)
+                chart_png=png, html_path=view_path)
             # Manipulation / liquidity-test filter (entry
             # selection, NOT a veto): a signal chasing past
             # a level whose most recent test failed is
@@ -9655,11 +9658,14 @@ class MT5Runner:
         png, _path = self._build_chart(
             sig, verdict, alert_id=request.alert_id, playbook=pb.name,
             fill_price=fill, suffix="-fill")
+        _, view_path = self._build_signal_view(
+            sig, verdict, alert_id=request.alert_id, playbook=pb.name,
+            fill_price=fill, suffix="-fill")
         self._send_alert(
             f"MT5 FILL {pb.name} {'+' if sig.direction > 0 else '-'}1 "
             f"{lots} lots @ {fill:.2f} SL {stop0:.2f} "
             f"(ticket {res.ticket})",
-            chart_png=png)
+            chart_png=png, html_path=view_path)
 
     # ------------------------------------------------------- pending orders
     # A pending LIMIT / STOP is a broker order waiting for the market:
@@ -9816,12 +9822,15 @@ class MT5Runner:
         png, _path = self._build_chart(
             sig, verdict, alert_id=request.alert_id, playbook=pb.name,
             suffix="-pending")
+        _, view_path = self._build_signal_view(
+            sig, verdict, alert_id=request.alert_id, playbook=pb.name,
+            suffix="-pending")
         self._send_alert(
             f"MT5 PENDING {kind.upper()} {pb.name} "
             f"{'+' if sig.direction > 0 else '-'}1 "
             f"{request.volume} lots @ {level:.2f} "
             f"SL {request.stop_loss:.2f} (ticket {res.ticket})",
-            chart_png=png)
+            chart_png=png, html_path=view_path)
         return True
 
     def _cancel_pending(self, ticket: int, reason: str,
@@ -10158,18 +10167,23 @@ class MT5Runner:
         # Fill chart when the signal is known (placed this run);
         # adopted pendings (restart) have no signal — text only.
         png = None
+        view_path = None
         if sig is not None and getattr(state, "verdict", None) is not None:
             png, _path = self._build_chart(
                 sig, state.verdict, alert_id=state.alert_id,
                 playbook=state.playbook, fill_price=float(pos.entry_price),
                 suffix="-fill")
+            _, view_path = self._build_signal_view(
+                sig, state.verdict, alert_id=state.alert_id,
+                playbook=state.playbook,
+                fill_price=float(pos.entry_price), suffix="-fill")
         self._send_alert(
             f"MT5 FILL {state.playbook or 'pending'} "
             f"{'+' if state.direction > 0 else '-'}1 "
             f"{volume} lots @ {float(pos.entry_price):.2f} "
             f"SL {state.sl:.2f} (ticket {pos.ticket})"
             + (" — PARTIAL" if partial else ""),
-            chart_png=png)
+            chart_png=png, html_path=view_path)
 
     def _adopt_existing_pending(self, executor: MT5Executor) -> None:
         """Adopt broker pending orders with our magic (restart sync)."""
@@ -11901,6 +11915,51 @@ class MT5Runner:
                     f"{spec.name}: {exc}")
 
     # ------------------------------------------------- alerts + charts
+    def _studies_for_chart(self, h1, entry: float, atr: float,
+                           zone) -> dict:
+        """Studies shared by the PNG chart and the HTML signal view:
+        nearby cache zones, the feature pipeline's auto-Fib + dealing
+        range on H1, and the Fib read (nearest level, at-Fib, OTE).
+        Any study that fails to compute comes back None — never
+        invented, never breaking the alert."""
+        nearby = []
+        try:
+            _v, cache_zones = self._zone_cache.nearby(entry, atr)
+            nearby = zones_to_study_dicts(cache_zones, entry, zone)
+        except Exception:
+            nearby = []
+        fib_levels = fib_range = ote_band = None
+        fib_info = None
+        try:
+            states = read_and_featurize(h1, None)
+            last = states[-1]
+            fib = last.features.fib
+            if fib.levels:
+                fib_levels = [(float(f), float(p)) for f, p in fib.levels]
+                if (math.isfinite(fib.ote_low)
+                        and math.isfinite(fib.ote_high)):
+                    ote_band = (float(fib.ote_low), float(fib.ote_high))
+                nf = fib.nearest_frac
+                fib_info = {
+                    "nearest_frac": (float(nf)
+                                     if math.isfinite(nf) else None),
+                    "at_fib": bool(fib.at_fib),
+                    "in_ote_long": bool(fib.in_ote_long),
+                    "in_ote_short": bool(fib.in_ote_short),
+                    "leg_direction": int(fib.leg_direction),
+                }
+            if (math.isfinite(last.range_high)
+                    and math.isfinite(last.range_low)
+                    and last.range_high > last.range_low):
+                fib_range = (float(last.range_low),
+                             float(last.range_high))
+        except Exception:
+            fib_levels = fib_range = ote_band = None
+            fib_info = None
+        return {"nearby": nearby, "fib_levels": fib_levels,
+                "fib_range": fib_range, "ote_band": ote_band,
+                "fib_info": fib_info}
+
     def _build_chart(self, sig, verdict: dict | None, *,
                      alert_id: str, playbook: str = "",
                      fill_price: float | None = None,
@@ -11924,32 +11983,8 @@ class MT5Runner:
             zone = (verdict or {}).get("zone")
             entry_clock = (verdict or {}).get("entry_clock") or "M15"
             entry = float(sig.entry_ref)
-            nearby = []
-            try:
-                atr = float(getattr(sig, "atr", 0.0) or 0.0)
-                _v, cache_zones = self._zone_cache.nearby(entry, atr)
-                nearby = zones_to_study_dicts(cache_zones, entry, zone)
-            except Exception:
-                nearby = []
-            fib_levels = fib_range = ote_band = None
-            try:
-                states = read_and_featurize(h1, None)
-                last = states[-1]
-                fib = last.features.fib
-                if fib.levels:
-                    fib_levels = [(float(f), float(p))
-                                  for f, p in fib.levels]
-                    if (math.isfinite(fib.ote_low)
-                            and math.isfinite(fib.ote_high)):
-                        ote_band = (float(fib.ote_low),
-                                    float(fib.ote_high))
-                if (math.isfinite(last.range_high)
-                        and math.isfinite(last.range_low)
-                        and last.range_high > last.range_low):
-                    fib_range = (float(last.range_low),
-                                 float(last.range_high))
-            except Exception:
-                fib_levels = fib_range = ote_band = None
+            atr = float(getattr(sig, "atr", 0.0) or 0.0)
+            st = self._studies_for_chart(h1, entry, atr, zone)
             png = render_mt5_signal(
                 h1, zone=zone, entry=entry,
                 stop=float(sig.invalidation),
@@ -11962,14 +11997,55 @@ class MT5Runner:
                 entry_frame=frames.get(entry_clock),
                 entry_clock=entry_clock,
                 style=self.cfg.chart_style,
-                nearby_zones=nearby, fib_levels=fib_levels,
-                fib_range=fib_range, ote_band=ote_band)
+                nearby_zones=st["nearby"], fib_levels=st["fib_levels"],
+                fib_range=st["fib_range"], ote_band=st["ote_band"])
             path = self._charts_dir / f"{alert_id}{suffix}.png"
             path.write_bytes(png)
             return png, path
         except Exception as exc:
             self.journal.log_note(
                 f"mt5: chart build failed for {alert_id}: {exc}")
+            return None, None
+
+    def _build_signal_view(self, sig, verdict: dict | None, *,
+                           alert_id: str, playbook: str = "",
+                           fill_price: float | None = None,
+                           suffix: str = "") -> tuple[str | None, Path | None]:
+        """Self-contained HTML terminal view for a signal: one page,
+        baked at signal time, with per-timeframe bars + analysis,
+        trade levels, and the same studies as the PNG chart. Saved
+        next to the chart and attached to the alert as a document.
+
+        Never breaks the signal path: on any failure returns
+        (None, None) and logs a note.
+        """
+        try:
+            frames = self._stack.frames if self._stack else {}
+            h1 = frames.get("H1")
+            if h1 is None or len(h1) == 0:
+                return None, None
+            zone = (verdict or {}).get("zone")
+            entry = float(sig.entry_ref)
+            atr = float(getattr(sig, "atr", 0.0) or 0.0)
+            st = self._studies_for_chart(h1, entry, atr, zone)
+            html_str = build_signal_view_html(
+                frames=frames, entry=entry,
+                stop=float(sig.invalidation),
+                targets=[float(x) for x in (sig.targets or [])],
+                direction=int(sig.direction), playbook=playbook,
+                score=float(getattr(sig, "score", 0.0) or 0.0),
+                verdict=verdict, zone=zone,
+                nearby_zones=st["nearby"], fib_levels=st["fib_levels"],
+                fib_range=st["fib_range"], ote_band=st["ote_band"],
+                fib_info=st["fib_info"], alert_id=alert_id,
+                instrument=self.cfg.symbol, fill_price=fill_price,
+                signal_time=datetime.now(timezone.utc).isoformat())
+            path = self._charts_dir / f"{alert_id}{suffix}.html"
+            path.write_text(html_str, encoding="utf-8")
+            return html_str, path
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: signal view build failed for {alert_id}: {exc}")
             return None, None
 
     def _send_startup_progress(self, text: str) -> None:
@@ -12073,6 +12149,7 @@ class MT5Runner:
 
     def _send_alert(self, text: str, *,
                     chart_png: bytes | None = None,
+                    html_path: Path | None = None,
                     reply_markup: dict | None = None) -> None:
         """Send a text alert, with the chart photo when one is attached.
 
@@ -12082,7 +12159,10 @@ class MT5Runner:
         deduped-console-printed (see _note_tg_failure), never raised
         into the tick loop.  ``reply_markup`` (inline keyboard) is
         passed through when the sender supports it —
-        used by the Golden Swing Confirm request.
+        used by the Golden Swing Confirm request.  ``html_path`` (the
+        per-signal HTML view) goes out as a document after the alert,
+        on senders that support it; a document failure is journaled
+        the same way and never breaks the alert.
         """
         for sender in self.senders:
             try:
@@ -12103,6 +12183,19 @@ class MT5Runner:
                             f"alert send failed: {res.detail}")
                 else:
                     sender.send(text)
+                if html_path is not None and hasattr(sender,
+                                                     "send_document"):
+                    try:
+                        res = sender.send_document(
+                            html_path,
+                            caption="Signal view — open in a browser, "
+                                    "switch timeframes")
+                    except TypeError:
+                        # Legacy sender without caption support.
+                        res = sender.send_document(html_path)
+                    if not getattr(res, "delivered", False):
+                        self._note_tg_failure(
+                            f"alert view send failed: {res.detail}")
             except Exception as exc:
                 self._note_tg_failure(f"alert send failed: {exc}")
 
