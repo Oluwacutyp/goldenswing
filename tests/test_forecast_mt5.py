@@ -80,7 +80,29 @@ def test_format_labels_forecast_not_signal():
     assert "87" in text and "82" in text
 
 
-def test_forecaster_alerts_once_per_bar(tmp_path):
+def test_forecaster_alerts_on_crossing_only():
+    # Crossing state machine, driven directly: a rank sitting above
+    # threshold must not re-alert; dropping below re-arms it.
+    forecaster = MT5Forecaster(bundle_path="none", threshold=80.0)
+    above = ForecastRanks(
+        bar_time="t1", close=2000.0,
+        ranks={24: {"up": 87.0, "dn": 20.0}, 72: {"up": 60.0, "dn": 15.0}},
+        horizons=(24, 72))
+    below = ForecastRanks(
+        bar_time="t2", close=2000.0,
+        ranks={24: {"up": 40.0, "dn": 20.0}, 72: {"up": 60.0, "dn": 15.0}},
+        horizons=(24, 72))
+    text, _ = forecaster._decide(above)
+    assert text is not None and "87" in text  # first crossing fires
+    text, note = forecaster._decide(above)
+    assert text is None and "no new threshold crossing" in note
+    text, _ = forecaster._decide(below)
+    assert text is None  # dropping below re-arms, alerts nothing
+    text, _ = forecaster._decide(above)
+    assert text is not None  # crossing again fires
+
+
+def test_forecaster_real_path_quiet_while_persisting(tmp_path):
     frame = _synthetic_frame()
     out = tmp_path / "forecast_models.joblib"
     train_from_frame(frame, out)
@@ -88,9 +110,11 @@ def test_forecaster_alerts_once_per_bar(tmp_path):
     text, note = forecaster.maybe_alert(frame)
     assert text is not None, note
     assert "FORECAST" in text
-    text2, note2 = forecaster.maybe_alert(frame)
-    assert text2 is None
-    assert "already alerted" in note2
+    frame2 = pd.concat([frame, frame.iloc[[-1]].copy()])
+    frame2.index = pd.DatetimeIndex(list(frame.index) + [frame.index[-1] + pd.Timedelta(hours=1)])
+    text2, note2 = forecaster.maybe_alert(frame2)
+    assert text2 is None  # still above threshold: persistence is quiet
+    assert "no new threshold crossing" in note2
 
 
 def test_forecaster_caches_bundle_across_bars(tmp_path):

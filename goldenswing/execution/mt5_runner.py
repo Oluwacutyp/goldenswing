@@ -670,6 +670,7 @@ class MT5Runner:
             DATA_DIR / "forecast_models.joblib")
         self._forecaster = MT5Forecaster(bundle_path=_bundle)
         self._forecast_last_scored_bar = None
+        self._forecast_no_d1_noted = False
         # Deterministic engine runtime (bridge).  Best-effort: if it
         # fails to initialise, the legacy journal path continues and
         # the failure is noted — the live loop never dies on it.
@@ -1784,11 +1785,11 @@ class MT5Runner:
                 raise RuntimeError("MT5 runner: warm start returned no H1 bars")
             # Forecast readiness, stated once at startup (no eager
             # bundle load — a multi-hundred-MB file is read only when
-            # the first H1 close scores, and cached after that).
+            # the first D1 close scores, and cached after that).
             _bp = Path(self._forecaster.bundle_path)
             self.journal.log_note(
                 "forecast: bundle present at "
-                f"{_bp} — scoring starts on the next H1 close"
+                f"{_bp} — scoring starts on the next D1 close"
                 if _bp.exists() else
                 "forecast: untrained — no bundle at "
                 f"{_bp}; train from MT5 history to enable forecast alerts")
@@ -2029,10 +2030,11 @@ class MT5Runner:
                 if self._regime_pause != "paused_complete":
                     self._reconcile(price, stats)
             self._refresh_bars(tick, stats)
-            # Forecast alerts (owner rulings §3): a newly closed H1
-            # bar scores the ensemble; a notable forecast alerts.
-            # Forecasts never touch orders — this call reads bars and
-            # sends an alert, nothing else.
+            # Forecast alerts (owner rulings §3): scored on D1 closes
+            # — a days-ahead forecast is daily news, not hourly noise.
+            # The H1 frame stays the model's input; only the cadence
+            # changed. Forecasts never touch orders — this call reads
+            # bars and sends an alert, nothing else.
             self._maybe_forecast_alert()
             # Live evaluation clock: touch arms, family confirms on
             # entry-TF closes.  H1 closes never gate evaluation.
@@ -2794,25 +2796,36 @@ class MT5Runner:
 
     # --------------------------------------------------------------- bars
     def _maybe_forecast_alert(self) -> None:
-        """Score a newly closed H1 bar; alert a notable forecast.
+        """Score the ensemble on a newly closed D1 bar; alert a new
+        threshold crossing.
 
-        Runs at most once per closed H1 bar (cursor change detection),
-        so per-tick calls cost one dict lookup. Any failure is
+        Runs at most once per closed D1 bar (cursor change detection),
+        so per-tick calls cost a few dict lookups. The H1 frame is
+        scored — it is the model's input — but the D1 close sets the
+        cadence: a 1-day+ forecast re-alerting every hour while its
+        rank sits high would be spam, not signal. Any failure is
         journaled and never raised into the tick loop — a forecast
         problem must never stop evaluation, management, or orders.
         """
         try:
+            d1 = self._stack.frames.get("D1")
+            if d1 is None or len(d1) == 0:
+                if not self._forecast_no_d1_noted:
+                    self._forecast_no_d1_noted = True
+                    self.journal.log_note(
+                        "forecast: no D1 frame — forecast alerts idle")
+                return
+            day = d1.index[-1]
+            if day == self._forecast_last_scored_bar:
+                return
+            self._forecast_last_scored_bar = day
             frame = self._stack.frames.get("H1")
             if frame is None or len(frame) < 50:
                 return
-            bar_time = frame.index[-1]
-            if bar_time == self._forecast_last_scored_bar:
-                return
-            self._forecast_last_scored_bar = bar_time
             text, note = self._forecaster.maybe_alert(frame)
             if text is not None:
                 self.journal.log_note(
-                    f"forecast alert @ {bar_time}: {note}")
+                    f"forecast alert @ {day}: {note}")
                 self._send_alert(text)
         except Exception as exc:  # noqa: BLE001 — tick-loop guard
             self.journal.log_note(

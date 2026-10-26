@@ -130,20 +130,25 @@ def _horizon_label(h: int) -> str:
     return {12: "12h", 24: "1d", 72: "3d", 168: "7d", 360: "15d"}.get(h, f"{h}b")
 
 
-def format_forecast_alert(ranks: ForecastRanks) -> str:
-    """Alert text. Labeled a forecast, never a signal, ranks only."""
+def format_forecast_alert(ranks: ForecastRanks,
+                          *, headline: tuple[str, int, float] | None = None) -> str:
+    """Alert text. Labeled a forecast, never a signal, ranks only.
+
+    ``headline`` is the crossing that fired the alert; when omitted
+    it falls back to the strongest gating rank (display callers).
+    """
     parts = []
     for h in ranks.horizons:
         up, dn = ranks.rank(h, "up"), ranks.rank(h, "dn")
         parts.append(f"{_horizon_label(h)} up {up:.0f} / dn {dn:.0f}")
-    top = notable(ranks)
-    headline = (
+    top = headline if headline is not None else notable(ranks)
+    headline_txt = (
         f"big-move rank {top[2]:.0f} {top[0].upper()} "
         f"@{_horizon_label(top[1])}" if top else "no gating rank above threshold"
     )
     return (
         "🔮 FORECAST — not a trade signal, not an order\n"
-        f"XAUUSD {ranks.close:,.1f} @ {ranks.bar_time} — {headline}\n"
+        f"XAUUSD {ranks.close:,.1f} @ {ranks.bar_time} — {headline_txt}\n"
         + " · ".join(parts)
         + "\nRanks, not probabilities: uncalibrated ensemble scores."
     )
@@ -230,12 +235,16 @@ def train_from_frame(
 
 @dataclass
 class MT5Forecaster:
-    """Runner-side forecast service: score H1 closes, alert notables.
+    """Runner-side forecast service: score daily closes, alert crossings.
 
-    The runner calls :meth:`maybe_alert` on each closed H1 bar with
-    the stack's H1 frame. At most one alert per closed bar, only when
-    notable. Never touches orders — the runner's order paths do not
-    read this object at all.
+    The runner calls :meth:`maybe_alert` on each closed D1 bar with
+    the stack's H1 frame (the H1 frame is the model's input; the D1
+    close is the cadence — a days-ahead forecast is daily news, not
+    hourly noise). Alerts fire ONLY when a gating rank crosses from
+    below to at/above threshold: a rank sitting above threshold does
+    not re-alert, and dropping below re-arms the crossing. Never
+    touches orders — the runner's order paths do not read this object
+    at all.
 
     The bundle dict is cached and reloaded only when its file mtime
     changes (a retrain), so scoring a new bar does not re-read a
@@ -245,7 +254,8 @@ class MT5Forecaster:
 
     bundle_path: str | Path
     threshold: float = DEFAULT_THRESHOLD
-    last_alert_bar: object = None
+    _above: dict[tuple[str, int], bool] = field(
+        default_factory=dict, repr=False)
     _bundle: dict | None = field(default=None, repr=False)
     _bundle_mtime: float | None = field(default=None, repr=False)
 
@@ -267,6 +277,22 @@ class MT5Forecaster:
         self._bundle, self._bundle_mtime = bundle, mtime
         return bundle, "bundle loaded"
 
+    def _decide(self, ranks: ForecastRanks) -> tuple[str | None, str]:
+        """Crossing-only alert decision for one scored close."""
+        crossed: list[tuple[str, int, float]] = []
+        for h in ALERT_HORIZONS:
+            for direction in ("up", "dn"):
+                r = ranks.rank(h, direction)
+                is_above = bool(np.isfinite(r) and r >= self.threshold)
+                was_above = self._above.get((direction, h), False)
+                self._above[(direction, h)] = is_above
+                if is_above and not was_above:
+                    crossed.append((direction, h, float(r)))
+        if not crossed:
+            return None, "no new threshold crossing"
+        top = max(crossed, key=lambda c: c[2])
+        return format_forecast_alert(ranks, headline=top), "forecast alert"
+
     def maybe_alert(
         self, df: pd.DataFrame, *, peers: dict | None = None
     ) -> tuple[str | None, str]:
@@ -277,10 +303,4 @@ class MT5Forecaster:
         ranks, note = score_last_bar_bundle(df, bundle, peers=peers)
         if ranks is None:
             return None, note
-        if self.last_alert_bar is not None and ranks.bar_time == self.last_alert_bar:
-            return None, "already alerted for this bar"
-        top = notable(ranks, threshold=self.threshold)
-        if top is None:
-            return None, "no gating rank above threshold"
-        self.last_alert_bar = ranks.bar_time
-        return format_forecast_alert(ranks), "forecast alert"
+        return self._decide(ranks)

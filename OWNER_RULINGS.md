@@ -82,6 +82,12 @@ demo command is stale — see §5.
   own history grows (owner correction 2026-10-25). No external hourly
   frame is the training source, and no pre-trained artifact is ferried
   between machines.
+- **Cadence (owner correction 2026-10-25):** the forecast is scored on
+  D1 closes — a days-ahead forecast is daily news, not hourly noise —
+  and alerts fire ONLY when a gating rank (1d/3d) crosses into notable.
+  A rank sitting above threshold does not re-alert; dropping below
+  re-arms the crossing. The H1 frame remains the model's input; only
+  the alert cadence is daily.
 
 ## 4. Chart studies and terminal (owner direction 2026-10-24, build order)
 
