@@ -7,8 +7,9 @@ XAUUSD trades Sunday 22:00 UTC through Friday 21:00 UTC. The
 Friday 21:00 UTC -> Sunday 22:00 UTC window is the weekly close —
 an old tick inside it is the expected calendar pause, never a
 feed failure. This is the calendar the Saturday fix needs;
-feed-freshness reporting uses it now, health.tick_state wiring
-follows in the calendar step (it still reads the broker flag).
+feed-freshness reporting uses it, and health.tick_state treats
+calendar-closed as known-closed (with broker-vs-calendar
+disagreement surfaced in the health line).
 """
 
 from __future__ import annotations

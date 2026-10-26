@@ -123,9 +123,11 @@ demo command is stale — see §5.
 1. Ensemble forecasting + forecast alerts (the main build): MT5 data
    to training to live forecast alerts, labeled as forecasts, never
    touching orders.
-2. Saturday calendar fix (the engine carries its own XAUUSD calendar;
-   known-closed periods render `closed_expected`, never a breach;
-   feed-vs-calendar disagreement surfaces explicitly).
+2. Saturday calendar fix — DONE 2026-10-25 (the engine carries its own
+   XAUUSD calendar in `live/market_hours.py`; known-closed periods
+   render `closed_expected`, never a breach, via `live/health.py`
+   tick_state; feed-vs-calendar disagreement surfaces explicitly
+   in the health line).
 3. Full chart studies (≤4 real overlays, exactly what the reasoning
    used — zones, Fib, and all) attached to signals/alerts, not just the
    minimal phone chart.

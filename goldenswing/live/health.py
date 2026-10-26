@@ -29,6 +29,13 @@ again (EC2: ``feed: OK`` beside ``BREACH: tick_stale`` for a
 2501s-old tick on a closed market).  An UNKNOWN market state
 keeps the fail-loud reading: stale is a breach until the feed
 proves the closure was expected.
+
+Calendar wiring (2026-10-25): the engine's own weekly calendar
+(``live/market_hours.py``) now counts as known-closed alongside the
+broker flag, so a Saturday pause reads ``closed_expected`` even when
+the broker flag is unknown or stale. When the broker flag and the
+calendar disagree, :meth:`describe` says so explicitly — the
+difference is surfaced, never silently resolved.
 """
 from __future__ import annotations
 
@@ -36,6 +43,8 @@ from collections import deque
 from datetime import datetime, timezone
 
 import pandas as pd
+
+from .market_hours import xauusd_market_open
 
 #: Ticks older than this are stale (market hours; the pump delivers
 #: continuously while the market is open).
@@ -108,6 +117,24 @@ class HealthMonitor:
             last = last.replace(tzinfo=timezone.utc)
         return max(0.0, (now - last).total_seconds())
 
+    def calendar_disagreement(self, now: datetime | None = None) -> str | None:
+        """Broker flag vs the engine's weekly calendar, when they differ.
+
+        Returns None when they agree or the broker state is unknown.
+        Broker-open-while-calendar-closed means a stale broker flag
+        inside the weekly close; broker-closed-while-calendar-open
+        usually means a real holiday the weekly calendar does not
+        know. Neither changes the state class — both are surfaced
+        in :meth:`describe` so the difference is visible, not silent.
+        """
+        if self._market_open is None:
+            return None
+        if self._market_open and not xauusd_market_open(now):
+            return "broker says open, calendar says weekly close"
+        if not self._market_open and xauusd_market_open(now):
+            return "broker says closed, calendar says open (possible holiday)"
+        return None
+
     def tick_state(self, now: datetime | None = None) -> str:
         """The tick freshness class — ONE vocabulary for the Feed
         line, the Health line and the breach set, so they cannot
@@ -118,19 +145,20 @@ class HealthMonitor:
           open or its state is unknown — a genuine feed failure
           class (fail loud);
         - ``closed_expected``: older than the threshold (or never
-          arrived) while the market is KNOWN closed — the
+          arrived) while the market is KNOWN closed — by the broker
+          flag OR by the engine's own weekly calendar — the
           calendar pause, not a failure;
         - ``no_ticks``: nothing has ever arrived and the market
           is not known closed.
         """
         age = self.tick_age_sec(now)
+        known_closed = (self._market_open is False
+                        or not xauusd_market_open(now))
         if age is None:
-            return ("closed_expected" if self._market_open is False
-                    else "no_ticks")
+            return "closed_expected" if known_closed else "no_ticks"
         if age <= self.tick_stale_sec:
             return "live"
-        return ("closed_expected" if self._market_open is False
-                else "stale")
+        return "closed_expected" if known_closed else "stale"
 
     def latency_stats(self) -> dict:
         vals = list(self._latencies)
@@ -185,4 +213,6 @@ class HealthMonitor:
         breaches = self.breaches(now)
         flag = "" if not breaches else (
             f" ⚠ BREACH: {', '.join(sorted(breaches))}")
-        return f"health: {tick} | {lat_txt} | {slip_txt}{flag}"
+        note = self.calendar_disagreement(now)
+        dis = "" if note is None else f" ⚠ calendar disagreement: {note}"
+        return f"health: {tick} | {lat_txt} | {slip_txt}{flag}{dis}"
