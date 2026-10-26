@@ -143,8 +143,55 @@ def fmt_progress(frac: float, width: int = 10) -> str:
 
 
 def fmt_next_cta(*commands: str) -> str:
-    """Explicit next-action CTA, e.g. ``➡️ Next: /playbooks • /health``."""
+    """Explicit next-action CTA, e.g. ``➡️ Next: /playbooks • /health``.
+
+    LEGACY TEXT FORM — kept for the OANDA/paper command set, whose
+    runner has no callback routing.  The live MT5 set renders its
+    next actions as inline buttons instead (``fmt_next_keyboard``);
+    no MT5 handler may append this text line anymore.
+    """
     return "\n➡️ Next: " + " • ".join(commands)
+
+
+def _next_command(cmd: str) -> str:
+    """Map a next-action label to the command tapping it runs.
+
+    Placeholders (``/assess <playbook>``) map to their base command
+    (``/assess``), whose usage text is what the hint points at.
+    """
+    base = cmd.split(" <", 1)[0].strip()
+    return base or cmd
+
+
+def next_button_rows(*commands: str, back: bool = True) -> list:
+    """Inline-button rows for a next-action list (BotFather model).
+
+    Two buttons per row; each button's callback is
+    ``mt5:cmd:<command>`` (Telegram caps callback_data at 64 bytes —
+    every next command here is far shorter).  A ``« Back to Status``
+    row closes the keyboard unless ``/status`` is already among the
+    commands (the status screen IS the hub, so it gets no Back row)
+    or the caller passes ``back=False`` (the nav keyboard already
+    carries a Status button).
+    """
+    mapped: list[str] = []
+    for cmd in commands:
+        nxt = _next_command(cmd)
+        if nxt not in mapped:
+            mapped.append(nxt)
+    rows: list = []
+    for i in range(0, len(mapped), 2):
+        rows.append([{"text": c, "callback_data": f"mt5:cmd:{c}"}
+                     for c in mapped[i:i + 2]])
+    if back and "/status" not in mapped:
+        rows.append([{"text": "« Back to Status",
+                      "callback_data": "mt5:cmd:/status"}])
+    return rows
+
+
+def fmt_next_keyboard(*commands: str) -> dict:
+    """Next actions as a real inline keyboard (no text CTA line)."""
+    return {"inline_keyboard": next_button_rows(*commands)}
 
 
 def fmt_feed_line(fs: dict | None, last_bar_time, last_price,
@@ -1082,8 +1129,9 @@ def start_backtest_from_args(ctx: CommandContext, args: list[str], *,
              f"ETA: {fmt_code(_eta_text(days))} (measured ~0.25s/tick + "
              "~65s startup) — I'll send the report file + summary "
              "when it finishes. The bot keeps trading meanwhile."
-             f"{stale}"
-             + fmt_next_cta("/backtest_export", "/status", "/health"))
+             f"{stale}",
+        reply_markup=fmt_next_keyboard("/backtest_export", "/status",
+                                        "/health"))
 
 
 @command("/backtest", "run a real whole-engine backtest (async)")
@@ -1152,8 +1200,9 @@ def _snapshot(ctx: CommandContext, args: list[str]) -> CommandResult:
             f"N={fmt_code(s.get('watermark'))} "
             f"root={fmt_code(str(s.get('snapshot_root'))[:12] + '…')} "
             f"chain={fmt_code(str(s.get('chain_n'))[:12] + '…')}")
-    lines.append(fmt_next_cta("/journal", "/health", "/status"))
-    return CommandResult(text="\n".join(lines))
+    return CommandResult(
+        text="\n".join(lines),
+        reply_markup=fmt_next_keyboard("/journal", "/health", "/status"))
 
 
 @command("/reconcile", "reconciliation status: unresolved / open vs closed")
@@ -1168,8 +1217,9 @@ def _reconcile(ctx: CommandContext, args: list[str]) -> CommandResult:
                 f"unresolved: {len(unresolved)}",
                 f"reconciliation_complete: "
                 f"{reconciler.reconciliation_complete}",
-                f"holding queue: {len(reconciler.holding)}",
-                fmt_next_cta("/health", "/journal", "/status")]))
+                f"holding queue: {len(reconciler.holding)}"]),
+            reply_markup=fmt_next_keyboard("/health", "/journal",
+                                            "/status"))
     if ctx.journal is None:
         return CommandResult(text="no journal attached.")
     from goldenswing.execution.reporting import open_positions
@@ -1183,8 +1233,8 @@ def _reconcile(ctx: CommandContext, args: list[str]) -> CommandResult:
             "no live reconciler attached to this loop.",
             f"journal open positions (unclosed): {len(opens)}",
             "Run the deterministic engine for live "
-            "UNCONFIRMED/UNKNOWN reconciliation status.",
-            fmt_next_cta("/health", "/journal", "/status")]))
+            "UNCONFIRMED/UNKNOWN reconciliation status."]),
+        reply_markup=fmt_next_keyboard("/health", "/journal", "/status"))
 
 
 @command("/health", "feed + journal + open positions health")

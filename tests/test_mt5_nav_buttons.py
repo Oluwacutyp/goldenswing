@@ -15,6 +15,7 @@ from goldenswing.execution.mt5_commands import (
     _mt5_forecast_train,
     _mt5_health,
     mt5_nav_keyboard,
+    mt5_nav_with_next,
 )
 from test_mt5_telegram_control import (
     OWNER,
@@ -48,11 +49,13 @@ def test_nav_keyboard_shape():
 def test_assess_returns_carry_nav_keyboard(tmp_path):
     ctx = CommandContext(journal=_Journal([_record("short read")]))
     index = _mt5_assess(ctx, [])
-    assert index.reply_markup == mt5_nav_keyboard()
+    assert index.reply_markup == mt5_nav_with_next(
+        "/assess <playbook>", "/assess all", "/status")
     single = _mt5_assess(ctx, ["sweep_reversal"])
-    assert single.reply_markup == mt5_nav_keyboard()
+    assert single.reply_markup == mt5_nav_with_next(
+        "/assess all", "/status")
     all_text = _mt5_assess(ctx, ["all"])
-    assert all_text.reply_markup == mt5_nav_keyboard()
+    assert all_text.reply_markup == mt5_nav_with_next("/assess", "/status")
     long_ctx = CommandContext(
         journal=_Journal([_record("🧭 long\n" + "x" * 3600)]),
         reports_dir=tmp_path)
@@ -65,7 +68,8 @@ def test_health_and_forecast_train_carry_nav_keyboard():
     ctx = CommandContext(feed_status={}, journal=None,
                          live_positions=[], pending_orders=[])
     health = _mt5_health(ctx, [])
-    assert health.reply_markup == mt5_nav_keyboard()
+    assert health.reply_markup == mt5_nav_with_next(
+        "/status", "/reconcile", "/journal")
 
     class Ctrl:
         def forecast_train_now(self):

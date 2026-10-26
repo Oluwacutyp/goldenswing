@@ -159,8 +159,9 @@ from .friction_gate import (
     FRICTION_REASON_CODE as _FRICTION_CODE,
     assess_entry_friction as _assess_friction)
 from .signal_log import log_signal
-from .mt5_commands import (mt5_confirm_keyboard, mt5_control_keyboard,
-                           mt5_nav_keyboard, mt5_router, parse_mt5_callback)
+from .mt5_commands import (mt5_back_keyboard, mt5_confirm_keyboard,
+                           mt5_control_keyboard, mt5_nav_keyboard,
+                           mt5_router, parse_mt5_callback)
 from .mt5_config import LiveConfigStore, unknown_disabled_names
 from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
@@ -12544,7 +12545,7 @@ class MT5Runner:
                         "chat_id": chat_id, "message_id": message_id,
                         "text": result.text or "",
                         "reply_markup": _json.dumps(
-                            mt5_control_keyboard())})
+                            result.reply_markup or mt5_control_keyboard())})
                 _answer("refreshed")
                 return
             if action == "config":
@@ -12555,7 +12556,7 @@ class MT5Runner:
                         "chat_id": chat_id, "message_id": message_id,
                         "text": result.text or "",
                         "reply_markup": _json.dumps(
-                            mt5_control_keyboard())})
+                            result.reply_markup or mt5_control_keyboard())})
                 _answer("config")
                 return
             if action in ("assess_all", "health", "forecast_train"):
@@ -12582,6 +12583,38 @@ class MT5Runner:
                         "reply_markup": _json.dumps(
                             result.reply_markup or mt5_nav_keyboard())})
                 _answer(action.replace("_", " "))
+                return
+            if action == "cmd":
+                # Generic next-button routing: the button payload
+                # is the typed command itself (``mt5:cmd:/pending``).
+                # Dispatch through the same registry typed
+                # commands use; re-render in place for text,
+                # new message for documents (cannot edit in
+                # place).  Results without a keyboard fall back
+                # to a bare Back row so navigation never strands.
+                cmd_text = (arg or "").strip()
+                if not cmd_text.startswith("/"):
+                    _answer("unknown button")
+                    return
+                parts = cmd_text[1:].split()
+                if not parts:
+                    _answer("unknown button")
+                    return
+                from .mt5_commands import MT5_COMMANDS as _MT5_REG
+                entry = _MT5_REG.get("/" + parts[0])
+                if entry is None:
+                    _answer("unknown button")
+                    return
+                result = entry[1](self._command_context(), parts[1:])
+                if result.document is not None:
+                    self._reply_command(result)
+                elif message_id is not None:
+                    self._tg_api("editMessageText", {
+                        "chat_id": chat_id, "message_id": message_id,
+                        "text": result.text or "",
+                        "reply_markup": _json.dumps(
+                            result.reply_markup or mt5_back_keyboard())})
+                _answer(parts[0].replace("_", " "))
                 return
             _answer("unknown button")
         except Exception as exc:

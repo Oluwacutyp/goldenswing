@@ -33,9 +33,10 @@ from ..feed.tick_log import export_tick_history
 from ..feed.mt5 import MT5Feed
 from ..alerts.commands import (CommandContext, CommandResult,
                                CommandRouter, build_zip_bundle,
-                               fmt_code, fmt_feed_line, fmt_next_cta,
-                               fmt_none, fmt_pnl, fmt_progress, fmt_r,
-                               fmt_section)
+                               fmt_code, fmt_feed_line,
+                               fmt_next_keyboard, fmt_none, fmt_pnl,
+                               fmt_progress, fmt_r, fmt_section,
+                               next_button_rows)
 from .mt5_config import (EXECUTE_PLAYBOOK_NAMES, SHADOW_PLAYBOOK_NAMES,
                         describe_change, parse_set)
 
@@ -112,6 +113,42 @@ def mt5_nav_keyboard() -> dict:
          {"text": "🔮 Train forecast",
           "callback_data": "mt5:forecast_train"}],
     ]}
+
+
+def mt5_back_keyboard() -> dict:
+    """Bare Back row, for command results that carry no keyboard.
+
+    The callback branch falls back to this so tapping into a
+    keyboard-less result (e.g. /set usage) never strands the user
+    on a message with no way back.
+    """
+    return {"inline_keyboard": [
+        [{"text": "« Back to Status", "callback_data": "mt5:cmd:/status"}],
+    ]}
+
+
+def mt5_control_with_next(*commands: str) -> dict:
+    """Control rows + next-action buttons + Back, one markup.
+
+    mt5_control_keyboard itself stays pinned exactly; the merge
+    happens here so control messages keep their actions AND gain
+    the next navigation the old ``➡️ Next:`` text line named.
+    """
+    rows = [list(row) for row in
+            mt5_control_keyboard()["inline_keyboard"]]
+    rows += next_button_rows(*commands)
+    return {"inline_keyboard": rows}
+
+
+def mt5_nav_with_next(*commands: str) -> dict:
+    """Nav rows + next-action buttons, one markup.
+
+    No extra Back row: the nav rows already carry a Status button,
+    which is the Back destination.
+    """
+    rows = [list(row) for row in mt5_nav_keyboard()["inline_keyboard"]]
+    rows += next_button_rows(*commands, back=False)
+    return {"inline_keyboard": rows}
 
 
 # ------------------------------------------------- persistent reply menu
@@ -298,8 +335,7 @@ def _config_text(ctx: CommandContext) -> str:
         mark = "✅" if enabled else "⏸️"
         lines.append(f"  {mark} {name}: {'on' if enabled else 'off'}")
     lines += ["", "Change with `/set <key> <value>` (confirm required).",
-              "Pause is not a `/set` key — use ⏸️ Pause / ▶️ Resume.",
-              fmt_next_cta("/status", "/playbooks", "/set")]
+              "Pause is not a `/set` key — use ⏸️ Pause / ▶️ Resume."]
     return "\n".join(lines)
 
 
@@ -310,8 +346,7 @@ def _mt5_start(ctx: CommandContext, args: list[str]) -> CommandResult:
     return CommandResult(
         text=("🤖 GoldenSwing MT5 engine — use the menu below, or /help "
               "for the full command list.  Status / position / pending "
-              "messages carry their own action buttons.\n"
-              + fmt_next_cta("/status", "/playbooks", "/help")),
+              "messages carry their own action buttons."),
         reply_markup=MENU_KEYBOARD)
 
 
@@ -348,10 +383,9 @@ def _mt5_playbooks(ctx: CommandContext, args: list[str]) -> CommandResult:
                      f"{'on' if on else 'off'}, "
                      f"signals {counts.get(name, 0)}")
     lines += ["", "Toggle with `/set playbook.<name> on/off` "
-                  "(confirm required).",
-              fmt_next_cta("/status", "/config", "/set")]
+                  "(confirm required)."]
     return CommandResult(text="\n".join(lines),
-                         reply_markup=mt5_control_keyboard())
+                         reply_markup=mt5_control_with_next("/status", "/config", "/set"))
 
 
 @mt5_command("/help", "list the MT5 engine commands")
@@ -361,8 +395,8 @@ def _mt5_help(ctx: CommandContext, args: list[str]) -> CommandResult:
     for name in sorted(MT5_COMMANDS):
         desc, _ = MT5_COMMANDS[name]
         lines.append(f"`{name}` — {desc}")
-    lines += ["", fmt_next_cta("/status", "/playbooks", "/health")]
-    return CommandResult(text="\n".join(lines))
+    return CommandResult(text="\n".join(lines),
+                         reply_markup=fmt_next_keyboard("/status", "/playbooks", "/health"))
 
 
 @mt5_command("/status", "MT5 engine health: positions+layers, pendings, blocked-leg stats, today's P&L")
@@ -577,9 +611,8 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append("")
             lines.append(fmt_section("🧭", "Decision Funnel"))
             lines.append(funnel())
-    lines.append(fmt_next_cta("/playbooks", "/health", "/trades"))
     return CommandResult(text="\n".join(lines),
-                         reply_markup=mt5_control_keyboard())
+                         reply_markup=mt5_control_with_next("/playbooks", "/health", "/trades"))
 
 
 @mt5_command("/marketread", "standing market read: trend + key zones + scenarios (same read as the /status section, on its own)")
@@ -596,9 +629,8 @@ def _mt5_marketread(ctx: CommandContext, args: list[str]) -> CommandResult:
             text="Market Read needs the live MT5 engine — "
                  "no runner attached to this chat.")
     lines = [fmt_section("🔭", "Market Read"), "", read()]
-    lines.append(fmt_next_cta("/status", "/assess", "/playbooks"))
     return CommandResult(text="\n".join(lines),
-                         reply_markup=mt5_control_keyboard())
+                         reply_markup=mt5_control_with_next("/status", "/assess", "/playbooks"))
 
 
 @mt5_command("/assess", "the engine's latest market assessment: /assess [playbook|all]")
@@ -669,16 +701,15 @@ def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
                      f"assessed so far: {known}\n"
                      f"usage: /assess [playbook|all]")
         return CommandResult(
-            text=_text_of(rec)
-            + "\n" + fmt_next_cta("/assess all", "/status"),
-            reply_markup=mt5_nav_keyboard())
+            text=_text_of(rec),
+            reply_markup=mt5_nav_with_next("/assess all", "/status"))
     if arg == "all":
         blocks = [_text_of(latest[name]) for name in sorted(latest)]
         text = ("\n\n" + "—" * 24 + "\n\n").join(blocks)
         if len(text) <= 3500 or not ctx.reports_dir:
             return CommandResult(
-                text=text + "\n" + fmt_next_cta("/assess", "/status"),
-                reply_markup=mt5_nav_keyboard())
+                text=text,
+                reply_markup=mt5_nav_with_next("/assess", "/status"))
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         path = Path(ctx.reports_dir) / f"mt5-assess-{stamp}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -693,28 +724,25 @@ def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
              fmt_section("🧭", "Latest per playbook")]
     for name in sorted(latest):
         lines.append(_index_line(name, latest[name]))
-    lines.append(fmt_next_cta("/assess <playbook>", "/assess all",
-                              "/status"))
     return CommandResult(text="\n".join(lines),
-                         reply_markup=mt5_nav_keyboard())
+                         reply_markup=mt5_nav_with_next("/assess <playbook>", "/assess all",
+                                                         "/status"))
 
 
 @mt5_command("/position", "open MT5 positions with layers")
 def _mt5_position(ctx: CommandContext, args: list[str]) -> CommandResult:
     lines = [fmt_section("📈", "MT5 OPEN POSITIONS:"), ""]
     lines += _position_lines(ctx)
-    lines.append(fmt_next_cta("/status", "/pending", "/trades"))
     return CommandResult(text="\n".join(lines),
-                         reply_markup=mt5_control_keyboard())
+                         reply_markup=mt5_control_with_next("/status", "/pending", "/trades"))
 
 
 @mt5_command("/pending", "resting MT5 pending LIMIT / STOP orders")
 def _mt5_pending(ctx: CommandContext, args: list[str]) -> CommandResult:
     lines = [fmt_section("⏳", "MT5 PENDING ORDERS:"), ""]
     lines += _pending_lines(ctx)
-    lines.append(fmt_next_cta("/status", "/position", "/cancel_pending"))
     return CommandResult(text="\n".join(lines),
-                         reply_markup=mt5_control_keyboard())
+                         reply_markup=mt5_control_with_next("/status", "/position", "/cancel_pending"))
 
 
 @mt5_command("/pause", "pause new signals (management continues) — confirm required")
@@ -741,7 +769,7 @@ def _mt5_trim(ctx: CommandContext, args: list[str]) -> CommandResult:
 @mt5_command("/config", "show the live MT5 config (safe keys only)")
 def _mt5_config(ctx: CommandContext, args: list[str]) -> CommandResult:
     return CommandResult(text=_config_text(ctx),
-                         reply_markup=mt5_control_keyboard())
+                         reply_markup=mt5_control_with_next("/status", "/playbooks", "/set"))
 
 
 @mt5_command("/set", "change a safe live config key: /set <key> <value> — confirm required")
@@ -789,8 +817,8 @@ def _mt5_trades(ctx: CommandContext, args: list[str]) -> CommandResult:
         ts = (t["closed_ts"] or "?")[:16].replace("T", " ")
         lines.append(f"{ts} {t['playbook']} {side} "
                      f"{fmt_r(t['r_net'])} ({t['reason']})")
-    lines.append(fmt_next_cta("/status", "/report", "/recap"))
-    return CommandResult(text="\n".join(lines))
+    return CommandResult(text="\n".join(lines),
+                         reply_markup=fmt_next_keyboard("/status", "/report", "/recap"))
 
 
 @mt5_command("/db", "send the MT5 journal as a file")
@@ -858,8 +886,8 @@ def _mt5_recap(ctx: CommandContext, args: list[str]) -> CommandResult:
         except Exception:
             bar = ""
         return CommandResult(
-            text=header + "\n\n" + text + bar
-            + fmt_next_cta("/status", "/trades", "/report"))
+            text=header + "\n\n" + text + bar,
+            reply_markup=fmt_next_keyboard("/status", "/trades", "/report"))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     path = Path(ctx.reports_dir) / f"mt5-recap-{period}-{stamp}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1170,8 +1198,8 @@ def _mt5_journal(ctx: CommandContext, args: list[str]) -> CommandResult:
             f"last: seq={fmt_code(last.get('seq', '?'))} "
             f"type={fmt_code(last.get('type', '?'))} "
             f"ts={fmt_code(last.get('ts', '?'))}")
-    lines.append(fmt_next_cta("/snapshot", "/health", "/status"))
-    return CommandResult(text="\n".join(lines))
+    return CommandResult(text="\n".join(lines),
+                         reply_markup=fmt_next_keyboard("/snapshot", "/health", "/status"))
 
 
 @mt5_command("/snapshot", "deterministic-engine snapshot manifest (N / N_prev)")
@@ -1222,9 +1250,8 @@ def _mt5_health(ctx: CommandContext, args: list[str]) -> CommandResult:
                     f"deterministic: ⚠️ disabled ({det.get('error')})")
         except Exception:
             pass
-    lines.append(fmt_next_cta("/status", "/reconcile", "/journal"))
     return CommandResult(text="\n".join(lines),
-                         reply_markup=mt5_nav_keyboard())
+                         reply_markup=mt5_nav_with_next("/status", "/reconcile", "/journal"))
 
 
 @mt5_command("/forecast_train", "start forecast training now (operator lever; auto-bootstrap is primary)")

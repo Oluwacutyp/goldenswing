@@ -130,7 +130,8 @@ def test_mt5_status_sections_in_order(tmp_path):
                 "🌍 Macro Alignment", "💵 DXY", "❤️ Health",
                 "🔧 Config", "📈 Open Positions", "⏳ Pending Orders",
                 "📅 Today (UTC)", "🚫 why no trades",
-                "🎯 Per-Playbook Signals", "➡️ Next:"]
+                "🎯 Per-Playbook Signals"]
+    assert "➡️ Next:" not in text  # next actions are buttons now
     positions = [text.index(s) for s in sections]
     assert positions == sorted(positions), text
     assert "✅" in text and "`4,176.4`" in text
@@ -144,7 +145,8 @@ def test_mt5_status_sections_in_order(tmp_path):
     assert "`sizing=`" in text and "dynamic k=0.01" in text
     assert "C=1.0 pending" in text
     assert "fixed_lots" not in text
-    assert "/playbooks" in text  # CTA
+    # The old "/playbooks" CTA text line is gone by design — the
+    # next actions are buttons now (pinned in test_mt5_next_buttons).
 
 
 def test_mt5_status_stale_feed_and_paused(tmp_path):

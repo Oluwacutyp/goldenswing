@@ -21,7 +21,8 @@ import pytest
 from goldenswing.alerts.commands import CommandContext
 from goldenswing.execution.executor import OrderResult
 from goldenswing.execution.mt5_commands import (
-    mt5_control_keyboard, mt5_router, parse_mt5_callback)
+    mt5_control_keyboard, mt5_control_with_next, mt5_router,
+    parse_mt5_callback)
 from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
 from goldenswing.execution.risk import gold_spec
 from goldenswing.live.hierarchy import TimeframeStack
@@ -407,7 +408,8 @@ def test_counter_bias_signal_scored_by_floor_counted_in_status(tmp_path):
     assert "min_score" in res.text         # the floor leg, counted
     assert "judas_swing" in res.text       # last-blocked names it
     assert "d1_bias" not in res.text       # no hierarchy leg exists
-    assert res.reply_markup == mt5_control_keyboard()
+    assert res.reply_markup == mt5_control_with_next(
+        "/playbooks", "/health", "/trades")
 
 
 def test_pause_blocks_orders_and_counts_paused_leg(tmp_path):
@@ -722,10 +724,12 @@ def test_position_and_pending_commands_carry_buttons(tmp_path):
     router = mt5_router(OWNER)
     res, _ = router.dispatch(_update("/position"), ctx)
     assert "OPEN POSITIONS" in res.text
-    assert res.reply_markup == mt5_control_keyboard()
+    assert res.reply_markup == mt5_control_with_next(
+        "/status", "/pending", "/trades")
     res, _ = router.dispatch(_update("/pending"), ctx)
     assert "#777" in res.text and "LIMIT" in res.text
-    assert res.reply_markup == mt5_control_keyboard()
+    assert res.reply_markup == mt5_control_with_next(
+        "/status", "/position", "/cancel_pending")
 
 
 def test_pause_resume_cancel_commands_stage_confirm(tmp_path):
@@ -838,7 +842,8 @@ def test_playbooks_command_shows_state_and_counts(tmp_path):
     assert "judas_swing: executing, on, signals 3" in res.text
     assert "turtle_soup: executing, off, signals 0" in res.text
     assert "qm_m5: executing, on" in res.text
-    assert res.reply_markup == mt5_control_keyboard()
+    assert res.reply_markup == mt5_control_with_next(
+        "/status", "/config", "/set")
 
 
 def test_reply_menu_and_inline_buttons_coexist(tmp_path):
