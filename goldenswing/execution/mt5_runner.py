@@ -579,6 +579,18 @@ class PendingOrderState:
     restart, where only the broker SL is known).  ``placed_bar`` is
     the forming-H1-bar index at placement; ``expiry_bar`` is the
     first H1-close index at which the pending dies unfilled.
+
+    Step 4 (2026-10-27) route-aware fields: ``premise`` records
+    WHICH setup the pending belongs to — "h1" for pendings under
+    the H1 trigger premise (``_live_setup``) and "native" for
+    pendings placed by a native-clock route (qm_m5 / qm_d1), which
+    ``_live_setup`` never arms.  ``entry_clock`` is the playbook's
+    generation clock (registry ``native_tf``, "H1" fallback for
+    adopted / unknown playbooks); ``entry_placed_bar`` and
+    ``entry_expiry_bar`` are the placement / expiry pair counted
+    in ENTRY-CLOCK bars, so a native pending is governed on its
+    own clock.  For H1 pendings entry_* == placed / expiry by
+    construction, so H1 behaviour is unchanged.
     """
 
     ticket: int
@@ -594,6 +606,11 @@ class PendingOrderState:
     invalidation: float             # raw structural invalidation
     placed_bar: int
     expiry_bar: int
+    premise: str = "h1"             # "h1" | "native" (step 4)
+    entry_clock: str = "H1"         # playbook generation clock (step 4)
+    entry_placed_bar: int = 0       # forming-bar index on entry clock
+    entry_expiry_bar: int = 0       # first entry-clock close index at
+                                    # which the pending dies unfilled
     track_request: object = None    # OrderRequest for TickManager on fill
     sig: object = None              # playbook signal (fill chart/alert)
     verdict: dict | None = None     # hierarchy verdict (fill chart)
@@ -5293,15 +5310,33 @@ class MT5Runner:
         t = len(h1) - 1
         playbooks = {pb.name: pb for pb in self._get_playbooks()}
         for ticket, state in list(self._pending_orders.items()):
+            if state.premise == "native":
+                # Step 4: H1-clock decay never applies to a native
+                # pending — the H1 roster cannot re-score it (natives
+                # are not in _get_playbooks), so without this skip
+                # every native pending reads "gone" and dies within
+                # score_decay_bars H1 closes.  Step 2 exempted only
+                # the no-floor route (qm_m5); qm_d1 carries a floor
+                # and still died the same way — this skip covers
+                # ALL native premises.  A native-frame re-emission
+                # decay was investigated and REJECTED: the QM
+                # live_signal is touch-only and cursor-based (it
+                # returns signals touched on bar t, never re-emits
+                # a processed bar), so absence of a re-emission
+                # proves nothing about a resting limit — decay by
+                # re-emission would kill every QM pending within
+                # score_decay_bars native closes.  Native pendings
+                # are guarded by native expiry + invalidation
+                # instead (see _check_native_pendings).
+                self.journal.log_note(
+                    f"mt5: pending ticket {ticket} decay skipped "
+                    f"({state.playbook} native premise — H1 decay "
+                    f"does not apply; native expiry/invalidation "
+                    f"guard it)")
+                continue
             if _decay_exempt(state.playbook):
                 # Step 2: this route carries NO score floor, so the
-                # legacy-floor decay must not touch it — and the H1
-                # roster cannot re-score a native playbook anyway
-                # (natives are not in _get_playbooks), so without
-                # this skip every native pending reads "gone" and
-                # dies within score_decay_bars H1 closes.  Native-
-                # frame decay returns in step 4; until then expiry,
-                # bias-flip and invalidation still guard it.
+                # legacy-floor decay must not touch it.
                 self.journal.log_note(
                     f"mt5: pending ticket {ticket} decay skipped "
                     f"({state.playbook} carries no score floor — "
@@ -5505,13 +5540,32 @@ class MT5Runner:
         POI -> distance/through -> regime -> score/manipulation.
         """
         # Expiry: pending_expiry_bars (config) elapsed during
-        # downtime -> stale.
-        last_bar_index = len(h1) - 1 \
-            if h1 is not None and len(h1) else 0
-        if last_bar_index >= state.expiry_bar:
-            return ("expired",
-                    f"expiry_bar {state.expiry_bar} passed "
-                    f"(now {last_bar_index})")
+        # downtime -> stale.  Step 4: a native pending is audited
+        # on its own clock when that frame is available, and the
+        # H1 check is then SKIPPED for it — otherwise the H1 pair
+        # would still kill a daily pending after 4h at audit time,
+        # which is exactly the units bug entry-clock expiry fixes.
+        # The H1 pair is the fallback only when the native frame
+        # is missing (or the pending is H1 / adopted).
+        _native_audited = False
+        if getattr(state, "entry_clock", "H1") != "H1" \
+                and self._stack is not None:
+            _nframe = self._stack.frames.get(state.entry_clock)
+            if _nframe is not None and len(_nframe):
+                _native_audited = True
+                _nidx = len(_nframe) - 1
+                if _nidx >= state.entry_expiry_bar:
+                    return ("expired",
+                            f"entry_expiry_bar "
+                            f"{state.entry_expiry_bar} passed on "
+                            f"{state.entry_clock} (now {_nidx})")
+        if not _native_audited:
+            last_bar_index = len(h1) - 1 \
+                if h1 is not None and len(h1) else 0
+            if last_bar_index >= state.expiry_bar:
+                return ("expired",
+                        f"expiry_bar {state.expiry_bar} passed "
+                        f"(now {last_bar_index})")
         # POI still valid?  Price through the POI + buffer kills
         # it; a POI level that no longer exists in the current H4
         # zones is a dead setup (never reprice silently).
@@ -5942,6 +5996,12 @@ class MT5Runner:
         # before the 4-bar expiry anyway.
         self._check_pending_score_decay(stats)
         for ticket, state in list(self._pending_orders.items()):
+            if state.premise == "native":
+                # Step 4: native pendings expire on their own clock
+                # (_check_native_pendings, called from the native
+                # routes) — the H1-close loop must not kill them on
+                # H1 units, or entry-clock expiry is dead code.
+                continue
             if last_bar_index >= state.expiry_bar:
                 if state.ladder_levels and state.ladder_lots:
                     # Ladder: this rung expired — cancel it and
@@ -5984,11 +6044,90 @@ class MT5Runner:
             "volume": 0.0, "real_volume": 0.0,
             "spread": tick.get("spread", 0)}
 
+    def _check_native_pendings(self, clock: str,
+                               stats: dict) -> None:
+        """Native-clock pending guards (step 4), run on native closes.
+
+        Called from the native routes (``_run_qm_m5`` / ``_run_qm_d1``)
+        before candidate evaluation, so an expired native pending
+        never blocks the one-position rule.  Two guards, both
+        counted on the entry clock:
+
+        * expiry — the closed entry-clock index reached
+          ``entry_expiry_bar`` (entry-clock bars since placement,
+          wall duration preserved from ``pending_expiry_bars``);
+        * invalidation — any closed entry-clock bar since placement
+          traded through the structural invalidation.  In
+          continuous trading a fill precedes such a breach (price
+          must cross the entry to reach the invalidation), so a
+          still-resting pending past its invalidation is a dead
+          setup (gap / fill miss), never a live one.
+
+        A guard failure never crashes the route: it is journalled
+        and the pending is left for the next close.  H1 pendings
+        are untouched here — the H1-close loop governs them.
+        """
+        if self._stack is None:
+            return
+        frame = self._stack.frames.get(clock)
+        if frame is None or len(frame) == 0:
+            return
+        idx = len(frame) - 1
+        for ticket, state in list(self._pending_orders.items()):
+            if state.entry_clock != clock:
+                continue
+            try:
+                if idx >= state.entry_expiry_bar:
+                    self._cancel_pending(
+                        ticket,
+                        f"expired: no fill after "
+                        f"{state.entry_expiry_bar - state.entry_placed_bar} "
+                        f"{clock} bars",
+                        stats)
+                    continue
+                inv = float(state.invalidation or 0.0)
+                if inv and "high" in frame.columns \
+                        and "low" in frame.columns:
+                    try:
+                        bars = frame.iloc[state.entry_placed_bar:]
+                    except Exception:
+                        bars = frame.iloc[0:0]
+                    if len(bars):
+                        if state.direction > 0:
+                            breached = bool((bars["low"] < inv).any())
+                        else:
+                            breached = bool((bars["high"] > inv).any())
+                        if breached:
+                            self._cancel_pending(
+                                ticket,
+                                f"invalidated: price through "
+                                f"invalidation {inv:.2f} on {clock} "
+                                f"close",
+                                stats)
+            except Exception as exc:
+                self.journal.log_note(
+                    f"mt5: native pending check failed for ticket "
+                    f"{ticket} (pending left alone): {exc}")
+
     def _check_pending_bias(self, stats: dict) -> None:
         """D1/H4 close flipped the bias (or un-armed the setup): the
         pending trigger's premise is gone — invalidate, never erase.
         Pending ORDERS die the same way: a bias flip / un-armed
-        setup cancels every resting order whose premise is gone."""
+        setup cancels every resting order whose premise is gone.
+
+        Step 4 premise scope: this check governs ONLY H1-premise
+        orders.  ``_live_setup`` is armed solely by the H1 trigger
+        path — native routes never arm it — so applying this check
+        to a native pending cancels it on every D1/H4 close for a
+        premise it never had (2026-10-26: qm_m5 ticket 514827226
+        cancelled 12:00:27 "bias_flipped: setup unarmed" five
+        minutes after placement, never filled).  Native pendings
+        are skipped here and guarded on their own clock (native
+        expiry / invalidation, step 4).  The setup-None reason is
+        renamed ``setup_unarmed``: it is not a bias flip, it is an
+        un-armed H1 premise, and the old wording hid that
+        distinction in the journal.
+        """
         setup = self._live_setup
         if self._pending is not None:
             if setup is None \
@@ -5996,12 +6135,25 @@ class MT5Runner:
                 self._invalidate_pending("bias_flipped", stats)
         if self._pending_orders:
             if setup is None:
-                for ticket in list(self._pending_orders):
+                for ticket, state in list(
+                        self._pending_orders.items()):
+                    if state.premise != "h1":
+                        self.journal.log_note(
+                            f"mt5: bias check skipped ticket {ticket} "
+                            f"({state.playbook}): native premise — "
+                            f"_live_setup never arms native routes")
+                        continue
                     self._cancel_pending(
-                        ticket, "bias_flipped: setup unarmed", stats)
+                        ticket, "setup_unarmed", stats)
             else:
                 for ticket, state in list(
                         self._pending_orders.items()):
+                    if state.premise != "h1":
+                        self.journal.log_note(
+                            f"mt5: bias check skipped ticket {ticket} "
+                            f"({state.playbook}): native premise — "
+                            f"_live_setup never arms native routes")
+                        continue
                     if state.direction != setup["direction"]:
                         self._cancel_pending(
                             ticket, "bias_flipped", stats)
@@ -10359,7 +10511,34 @@ class MT5Runner:
                              ladder_lots: list | None = None,
                              decision_score: float | None = None
                              ) -> PendingOrderState:
-        """Register a broker pending order in engine tracking."""
+        """Register a broker pending order in engine tracking.
+
+        Step 4: premise and entry clock are derived from the
+        playbook name via the registry (``native_tf``), at this
+        single tracking point, so every caller — H1 path, native
+        routes, layers, restart adoption — classifies the pending
+        the same way without new arguments threaded through the
+        order path.  A native pending's entry window preserves the
+        H1 window's WALL duration (``pending_expiry_bars`` H1 bars)
+        counted in entry-clock bars (ceil): qm_m5 gets 48 M5 bars
+        (4h, same duration as before, finer granularity); qm_d1
+        gets 1 D1 bar (its route cannot be evaluated more finely
+        than daily closes — the old 4h H1 kill of a daily setup
+        was the units bug).  The entry-placed index is the forming
+        index on the entry clock (len of that clock's frame), the
+        same convention as ``_current_h1_bar``.
+        """
+        entry_clock = _native_tf(playbook) or "H1"
+        premise = "native" if entry_clock != "H1" else "h1"
+        if premise == "native" and self._stack is not None:
+            _frame = self._stack.frames.get(entry_clock)
+            entry_placed = len(_frame) if _frame is not None \
+                else int(placed_bar)
+        else:
+            entry_placed = int(placed_bar)
+        _minutes = {"M5": 5, "D1": 1440, "H1": 60}.get(entry_clock, 60)
+        _count = (int(self.cfg.pending_expiry_bars) * 60
+                  + _minutes - 1) // _minutes
         state = PendingOrderState(
             ticket=int(order.ticket), kind=str(order.kind),
             direction=int(order.direction), level=float(order.price),
@@ -10371,6 +10550,9 @@ class MT5Runner:
             zone=zone, invalidation=float(invalidation),
             placed_bar=int(placed_bar),
             expiry_bar=int(placed_bar) + self.cfg.pending_expiry_bars,
+            premise=premise, entry_clock=entry_clock,
+            entry_placed_bar=int(entry_placed),
+            entry_expiry_bar=int(entry_placed) + max(1, _count),
             track_request=track_request, sig=sig, verdict=verdict,
             is_layer=bool(is_layer),
             placed_score=(float(decision_score)
@@ -11005,6 +11187,9 @@ class MT5Runner:
                     reason="M5 frame unavailable or shorter than "
                            "30 bars — not evaluated")
                 return []
+            # Step 4: native-clock pending guards run first, on
+            # every M5 close, before new candidates are evaluated.
+            self._check_native_pendings("M5", stats)
             last_bar_ts = m5_df.index[-1]
             # Data freshness against the tick clock (the engine's
             # clock); the wall clock is only a bare-test fallback.
@@ -11843,6 +12028,9 @@ class MT5Runner:
                     reason="D1 frame unavailable or shorter than "
                            "30 bars — not evaluated")
                 return []
+            # Step 4: native-clock pending guards run first, on
+            # every D1 close, before new candidates are evaluated.
+            self._check_native_pendings("D1", stats)
             pb = QMD1Playbook()
             ctx = EngineContext(df=d1_df, states=[], years=0.0,
                                 instrument=self.cfg.symbol)
