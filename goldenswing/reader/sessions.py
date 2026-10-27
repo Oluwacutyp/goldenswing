@@ -1,5 +1,11 @@
 """Session tagging in UTC (DST ignored — documented approximation).
 
+LEGACY — NOT the live session authority.  Live decisions, eval
+records and charts use ``reader.session_timeframes`` (DST-aware
+wall clocks).  This module remains ONLY for backtest/experiment
+reproducibility (tests pin it; backtest comparability depends on
+it) — do not wire new live paths to it.
+
 ICT killzones (converted from EST): London 07:00-10:00 UTC,
 New York 12:00-15:00 UTC.
 """

@@ -20,7 +20,7 @@ import html as _html
 import json
 import math
 
-from ..reader import sessions
+from ..reader import session_timeframes as sessions  # Step 3: DST-aware authority (was fixed-UTC sessions)
 
 TF_ORDER = ("D1", "H4", "H1", "M30", "M15", "M5")
 _BARS_CAP = 500

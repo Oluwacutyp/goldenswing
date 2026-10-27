@@ -133,6 +133,7 @@ from ..live.narrative import (ENTRY as _NARR_ENTRY,
                               _finalize_narrative_exit, load_narrative_state,
                               mark_entered as _mark_narrative_entered,
                               save_narrative_state)
+from ..live import market_hours as _market_hours
 from ..live.manipulation import chase_blocked
 from ..live.news import NewsCalendar
 from ..live.reasoning import build_reasoning, build_study
@@ -1287,13 +1288,18 @@ class MT5Runner:
             decision["reason_category"] = category_for_code(
                 decision.get("reason_code") or reason_code,
                 decision.get("result"))
+        # Step 3: capture the evaluation instant ONCE — the record's
+        # ts and its evaluation-session tag must describe the same
+        # instant (a second wall-clock read could straddle a
+        # session boundary).
+        _eval_now = self._evaluation_now()
         record = {
             "type": "evaluation", "kind": kind,
             # Journal auditability (owner, 2026-10-26): every
             # record carries its own evaluation timestamp — the
             # renderer reads this first, so no record can ever
             # again render "evaluated not recorded".
-            "ts": str(self._evaluation_now()),
+            "ts": str(_eval_now),
             "run_id": self._run_id, "commit": self._build_commit(),
             "config_fingerprint": self._config_fingerprint(),
             "playbook": playbook,
@@ -1311,6 +1317,24 @@ class MT5Runner:
             "evidence": evidence,
             "trigger_stage": trigger_stage,
             "evaluation_source": source,
+        }
+        # Step 3: session provenance — the session of the candidate
+        # bar AND of the evaluation instant, from the one DST-aware
+        # authority (reader.session_timeframes).  Session detection
+        # is not market-open detection: these fields say which
+        # session a decision belongs to, never whether the broker
+        # accepts orders.
+        def _sess(ts):
+            if ts is None:
+                return None
+            try:
+                _s, _kz = session_of(pd.Timestamp(ts))
+                return {"session": _s, "killzone": _kz}
+            except Exception:
+                return None
+        record["session"] = {
+            "candidate_bar": _sess(last_bar_ts),
+            "evaluation": _sess(_eval_now),
         }
         # Amendment 3 (owner, 2026-10-23): every evaluation record
         # carries a renderable MARKET ASSESSMENT — structure read,
@@ -9506,14 +9530,35 @@ class MT5Runner:
         """Broker accepting new orders?  Feeds without market_open()
         are legacy — treated as open (the real MT5Feed implements
         it, and a missing method must not change order behaviour
-        for a feed that never claimed the check)."""
+        for a feed that never claimed the check).
+
+        Step 3: broker-open AGREEMENT — the broker flag alone does
+        not open the market.  Broker-open while the engine's weekly
+        calendar says closed is a stale flag inside the weekly close
+        and refuses (fail closed); broker-closed while the calendar
+        is open (a real holiday the weekly calendar does not know)
+        stays closed via the broker flag.  If the calendar itself
+        cannot answer, the broker flag (measured from the terminal)
+        stands.  Session detection is a separate question and never
+        enters this guard.
+        """
         fn = getattr(self.feed, "market_open", None)
         if fn is None:
             return True, ""
         try:
-            return fn()
+            ok, reason = fn()
         except Exception as exc:
             return False, f"market_open check failed: {exc}"
+        if ok:
+            try:
+                if not _market_hours.xauusd_market_open(
+                        datetime.now(timezone.utc)):
+                    return False, ("calendar disagreement: broker "
+                                   "says open, calendar says weekly "
+                                   "close — refusing (stale broker flag)")
+            except Exception:
+                pass
+        return ok, reason
 
     def _open_risk_state(self, spec) -> tuple[float, int]:
         """(open risk money, unstopped position count) across the

@@ -56,7 +56,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
 
-from ..reader import sessions
+from ..reader import session_timeframes as sessions  # Step 3: DST-aware authority (was fixed-UTC sessions)
 
 STYLES = ("classic", "heikin_ashi", "line", "blueprint", "signal")
 

@@ -91,6 +91,20 @@ def replay(*, symbol: str, ticks: pd.DataFrame, frames: dict[str, pd.DataFrame],
            store_path: Path, output_path: Path, max_ticks: int | None = None) -> dict:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     store_path.parent.mkdir(parents=True, exist_ok=True)
+    # Step 3 (clock provenance): ticks stamped in the future are
+    # impossible history.  The 2026-10-26 harvests carried tick
+    # files stamped AFTER their harvest times — quarantined from
+    # training/replay.  Fail closed instead of replaying them; a
+    # small tolerance covers broker/local clock skew.
+    _future_cutoff = pd.Timestamp.now(tz="UTC") + pd.Timedelta(minutes=5)
+    future = ticks[ticks["time"] > _future_cutoff]
+    if len(future):
+        raise ValueError(
+            f"refusing {len(future)} future-dated tick(s) "
+            f"(first {future['time'].iloc[0]}, "
+            f"last {future['time'].iloc[-1]}; wall now "
+            f"{pd.Timestamp.now(tz='UTC')}) — ticks stamped after "
+            f"the present cannot be history; check clock provenance")
     engine = HotScalpResearchEngine(
         SetupStore(store_path), HotScalpConfig(enabled=True),
         instance_id="historical-shadow-replay")
@@ -117,7 +131,11 @@ def replay(*, symbol: str, ticks: pd.DataFrame, frames: dict[str, pd.DataFrame],
                 break
     return {"symbol": symbol, "ticks_processed": processed,
             "event_counts": counts, "output_path": str(output_path),
-            "store_path": str(store_path), "execution_authority": "shadow_only"}
+            "store_path": str(store_path), "execution_authority": "shadow_only",
+            "tick_first": (str(ticks["time"].iloc[0])
+                           if len(ticks) else None),
+            "tick_last": (str(ticks["time"].iloc[-1])
+                          if len(ticks) else None)}
 
 
 def main(argv: list[str] | None = None) -> int:
