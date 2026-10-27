@@ -50,7 +50,8 @@ class TradeJournal:
                  forecaster_rank: float | None = None,
                  risk_atr: float | None = None,
                  intended_entry: float | None = None,
-                 slippage: float | None = None) -> dict:
+                 slippage: float | None = None,
+                 broker_sl: float | None = None) -> dict:
         # Friction audit (owner directive 2026-10-22): every open
         # record carries its stop distance (|entry - stop|, price
         # units) so R geometry is auditable from the journal alone;
@@ -77,6 +78,13 @@ class TradeJournal:
                 "n_factors": len(factors),
             },
         }
+        if broker_sl is not None:
+            # Step 2: the broker stop that owns the trade, kept
+            # distinct from the structural ``stop`` — close R divides
+            # by this distance, so it must be on the record.
+            record["broker_sl"] = float(broker_sl)
+            record["broker_stop_distance"] = abs(
+                float(entry) - float(broker_sl))
         if intended_entry is not None:
             record["intended_entry"] = float(intended_entry)
         if slippage is not None:

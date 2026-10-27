@@ -180,6 +180,7 @@ from .mt5_config import LiveConfigStore, unknown_disabled_names
 from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
                                 ROSTER_SPECS, ROSTER_SPECS_H1,
+                                decay_exempt as _decay_exempt,
                                 native_tf_of as _native_tf)
 from .risk import RiskConfig, RiskGuards
 from .tick_manager import (DEFAULT_TIME_EXIT_BARS, TickAction, TickConfig,
@@ -596,8 +597,10 @@ class PendingOrderState:
     sig: object = None              # playbook signal (fill chart/alert)
     verdict: dict | None = None     # hierarchy verdict (fill chart)
     is_layer: bool = False          # pending fills onto the held position
-    # Score-decay (owner's-bot PendingOrderTracker): the signal score
-    # at placement + consecutive H1 closes on which a re-evaluation
+    # Score-decay (owner's-bot PendingOrderTracker): the DECISION
+    # score at placement (Asymmetry total when the Score object
+    # exists — never the sleeve-base placeholder, step 2
+    # 2026-10-27) + consecutive H1 closes on which a re-evaluation
     # found no same-direction signal at this level scoring at/above
     # the decay floor.  At score_decay_bars the pending is cancelled
     # (the setup died while the order rested — a real trader does
@@ -5266,6 +5269,20 @@ class MT5Runner:
         t = len(h1) - 1
         playbooks = {pb.name: pb for pb in self._get_playbooks()}
         for ticket, state in list(self._pending_orders.items()):
+            if _decay_exempt(state.playbook):
+                # Step 2: this route carries NO score floor, so the
+                # legacy-floor decay must not touch it — and the H1
+                # roster cannot re-score a native playbook anyway
+                # (natives are not in _get_playbooks), so without
+                # this skip every native pending reads "gone" and
+                # dies within score_decay_bars H1 closes.  Native-
+                # frame decay returns in step 4; until then expiry,
+                # bias-flip and invalidation still guard it.
+                self.journal.log_note(
+                    f"mt5: pending ticket {ticket} decay skipped "
+                    f"({state.playbook} carries no score floor — "
+                    f"legacy-floor decay does not apply)")
+                continue
             try:
                 current, crash = self._pending_current_score(
                     state, playbooks, states, t, h1)
@@ -7615,7 +7632,11 @@ class MT5Runner:
         ceiling is exactly the old one; distribution inside it is
         evidence-driven.  Fixed mode books the owner's explicit
         lots against an envelope at least as large (the pool is
-        the ledger there, RiskGuards remain the gate)."""
+        the ledger there, RiskGuards remain the gate).
+
+        ``stop`` MUST be the buffered broker stop (state.sl /
+        stop0), never the structural invalidation — step 2: the
+        pool books true exposure, matching sizing and close R."""
         # P3: every base fill registers its management context
         # (independent of the pool ledger's fate below).
         self._register_position_ctx(
@@ -7646,11 +7667,24 @@ class MT5Runner:
                     abs(float(entry) - float(stop)), float(lots)))
             except Exception:
                 realized = budget
+            # Step 2: a widening is an EXCEPTION, named as one.  The
+            # routine case after broker-stop booking is the broker
+            # minimum flooring above the budget (min_override) —
+            # the owner ruling says the trade still happens, but
+            # the ledger must say WHY it exceeds the envelope.
+            _min_floor = bool(
+                (self._sizing_detail.get(alert_id) or {}).get(
+                    "min_override"))
             self.journal.log_note(
                 f"mt5 pool: base layer risk {realized:.2f} exceeds "
                 f"the position budget {budget:.2f} for ticket "
                 f"{ticket} ({self._sizing_mode()} mode) — ledger "
-                "widened to fit the filled order, headroom 0")
+                "widened to fit the filled order, headroom 0"
+                + (" — exception: broker-minimum floor "
+                   "(min_override): the broker minimum sizes above "
+                   "the budget, so the filled order cannot fit it"
+                   if _min_floor else
+                   " — exception: placement sized past the envelope"))
             pool = RiskPool(max(budget, realized))
             pool.authorize(alert_id, lots, entry, stop,
                            int(direction), spec)
@@ -10141,7 +10175,7 @@ class MT5Runner:
                 stats, entry_bar, is_layer=is_layer,
                 ladder_levels=_ladder_levels,
                 ladder_lots=_ladder_lots,
-                funding_events=funding_events)
+                funding_events=funding_events, score=score)
             if placed and fingerprint:
                 self.entry_gate.record_open(time.time(), fingerprint)
             return
@@ -10176,27 +10210,37 @@ class MT5Runner:
         if _narr_state is not None:
             self._narrative_states[int(res.ticket)] = _narr_state
         # A13: open the position's RiskPool ledger on the fill.
+        # Step 2: the pool books the BROKER stop (stop0), never the
+        # structural invalidation — sizing, close R and the tick
+        # manager all measure on the broker stop, and booking the
+        # tighter structural stop understated true exposure
+        # (2026-10-26: pool booked 2.28, broker exposure 3.27).
         self._pool_for_open(
             int(res.ticket), lots=float(lots), entry=float(fill),
-            stop=float(sig.invalidation),
+            stop=float(stop0),
             direction=int(sig.direction),
             alert_id=request.alert_id)
         stats["executed"] = stats.get("executed", 0) + 1
         # Open record: without it, /trades /report /harvest cannot see
-        # this fill (they join close -> open by alert_id).  Stop here is
-        # the invalidation the R accounting tracks on; the broker SL
-        # is the buffered stop0 (see the fill note below).
+        # this fill (they join close -> open by alert_id).  Two stops
+        # ride the record, each under its own name: ``stop`` is the
+        # structural invalidation (analysis), ``broker_sl`` is the
+        # buffered stop0 that owns the trade — and close R divides
+        # by the broker distance, so risk_money is broker-based too.
         try:
             risk_money = spec.money_for_move(
-                abs(fill - float(sig.invalidation)), lots)
+                abs(fill - float(stop0)), lots)
         except Exception:
             risk_money = 0.0
         self.journal.log_open(
             alert_id=request.alert_id, instrument=self.cfg.symbol,
             mode="MT5", playbook=pb.name, phase="live",
-            direction=int(sig.direction), score=float(sig.score),
+            direction=int(sig.direction),
+            score=(float(score.total)
+                   if score is not None else float(sig.score)),
             source="mt5", ticket=int(res.ticket), entry=float(fill),
-            stop=float(sig.invalidation), volume=float(lots),
+            stop=float(sig.invalidation), broker_sl=float(stop0),
+            volume=float(lots),
             risk_money=float(risk_money),
             factors=list(getattr(sig, "factors", []) or []),
             intended_entry=float(sig.entry_ref),
@@ -10267,7 +10311,8 @@ class MT5Runner:
                              sig, verdict, track_request,
                              is_layer: bool = False,
                              ladder_levels: list | None = None,
-                             ladder_lots: list | None = None
+                             ladder_lots: list | None = None,
+                             decision_score: float | None = None
                              ) -> PendingOrderState:
         """Register a broker pending order in engine tracking."""
         state = PendingOrderState(
@@ -10283,7 +10328,9 @@ class MT5Runner:
             expiry_bar=int(placed_bar) + self.cfg.pending_expiry_bars,
             track_request=track_request, sig=sig, verdict=verdict,
             is_layer=bool(is_layer),
-            placed_score=float(getattr(sig, "score", 0.0) or 0.0),
+            placed_score=(float(decision_score)
+                          if decision_score is not None
+                          else float(getattr(sig, "score", 0.0) or 0.0)),
             ladder_levels=list(ladder_levels or []),
             ladder_lots=list(ladder_lots or []))
         self._pending_orders[state.ticket] = state
@@ -10336,7 +10383,8 @@ class MT5Runner:
                              is_layer: bool = False,
                              ladder_levels: list | None = None,
                              ladder_lots: list | None = None,
-                             funding_events: list | None = None
+                             funding_events: list | None = None,
+                             score=None
                              ) -> bool:
         """Place a pending LIMIT / STOP and start tracking it.
         Returns True when the broker accepted the order."""
@@ -10372,7 +10420,9 @@ class MT5Runner:
             invalidation=float(sig.invalidation),
             placed_bar=placed_bar, sig=sig, verdict=verdict,
             track_request=track_request, is_layer=is_layer,
-            ladder_levels=ladder_levels, ladder_lots=ladder_lots)
+            ladder_levels=ladder_levels, ladder_lots=ladder_lots,
+            decision_score=(float(score.total)
+                            if score is not None else None))
         if is_layer and funding_events:
             self._pending_funding[state.ticket] = list(funding_events)
         stats["pending"] = stats.get("pending", 0) + 1
@@ -10638,7 +10688,7 @@ class MT5Runner:
             self._pool_for_open(
                 int(pos.ticket), lots=float(filled_vol),
                 entry=float(pos.entry_price),
-                stop=float(state.invalidation),
+                stop=float(state.sl),
                 direction=int(state.direction),
                 alert_id=state.alert_id)
             state.volume = state.volume - filled_vol
@@ -10664,7 +10714,7 @@ class MT5Runner:
         self._pool_for_open(
             int(pos.ticket), lots=float(state.volume),
             entry=float(pos.entry_price),
-            stop=float(state.invalidation),
+            stop=float(state.sl),
             direction=int(state.direction),
             alert_id=state.alert_id)
         stats["executed"] = stats.get("executed", 0) + 1
@@ -10677,25 +10727,35 @@ class MT5Runner:
                            *, partial: bool) -> None:
         """Open record + fill note/alert for a base fill (full or
         partial).  Same open record as a market fill — the entry
-        is the broker's fill price, the stop is the placement-time
-        invalidation, the volume is the filled volume."""
+        is the broker's fill price, the volume is the filled volume.
+        Step 2: the record carries BOTH stops under their own names
+        (``stop`` = structural invalidation, ``broker_sl`` = the
+        broker stop that owns the trade) and the DECISION score
+        (state.placed_score, set at placement from the Score object
+        — never the sleeve-base placeholder that used to ride here
+        as a flat 60.0 while the signal record said 32.71).
+        risk_money is broker-distance exposure, matching sizing
+        and close R."""
         sig = getattr(state, "sig", None)
         try:
             spec = self.executor.symbol_spec(self.cfg.symbol)
             risk_money = spec.money_for_move(
-                abs(float(pos.entry_price) - float(state.invalidation)),
+                abs(float(pos.entry_price) - float(state.sl)),
                 float(volume))
         except Exception:
             risk_money = 0.0
+        _decision_score = float(state.placed_score or 0.0)
+        if not _decision_score and sig is not None:
+            _decision_score = float(getattr(sig, "score", 0.0) or 0.0)
         self.journal.log_open(
             alert_id=state.alert_id, instrument=self.cfg.symbol,
             mode="MT5", playbook=state.playbook or "pending",
             phase="live", direction=int(state.direction),
-            score=float(getattr(sig, "score", 0.0) or 0.0)
-            if sig is not None else 0.0,
+            score=float(_decision_score),
             source="mt5", ticket=int(pos.ticket),
             entry=float(pos.entry_price),
             stop=float(state.invalidation),
+            broker_sl=float(state.sl),
             volume=float(volume), risk_money=float(risk_money),
             factors=list(getattr(sig, "factors", []) or [])
             if sig is not None else [],

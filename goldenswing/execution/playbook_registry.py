@@ -193,6 +193,24 @@ FLOOR_AUTHORITY: dict[str, str] = {
         "_execute_qm_d1_candidate",
 }
 
+
+def decay_exempt(playbook_name: str) -> bool:
+    """True when a playbook's route carries NO score floor, so the
+    legacy score-decay cancellation must not touch its pendings.
+
+    Step 2 (2026-10-27): decay re-scores on the H1 roster frame
+    against ``min_score`` (legacy 60.0) — but the judgment route
+    (native qm_m5) has NO floor by FLOOR_AUTHORITY, and native
+    playbooks are not even in the H1 roster, so a re-score returns
+    "gone" for every native pending and decay cancels it within
+    ``score_decay_bars`` H1 closes (the 2026-10-26 4019.16 cancel).
+    Exempt routes skip floor-decay until step 4 restores a
+    native-frame decay; expiry, bias-flip and invalidation still
+    guard the pending.  Roster and range routes keep their floors.
+    """
+    text = FLOOR_AUTHORITY.get("native:" + playbook_name, "")
+    return text.startswith("NO score floor")
+
 #: Names the Telegram control surface may manage (kill switch,
 #: /config, /playbooks).  Today: every registered playbook.
 MANAGEABLE_NAMES: tuple[str, ...] = tuple(
