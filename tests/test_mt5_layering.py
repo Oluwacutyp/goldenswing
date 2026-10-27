@@ -107,6 +107,13 @@ def _base_position(runner, ticket=101):
                        targets=[2030.0], atr=10.0, bar_index=5)
     runner.tick_manager.open(ticket=ticket, request=req, fill_price=2000.0,
                              entry_bar=6, broker_sl=1987.5)
+    # Step 5: a held position must also exist at the (fake) broker —
+    # layer decisions are broker-reconciled now, so a
+    # tick_manager-only position no longer counts as held.
+    runner.executor._positions.append(Position(
+        ticket=ticket, symbol="XAUUSD", direction=1, volume=1.0,
+        entry_price=2000.0, sl=1987.5, tp=2030.0,
+        magic=runner.cfg.magic, alert_id=""))
     return req
 
 

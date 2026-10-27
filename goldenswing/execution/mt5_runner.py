@@ -101,6 +101,7 @@ from ..live.urgency import urgency_score
 from ..live.volume_profile import volume_profile
 from ..live.hot_scalp import HotScalpConfig, HotScalpResearchEngine
 from ..live.evidence import (BASE_CATEGORY_WEIGHTS, EvidenceItem, score_evidence)
+from ..live.stacking import evaluate_layer_add as _evaluate_layer_add
 from ..live.patterns import (detect_sweep as _ev_detect_sweep,
                              liquidity_pools as _ev_liquidity_pools,
                              order_blocks as _ev_order_blocks,
@@ -962,6 +963,12 @@ class MT5Runner:
         self._last_scores: dict[str, dict] = {}
         self._last_score: dict | None = None
         self._funded_events: dict[int, set] = {}
+        # Step 5: layer trigger identities already consumed by a
+        # filled layer, per parent ticket (stacking policy
+        # trigger_duplicate input).  Marked on fill, never on
+        # placement attempt — a rejected order must not burn its
+        # trigger.
+        self._layer_trigger_ids: dict[int, set] = {}
         # P3: PullbackWatch is MULTI-SLOT — several parked setups,
         # each with its own zone/expiry/invalidation (was a single
         # dict pre-P3; _pullback_watch property below keeps the
@@ -8989,6 +8996,158 @@ class MT5Runner:
     # position is in profit, with total risk capped.  The broker nets
     # the layer deal into the one position (same symbol / direction /
     # magic); the engine tracks the legs in TickManager.layers.
+    def _layer_broker_state(self, ticket: int, pos):
+        """Fresh broker snapshot for a layer decision (step 5).
+
+        Returns (snapshot, fail_reason): snapshot carries the broker
+        parent position (ticket + magic match), broker entry/SL,
+        broker volume (netting ticket plus same-alert hedging
+        tickets when the tracked alert_id is non-empty), and the
+        tracked legs.  ``fail_reason`` is set only when the broker
+        read itself failed — unknown broker state fails closed
+        before any policy input is built.  A missing parent, a
+        direction mismatch, or a volume disagreement is NOT a read
+        failure: it is carried in the snapshot so the policy (or
+        the pre-gate note) can name it precisely.
+        """
+        try:
+            live = self.executor.positions()
+        except Exception as exc:
+            return None, f"broker positions unreadable: {exc}"
+        try:
+            parent = None
+            broker_volume = 0.0
+            for p in live:
+                if int(getattr(p, "ticket", -1)) == int(ticket) \
+                        and int(getattr(p, "magic", -1)) \
+                        == int(self.cfg.magic):
+                    parent = p
+            if parent is not None:
+                broker_volume = float(parent.volume)
+                alert = str(getattr(pos, "alert_id", "") or "")
+                if alert:
+                    for p in live:
+                        if int(getattr(p, "ticket", -1)) == int(ticket):
+                            continue
+                        if int(getattr(p, "magic", -1)) \
+                                != int(self.cfg.magic):
+                            continue
+                        if str(getattr(p, "alert_id", "") or "") != alert:
+                            continue
+                        if int(getattr(p, "direction", 0)) \
+                                != int(pos.direction):
+                            continue
+                        broker_volume += float(p.volume)
+            return {
+                "parent": parent,
+                "broker_entry": (float(parent.entry_price)
+                                 if parent is not None else None),
+                "broker_sl": (float(parent.sl)
+                              if parent is not None
+                              and parent.sl is not None else None),
+                "broker_volume": broker_volume,
+            }, None
+        except Exception as exc:
+            return None, f"broker snapshot malformed: {exc}"
+
+    def _layer_policy_gate(self, *, ticket: int, pos, layers,
+                           snapshot, mid: float, lots: float,
+                           stop0: float, mode: str, trigger_key: str,
+                           trigger_independent: bool, max_layers: int,
+                           budget: float, spec, pb, sig,
+                           stats: dict) -> bool:
+        """Stacking-policy gate between sizing and placement (step 5).
+
+        The release decision (funding / in-profit) is the trigger;
+        this gate is the broker-reconciled check on top of it: the
+        parent must be broker-confirmed, the broker SL verified,
+        the parent not losing, the layer count and the shared
+        budget respected — all measured on broker stops, never on
+        tracked stops alone.  Returns True to place, False to skip
+        (already journalled, with the policy's reason code).
+        """
+        parent = snapshot.get("parent") if snapshot else None
+        broker_sl = snapshot.get("broker_sl") if snapshot else None
+        broker_entry = snapshot.get("broker_entry") if snapshot else None
+        sl_verified = (
+            parent is not None and broker_sl is not None
+            and broker_entry is not None and broker_sl > 0
+            and ((int(pos.direction) > 0
+                  and broker_sl < broker_entry)
+                 or (int(pos.direction) < 0
+                     and broker_sl > broker_entry)))
+        if sl_verified:
+            dist = abs(broker_entry - broker_sl)
+            unreal_r = (int(pos.direction) * (float(mid) - broker_entry)
+                        / dist) if dist > 0 else None
+        else:
+            unreal_r = None
+        if snapshot is not None:
+            # A missing parent is the policy's parent_not_open, not
+            # a volume disagreement — the volume pre-gate only fires
+            # when the broker DOES hold the parent at another size.
+            volume_ok = (parent is None or abs(
+                float(snapshot["broker_volume"])
+                - float(pos.volume)) <= _VOL_EPS)
+        else:
+            volume_ok = False
+        if not volume_ok:
+            self.journal.log_note(
+                f"mt5: layer skipped {pb.name}: broker volume "
+                f"{snapshot.get('broker_volume') if snapshot else None} "
+                f"disagrees with tracked {float(pos.volume):.2f} — "
+                f"layer refused until reconcile")
+            return False
+        existing = 0.0
+        for ly in layers:
+            existing += spec.money_for_move(
+                abs(float(ly.entry) - broker_sl), float(ly.volume)) \
+                if sl_verified else 0.0
+        proposed = spec.money_for_move(
+            abs(float(sig.entry_ref) - float(stop0)), float(lots))
+        decision = _evaluate_layer_add(
+            parent_setup_id=str(getattr(pos, "alert_id", "")
+                                or f"ticket-{ticket}"),
+            mode=mode, trigger_id=trigger_key,
+            trigger_direction=int(sig.direction),
+            parent_direction=int(pos.direction),
+            parent_open=parent is not None,
+            parent_thesis_valid=parent is not None,
+            trigger_fresh=True,
+            trigger_independent=bool(trigger_independent),
+            trigger_already_used=(
+                trigger_key in self._layer_trigger_ids.get(ticket, set())),
+            parent_unrealized_r=unreal_r,
+            active_layers=len(layers),
+            max_layers=min(int(max_layers), 3),
+            risk_budget_money=(float(budget) if budget is not None
+                               else None),
+            existing_worst_case_risk_money=existing,
+            proposed_worst_case_risk_money=proposed,
+            broker_stop_verified=bool(sl_verified))
+        if not decision.get("eligible"):
+            self.journal.log_note(
+                f"mt5: layer refused {pb.name} "
+                f"({decision.get('reason_code')}): "
+                f"{decision.get('reason')}")
+            log_signal(
+                self.journal,
+                signal_id=f"MT5-{pb.name}-{getattr(sig, 'index', '?')}-layer",
+                playbook=pb.name, direction=int(sig.direction),
+                score=float(getattr(sig, "score", 0.0) or 0.0),
+                decision="gated",
+                reason=f"stacking: {decision.get('reason_code')}",
+                entry=float(sig.entry_ref), stop=float(stop0),
+                trigger_source="stacking_policy")
+            return False
+        self.journal.log_note(
+            f"mt5: layer policy pass {pb.name} "
+            f"({decision.get('reason_code')}, child "
+            f"{decision.get('child_entry_id')}, combined risk "
+            f"{decision.get('combined_worst_case_risk_money')} of "
+            f"budget {decision.get('shared_risk_budget_money')})")
+        return True
+
     def _try_layer(self, pb, sig, stats: dict,
                    verdict: dict | None = None,
                    entry_bar: int | None = None,
@@ -9037,6 +9196,18 @@ class MT5Runner:
                 f"{max_layers} reached (config "
                 f"{self.cfg.layer_max_layers}, traffic {_tier})")
             return
+        # Step 5: broker-reconciled snapshot BEFORE sizing — a layer
+        # decision on tracked state alone is how a broker-closed or
+        # partially-closed parent keeps stacking.  A failed broker
+        # read fails closed: unknown broker state never authorizes
+        # new risk.
+        snapshot, snapshot_fail = self._layer_broker_state(ticket, pos)
+        if snapshot is None:
+            self.journal.log_note(
+                f"mt5: layer skipped {pb.name}: {snapshot_fail} — "
+                f"unknown broker state fails closed")
+            return
+        trigger_key = f"MT5-{pb.name}-{getattr(sig, 'index', '?')}"
         # Funding events not yet consumed by this position.
         consumed = self._funded_events.setdefault(ticket, set())
         new_events = [e for e in (funding.events if funding else [])
@@ -9063,6 +9234,13 @@ class MT5Runner:
                 "required and no funding event with the stop at "
                 "breakeven")
             return
+        # Step 5: trigger independence for the policy gate — a
+        # funding release is independent by its fresh event; a
+        # legacy release is independent when it is not a
+        # re-emission of the parent's own signal.
+        trigger_independent = (
+            bool(new_events) if event_funded
+            else trigger_key != str(getattr(pos, "alert_id", "") or ""))
         # Total risk cap: base risk money x max_mult, across all layers.
         try:
             spec = self.executor.symbol_spec(self.cfg.symbol)
@@ -9144,6 +9322,18 @@ class MT5Runner:
                     "lots": float(result.lots),
                     "min_override": False,
                     "headroom": float(headroom)}
+            # Step 5: stacking-policy gate on broker-reconciled
+            # state (shared budget = pool budget, fixed at open).
+            if not self._layer_policy_gate(
+                    ticket=ticket, pos=pos, layers=layers,
+                    snapshot=snapshot, mid=mid,
+                    lots=float(result.lots), stop0=float(stop0),
+                    mode="pyramid" if event_funded else "same_setup",
+                    trigger_key=trigger_key,
+                    trigger_independent=trigger_independent,
+                    max_layers=max_layers, budget=float(pool.budget),
+                    spec=spec, pb=pb, sig=sig, stats=stats):
+                return
             self._place_live_order(
                 pb, sig, stats, verdict=verdict,
                 entry_bar=entry_bar, is_layer=True,
@@ -9194,6 +9384,25 @@ class MT5Runner:
                 f"mt5: layer skipped {pb.name}: risk cap leaves "
                 f"{lots:.2f} lots (< 0.01)")
             return
+        # Step 5: stacking-policy gate (legacy budget = mult x
+        # ORIGINAL base risk, so a breakeven stop roll frees
+        # budget instead of collapsing it to zero).
+        _base_leg = layers[0]
+        _base_risk = spec.money_for_move(
+            abs(float(_base_leg.entry) - float(_base_leg.sl)),
+            float(_base_leg.volume))
+        if not self._layer_policy_gate(
+                ticket=ticket, pos=pos, layers=layers,
+                snapshot=snapshot, mid=mid, lots=float(lots),
+                stop0=float(stop0),
+                mode="pyramid" if event_funded else "same_setup",
+                trigger_key=trigger_key,
+                trigger_independent=trigger_independent,
+                max_layers=max_layers,
+                budget=float(self.cfg.layer_max_total_risk_mult
+                             * _base_risk),
+                spec=spec, pb=pb, sig=sig, stats=stats):
+            return
         self._place_live_order(pb, sig, stats, verdict=verdict,
                                entry_bar=entry_bar, is_layer=True,
                                layer_lots=float(lots),
@@ -9232,6 +9441,11 @@ class MT5Runner:
             return
         stats["layers"] = stats.get("layers", 0) + 1
         stats["layer_fills"] = stats.get("layer_fills", 0) + 1
+        # Step 5: the trigger that produced this layer is consumed
+        # (stacking policy trigger_duplicate input).  Marked on
+        # fill, never on placement attempt.
+        self._layer_trigger_ids.setdefault(ticket, set()).add(
+            f"MT5-{pb_name}-{getattr(sig, 'index', '?')}")
         layers = self.tick_manager.layers(ticket)
         # RiskPool booking + funding-event consumption (A13/§4.2).
         if not self._pool_book_layer(
@@ -10827,6 +11041,13 @@ class MT5Runner:
                         volume=filled_vol, sl=float(state.sl),
                         alert_id=state.alert_id,
                         playbook=state.playbook)
+                    # Step 5: partial fills consume their trigger
+                    # too — the layer exists, even partially.
+                    _psig = getattr(state, "sig", None)
+                    self._layer_trigger_ids.setdefault(
+                        self.tick_manager.tickets()[0], set()).add(
+                        f"MT5-{state.playbook or 'pending'}-"
+                        f"{getattr(_psig, 'index', '?')}")
                     self._pool_book_layer(
                         self.tick_manager.tickets()[0],
                         lots=float(filled_vol),
