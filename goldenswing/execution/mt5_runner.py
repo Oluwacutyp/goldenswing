@@ -60,6 +60,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -100,6 +101,7 @@ from ..forecast.mt5 import MT5Forecaster
 from ..live.urgency import urgency_score
 from ..live.volume_profile import volume_profile
 from ..live.hot_scalp import HotScalpConfig, HotScalpResearchEngine
+from ..live.multitf import atr14 as _atr14
 from ..live.evidence import (BASE_CATEGORY_WEIGHTS, EvidenceItem, score_evidence)
 from ..live.stacking import evaluate_layer_add as _evaluate_layer_add
 from ..live.patterns import (detect_sweep as _ev_detect_sweep,
@@ -438,6 +440,14 @@ class MT5RunnerConfig:
     # context, but deliberately has no order-dispatch path.
     hot_scalp_shadow_enabled: bool = True
     hot_scalp_db_path: Path | None = None
+    # Step 6 promotion switch: DEFAULT OFF, config-file/env only.
+    # /set cannot touch it — parse_set allowlists only max_layers,
+    # manipulation_filter, pending_expiry_bars, playbook.* — so
+    # enabling live Hot Scalp authority is a deliberate operator
+    # act on the host, never a chat command.  While OFF, the
+    # promotion method is never called from the live loop, and it
+    # refuses even when called directly (defense in depth).
+    hot_scalp_live_enabled: bool = False
     # DXY correlation (owner's-bot floor): the XAUUSD vs DXYm
     # correlation is confluence context (Ghost Sentinel bands,
     # bounded ±0.5) — never a gate leg.  A dead DXY feed degrades
@@ -564,6 +574,10 @@ class MT5RunnerConfig:
         env_shadow = os.environ.get("GS_HOT_SCALP_SHADOW")
         if env_shadow is not None:
             self.hot_scalp_shadow_enabled = env_shadow.strip().lower() in (
+                "1", "true", "yes", "on")
+        env_live = os.environ.get("GS_HOT_SCALP_LIVE")
+        if env_live is not None:
+            self.hot_scalp_live_enabled = env_live.strip().lower() in (
                 "1", "true", "yes", "on")
         if self.hot_scalp_db_path is None:
             self.hot_scalp_db_path = self.journal_path.parent / "hot_scalp_setups.db"
@@ -6682,12 +6696,18 @@ class MT5Runner:
                 trigger_source="resting_limit",
                 context=self._decision_context())
 
-    def _run_hot_scalp_shadow(self, tick: dict) -> None:
-        """Observe the separate Hot Scalp sleeve without granting order authority."""
+    def _run_hot_scalp_shadow(self, tick: dict) -> list[dict]:
+        """Observe the separate Hot Scalp sleeve without granting order authority.
+
+        Returns the engine's events (step 6: the live loop feeds
+        candidate_shadow events to the flag-gated promotion path;
+        returning them changes no existing caller, which ignored
+        the previous None).
+        """
         engine = getattr(self, "_hot_scalp", None)
         stack = getattr(self, "_stack", None)
         if engine is None or stack is None:
-            return
+            return []
         try:
             _scalp_frames = dict(stack.frames or {})
             _scalp_frames["M1"] = self._hot_scalp_aux_frames.get("M1")
@@ -6737,6 +6757,185 @@ class MT5Runner:
                         f"— shadow only")
                 except Exception:
                     pass
+        return events
+
+    def _promote_hot_scalp_candidate(self, candidate: dict, tick: dict,
+                                     stats: dict) -> bool:
+        """Promote one shadow candidate to the SHARED order path (step 6).
+
+        Disabled by default (``hot_scalp_live_enabled``); the flag
+        is config-file/env only and can never be flipped from chat.
+        Every refusal is journalled with a reason code, and the
+        claim's fate follows the refusal kind:
+
+        - transient refusals (paused, spread widened, order-path
+          refusal with nothing placed) resolve the claim back to
+          "touched" via an authoritative False — the setup stays
+          live and may re-trigger;
+        - disagreement/ambiguity (broker shows an untracked magic
+          position, broker lookup failed, fill recorded but broker
+          does not confirm it) LEAVES the claim claimed — fail
+          closed; the setup expires on its TTL if nothing resolves
+          it, and V2 reconciliation remains the only release.
+        - success resolves to "order_reconciled" only after the
+          broker itself shows the new magic position.
+
+        v1 scope, stated honestly: flat-only (a candidate while
+        holding is refused — scalp layering needs the parent
+        identity mapping between hot-scalp setup IDs and live
+        alert IDs, which does not exist yet) and market-shape-only
+        (a candidate whose promotion tick would select a pending
+        order is refused — pending-fill claim resolution is not
+        built yet, and a pending that later fills must never leave
+        its claim dangling).
+        """
+        sid = str(candidate.get("setup_id") or "")
+        engine = getattr(self, "_hot_scalp", None)
+        if not self.cfg.hot_scalp_live_enabled:
+            self.journal.log_note(
+                f"mt5: hot_scalp promotion refused {sid}: "
+                f"live authority OFF (hot_scalp_live_enabled=False)")
+            return False
+        if engine is None:
+            return False
+        claim = candidate.get("claim") or {}
+        if str(claim.get("claimant") or "") != str(engine.instance_id):
+            self.journal.log_note(
+                f"mt5: hot_scalp promotion refused {sid}: claim owned "
+                f"by another process ({claim.get('claimant')})")
+            return False
+
+        def _resolve(exists: bool) -> bool:
+            try:
+                return bool(engine.store.resolve_claim_after_broker_reconciliation(
+                    setup_id=sid,
+                    fencing_token=int(claim.get("fencing_token") or 0),
+                    broker_order_exists=bool(exists), now=tick.get("time")))
+            except Exception as exc:
+                self.journal.log_note(
+                    f"mt5: hot_scalp claim resolution failed {sid}: {exc}")
+                return False
+
+        if self.cfg.paused:
+            self.journal.log_note(
+                f"mt5: hot_scalp promotion refused {sid}: runner paused")
+            _resolve(False)
+            return False
+        # Flat-only v1: a candidate while holding is not a layer
+        # yet — the parent-identity mapping does not exist.
+        if self.tick_manager.tickets():
+            self.journal.log_note(
+                f"mt5: hot_scalp promotion refused {sid}: holding — "
+                f"scalp layering not yet promoted (flat-only v1)")
+            _resolve(False)
+            return False
+        # V2 pre-submit broker check: the broker must agree we are
+        # flat before any new risk is submitted.
+        try:
+            broker_before = [p for p in self.executor.positions()
+                             if int(getattr(p, "magic", -1))
+                             == int(self.cfg.magic)]
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: hot_scalp promotion withheld {sid}: broker "
+                f"lookup failed ({exc}) — claim left claimed")
+            return False
+        if broker_before:
+            self.journal.log_note(
+                f"mt5: hot_scalp promotion refused {sid}: broker "
+                f"shows an untracked magic position — claim left claimed")
+            return False
+        # Cost-envelope re-check at the promotion tick: the spread
+        # that was tight at trigger time may have widened since.
+        try:
+            bid, ask = float(tick.get("bid")), float(tick.get("ask"))
+            spread = ask - bid
+            m1 = (getattr(self, "_hot_scalp_aux_frames", {}) or {}).get("M1")
+            atr1 = float(_atr14(m1) or 0.0) if m1 is not None \
+                and len(m1) >= 15 else 0.0
+        except (TypeError, ValueError):
+            bid, ask, spread, atr1 = 0.0, 0.0, None, 0.0
+        if spread is None or spread < 0 or atr1 <= 0 \
+                or spread > engine.cfg.max_spread_atr_m1 * atr1:
+            self.journal.log_note(
+                f"mt5: hot_scalp promotion refused {sid}: cost "
+                f"envelope unverifiable or exceeded at promotion "
+                f"(spread={spread}, m1_atr={atr1})")
+            _resolve(False)
+            return False
+        # Market-shape-only v1: promotion runs on the trigger tick,
+        # where price IS the entry, so the shared path must select
+        # MARKET.  Anything else (limit/stop/invalid) is refused
+        # rather than leaving a pending whose fill could never
+        # resolve this claim.
+        direction = 1 if int(candidate.get("direction", 0)) > 0 else -1
+        entry_ref = float(candidate.get("entry_reference") or 0.0)
+        mid = float(tick.get("mid") or entry_ref)
+        setup_row = None
+        try:
+            for row in engine.store.active():
+                if str(row.get("setup_id")) == sid:
+                    setup_row = row
+                    break
+        except Exception:
+            setup_row = None
+        setup = (setup_row or {}).get("payload") or {}
+        atr_m5 = 0.0
+        try:
+            atr_m5 = float(setup.get("atr_m5") or 0.0)
+        except (TypeError, ValueError):
+            atr_m5 = 0.0
+        kind, _level, _why = select_order_type(
+            direction=direction, price=mid, entry_ref=entry_ref,
+            atr=atr_m5)
+        if kind != "market":
+            self.journal.log_note(
+                f"mt5: hot_scalp promotion refused {sid}: order "
+                f"shape is {kind}, not market (market-shape-only v1)")
+            _resolve(False)
+            return False
+        sig = SimpleNamespace(
+            direction=direction, entry_ref=entry_ref,
+            invalidation=float(candidate.get("structural_stop") or 0.0),
+            targets=[float(candidate.get("target_reference") or 0.0)],
+            atr=atr_m5, index=self._current_h1_bar(),
+            score=float(candidate.get("score") or 0.0),
+            execution_eligible=True)
+        pb = SimpleNamespace(name="hot_scalp")
+        tracked_before = set(self.tick_manager.tickets())
+        self._last_tick = dict(tick)
+        # score=None on purpose: _place_live_order's score parameter
+        # must be a Score object (it reads score.total); passing a
+        # float crashes its fill journal.  The candidate score
+        # travels on sig.score, which the order path uses when
+        # score is None.
+        self._place_live_order(
+            pb, sig, stats, verdict={"entry": entry_ref}, score=None)
+        tracked_new = set(self.tick_manager.tickets()) - tracked_before
+        if not tracked_new:
+            # Nothing placed: the shared path refused it (gated and
+            # journalled there).  The setup stays live.
+            _resolve(False)
+            return False
+        try:
+            broker_after = [p for p in self.executor.positions()
+                            if int(getattr(p, "magic", -1))
+                            == int(self.cfg.magic)]
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: hot_scalp fill recorded {sid} but broker "
+                f"confirmation lookup failed ({exc}) — claim left claimed")
+            return False
+        if not broker_after:
+            self.journal.log_note(
+                f"mt5: hot_scalp fill recorded {sid} but broker "
+                f"shows no new magic position — claim left claimed")
+            return False
+        _resolve(True)
+        self.journal.log_note(
+            f"mt5: hot_scalp promoted {sid}: order reconciled at "
+            f"broker (claim resolved)")
+        return True
 
     def _evaluate_live_tick(self, tick: dict, stats: dict) -> None:
         """Live evaluation clock: touch arms, family confirms, entry
@@ -6746,7 +6945,26 @@ class MT5Runner:
         # Independent Hot Scalp research: it runs on every live tick even while
         # the main sleeve is holding/paused. Its only output is a journaled
         # shadow candidate; it cannot submit orders or alter existing gates.
-        self._run_hot_scalp_shadow(tick)
+        # Step 6: when (and only when) the operator has enabled live
+        # Hot Scalp authority on the host, this tick's shadow
+        # candidates also flow to the flag-gated promotion path.
+        _hs_events = self._run_hot_scalp_shadow(tick)
+        if self.cfg.hot_scalp_live_enabled:
+            for _event in _hs_events or []:
+                if _event.get("event") == "candidate_shadow":
+                    # Safety boundary: a promotion failure must
+                    # never break the tick loop (the shared order
+                    # path can raise after a fill, e.g. on a
+                    # journal error — the claim then stays claimed,
+                    # fail closed, and the loop continues).
+                    try:
+                        self._promote_hot_scalp_candidate(
+                            _event, tick, stats)
+                    except Exception as exc:
+                        self.journal.log_note(
+                            f"mt5: hot_scalp promotion error "
+                            f"{_event.get('setup_id')}: "
+                            f"{type(exc).__name__}: {exc}")
         mid = float(tick["mid"])
         # Zone cache: per-tick nearby query (in-memory bisect, no
         # SQLite) — runs even while paused / holding, so /status
