@@ -75,7 +75,7 @@ def log_signal(journal, *, signal_id: str, playbook: str,
         decision = "gated"
         reason = f"unknown decision recorded as gated; was: {decision!r}"
     try:
-        return journal.append({
+        record = {
             "type": "signal",
             "signal_id": signal_id,
             "playbook": playbook,
@@ -104,7 +104,25 @@ def log_signal(journal, *, signal_id: str, playbook: str,
             # trigger clock — the scenario the decision was made
             # IN, on the record.  None on legacy-path records.
             "context": context,
-        })
+        }
+        # The common evidence ledger is deliberately a shadow-only addition.
+        # Existing playbook decisions and execution gates are unchanged until
+        # chronological, cost-aware testing supports promotion. A provider is
+        # attached by the MT5 runner; standalone/paper users remain compatible.
+        provider = getattr(journal, "shared_evidence_provider", None)
+        if decision != "management" and callable(provider):
+            try:
+                record["shared_evidence"] = provider(
+                    direction=int(direction), playbook=str(playbook),
+                    entry=entry, bar_ts=bar_ts, context=context or {})
+            except Exception as exc:  # observational failure never blocks a signal
+                record["shared_evidence"] = {
+                    "status": "unavailable",
+                    "reason_code": "shared_evidence.provider_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "execution_gate": False,
+                }
+        return journal.append(record)
     except Exception:
         return {}
 

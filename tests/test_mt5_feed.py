@@ -59,8 +59,8 @@ def test_warm_start_all_closed_bars_only():
     feed = _feed()
     feed.connect()
     frames = feed.warm_start_all()
-    # Stack TFs + macro TFs (W1/MN1 feed alignment + strategies;
-    # they are NOT hierarchy legs).
+    # Default feed contract: hierarchy TFs + macro TFs (W1/MN1). M1
+    # is requested explicitly by the Hot Scalp sleeve, never by default.
     assert set(frames) == {"D1", "H4", "H1", "M15", "M30", "M5",
                            "W1", "MN1"}
     now = pd.Timestamp.now(tz="UTC")
@@ -79,6 +79,15 @@ def test_warm_start_all_closed_bars_only():
         last_close = frame.index[-1] + pd.Timedelta(
             minutes=tf_minutes[tf])
         assert last_close <= now + pd.Timedelta(seconds=5)
+
+
+
+def test_auxiliary_m1_is_opt_in_and_not_a_hierarchy_leg():
+    feed = _feed(auxiliary_tfs=("M1",))
+    feed.connect()
+    frames = feed.warm_start_all()
+    assert "M1" in frames
+    assert "M1" not in feed.cfg.granularities
 
 
 def test_fetch_new_all_returns_only_newer_closed_bars():

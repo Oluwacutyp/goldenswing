@@ -171,7 +171,7 @@ def order_blocks(df: pd.DataFrame, *, lookback: int = 60) -> list[dict]:
                     else "bearish_ob", "direction": direction,
                     "top": top, "bottom": bottom,
                     "level": (top + bottom) / 2.0,
-                    "bar_index": int(sub.index[i]),
+                    "bar_index": int(i),
                     "ts": sub.index[i], "mitigated": mitigated,
                     "score": 55.0 if not mitigated else 20.0})
     out.sort(key=lambda b: b["bar_index"], reverse=True)
@@ -256,7 +256,7 @@ def fvg_list(df: pd.DataFrame, *, lookback: int = 120) -> list[dict]:
                     else "bearish_fvg", "direction": direction,
                     "top": top, "bottom": bottom,
                     "ce": (top + bottom) / 2.0,
-                    "bar_index": int(sub.index[i]), "ts": sub.index[i],
+                    "bar_index": int(i), "ts": sub.index[i],
                     "filled": filled, "inverted": inverted,
                     "score": 60.0 if not filled else (
                         65.0 if inverted else 25.0)})
@@ -343,7 +343,7 @@ def detect_sweep(df: pd.DataFrame, level: float, *, direction: int,
                         "detail": f"sweep above {level:.1f}: wick "
                         f"{h[i]:.1f}, close back {c[i]:.1f}",
                         "wick": float(h[i]), "close": float(c[i]),
-                        "bar_index": int(df.index[i])}
+                        "bar_index": int(i), "ts": df.index[i]}
         else:  # sweep below a low -> long
             if l[i] <= level - SWEEP_MIN_ATR * a and c[i] > level:
                 return {"present": True, "score": 70.0,
@@ -351,7 +351,7 @@ def detect_sweep(df: pd.DataFrame, level: float, *, direction: int,
                         "detail": f"sweep below {level:.1f}: wick "
                         f"{l[i]:.1f}, close back {c[i]:.1f}",
                         "wick": float(l[i]), "close": float(c[i]),
-                        "bar_index": int(df.index[i])}
+                        "bar_index": int(i), "ts": df.index[i]}
     return _absent("no sweep wick + close-back-inside in last 5 bars")
 
 
@@ -642,10 +642,12 @@ def session_label(ts) -> dict:
     killzone = None
     if 2.0 <= hh < 5.0:
         killzone = "london_killzone"
+    elif 10.0 <= hh < 10.5:
+        # The 10:00 New York silver-bullet window is after the NY KZ;
+        # keep it distinct instead of shadowed by the 07:00-10:00 branch.
+        killzone = "silver_bullet"
     elif 7.0 <= hh < 10.0:
         killzone = "ny_killzone"
-    elif 9.9 <= hh < 10.3:
-        killzone = "silver_bullet"
     elif 11.0 <= hh < 12.0:
         killzone = "london_close"
     elif 15.0 <= hh < 16.0:

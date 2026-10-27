@@ -99,6 +99,19 @@ from ..live.sizing import RiskPool, size_for_risk
 from ..forecast.mt5 import MT5Forecaster
 from ..live.urgency import urgency_score
 from ..live.volume_profile import volume_profile
+from ..live.hot_scalp import HotScalpConfig, HotScalpResearchEngine
+from ..live.evidence import (BASE_CATEGORY_WEIGHTS, EvidenceItem, score_evidence)
+from ..live.patterns import (detect_sweep as _ev_detect_sweep,
+                             liquidity_pools as _ev_liquidity_pools,
+                             order_blocks as _ev_order_blocks,
+                             premium_discount as _ev_premium_discount,
+                             session_label as _ev_session_label,
+                             structure_event as _ev_structure_event,
+                             trend_bias as _ev_trend_bias,
+                             unfilled_fvgs as _ev_unfilled_fvgs,
+                             volume_confirm as _ev_volume_confirm)
+from ..live.candle_taxonomy import detect_named_patterns as _ev_named_candles
+from ..live.setup_store import SetupStore, SetupStoreError
 from ..live.hierarchy import (LEG_ORDER, TimeframeStack, TF_MINUTES,
                               check_live_trigger,
                               check_zone_touch, evaluate_hierarchy,
@@ -417,6 +430,11 @@ class MT5RunnerConfig:
     # real choice, not inert config.  Config-file / env only.
     scalp_playbooks: tuple = ()
     scalp_cap_minutes: float = 15.0  # owner's scalping_max_holding
+    # The first Hot Scalp implementation is a distinct, persistent RESEARCH
+    # sleeve. It journals candidates from M1 reactions + M5 structure + M15
+    # context, but deliberately has no order-dispatch path.
+    hot_scalp_shadow_enabled: bool = True
+    hot_scalp_db_path: Path | None = None
     # DXY correlation (owner's-bot floor): the XAUUSD vs DXYm
     # correlation is confluence context (Ghost Sentinel bands,
     # bounded ±0.5) — never a gate leg.  A dead DXY feed degrades
@@ -540,6 +558,12 @@ class MT5RunnerConfig:
         # Same for the Friday-close action: unknown -> "hold".
         if self.friday_close_action not in ("hold", "close"):
             self.friday_close_action = "hold"
+        env_shadow = os.environ.get("GS_HOT_SCALP_SHADOW")
+        if env_shadow is not None:
+            self.hot_scalp_shadow_enabled = env_shadow.strip().lower() in (
+                "1", "true", "yes", "on")
+        if self.hot_scalp_db_path is None:
+            self.hot_scalp_db_path = self.journal_path.parent / "hot_scalp_setups.db"
 
 
 @dataclass
@@ -642,6 +666,16 @@ def _telegram_startup_warnings(senders: list) -> list[str]:
     return []
 
 
+def _safe_atr(frame) -> float:
+    """Best-effort finite ATR for observational evidence only."""
+    try:
+        from ..live.multitf import atr14
+        value = float(atr14(frame))
+        return value if math.isfinite(value) and value > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
 class MT5Runner:
     """Tick-driven live loop on MT5 feed + MT5 executor."""
 
@@ -665,6 +699,23 @@ class MT5Runner:
         # printed once per process start, never every 30s poll.
         self._tg_unavailable_logged = False
         self.journal = TradeJournal(self.cfg.journal_path)
+        # Hot Scalp is a separate, persistent research sleeve. Setup storage
+        # lives beside the journal so two runner processes on this EC2 host
+        # share identity and atomic trigger claims. Failure disables this
+        # sleeve; it never falls back to in-memory ownership or order dispatch.
+        self._hot_scalp: HotScalpResearchEngine | None = None
+        self._hot_scalp_last_degraded_key: str | None = None
+        self._hot_scalp_instance_id = uuid.uuid4().hex
+        if self.cfg.hot_scalp_shadow_enabled:
+            try:
+                _hs_store = SetupStore(self.cfg.hot_scalp_db_path)
+                self._hot_scalp = HotScalpResearchEngine(
+                    _hs_store, HotScalpConfig(enabled=True),
+                    instance_id=self._hot_scalp_instance_id)
+            except Exception as _hs_exc:
+                self.journal.log_note(
+                    "hot_scalp: shadow sleeve disabled because shared setup "
+                    f"storage is unavailable: {_hs_exc}")
         # Forecast service (owner rulings §3): forecasts + alerts only.
         # The engine trains itself: untrained at warm start, or stale
         # by 500+ new H1 bars at a D1 close, it trains in the
@@ -724,6 +775,11 @@ class MT5Runner:
         self._playbooks: list | None = None
         self._engine: ConfluenceEngine | None = None
         self._stack: TimeframeStack | None = None
+        # M1 is an auxiliary trigger stream for Hot Scalp, deliberately kept
+        # outside the hierarchy stack so it cannot become a context vote.
+        self._hot_scalp_aux_frames: dict[str, pd.DataFrame] = {}
+        self._hot_scalp_last_processed_m1: pd.Timestamp | None = None
+        self._hot_scalp_m1_refresh_error_key: str | None = None
         self._qm_touch: dict | None = None
         # Daily QM: last touch index already journal-logged
         # (the D1 scan logs each touch once, never re-logs history).
@@ -1017,6 +1073,10 @@ class MT5Runner:
                         f"playbooks): {', '.join(_dropped)}")
             except Exception:
                 pass
+        # Common evidence is attached to the signal logger so every existing
+        # MT5 playbook gets the same explainable, non-gating research snapshot.
+        # It cannot alter a verdict or authorize an order.
+        self.journal.shared_evidence_provider = self._build_shared_signal_evidence
 
     # ------------------------------------------------------------ wiring
     def _get_playbooks(self) -> list:
@@ -1809,7 +1869,25 @@ class MT5Runner:
             # when poll_status says not-ok — a stale / disconnected
             # feed is a feed problem, distinct from a flat-bias HOLD.
             self.report_feed_status(feed.poll_status())
-            self._stack = TimeframeStack.from_frames(feed.warm_start_all())
+            # M1 is an auxiliary trigger stream for Hot Scalp, NOT a new
+            # higher-timeframe hierarchy leg. It is fetched only while the
+            # research sleeve is enabled.
+            if hasattr(feed, "cfg") and hasattr(feed.cfg, "auxiliary_tfs"):
+                _aux = tuple(getattr(feed.cfg, "auxiliary_tfs", ()) or ())
+                if self._hot_scalp is not None:
+                    feed.cfg.auxiliary_tfs = tuple(dict.fromkeys(_aux + ("M1",)))
+                else:
+                    feed.cfg.auxiliary_tfs = tuple(x for x in _aux if x != "M1")
+            _warm_frames = feed.warm_start_all()
+            if self._hot_scalp is not None:
+                _m1 = _warm_frames.pop("M1", None)
+                if _m1 is not None and len(_m1):
+                    self._hot_scalp_aux_frames["M1"] = _m1.tail(3000)
+                    self._hot_scalp_last_processed_m1 = (
+                        _m1.index[-1] + pd.Timedelta(minutes=1))
+            else:
+                _warm_frames.pop("M1", None)
+            self._stack = TimeframeStack.from_frames(_warm_frames)
             h1 = self._stack.frames.get("H1")
             if h1 is None or len(h1) == 0:
                 raise RuntimeError("MT5 runner: warm start returned no H1 bars")
@@ -2993,6 +3071,37 @@ class MT5Runner:
             closed = MT5Feed.closed_bar_close(tf, tick_time)
             if closed > self._last_processed.get(tf, closed):
                 closed_tfs.append(tf)
+        # Refresh the separate M1 trigger stream on its own minute clock.
+        # It is deliberately not inserted into TimeframeStack: that stack is
+        # reserved for hierarchy/context frames. A missed/failed M1 refresh
+        # simply makes Hot Scalp fail closed on freshness; it cannot disturb
+        # the main strategy clock.
+        if self._hot_scalp is not None:
+            m1_close = MT5Feed.closed_bar_close("M1", tick_time)
+            if (self._hot_scalp_last_processed_m1 is None
+                    or m1_close > self._hot_scalp_last_processed_m1):
+                try:
+                    _m1_current = self._hot_scalp_aux_frames.get("M1")
+                    _m1_cursor = (_m1_current.index[-1]
+                                  if _m1_current is not None and len(_m1_current)
+                                  else None)
+                    _m1_new = self.feed.fetch_new_all(
+                        {"M1": _m1_cursor}, tfs=("M1",)).get("M1")
+                    if _m1_new is not None and len(_m1_new):
+                        _m1_merged = pd.concat([_m1_current, _m1_new]) \
+                            if _m1_current is not None and len(_m1_current) \
+                            else _m1_new
+                        _m1_merged = _m1_merged.sort_index()
+                        _m1_merged = _m1_merged[~_m1_merged.index.duplicated(keep="last")]
+                        self._hot_scalp_aux_frames["M1"] = _m1_merged.tail(3000)
+                        self._hot_scalp_last_processed_m1 = (
+                            _m1_merged.index[-1] + pd.Timedelta(minutes=1))
+                    self._hot_scalp_m1_refresh_error_key = None
+                except Exception as _m1_exc:
+                    _error_key = f"{m1_close}:{type(_m1_exc).__name__}:{_m1_exc}"
+                    if _error_key != self._hot_scalp_m1_refresh_error_key:
+                        _log.warning("hot_scalp M1 refresh failed; shadow scan will fail closed: %s", _m1_exc)
+                        self._hot_scalp_m1_refresh_error_key = _error_key
         if not closed_tfs:
             return
         # Logged (info): this fetch is the live engine's normal
@@ -3004,7 +3113,14 @@ class MT5Runner:
         # warnings are now warm-start-only via warn_short=False.)
         _log.info("mt5 refresh: TFs closed: %s — fetching new bars",
                   closed_tfs)
-        fresh = self.feed.fetch_new_all(cursors)
+        try:
+            fresh = self.feed.fetch_new_all(cursors, tfs=tuple(closed_tfs))
+        except TypeError as _fetch_type_error:
+            # Legacy test doubles / externally supplied feeds may still expose
+            # the pre-filter signature; keep that adapter explicit.
+            if "tfs" not in str(_fetch_type_error) and "keyword" not in str(_fetch_type_error):
+                raise
+            fresh = self.feed.fetch_new_all(cursors)
         # Phase 2: append every newly closed bar; refresh legs.
         appended: list[str] = []
         appended_counts: dict[str, int] = {}
@@ -3439,6 +3555,343 @@ class MT5Runner:
                 else ts.tz_localize("UTC").to_pydatetime()
         from datetime import datetime, timezone
         return datetime.now(timezone.utc)
+
+    def _build_shared_signal_evidence(self, *, direction: int, playbook: str,
+                                      entry: float | None, bar_ts=None,
+                                      context: dict | None = None) -> dict:
+        """Build the common evidence snapshot for any emitted MT5 signal.
+
+        This is audit/research metadata only. Missing measurements are neutral,
+        correlated evidence shares one contribution budget, and the result is
+        never consumed by the execution path. Main playbooks remain governed by
+        their current decision/risk logic until this measure is calibrated on
+        chronological, cost-aware replay.
+        """
+        try:
+            direction = 1 if int(direction) > 0 else -1 if int(direction) < 0 else 0
+            if direction == 0:
+                return {"status": "unavailable", "reason_code": "direction.invalid",
+                        "execution_gate": False}
+            stack = getattr(self, "_stack", None)
+            frames = dict(getattr(stack, "frames", {}) or {}) if stack is not None else {}
+            m5 = frames.get("M5")
+            m15 = frames.get("M15")
+            aux = getattr(self, "_hot_scalp_aux_frames", {}) or {}
+            m1 = aux.get("M1")
+            # This is an observational layer called on signal emissions, not a
+            # history backfill. Bound every detector to recent causal windows so
+            # a large MT5 cache cannot stall the tick-driven execution loop.
+            if m5 is not None and len(m5) > 600:
+                m5 = m5.tail(600)
+            if m15 is not None and len(m15) > 600:
+                m15 = m15.tail(600)
+            if m1 is not None and len(m1) > 300:
+                m1 = m1.tail(300)
+            if m5 is None or not len(m5) or m15 is None or not len(m15):
+                return {"status": "unavailable", "reason_code": "data.stack_not_ready",
+                        "playbook": str(playbook), "execution_gate": False,
+                        "data_timestamps": {tf: str(df.index[-1])
+                                             for tf, df in (("M5", m5), ("M15", m15))
+                                             if df is not None and len(df)}}
+
+            def _utc(value):
+                try:
+                    ts = pd.Timestamp(value)
+                    if ts.tzinfo is None:
+                        ts = ts.tz_localize("UTC")
+                    else:
+                        ts = ts.tz_convert("UTC")
+                    return ts
+                except Exception:
+                    return None
+
+            tick = getattr(self, "_last_tick", None) or {}
+            now = _utc(tick.get("time") or bar_ts or m5.index[-1])
+            if now is None:
+                return {"status": "unavailable", "reason_code": "clock.invalid",
+                        "playbook": str(playbook), "execution_gate": False}
+            observed_price = None
+            try:
+                if entry is not None and math.isfinite(float(entry)) and float(entry) > 0:
+                    observed_price = float(entry)
+            except (TypeError, ValueError):
+                pass
+            if observed_price is None:
+                try:
+                    bid, ask = float(tick.get("bid")), float(tick.get("ask"))
+                    observed_price = (bid + ask) / 2 if bid > 0 and ask >= bid else None
+                except (TypeError, ValueError):
+                    observed_price = None
+            if observed_price is None:
+                observed_price = float(m5["close"].iloc[-1])
+
+            items: list[EvidenceItem] = []
+            timestamps = {"M5": _utc(m5.index[-1]), "M15": _utc(m15.index[-1])}
+            if m1 is not None and len(m1):
+                timestamps["M1"] = _utc(m1.index[-1])
+
+            def _item(key, label, source, observed_at, timeframe, category,
+                      group, stance="neutral", strength=0.0, available=True,
+                      detail=""):
+                ts = _utc(observed_at)
+                items.append(EvidenceItem(
+                    key=str(key), label=str(label), source=str(source),
+                    observed_at=ts.isoformat() if ts is not None else "unknown",
+                    timeframe=str(timeframe), category=str(category),
+                    correlation_group=str(group), stance=stance,
+                    strength=float(strength), available=bool(available),
+                    detail=str(detail)))
+
+            # M15 context bias.
+            m15_ctx = _ev_trend_bias(m15)
+            cdir = int(m15_ctx.get("bias", 0) or 0)
+            _item(f"m15_bias:{timestamps['M15']}:{direction}",
+                  "M15 swing-structure context", "patterns.trend_bias",
+                  m15.index[-1], "M15", "higher_context",
+                  f"m15-context:{timestamps['M15']}",
+                  "supports" if cdir == direction else
+                  "contradicts" if cdir == -direction else "neutral",
+                  1.0 if cdir else 0.0, detail=m15_ctx.get("detail", "bias unavailable"))
+
+            # M5 swing bias and last-bar event are intentionally one correlated
+            # evidence group: two labels derived from the same local structure
+            # must not count as two independent confirmations.
+            m5_ctx = _ev_trend_bias(m5)
+            bdir = int(m5_ctx.get("bias", 0) or 0)
+            group_m5 = f"m5-structure:{timestamps['M5']}"
+            _item(f"m5_bias:{timestamps['M5']}:{direction}",
+                  "M5 swing structure", "patterns.trend_bias", m5.index[-1],
+                  "M5", "structure", group_m5,
+                  "supports" if bdir == direction else
+                  "contradicts" if bdir == -direction else "neutral",
+                  0.8 if bdir else 0.0, detail=m5_ctx.get("detail", "bias unavailable"))
+            try:
+                event = _ev_structure_event(m5, trend=cdir)
+            except Exception as exc:
+                event = {"present": False, "detail": f"detector error: {type(exc).__name__}"}
+            edir = int(event.get("direction", 0) or 0)
+            _item(f"m5_event:{timestamps['M5']}:{event.get('event', 'none')}:{direction}",
+                  "M5 BOS/CHoCH/MSB event", "patterns.structure_event",
+                  m5.index[-1], "M5", "structure", group_m5,
+                  "supports" if event.get("present") and edir == direction else
+                  "contradicts" if event.get("present") and edir == -direction else "neutral",
+                  min(1.0, float(event.get("score", 0.0) or 0.0) / 75.0),
+                  detail=event.get("detail", "no confirmed event"))
+
+            # Nearest unfilled FVG around the actual candidate price. If it is
+            # part of the latest M5 impulse, it shares that event's correlation
+            # group rather than increasing the score independently.
+            try:
+                fvgs = _ev_unfilled_fvgs(m5, lookback=120)
+                near = [f for f in fvgs if float(f["bottom"]) <= observed_price + 0.5 * max(_safe_atr(m5), 0.0)
+                        and float(f["top"]) >= observed_price - 0.5 * max(_safe_atr(m5), 0.0)]
+                if near:
+                    fvg = min(near, key=lambda f: abs(float(f.get("ce", (float(f["top"])+float(f["bottom"]))/2)) - observed_price))
+                    fdir = int(fvg.get("direction", 0) or 0)
+                    fts = _utc(fvg.get("ts"))
+                    evts = _utc(m5.index[-1])
+                    same_impulse = fts is not None and evts is not None and abs((evts - fts).total_seconds()) <= 2 * 5 * 60
+                    fgroup = f"m5-structure:{timestamps['M5']}" if same_impulse else f"fvg:{fts.isoformat() if fts is not None else 'unknown'}"
+                    _item(f"fvg:{fts}:{fdir}", "nearby unfilled fair-value gap",
+                          "patterns.unfilled_fvgs", fvg.get("ts"), "M5", "imbalance", fgroup,
+                          "supports" if fdir == direction else
+                          "contradicts" if fdir == -direction else "neutral",
+                          0.7, detail=f"FVG {fvg.get('bottom')}–{fvg.get('top')}; filled={fvg.get('filled')}")
+            except Exception:
+                # Unknown FVG schema is neutral; don't manufacture support.
+                pass
+
+            # Liquidity is a conditional event, not an automatic vote. First find
+            # a measured nearby pool, then require wick-through + close-back-inside
+            # from the detector. The sweep direction is the trade direction AFTER
+            # the sweep, and shares its reaction group with a candle pattern on the
+            # exact same bar so one rejection event isn't counted twice.
+            try:
+                atr5 = _safe_atr(m5)
+                pools = _ev_liquidity_pools(m5, lookback=240)
+                nearby_pools = [p for p in pools
+                                if abs(float(p.get("level", 0.0)) - observed_price)
+                                <= max(0.0, atr5 * 0.75)] if atr5 > 0 else []
+                if nearby_pools:
+                    pool = min(nearby_pools,
+                               key=lambda p: abs(float(p["level"]) - observed_price))
+                    sweep = _ev_detect_sweep(m5, float(pool["level"]),
+                                             direction=direction, atr=atr5)
+                    if sweep.get("present"):
+                        sweep_ts = _utc(sweep.get("ts")) or timestamps["M5"]
+                        _item(f"liquidity-sweep:{sweep_ts}:{direction}",
+                              "confirmed liquidity sweep and close-back-inside",
+                              "patterns.liquidity_pools + patterns.detect_sweep",
+                              sweep_ts, "M5", "reaction",
+                              f"m5-reaction:{sweep_ts.isoformat() if sweep_ts is not None else 'unknown'}",
+                              "supports", min(1.0, float(sweep.get("score", 70.0)) / 100.0),
+                              detail=str(sweep.get("detail", "confirmed sweep"))
+                              + f"; pool={pool.get('side')} level={pool.get('level')}")
+            except Exception:
+                # A missing pool/sweep detector is not a negative signal or support.
+                pass
+
+            # Recent named candle patterns can explain the final reaction. Only
+            # the freshest two closed bars are relevant; age/meaning are recorded,
+            # and neutral dojis never become directional support.
+            try:
+                for candle in _ev_named_candles(m5, window=3):
+                    if int(candle.get("bars_ago", 999)) > 1:
+                        continue
+                    candle_dir = int(candle.get("direction", 0) or 0)
+                    candle_ts = _utc(candle.get("bar_ts")) or timestamps["M5"]
+                    c_stance = ("supports" if candle_dir == direction else
+                                "contradicts" if candle_dir == -direction else "neutral")
+                    _item(f"candle:{candle.get('name')}:{candle_ts}:{direction}",
+                          f"recent candle pattern: {candle.get('name')}",
+                          "live.candle_taxonomy.detect_named_patterns", candle_ts,
+                          "M5", "reaction",
+                          f"m5-reaction:{candle_ts.isoformat() if candle_ts is not None else 'unknown'}",
+                          c_stance, 0.55 if c_stance != "neutral" else 0.0,
+                          detail=f"bars_ago={candle.get('bars_ago')}; direction={candle_dir}")
+            except Exception:
+                pass
+
+            # A nearby unmitigated order block is a location read, not a standalone
+            # trigger. It shares the location category's cap with premium/discount.
+            try:
+                atr5 = _safe_atr(m5)
+                blocks = [b for b in _ev_order_blocks(m5, lookback=60)
+                          if not bool(b.get("mitigated"))
+                          and float(b.get("bottom", 0.0)) - 0.25 * atr5 <= observed_price
+                          <= float(b.get("top", 0.0)) + 0.25 * atr5] if atr5 > 0 else []
+                if blocks:
+                    block = min(blocks, key=lambda b: abs(
+                        float(b.get("level", (float(b["top"])+float(b["bottom"]))/2)) - observed_price))
+                    block_dir = int(block.get("direction", 0) or 0)
+                    block_ts = _utc(block.get("ts"))
+                    _item(f"order-block:{block_ts}:{block_dir}:{direction}",
+                          "nearby unmitigated order block", "patterns.order_blocks",
+                          block_ts, "M5", "location",
+                          f"order-block:{block_ts.isoformat() if block_ts is not None else 'unknown'}",
+                          "supports" if block_dir == direction else
+                          "contradicts" if block_dir == -direction else "neutral",
+                          0.65, detail=f"OB {block.get('bottom')}–{block.get('top')}; kind={block.get('kind')}")
+            except Exception:
+                pass
+
+            # Premium/discount only scores when the detector supplies a schema
+            # we understand. Unknown output remains explicitly neutral.
+            try:
+                loc = _ev_premium_discount(m15)
+                zone = str(loc.get("zone", loc.get("position", loc.get("location", "")))).lower()
+                loc_stance = "neutral"
+                if zone in ("discount", "below_eq", "below equilibrium"):
+                    loc_stance = "supports" if direction > 0 else "contradicts"
+                elif zone in ("premium", "above_eq", "above equilibrium"):
+                    loc_stance = "supports" if direction < 0 else "contradicts"
+                _item(f"location:{timestamps['M15']}:{direction}",
+                      "M15 premium/discount location", "patterns.premium_discount",
+                      m15.index[-1], "M15", "location", f"range-location:{timestamps['M15']}",
+                      loc_stance, 0.7 if loc_stance != "neutral" else 0.0,
+                      detail=loc.get("detail", f"location={zone or 'unknown'}"))
+            except Exception:
+                pass
+
+            # Tick volume is directional; a surge opposite the proposed trade
+            # contradicts it instead of automatically voting in favour.
+            try:
+                volume_frame = m5
+                if "volume" not in volume_frame.columns and "tick_volume" in volume_frame.columns:
+                    volume_frame = volume_frame.copy()
+                    volume_frame["volume"] = volume_frame["tick_volume"]
+                vol = _ev_volume_confirm(volume_frame)
+                if vol.get("present"):
+                    last_dir = (1 if float(m5["close"].iloc[-1]) > float(m5["open"].iloc[-1])
+                                else -1 if float(m5["close"].iloc[-1]) < float(m5["open"].iloc[-1]) else 0)
+                    stance = ("supports" if last_dir == direction else
+                              "contradicts" if last_dir == -direction else "neutral")
+                    _item(f"volume:{timestamps['M5']}", "direction-aware M5 volume expansion",
+                          "patterns.volume_confirm + M5 candle direction", m5.index[-1], "M5",
+                          "activity", f"volume:{timestamps['M5']}", stance,
+                          min(1.0, float(vol.get("ratio", 1.5) or 1.5) / 2.0),
+                          detail=str(vol.get("detail", "volume expansion")) + f"; candle_direction={last_dir}")
+            except Exception:
+                pass
+
+            # EMA 9/21 is a small momentum observation, never a trigger or gate.
+            try:
+                if m1 is not None and len(m1) >= 22:
+                    closes = m1["close"].astype(float)
+                    fast = closes.ewm(span=9, adjust=False).mean().iloc[-1]
+                    slow = closes.ewm(span=21, adjust=False).mean().iloc[-1]
+                    gap = float(fast - slow)
+                    atr = _safe_atr(m1)
+                    normalized = abs(gap) / atr if atr > 0 else 0.0
+                    stance = ("neutral" if normalized < 0.05 else
+                              "supports" if direction * gap > 0 else "contradicts")
+                    _item(f"ema9x21:{timestamps.get('M1')}:{direction}",
+                          "M1 EMA(9)/EMA(21) alignment", "pandas.ewm EMA(9)/EMA(21)",
+                          m1.index[-1], "M1", "momentum", f"m1-momentum:{timestamps.get('M1')}",
+                          stance, min(1.0, normalized / 0.25),
+                          detail=f"EMA gap={gap:.6f}, normalized gap={normalized:.3f}")
+                else:
+                    _item(f"ema9x21:missing:{direction}", "M1 EMA momentum unavailable",
+                          "pandas.ewm EMA(9)/EMA(21)", now, "M1", "momentum", "m1-momentum:missing",
+                          available=False, detail="M1 auxiliary stream not ready")
+            except Exception:
+                _item(f"ema9x21:error:{direction}", "M1 EMA momentum unavailable",
+                      "pandas.ewm EMA(9)/EMA(21)", now, "M1", "momentum", "m1-momentum:missing",
+                      available=False, detail="M1 EMA measurement failed")
+
+            # Record the true wall/session state even outside a killzone. Only a
+            # named active window is supportive; ordinary time is neutral.
+            session = _ev_session_label(now)
+            in_window = bool(session.get("in_killzone"))
+            _item(f"session:{now.date()}:{session.get('session')}:{session.get('killzone')}",
+                  "session / killzone context", "patterns.session_label", now,
+                  "clock", "timing", f"session-window:{now.date()}:{session.get('session')}:{session.get('killzone')}",
+                  "supports" if in_window else "neutral", 0.5 if in_window else 0.0,
+                  detail=str(session.get("detail", "session unavailable")))
+
+            # Transaction costs are context on existing paths (their own friction
+            # gates remain authoritative). Missing quotes mean unavailable.
+            try:
+                bid, ask = float(tick.get("bid")), float(tick.get("ask"))
+                spread = ask - bid if bid > 0 and ask >= bid else None
+            except (TypeError, ValueError):
+                spread = None
+            atr1 = _safe_atr(m1) if m1 is not None and len(m1) else 0.0
+            if spread is not None and atr1 > 0:
+                ratio = spread / atr1
+                stance = "supports" if ratio <= 0.20 else "contradicts"
+                strength = min(1.0, max(0.0, 1.0 - ratio / 0.20))
+                _item(f"spread:{now.floor('min')}", "live spread relative to M1 ATR",
+                      "tick.bid/ask + live M1 ATR", now, "tick/M1", "execution_cost",
+                      f"spread-window:{now.floor('min')}", stance, strength,
+                      detail=f"spread/ATR={ratio:.4f}")
+            else:
+                _item(f"spread:missing:{now.floor('min')}", "live spread/ATR unavailable",
+                      "tick.bid/ask + live M1 ATR", now, "tick/M1", "execution_cost",
+                      f"spread-window:{now.floor('min')}", available=False,
+                      detail="quote or M1 ATR unavailable")
+
+            result = score_evidence(items, BASE_CATEGORY_WEIGHTS)
+            data_ts = {tf: (ts.isoformat() if ts is not None else None)
+                       for tf, ts in timestamps.items()}
+            ages = {tf: round(max(0.0, (now - ts).total_seconds()), 3)
+                    if ts is not None else None for tf, ts in timestamps.items()}
+            return {
+                "status": "measured", "playbook": str(playbook),
+                "direction": direction, "observed_price": observed_price,
+                "observed_at": now.isoformat(), "candidate_bar_ts": str(bar_ts) if bar_ts is not None else None,
+                "score": result.score, "score_is_calibrated_probability": False,
+                "method": result.method, "execution_gate": False,
+                "category_weights": dict(BASE_CATEGORY_WEIGHTS),
+                "evidence_score": result.to_dict(),
+                "evidence": [item.to_dict() for item in items],
+                "data_timestamps": data_ts, "data_age_seconds": ages,
+                "session": session, "context": dict(context or {}),
+            }
+        except Exception as exc:
+            return {"status": "unavailable", "reason_code": "shared_evidence.build_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "playbook": str(playbook), "execution_gate": False}
 
     def _decision_context(self, extra: dict | None = None) -> dict:
         """The J journaling context for one decision: regime
@@ -6029,11 +6482,71 @@ class MT5Runner:
                 trigger_source="resting_limit",
                 context=self._decision_context())
 
+    def _run_hot_scalp_shadow(self, tick: dict) -> None:
+        """Observe the separate Hot Scalp sleeve without granting order authority."""
+        engine = getattr(self, "_hot_scalp", None)
+        stack = getattr(self, "_stack", None)
+        if engine is None or stack is None:
+            return
+        try:
+            _scalp_frames = dict(stack.frames or {})
+            _scalp_frames["M1"] = self._hot_scalp_aux_frames.get("M1")
+            events = engine.on_tick(
+                symbol=str(getattr(self.cfg, "symbol", "XAUUSD")),
+                tick=tick, frames=_scalp_frames, now=tick.get("time"))
+        except Exception as exc:  # safety boundary: research cannot break main path
+            events = [{"event": "scan_degraded",
+                       "reason_code": "hot_scalp.runner_adapter_error",
+                       "reason": f"{type(exc).__name__}: {exc}"}]
+        for event in events:
+            name = str(event.get("event", "unknown"))
+            # A stale feed is a state, not a per-tick event. Report once per
+            # unchanged M1 close; reset after the sleeve recovers.
+            if name == "scan_degraded":
+                m1 = self._hot_scalp_aux_frames.get("M1")
+                key = f"{event.get('reason_code')}:{m1.index[-1] if m1 is not None and len(m1) else 'missing'}"
+                if key == self._hot_scalp_last_degraded_key:
+                    continue
+                self._hot_scalp_last_degraded_key = key
+            else:
+                self._hot_scalp_last_degraded_key = None
+            record = {
+                "type": "hot_scalp_event",
+                "run_id": getattr(self, "_run_id", None),
+                "commit": self._build_commit(),
+                "timestamp": str(tick.get("time")),
+                "symbol": str(getattr(self.cfg, "symbol", "XAUUSD")),
+                "event": name,
+                "reason_code": event.get("reason_code"),
+                "execution_authority": "shadow_only",
+                "research_only": True,
+                "details": event,
+            }
+            try:
+                self.journal.append(record)
+            except Exception as exc:
+                # If journaling fails, this sleeve remains non-executable.
+                _log.error("hot_scalp: journal write failed: %s", exc)
+            if name in ("setup_armed", "candidate_shadow", "candidate_blocked",
+                        "setup_invalidated", "setup_expired", "scan_degraded"):
+                try:
+                    self.journal.log_note(
+                        f"hot_scalp {name}: "
+                        f"{event.get('reason_code') or event.get('setup', {}).get('strategy', '')} "
+                        f"{event.get('setup_id') or event.get('setup', {}).get('setup_id', '')} "
+                        f"— shadow only")
+                except Exception:
+                    pass
+
     def _evaluate_live_tick(self, tick: dict, stats: dict) -> None:
         """Live evaluation clock: touch arms, family confirms, entry
         on entry-TF closes.  H1 closes never gate evaluation."""
         if self._stack is None:
             return
+        # Independent Hot Scalp research: it runs on every live tick even while
+        # the main sleeve is holding/paused. Its only output is a journaled
+        # shadow candidate; it cannot submit orders or alter existing gates.
+        self._run_hot_scalp_shadow(tick)
         mid = float(tick["mid"])
         # Zone cache: per-tick nearby query (in-memory bisect, no
         # SQLite) — runs even while paused / holding, so /status

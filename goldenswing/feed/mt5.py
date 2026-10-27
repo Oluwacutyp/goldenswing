@@ -80,7 +80,7 @@ SYMBOL_TRADE_MODE_FULL = 4
 #: still key off nearest levels).
 _WARM_BARS: dict[str, int] = {
     "D1": 2000, "H4": 4200, "H1": 2000, "M15": 3000, "M30": 2000,
-    "M5": 10000, "W1": 500, "MN1": 300,
+    "M5": 10000, "M1": 2000, "W1": 500, "MN1": 300,
 }
 
 
@@ -98,6 +98,10 @@ class MT5FeedConfig:
     #: for the built-in default.
     symbol_explicit: bool = False
     granularities: tuple[str, ...] = STACK_TFS
+    #: Auxiliary native bars used by strategy sleeves without adding new
+    #: hierarchy votes. M1 is a separate trigger/reaction stream; the
+    #: hierarchy leg roster in live.hierarchy.STACK_TFS remains unchanged.
+    auxiliary_tfs: tuple[str, ...] = ()
     #: Macro timeframes (W1/MN1) fetched alongside the stack for
     #: alignment (MacroTrend) and strategy use.  Deliberately NOT
     #: part of STACK_TFS: the hierarchy leg set must not gain W1/MN1
@@ -461,11 +465,14 @@ class MT5Feed:
         included) when you need it.
         """
         now = datetime.now(timezone.utc)
-        tfs = tuple(self.cfg.granularities) + tuple(self.cfg.macro_tfs)
+        tfs = tuple(dict.fromkeys(tuple(self.cfg.granularities)
+                                  + tuple(self.cfg.auxiliary_tfs)
+                                  + tuple(self.cfg.macro_tfs)))
         return {tf: self._closed_only(self.bars(tf, self.cfg.warm_bars.get(tf, 2000)), tf, now)
                 for tf in tfs}
 
-    def fetch_new_all(self, since_by_tf: dict | None = None
+    def fetch_new_all(self, since_by_tf: dict | None = None, *,
+                      tfs: tuple[str, ...] | list[str] | None = None
                       ) -> dict[str, pd.DataFrame]:
         """New CLOSED bars per TF (forming bar dropped — see above).
 
@@ -477,8 +484,11 @@ class MT5Feed:
         since_by_tf = since_by_tf or {}
         now = datetime.now(timezone.utc)
         out: dict[str, pd.DataFrame] = {}
-        tfs = tuple(self.cfg.granularities) + tuple(self.cfg.macro_tfs)
-        for tf in tfs:
+        requested = (tuple(tfs) if tfs is not None else
+                     tuple(dict.fromkeys(tuple(self.cfg.granularities)
+                                          + tuple(self.cfg.auxiliary_tfs)
+                                          + tuple(self.cfg.macro_tfs))))
+        for tf in requested:
             frame = self.bars(tf, 500, warn_short=False)
             since = since_by_tf.get(tf)
             if since is not None:
