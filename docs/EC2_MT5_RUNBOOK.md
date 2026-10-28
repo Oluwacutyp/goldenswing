@@ -221,6 +221,21 @@ bias, trigger, entry clock, AMD, QM, volume) and the actual fill price
 on fill charts. The PNG is attached to the Telegram
 message as a photo; if the photo fails, the text still arrives.
 
+### /terminal (interactive terminal, step 8)
+
+Send `/terminal` and the engine starts its own read-only chart page
+and replies with the URL (default `http://127.0.0.1:8899/`). Open it
+in a browser ON this box (RDP + localhost) — the server binds
+localhost only, so nothing is exposed to the network. The page shows
+live stack candles (M5–D1, TF switch fetches that timeframe), study
+toggles (sessions, nearby levels, Fib+OTE, premium/discount, signal
+zone — the studies come from the latest signal's chart and are
+labeled with it), zoom/pan/crosshair, and a freshness banner (LIVE /
+STALE / MARKET CLOSED, 30s polling). It never trades: there is no
+order or control endpoint, and write methods answer 405. Host knobs:
+`GS_TERMINAL_HOST` / `GS_TERMINAL_PORT` (a port opening or tunnel is
+a host network change, never a default).
+
 ## Safety — read before touching
 
 - DEMO-ONLY by default. The engine REFUSES a real MT5 account

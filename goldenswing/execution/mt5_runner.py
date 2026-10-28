@@ -71,6 +71,7 @@ from ..alerts.commands import CommandContext, is_owner_callback
 from ..backtest.data import REPO_ROOT
 from ..charts.engine import render_mt5_signal, zones_to_study_dicts
 from ..charts.signal_view import build_signal_view_html
+from ..charts.terminal_server import TerminalServer
 from ..confluence import ConfluenceEngine
 from ..features.engine import read_and_featurize
 from ..feed.tick_log import TickLogger
@@ -316,6 +317,13 @@ class MT5RunnerConfig:
     #: can attach to a different MT5 install than the one on screen
     #: (the 2026-10-16 backtest failure).  Set via --terminal-path.
     terminal_path: str | None = None
+    # Interactive terminal (step 8): the engine serves its own live
+    # chart page. Localhost-only by default — RDP + localhost on the
+    # box reaches it with zero new network exposure. A port opening
+    # or tunnel is a host network change, never a default. (Not to
+    # be confused with terminal_path above, which is the MT5 exe.)
+    terminal_host: str = "127.0.0.1"
+    terminal_port: int = 8899
     max_positions: int = 1
     reconcile_every_ticks: int = 20
     # Telegram command polling: ON by default — this engine OWNS
@@ -498,6 +506,8 @@ class MT5RunnerConfig:
             risk_pct=float(os.environ.get("GS_RISK_PCT", "0.01")),
             allow_live=os.environ.get("GS_MT5_ALLOW_LIVE", "0") == "1",
             poll_commands=os.environ.get("GS_MT5_POLL_COMMANDS", "1") != "0",
+            terminal_host=os.environ.get("GS_TERMINAL_HOST", "127.0.0.1"),
+            terminal_port=int(os.environ.get("GS_TERMINAL_PORT", "8899")),
             poll_interval_seconds=float(
                 os.environ.get("GS_MT5_POLL_INTERVAL", "30.0")),
             pending_expiry_bars=int(
@@ -735,6 +745,11 @@ class MT5Runner:
         # printed once per process start, never every 30s poll.
         self._tg_unavailable_logged = False
         self.journal = TradeJournal(self.cfg.journal_path)
+        # Step 8: latest signal studies for the interactive terminal
+        # (candles are live from the stack; studies are labeled with
+        # the signal they came from, never recomputed from a guess).
+        self._latest_studies: dict | None = None
+        self._terminal_server: TerminalServer | None = None
         # Hot Scalp is a separate, persistent research sleeve. Setup storage
         # lives beside the journal so two runner processes on this EC2 host
         # share identity and atomic trigger claims. Failure disables this
@@ -13367,6 +13382,29 @@ class MT5Runner:
             entry = float(sig.entry_ref)
             atr = float(getattr(sig, "atr", 0.0) or 0.0)
             st = self._studies_for_chart(h1, entry, atr, zone)
+            # Step 8: cache this signal's studies for the terminal.
+            # The terminal labels them with this signal id + time;
+            # it never recomputes studies from a guessed entry/ATR.
+            self._latest_studies = {
+                "signal": alert_id,
+                "signal_time": datetime.now(timezone.utc).isoformat(),
+                "zone": ({"top": float(zone["top"]),
+                          "bottom": float(zone["bottom"]),
+                          "kind": str(zone.get("kind", ""))}
+                         if zone and zone.get("top")
+                         and zone.get("bottom") else None),
+                "nearby": st["nearby"],
+                "fib": {
+                    "levels": [[float(f), float(p)]
+                               for f, p in (st["fib_levels"] or [])],
+                    "ote": ([float(st["ote_band"][0]),
+                             float(st["ote_band"][1])]
+                            if st["ote_band"] is not None else None),
+                    "range": ([float(st["fib_range"][0]),
+                               float(st["fib_range"][1])]
+                              if st["fib_range"] is not None else None),
+                },
+            }
             png = render_mt5_signal(
                 h1, zone=zone, entry=entry,
                 stop=float(sig.invalidation),
@@ -13436,6 +13474,64 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: signal view build failed for {alert_id}: {exc}")
             return None, None
+
+    def terminal_provider(self):
+        """Adapter: live stack + latest studies -> terminal provider."""
+        runner = self
+
+        class _TerminalProvider:
+            def frames(self, tf):
+                stack = runner._stack
+                if stack is None:
+                    return None
+                return stack.frames.get(tf)
+
+            def studies(self):
+                return runner._latest_studies
+
+            def status(self):
+                from ..live.market_hours import xauusd_market_open
+                stack = runner._stack
+                tfs: dict[str, str | None] = {}
+                if stack is not None:
+                    for tf, frame in stack.frames.items():
+                        if frame is not None and len(frame) > 0:
+                            idx = frame.index[-1]
+                            tfs[tf] = (idx.isoformat()
+                                       if hasattr(idx, "isoformat")
+                                       else str(idx))
+                        else:
+                            tfs[tf] = None
+                return {
+                    "server_time": datetime.now(timezone.utc).isoformat(),
+                    "market_open": bool(xauusd_market_open()),
+                    "tfs": tfs}
+
+        return _TerminalProvider()
+
+    def start_terminal_server(self) -> str:
+        """Start the interactive terminal server; idempotent.
+
+        Localhost-only by default (cfg.terminal_host) — reachable
+        via RDP + localhost on the box, with zero new network
+        exposure. A second call returns the running URL.
+        """
+        srv = self._terminal_server
+        if srv is not None and srv.running:
+            return srv.url
+        self._terminal_server = TerminalServer(
+            self.terminal_provider(), host=self.cfg.terminal_host,
+            port=self.cfg.terminal_port, instrument=self.cfg.symbol)
+        return self._terminal_server.start()
+
+    def terminal_status(self) -> dict:
+        """Terminal server state for the /terminal command."""
+        srv = self._terminal_server
+        return {
+            "running": bool(srv is not None and srv.running),
+            "url": srv.url if srv is not None else None,
+            "host": self.cfg.terminal_host,
+            "port": self.cfg.terminal_port}
 
     def _send_startup_progress(self, text: str) -> None:
         """One Telegram + console progress line during startup.

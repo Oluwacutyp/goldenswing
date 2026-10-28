@@ -1297,3 +1297,44 @@ def _mt5_forecast_train(ctx: CommandContext, args: list[str]) -> CommandResult:
     except Exception as exc:  # noqa: BLE001 — command honesty
         return CommandResult(text=f"forecast_train failed: {exc}",
                              reply_markup=mt5_nav_keyboard())
+
+
+@mt5_command("/terminal", "interactive terminal: live multi-timeframe chart page served by the engine")
+def _mt5_terminal(ctx: CommandContext, args: list[str]) -> CommandResult:
+    """Start (or report) the interactive terminal server.
+
+    Step 8: the page is served by the engine itself, localhost-only
+    by default — open it in a browser ON the EC2 box (RDP +
+    localhost). Read-only: the page views live candles + the latest
+    signal's studies; it never trades. Guarded for old runners,
+    same pattern as freshness_line.
+    """
+    ctrl = _control(ctx)
+    if ctrl is None:
+        return CommandResult(
+            text="Terminal unavailable (no live runner attached)",
+            reply_markup=mt5_control_with_next("/status", "/playbooks"))
+    start = getattr(ctrl, "start_terminal_server", None)
+    status = getattr(ctrl, "terminal_status", None)
+    if not callable(start) or not callable(status):
+        return CommandResult(
+            text="Terminal unavailable — this runner predates the "
+                 "terminal server (old build; pull for step 8).",
+            reply_markup=mt5_control_with_next("/status", "/playbooks"))
+    try:
+        url = start()
+        st = status()
+    except Exception as exc:  # noqa: BLE001 — command honesty
+        return CommandResult(
+            text=f"Terminal failed to start: {exc}",
+            reply_markup=mt5_control_with_next("/status", "/playbooks"))
+    return CommandResult(
+        text="📈 GoldenSwing terminal\n"
+             f"{url}\n"
+             "Read-only live view (M5–D1 candles, studies from the "
+             "latest signal, freshness banner).\n"
+             "Open it in a browser ON the EC2 box (RDP + localhost) "
+             "— the server binds localhost only.\n"
+             f"Running: {'yes' if st.get('running') else 'no'} · "
+             f"host {st.get('host')} · port {st.get('port')}",
+        reply_markup=mt5_control_with_next("/status", "/playbooks"))
