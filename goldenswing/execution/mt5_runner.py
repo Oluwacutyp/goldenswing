@@ -10962,6 +10962,7 @@ class MT5Runner:
                                request=track_request, fill_price=fill,
                                entry_bar=len(h1) - 1 if entry_bar is None
                                else entry_bar, broker_sl=stop0,
+                               playbook=pb.name,
                                **_narr_kwargs)
         if _narr_state is not None:
             self._narrative_states[int(res.ticket)] = _narr_state
@@ -11491,6 +11492,7 @@ class MT5Runner:
                 ticket=int(pos.ticket), request=track,
                 fill_price=float(pos.entry_price),
                 entry_bar=fill_bar, broker_sl=float(state.sl),
+                playbook=state.playbook,
                 **_narr_kwargs)
             if _narr_state is not None:
                 self._narrative_states[int(pos.ticket)] = _narr_state

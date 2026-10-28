@@ -96,6 +96,16 @@ class TickConfig:
     profit_lock_progress: float = 0.50
     profit_lock_fraction_of_risk: float = 0.50
     profit_lock_atr_mult: float = 0.75
+    #: Playbooks whose generic early-lock progress arm is DISABLED:
+    #: for these, travelling 50% of the way to TP1 does NOT arm
+    #: profit_lock — only a full 1R best excursion does.  Ordered
+    #: 2026-10-27: qm_m5's close targets made the progress arm
+    #: fire on small moves ("premature profit locking").  Re-enable
+    #: per playbook only on replay-grade evidence.  The best-R
+    #: arm, breakeven, trail, Chandelier, and the initial
+    #: protective stop are unaffected, and other playbooks keep
+    #: the progress arm.
+    profit_lock_progress_excluded_playbooks: tuple[str, ...] = ("qm_m5",)
     #: Chandelier trailing (owner's TrailingStopEngine): once the
     #: excursion reaches ``chandelier_activation_r``, the stop is the
     #: best price since entry minus ``chandelier_atr_mult`` x ATR
@@ -204,6 +214,11 @@ class _TickState:
     #: SL_MAX_FAILURES_PER_WINDOW times per window — the Oct 27
     #: journal shows 52 identical "Invalid stops" for one ticket.
     sl_failures: dict = field(default_factory=dict)
+    #: Playbook that opened this position ("" when unknown, e.g.
+    #: restart adoption): the progress-arm exclusion above keys
+    #: on it.  Set by the runner at fill time; never parsed out
+    #: of the alert id for gating.
+    playbook: str = ""
     #: Entry legs: base first, added layers after.
     layers: list = field(default_factory=list)
     #: Narrative management plan (``live/management.py`` dict from
@@ -289,6 +304,7 @@ class TickManager:
              fill_price: float, entry_bar: int,
              broker_sl: float | None = None,
              now: float | None = None,
+             playbook: str = "",
              narrative_plan: dict | None = None,
              narrative_atr: float = 0.0,
              narrative_choch_extreme: float | None = None,
@@ -315,6 +331,7 @@ class TickManager:
         self._states[ticket] = _TickState(
             pos=pos, broker_sl=(float(broker_sl) if broker_sl is not None
                                 else pos.stop0),
+            playbook=str(playbook),
             layers=[Layer(entry=float(fill_price),
                           volume=float(request.volume),
                           sl=float(broker_sl) if broker_sl is not None
@@ -777,7 +794,9 @@ class TickManager:
                 progress = d * (price - pos.entry_price) / target_dist \
                     if target_dist > 0 else 0.0
                 if pos.best_r >= tcfg.profit_lock_trigger_r \
-                        or progress >= tcfg.profit_lock_progress:
+                        or (progress >= tcfg.profit_lock_progress
+                            and st.playbook not in
+                            tcfg.profit_lock_progress_excluded_playbooks):
                     lock_dist = max(
                         tcfg.profit_lock_fraction_of_risk
                         * pos.risk_price,
