@@ -448,14 +448,18 @@ class MT5RunnerConfig:
     # context, but deliberately has no order-dispatch path.
     hot_scalp_shadow_enabled: bool = True
     hot_scalp_db_path: Path | None = None
-    # Step 6 promotion switch: DEFAULT OFF, config-file/env only.
-    # /set cannot touch it — parse_set allowlists only max_layers,
-    # manipulation_filter, pending_expiry_bars, playbook.* — so
-    # enabling live Hot Scalp authority is a deliberate operator
-    # act on the host, never a chat command.  While OFF, the
-    # promotion method is never called from the live loop, and it
-    # refuses even when called directly (defense in depth).
-    hot_scalp_live_enabled: bool = False
+    # Step 6 promotion switch — DEFAULT ON per owner order
+    # 2026-10-27 ("I meant live"; "I don't have time to be
+    # configuring"): pulling the code enables live Hot Scalp
+    # authority with zero host configuration.  Still
+    # config-file/env-overridable (set GS_HOT_SCALP_LIVE=0
+    # or the config flag False to disable) and still NOT
+    # /set-editable — parse_set allowlists only max_layers,
+    # manipulation_filter, pending_expiry_bars, playbook.*.
+    # While OFF, the promotion method is never called from
+    # the live loop, and it refuses even when called
+    # directly (defense in depth).
+    hot_scalp_live_enabled: bool = True
     # DXY correlation (owner's-bot floor): the XAUUSD vs DXYm
     # correlation is confluence context (Ghost Sentinel bands,
     # bounded ±0.5) — never a gate leg.  A dead DXY feed degrades
@@ -6884,8 +6888,9 @@ class MT5Runner:
                                      stats: dict) -> bool:
         """Promote one shadow candidate to the SHARED order path (step 6).
 
-        Disabled by default (``hot_scalp_live_enabled``); the flag
-        is config-file/env only and can never be flipped from chat.
+        Gated on ``hot_scalp_live_enabled`` (default ON per owner
+        order 2026-10-27; config-file/env can disable it); the flag
+        can never be flipped from chat.
         Every refusal is journalled with a reason code, and the
         claim's fate follows the refusal kind:
 
