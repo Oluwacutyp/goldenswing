@@ -606,6 +606,26 @@ class MT5Executor(Executor):
             message=f"modify failed: {mt5.last_error() if res is None else res.comment}",
             retcode=int(res.retcode) if res is not None else None)
 
+    def sl_constraints(self, symbol: str) -> dict | None:
+        """MT5 symbol_info stops/freeze levels (points) + point size."""
+        mt5 = self._lib()
+        try:
+            info = mt5.symbol_info(symbol)
+        except Exception:
+            return None
+        if info is None:
+            return None
+        try:
+            return {
+                "stops_level_points": int(
+                    getattr(info, "trade_stops_level", 0) or 0),
+                "freeze_level_points": int(
+                    getattr(info, "trade_freeze_level", 0) or 0),
+                "point": float(getattr(info, "point", 0.0) or 0.0),
+            }
+        except Exception:
+            return None
+
     def close_position(self, ticket: int,
                        volume: float | None = None) -> OrderResult:
         mt5 = self._lib()

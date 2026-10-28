@@ -189,7 +189,7 @@ from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 native_tf_of as _native_tf)
 from .risk import RiskConfig, RiskGuards
 from .tick_manager import (DEFAULT_TIME_EXIT_BARS, TickAction, TickConfig,
-                          TickManager)
+                          TickManager, sl_level_valid)
 from ..feed.mt5 import TRADE_MODE_REAL, MT5Feed, TickPump
 
 DATA_DIR = REPO_ROOT / "data"
@@ -750,6 +750,10 @@ class MT5Runner:
         # the signal they came from, never recomputed from a guess).
         self._latest_studies: dict | None = None
         self._terminal_server: TerminalServer | None = None
+        # SL stand-down notes already journalled, keyed
+        # (ticket, reason, level): a stood-down level notes once
+        # per side-invalid window, never once per tick.
+        self._sl_stood_down: set = set()
         # Hot Scalp is a separate, persistent research sleeve. Setup storage
         # lives beside the journal so two runner processes on this EC2 host
         # share identity and atomic trigger claims. Failure disables this
@@ -2212,7 +2216,9 @@ class MT5Runner:
             # position state, not regime_state.  Only a COMPLETE
             # pause (position state itself untrusted) stops it.
             if self._regime_pause != "paused_complete":
-                self._manage_tick(price, stats)
+                self._manage_tick(price, stats,
+                                  bid=tick.get("bid"),
+                                  ask=tick.get("ask"))
             if self._tick_count % self.cfg.reconcile_every_ticks == 0:
                 if self._regime_pause != "paused_complete":
                     self._reconcile(price, stats)
@@ -2233,7 +2239,34 @@ class MT5Runner:
             self._poll_telegram_commands(stats)
         return _handle
 
-    def _manage_tick(self, price: float, stats: dict) -> None:
+    def _sl_margin(self, bid: float, ask: float) -> float:
+        """Minimum distance a proposed SL must keep from the quote.
+
+        Broker stops/freeze levels (in points x point size) when
+        the executor reports them; else one spread when a real
+        quote is available; else 0 (legacy mid-only calls — the
+        side check itself still applies there).
+        """
+        try:
+            cons = self.executor.sl_constraints(self.cfg.symbol)
+        except Exception:
+            cons = None
+        if cons:
+            try:
+                point = float(cons.get("point") or 0.0)
+                pts = max(int(cons.get("stops_level_points") or 0),
+                          int(cons.get("freeze_level_points") or 0))
+                if point > 0 and pts > 0:
+                    return pts * point
+            except Exception:
+                pass
+        if ask > bid:
+            return float(ask) - float(bid)
+        return 0.0
+
+    def _manage_tick(self, price: float, stats: dict,
+                     bid: float | None = None,
+                     ask: float | None = None) -> None:
         """TickManager actions for every tracked position, executed now.
 
         Every executed management action that changes the position
@@ -2241,7 +2274,19 @@ class MT5Runner:
         — the disciplined caller's update — on top of the journal
         note.  Trail SL moves stay journal-only: they fire on
         nearly every favourable tick and would spam the channel.
+
+        SL moves are broker-aware before they are sent: a proposed
+        stop on the wrong side of the quote, or inside the
+        broker's stops/freeze distance, is stood down (noted once
+        per window, retried when price recovers) instead of
+        resubmitted every tick — the Oct 27 journal shows 52
+        identical "Invalid stops" for one ticket.  A broker
+        rejection is bounded to 3 submissions per side-valid
+        window, and a "no position" report stands the ticket down
+        for reconcile instead of retrying a closed trade.
         """
+        bid = float(bid) if bid is not None else float(price)
+        ask = float(ask) if ask is not None else float(price)
         for ticket in list(self.tick_manager.tickets()):
             for action in self.tick_manager.on_tick(ticket, price):
                 stats["tick_actions"] += 1
@@ -2249,7 +2294,37 @@ class MT5Runner:
                 pb = self._playbook_from_alert_id(
                     pos.alert_id if pos is not None else "")
                 if action.kind == "modify_sl":
-                    res = self.executor.modify_sl(ticket, action.level)
+                    level = float(action.level)
+                    if self.tick_manager.sl_blocked(
+                            ticket, action.reason, level):
+                        # Window exhausted; already journalled at
+                        # block time.  Silent until the window
+                        # re-opens (quote went side-invalid).
+                        continue
+                    direction = int(pos.direction) \
+                        if pos is not None else 0
+                    margin = self._sl_margin(bid, ask)
+                    if direction != 0 and not sl_level_valid(
+                            direction, level, bid, ask, margin):
+                        # Side-invalid: close the failure window
+                        # (a fresh budget when price recovers) and
+                        # note the stand-down once per window.
+                        self.tick_manager.reset_sl_window(
+                            ticket, action.reason, level)
+                        key = (ticket, action.reason, level)
+                        if key not in self._sl_stood_down:
+                            self._sl_stood_down.add(key)
+                            self.journal.log_note(
+                                f"mt5 tick: ticket {ticket} SL move "
+                                f"STOOD DOWN ({action.reason}): "
+                                f"proposed {level:.2f} not valid at "
+                                f"bid {bid:.2f}/ask {ask:.2f} "
+                                f"(margin {margin:.2f}) — retry when "
+                                f"price recovers")
+                        continue
+                    self._sl_stood_down.discard(
+                        (ticket, action.reason, level))
+                    res = self.executor.modify_sl(ticket, level)
                     if res.ok:
                         self.tick_manager.apply(ticket, action)
                         # A13: the pool's base layer rolls with the
@@ -2294,9 +2369,40 @@ class MT5Runner:
                                 f"SL -> {action.level:.2f} — profit "
                                 f"locked in, trade cannot lose")
                     else:
-                        self.journal.log_note(
-                            f"mt5 tick: ticket {ticket} SL move FAILED "
-                            f"({action.reason}): {res.message} — retry next tick")
+                        if str(res.message).startswith("no position"):
+                            # Broker-closed between ticks: stand
+                            # down, never retry.  The close record
+                            # itself comes from _reconcile on its
+                            # normal cadence — this path must not
+                            # invent or duplicate it.
+                            if self.tick_manager.mark_broker_gone(
+                                    ticket):
+                                self.journal.log_note(
+                                    f"mt5 tick: ticket {ticket} SL "
+                                    f"move FAILED ({action.reason}): "
+                                    f"broker has no such position — "
+                                    f"tracking stood down, reconcile "
+                                    f"will close it")
+                        else:
+                            blocked = self.tick_manager.note_sl_failure(
+                                ticket, action.reason, level)
+                            cur_sl = self.tick_manager.effective_stop(
+                                ticket)
+                            spread = (ask - bid) \
+                                if ask > bid else 0.0
+                            self.journal.log_note(
+                                f"mt5 tick: ticket {ticket} SL move "
+                                f"FAILED ({action.reason}): attempted "
+                                f"{level:.2f} vs broker SL "
+                                f"{cur_sl if cur_sl is not None else float('nan'):.2f} "
+                                f"at bid {bid:.2f}/ask {ask:.2f} "
+                                f"spread {spread:.2f} "
+                                f"margin {margin:.2f} "
+                                f"retcode {res.retcode}: "
+                                f"{res.message}"
+                                + (" — level blocked after 3 "
+                                   "rejections in this window"
+                                   if blocked else ""))
                 elif action.kind == "partial":
                     res = self.executor.close_position(ticket, action.volume)
                     if res.ok:

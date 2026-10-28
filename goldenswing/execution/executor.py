@@ -143,6 +143,16 @@ class Executor(ABC):
                   tp: float | None = None) -> OrderResult:
         ...
 
+    def sl_constraints(self, symbol: str) -> dict | None:
+        """Broker SL placement constraints for ``symbol``, or None
+        when the executor cannot report them.  MT5 shape:
+        {"stops_level_points": int, "freeze_level_points": int,
+        "point": float}.  The runner falls back to one spread of
+        margin when this is None — never to a zero margin on a
+        real quote, which would re-admit the wrong-side
+        resubmission this fix exists to kill."""
+        return None
+
     @abstractmethod
     def close_position(self, ticket: int,
                        volume: float | None = None) -> OrderResult:

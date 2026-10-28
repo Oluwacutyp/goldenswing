@@ -191,6 +191,19 @@ class _TickState:
     be_earned_by: str = ""
     #: SL actually on the broker (breakeven/trailing moves only tighten).
     broker_sl: float | None = None
+    #: Broker says this position is gone (a modify reported "no
+    #: position"): management stands down for this ticket and waits
+    #: for _reconcile to book the broker_closed close.  Never
+    #: retried — the Oct 27 journal shows "no position" retried on
+    #: the very next tick after the broker already closed the trade.
+    sl_gone: bool = False
+    #: Consecutive modify_sl failures per (reason, level) inside the
+    #: current side-valid window.  A side-invalid tick closes the
+    #: window (see reset_sl_window): the level may be tried again
+    #: when price recovers, but never more than
+    #: SL_MAX_FAILURES_PER_WINDOW times per window — the Oct 27
+    #: journal shows 52 identical "Invalid stops" for one ticket.
+    sl_failures: dict = field(default_factory=dict)
     #: Entry legs: base first, added layers after.
     layers: list = field(default_factory=list)
     #: Narrative management plan (``live/management.py`` dict from
@@ -218,6 +231,32 @@ class _TickState:
         if self.broker_sl is not None:
             return self.broker_sl
         return self.pos.active_stop
+
+
+#: Max identical modify_sl submissions per side-valid window.
+#: A window ends when the quote goes side-invalid for the level
+#: (price fell back); a fresh window opens when price recovers.
+#: 3 bounds the broker spam without forfeiting a level that
+#: becomes valid again — the Oct 27 journal's 52 identical
+#: rejections for one ticket came from an unbounded retry.
+SL_MAX_FAILURES_PER_WINDOW = 3
+
+
+def sl_level_valid(direction: int, level: float, bid: float, ask: float,
+                   margin: float) -> bool:
+    """True when a proposed SL can be sent to the broker.
+
+    Long: the stop must sit at least ``margin`` below the bid.
+    Short: at least ``margin`` above the ask.  A stop on the wrong
+    side of the quote, or inside the broker's stops/freeze
+    distance, is rejected as "Invalid stops" — and resubmitting
+    it unchanged every tick is spam, not management.
+    """
+    if direction == 1:
+        return level <= bid - margin
+    if direction == -1:
+        return level >= ask + margin
+    return False
 
 
 class TickManager:
@@ -455,6 +494,57 @@ class TickManager:
     def remove(self, ticket: int) -> None:
         self._states.pop(ticket, None)
 
+    # ------------------------------------------- broker-aware SL moves
+    def mark_broker_gone(self, ticket: int) -> bool:
+        """Stand a ticket down: the broker reports no such position.
+
+        True when the ticket was tracked and not already stood
+        down.  The state itself stays so _reconcile can book the
+        broker_closed close on its normal cadence — only further
+        management actions stop.
+        """
+        st = self._states.get(ticket)
+        if st is None or st.sl_gone:
+            return False
+        st.sl_gone = True
+        return True
+
+    def note_sl_failure(self, ticket: int, reason: str,
+                        level: float) -> bool:
+        """Record one failed modify_sl.  Returns True when the
+        (reason, level) window is exhausted and the level is
+        blocked until the runner re-opens the window (quote went
+        side-invalid) or a success clears it."""
+        st = self._states.get(ticket)
+        if st is None:
+            return False
+        key = (str(reason), float(level))
+        st.sl_failures[key] = int(st.sl_failures.get(key, 0)) + 1
+        return st.sl_failures[key] >= SL_MAX_FAILURES_PER_WINDOW
+
+    def _sl_blocked(self, ticket: int, reason: str,
+                    level: float) -> bool:
+        st = self._states.get(ticket)
+        if st is None:
+            return False
+        return int(st.sl_failures.get((str(reason), float(level)), 0)) \
+            >= SL_MAX_FAILURES_PER_WINDOW
+
+    def sl_blocked(self, ticket: int, reason: str,
+                   level: float) -> bool:
+        """Public read of the failure window (the runner checks it
+        before submitting, belt-and-braces over on_tick's skip)."""
+        return self._sl_blocked(ticket, reason, level)
+
+    def reset_sl_window(self, ticket: int, reason: str,
+                        level: float) -> None:
+        """Close the failure window for (reason, level): the quote
+        went side-invalid, so the next side-valid window starts
+        with a fresh failure budget."""
+        st = self._states.get(ticket)
+        if st is not None:
+            st.sl_failures.pop((str(reason), float(level)), None)
+
     def tickets(self) -> list[int]:
         return list(self._states)
 
@@ -517,10 +607,25 @@ class TickManager:
         if st is None:
             return []
         pos = st.pos
-        if pos.closed or pos.risk_price <= 0:
+        if pos.closed or st.sl_gone or pos.risk_price <= 0:
             return []
         d = pos.direction
         ex = self.exits
+
+        # Failure windows are runs of side-valid ticks: a tick
+        # whose mid price puts a failed level back on the wrong
+        # side closes its window, so the level gets a fresh
+        # budget when price recovers.  Without this, a blocked
+        # level could never be retried — on_tick skips blocked
+        # levels, so the runner would never see the tick that
+        # should re-open the window.  (Mid is the conservative
+        # proxy here: level above mid is certainly above bid for
+        # a long; the runner's margin-precise check still gates
+        # every actual submission.)
+        for _key in list(st.sl_failures):
+            _rsn, _lvl = _key
+            if (d == 1 and _lvl > price) or (d == -1 and _lvl < price):
+                st.sl_failures.pop(_key, None)
 
         # Wicked invalidation (observation only, never a close).
         if (d == 1 and price < pos.invalidation) or \
@@ -664,7 +769,12 @@ class TickManager:
                 tp = pos.targets[0] if pos.targets else None
                 target_dist = abs(tp - pos.entry_price) \
                     if tp is not None else 2.0 * pos.risk_price
-                progress = abs(price - pos.entry_price) / target_dist \
+                # Favourable progress ONLY: the old abs() armed
+                # profit_lock on adverse excursion too (a long
+                # falling away from its target counted as "progress"
+                # toward it) — the move then fired while the trade
+                # was underwater.
+                progress = d * (price - pos.entry_price) / target_dist \
                     if target_dist > 0 else 0.0
                 if pos.best_r >= tcfg.profit_lock_trigger_r \
                         or progress >= tcfg.profit_lock_progress:
@@ -706,8 +816,13 @@ class TickManager:
         if tighter:
             level, reason = max(tighter, key=lambda c: c[0]) \
                 if d == 1 else min(tighter, key=lambda c: c[0])
-            actions.append(TickAction("modify_sl", level=level,
-                                      reason=reason))
+            # A level that exhausted its failure window is NOT
+            # re-emitted: the runner re-opens the window when the
+            # quote goes side-invalid for it (price fell back),
+            # and a fresh window tries again when price recovers.
+            if not self._sl_blocked(ticket, reason, level):
+                actions.append(TickAction("modify_sl", level=level,
+                                          reason=reason))
         return actions
 
     def apply(self, ticket: int, action: TickAction) -> None:
@@ -718,6 +833,10 @@ class TickManager:
         pos = st.pos
         if action.kind == "modify_sl" and action.level is not None:
             st.broker_sl = float(action.level)
+            # A success closes the failure window for this level:
+            # the next candidate (if any) starts with a fresh budget.
+            st.sl_failures.pop((str(action.reason), float(action.level)),
+                               None)
             if action.reason == "breakeven":
                 st.breakeven_done = True
                 if not st.be_earned:
