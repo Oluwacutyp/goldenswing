@@ -694,7 +694,7 @@ def _mt5_trade_levels(ax, x_hi, *, entry: float, stop: float,
     """Shared entry / stops / targets / 2R / fill LINES on one panel.
 
     Draws the lines now and returns the label specs. Labels are drawn
-    later (``_mt5_trade_labels``), after a canvas draw finalizes axes
+    later (``_mt5_edge_labels``), after a canvas draw finalizes axes
     positions, so de-collision works in real pixels — entry and stop
     a couple of points apart no longer stack into one illegible blob
     at the right edge. ``stop`` is the structural invalidation;
@@ -725,12 +725,18 @@ def _mt5_trade_levels(ax, x_hi, *, entry: float, stop: float,
     return specs
 
 
-def _mt5_trade_labels(ax, x_hi, specs: list[dict]) -> None:
-    """Draw trade-level labels, de-collided in display pixels.
+def _mt5_edge_labels(ax, x_hi, specs: list[dict]) -> None:
+    """Draw right-edge level labels, de-collided in display pixels.
 
     Call only after a canvas draw: ``transData`` needs finalized
-    axes positions. Labels keep their line's color and value; a
-    shifted label gets a short vertical leader back to its line.
+    axes positions. This is the ONE right-edge label pass: trade
+    levels, nearby-zone levels, Fib levels and the OTE label all
+    arrive here as specs, so no label set can land on another —
+    the step-7 pass covered trade labels only, and study labels
+    drawn raw at the same edge still piled into the trade labels
+    (the 2026-10-28 qm_m5 chart). Labels keep their line's color
+    and value; a shifted label gets a short vertical leader back
+    to its line.
     """
     if not specs:
         return
@@ -836,8 +842,15 @@ def _mt5_premium_discount(ax, x_lo, x_hi, range_low, range_high, theme) -> None:
             color="#26a69a", alpha=0.8)
 
 
-def _mt5_nearby_lines(ax, x_hi, nearby_zones, theme) -> None:
-    """Cache zone levels as horizontal lines (MAJOR solid, rest dashed)."""
+def _mt5_nearby_lines(ax, x_hi, nearby_zones, theme) -> list[dict]:
+    """Cache zone levels as horizontal lines (MAJOR solid, rest dashed).
+
+    Lines are drawn now; labels come back as specs for the shared
+    post-draw de-collision pass (``_mt5_edge_labels``) — a zone label
+    drawn raw at the right edge lands on top of a trade label
+    whenever the zone sits near the entry, which is the common case.
+    """
+    specs: list[dict] = []
     for z in nearby_zones or []:
         lvl = float(z["level"])
         side = z.get("side", "")
@@ -849,23 +862,32 @@ def _mt5_nearby_lines(ax, x_hi, nearby_zones, theme) -> None:
         ax.axhline(lvl, color=col, linewidth=1.0 if major else 0.6,
                    linestyle="-" if major else (0, (6, 3)),
                    alpha=0.8, zorder=2)
-        ax.text(x_hi - 0.3, lvl, f" {tier} {lvl:.1f} ", ha="right",
-                va="bottom", fontsize=7.5, color=col)
+        specs.append({"value": lvl, "text": f" {tier} {lvl:.1f} ",
+                      "color": col, "bold": False, "size": 7.5})
+    return specs
 
 
-def _mt5_fib(ax, x_hi, fib_levels, ote_band, theme) -> None:
-    """Auto-Fib retracement lines + the OTE band, on the H1 panel."""
+def _mt5_fib(ax, x_hi, fib_levels, ote_band, theme) -> list[dict]:
+    """Auto-Fib retracement lines + the OTE band, on the H1 panel.
+
+    Lines and the OTE span are drawn now; labels come back as specs
+    for the shared post-draw de-collision pass (``_mt5_edge_labels``),
+    same reason as ``_mt5_nearby_lines``: raw right-edge labels
+    collide with the trade labels they sit next to.
+    """
+    specs: list[dict] = []
     for frac, price in fib_levels or []:
         ax.axhline(price, color="#8d6e00", linewidth=0.6,
                    linestyle=(0, (4, 3)), zorder=2)
-        ax.text(x_hi - 0.3, price, f" {frac:.3f} ", ha="right",
-                va="bottom", fontsize=7.5, color="#8d6e00")
+        specs.append({"value": float(price), "text": f" {frac:.3f} ",
+                      "color": "#8d6e00", "bold": False, "size": 7.5})
     if ote_band is not None:
         lo, hi = ote_band
         if hi > lo:
             ax.axhspan(lo, hi, color="#8d6e00", alpha=0.10, zorder=1)
-            ax.text(x_hi - 0.3, hi, " OTE ", ha="right", va="bottom",
-                    fontsize=7.5, color="#8d6e00", fontweight="bold")
+            specs.append({"value": float(hi), "text": " OTE ",
+                          "color": "#8d6e00", "bold": True, "size": 7.5})
+    return specs
 
 
 def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
@@ -999,12 +1021,13 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                         f"{_fmt(zbot)}–{_fmt(ztop)}",
                         va="bottom", fontsize=8.5, color="#8a6d00",
                         fontweight="bold")
-        _mt5_nearby_lines(ax, x_hi, nearby_zones, theme)
+        study_specs = _mt5_nearby_lines(ax, x_hi, nearby_zones, theme)
         if is_h1:
             if fib_range is not None:
                 _mt5_premium_discount(ax, x_lo, x_hi, fib_range[0],
                                       fib_range[1], theme)
-            _mt5_fib(ax, x_hi, fib_levels, ote_band, theme)
+            study_specs += _mt5_fib(ax, x_hi, fib_levels, ote_band,
+                                    theme)
         lo_v, hi_v = _mt5_panel_ylim(
             view, entry=entry, stop=stop, broker_stop=broker_stop,
             targets=targets, fill_price=fill_price,
@@ -1013,7 +1036,7 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
         label_specs.append((ax, x_hi, _mt5_trade_levels(
             ax, x_hi, entry=entry, stop=stop, broker_stop=broker_stop,
             targets=targets, direction=direction, risk=risk,
-            fill_price=fill_price, theme=theme)))
+            fill_price=fill_price, theme=theme) + study_specs))
         if marker is not None:
             last = len(view) - 1
             ax.axvspan(last - 0.5, last + 0.5, color="#7e57c2",
@@ -1079,7 +1102,7 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
     # de-collision pass measures real pixels, not estimates.
     fig.canvas.draw()
     for ax, x_hi_panel, specs in label_specs:
-        _mt5_trade_labels(ax, x_hi_panel, specs)
+        _mt5_edge_labels(ax, x_hi_panel, specs)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=_DPI, facecolor=theme["bg"],
