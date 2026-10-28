@@ -9004,10 +9004,16 @@ class MT5Runner:
                 continue
             # Chart: H4 zone + entry/stop/targets + verdict, saved
             # next to the journal and attached to the alert.
+            # Step 7: the journal score here IS sig.score on this
+            # path (log_signal above records score=float(sig.score)),
+            # so passing it explicitly is the journal score, not a
+            # placeholder; no broker stop exists pre-order.
             png, _path = self._build_chart(
-                sig, verdict, alert_id=alert_id, playbook=pb.name)
+                sig, verdict, alert_id=alert_id, playbook=pb.name,
+                decision_score=float(sig.score))
             _, view_path = self._build_signal_view(
-                sig, verdict, alert_id=alert_id, playbook=pb.name)
+                sig, verdict, alert_id=alert_id, playbook=pb.name,
+                decision_score=float(sig.score))
             self._send_alert(
                 f"MT5 [{tag}] {pb.name} "
                 f"{'+' if sig.direction > 0 else '-'}1 "
@@ -10894,12 +10900,20 @@ class MT5Runner:
                 f"{_pool.state() if _pool is not None else 'n/a'}")
         # Fill chart: same levels + the actual fill price, saved
         # alongside the signal chart and attached to the fill alert.
+        # Step 7: decision score + broker stop mirror the fill record
+        # logged just above (score.total or sig.score; stop0).
         png, _path = self._build_chart(
             sig, verdict, alert_id=request.alert_id, playbook=pb.name,
-            fill_price=fill, suffix="-fill")
+            fill_price=fill, suffix="-fill",
+            decision_score=(float(score.total)
+                            if score is not None else float(sig.score)),
+            broker_stop=float(stop0))
         _, view_path = self._build_signal_view(
             sig, verdict, alert_id=request.alert_id, playbook=pb.name,
-            fill_price=fill, suffix="-fill")
+            fill_price=fill, suffix="-fill",
+            decision_score=(float(score.total)
+                            if score is not None else float(sig.score)),
+            broker_stop=float(stop0))
         self._send_alert(
             f"MT5 FILL {pb.name} {'+' if sig.direction > 0 else '-'}1 "
             f"{lots} lots @ {fill:.2f} SL {stop0:.2f} "
@@ -11094,12 +11108,20 @@ class MT5Runner:
         # Pending chart + alert, marked PENDING: the entry line IS
         # the pending level (sig.entry_ref), the fill line comes
         # only when the market reaches it.
+        # Step 7: decision score + broker stop mirror the pending
+        # record (score.total or None; the pending order's stop).
         png, _path = self._build_chart(
             sig, verdict, alert_id=request.alert_id, playbook=pb.name,
-            suffix="-pending")
+            suffix="-pending",
+            decision_score=(float(score.total)
+                            if score is not None else None),
+            broker_stop=float(request.stop_loss))
         _, view_path = self._build_signal_view(
             sig, verdict, alert_id=request.alert_id, playbook=pb.name,
-            suffix="-pending")
+            suffix="-pending",
+            decision_score=(float(score.total)
+                            if score is not None else None),
+            broker_stop=float(request.stop_loss))
         self._send_alert(
             f"MT5 PENDING {kind.upper()} {pb.name} "
             f"{'+' if sig.direction > 0 else '-'}1 "
@@ -11458,17 +11480,26 @@ class MT5Runner:
                 f"{_pool.state() if _pool is not None else 'n/a'}")
         # Fill chart when the signal is known (placed this run);
         # adopted pendings (restart) have no signal — text only.
+        # Step 7: decision score is the recorded placed_score, or
+        # unavailable when none was recorded (never the sleeve
+        # placeholder); broker stop is the filled position's SL.
         png = None
         view_path = None
         if sig is not None and getattr(state, "verdict", None) is not None:
             png, _path = self._build_chart(
                 sig, state.verdict, alert_id=state.alert_id,
                 playbook=state.playbook, fill_price=float(pos.entry_price),
-                suffix="-fill")
+                suffix="-fill",
+                decision_score=(float(state.placed_score)
+                                if state.placed_score else None),
+                broker_stop=float(state.sl))
             _, view_path = self._build_signal_view(
                 sig, state.verdict, alert_id=state.alert_id,
                 playbook=state.playbook,
-                fill_price=float(pos.entry_price), suffix="-fill")
+                fill_price=float(pos.entry_price), suffix="-fill",
+                decision_score=(float(state.placed_score)
+                                if state.placed_score else None),
+                broker_stop=float(state.sl))
         self._send_alert(
             f"MT5 FILL {state.playbook or 'pending'} "
             f"{'+' if state.direction > 0 else '-'}1 "
@@ -13306,12 +13337,20 @@ class MT5Runner:
     def _build_chart(self, sig, verdict: dict | None, *,
                      alert_id: str, playbook: str = "",
                      fill_price: float | None = None,
-                     suffix: str = "") -> tuple[bytes | None, Path | None]:
+                     suffix: str = "",
+                     decision_score: float | None = None,
+                     broker_stop: float | None = None) -> tuple[bytes | None, Path | None]:
         """Chart PNG for a signal/fill: the WHOLE hierarchy stack
         (H4 structure / H1 trigger / entry-TF entry) + levels + verdict
         + the studies the reasoning used: nearby cache zones, the
         feature pipeline's auto-Fib + dealing range on H1, and
         killzone session shading.
+
+        Step 7: the chart shows the DECISION score passed by the
+        caller (never the signal object's sleeve placeholder) and
+        BOTH stops — structural invalidation plus the broker stop
+        when the caller knows one. A caller that passes neither gets
+        "Score unavailable" / "Broker SL pending at placement".
 
         Studies are best-effort: any study that fails to compute is
         left off, never invented. Never breaks the signal path: on
@@ -13334,7 +13373,8 @@ class MT5Runner:
                 targets=[float(x) for x in (sig.targets or [])],
                 direction=int(sig.direction), verdict=verdict,
                 playbook=playbook,
-                score=float(getattr(sig, "score", 0.0) or 0.0),
+                decision_score=decision_score,
+                broker_stop=broker_stop,
                 instrument=self.cfg.symbol, fill_price=fill_price,
                 h4=frames.get("H4"),
                 entry_frame=frames.get(entry_clock),
@@ -13353,11 +13393,16 @@ class MT5Runner:
     def _build_signal_view(self, sig, verdict: dict | None, *,
                            alert_id: str, playbook: str = "",
                            fill_price: float | None = None,
-                           suffix: str = "") -> tuple[str | None, Path | None]:
+                           suffix: str = "",
+                           decision_score: float | None = None,
+                           broker_stop: float | None = None) -> tuple[str | None, Path | None]:
         """Self-contained HTML terminal view for a signal: one page,
         baked at signal time, with per-timeframe bars + analysis,
         trade levels, and the same studies as the PNG chart. Saved
         next to the chart and attached to the alert as a document.
+
+        Step 7: same truth as the PNG — the caller's decision score
+        (never the sleeve placeholder) and both stops.
 
         Never breaks the signal path: on any failure returns
         (None, None) and logs a note.
@@ -13376,7 +13421,8 @@ class MT5Runner:
                 stop=float(sig.invalidation),
                 targets=[float(x) for x in (sig.targets or [])],
                 direction=int(sig.direction), playbook=playbook,
-                score=float(getattr(sig, "score", 0.0) or 0.0),
+                decision_score=decision_score,
+                broker_stop=broker_stop,
                 verdict=verdict, zone=zone,
                 nearby_zones=st["nearby"], fib_levels=st["fib_levels"],
                 fib_range=st["fib_range"], ote_band=st["ote_band"],

@@ -57,6 +57,11 @@ import pandas as pd  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
 
 from ..reader import session_timeframes as sessions  # Step 3: DST-aware authority (was fixed-UTC sessions)
+from .signal_model import (  # Step 7: one shared signal-view model
+    decollide_label_ys,
+    panel_role,
+    score_text,
+)
 
 STYLES = ("classic", "heikin_ashi", "line", "blueprint", "signal")
 
@@ -683,39 +688,68 @@ def _mt5_candles(ax, view, xs, theme) -> None:
 
 
 def _mt5_trade_levels(ax, x_hi, *, entry: float, stop: float,
+                      broker_stop: float | None,
                       targets: list[float], direction: int, risk: float,
-                      fill_price: float | None, theme) -> None:
-    """Shared entry / stop / targets / 2R / fill lines on one panel."""
-    ax.axhline(entry, color="#f7b924", linewidth=1.6, zorder=4)
-    ax.text(x_hi - 0.3, entry, f" ENTRY {_fmt(entry)}", ha="right",
-            va="bottom" if direction == 1 else "top", fontsize=9,
-            color="#8a6d00", fontweight="bold")
-    ax.axhline(stop, color="#d32f2f", linewidth=1.6, zorder=4)
-    ax.text(x_hi - 0.3, stop, " STOP ", ha="right",
-            va="top" if direction == 1 else "bottom", fontsize=9,
-            color="#d32f2f", fontweight="bold")
+                      fill_price: float | None, theme) -> list[dict]:
+    """Shared entry / stops / targets / 2R / fill LINES on one panel.
+
+    Draws the lines now and returns the label specs. Labels are drawn
+    later (``_mt5_trade_labels``), after a canvas draw finalizes axes
+    positions, so de-collision works in real pixels — entry and stop
+    a couple of points apart no longer stack into one illegible blob
+    at the right edge. ``stop`` is the structural invalidation;
+    ``broker_stop`` is the broker stop when one is known, else None.
+    """
+    specs: list[dict] = []
+
+    def _line(value, color, width, style, label, bold=False, size=9):
+        ax.axhline(value, color=color, linewidth=width,
+                   linestyle=style, zorder=4 if bold else 3)
+        specs.append({"value": float(value), "text": label,
+                      "color": color, "bold": bold, "size": size})
+
+    _line(entry, "#f7b924", 1.6, "-", f" ENTRY {_fmt(entry)}", bold=True)
+    _line(stop, "#d32f2f", 1.6, "-",
+          f" STOP {_fmt(stop)} (structural)", bold=True)
+    if broker_stop is not None:
+        _line(broker_stop, "#ff7043", 1.6, "-",
+              f" BROKER SL {_fmt(broker_stop)}", bold=True)
     for j, t in enumerate(targets):
-        ax.axhline(t, color="#2e7d32", linewidth=1.1,
-                   linestyle=(0, (6, 3)), zorder=3)
-        ax.text(x_hi - 0.3, t, f" T{j + 1} {_fmt(t)}", ha="right",
-                va="bottom" if direction == 1 else "top", fontsize=9,
-                color="#2e7d32")
+        _line(t, "#2e7d32", 1.1, (0, (6, 3)), f" T{j + 1} {_fmt(t)}")
     if risk > 0:
-        t2r = entry + direction * 2.0 * risk
-        ax.axhline(t2r, color="#2e7d32", linewidth=0.8,
-                   linestyle=(0, (2, 2)), alpha=0.7, zorder=3)
-        ax.text(x_hi - 0.3, t2r, " 2R ", ha="right",
-                va="bottom" if direction == 1 else "top", fontsize=8,
-                color="#2e7d32")
+        _line(entry + direction * 2.0 * risk, "#2e7d32", 0.8,
+              (0, (2, 2)), " 2R ", size=8)
     if fill_price is not None:
-        ax.axhline(fill_price, color="#7e57c2", linewidth=1.4,
-                   linestyle=(0, (8, 3)), zorder=4)
-        ax.text(x_hi - 0.3, fill_price, f" FILL {_fmt(fill_price)}",
-                ha="right", va="bottom", fontsize=9, color="#7e57c2",
-                fontweight="bold")
+        _line(fill_price, "#7e57c2", 1.4, (0, (8, 3)),
+              f" FILL {_fmt(fill_price)}", bold=True)
+    return specs
+
+
+def _mt5_trade_labels(ax, x_hi, specs: list[dict]) -> None:
+    """Draw trade-level labels, de-collided in display pixels.
+
+    Call only after a canvas draw: ``transData`` needs finalized
+    axes positions. Labels keep their line's color and value; a
+    shifted label gets a short vertical leader back to its line.
+    """
+    if not specs:
+        return
+    orig = [ax.transData.transform((0, s["value"]))[1] for s in specs]
+    bbox = ax.bbox
+    adj = decollide_label_ys(orig, min_gap=18.0,
+                             top=bbox.y1 - 4, bottom=bbox.y0 + 4)
+    for s, o_px, a_px in zip(specs, orig, adj):
+        a_val = ax.transData.inverted().transform((0, a_px))[1]
+        if abs(a_px - o_px) > 1.0:
+            ax.plot([x_hi - 0.3, x_hi - 0.3], [s["value"], a_val],
+                    color=s["color"], linewidth=0.7, zorder=5)
+        ax.text(x_hi - 0.3, a_val, s["text"], ha="right", va="center",
+                fontsize=s["size"], color=s["color"],
+                fontweight="bold" if s["bold"] else "normal", zorder=6)
 
 
 def _mt5_panel_ylim(view, *, entry: float, stop: float,
+                    broker_stop: float | None = None,
                     targets: list[float], fill_price: float | None,
                     zone: dict | None) -> tuple[float, float]:
     """Y limits from the panel's own candles + the shared levels."""
@@ -724,6 +758,8 @@ def _mt5_panel_ylim(view, *, entry: float, stop: float,
     lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
     span = max(hi_v - lo_v, 1e-9)
     cand = [lo_v, hi_v, stop, entry] + list(targets)
+    if broker_stop is not None:
+        cand.append(broker_stop)
     if fill_price is not None:
         cand.append(fill_price)
     if zone is not None and zone.get("top") and zone.get("bottom"):
@@ -836,7 +872,9 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                        entry: float, stop: float,
                        targets: list[float] | None = None,
                        direction: int = 0, verdict: dict | None = None,
-                       playbook: str = "", score: float = 0.0,
+                       playbook: str = "", score: float | None = None,
+                       decision_score: float | None = None,
+                       broker_stop: float | None = None,
                        instrument: str = "XAUUSD",
                        fill_price: float | None = None,
                        window: int = 120,
@@ -859,7 +897,15 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
     ``entry_clock`` defaults to the verdict's entry clock (M15/M30).
     ``style`` is ``"classic"`` or ``"blueprint"`` (the two MT5 chart
     classes).  Every level drawn comes from the caller — nothing is
-    inferred, estimated, or defaulted.
+    inferred, estimated, or defaulted.  Step 7: ``decision_score``
+    (the score recorded for the signal) is what the page shows;
+    ``score`` is only the legacy fallback for old callers, and no
+    score at all renders as "Score unavailable", never a placeholder.
+    ``broker_stop`` is the broker stop when one is known (fill /
+    pending charts); signal charts pass None and the page says so.
+    Panel roles come from the route + entry clock (see
+    ``charts.signal_model``): on native routes H1 is context, not
+    the trigger.
 
     Studies (at most four, all caller-supplied except sessions,
     which shade the panels' own bar timestamps):
@@ -878,7 +924,9 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
     if h1 is None or len(h1) == 0:
         raise ValueError("render_mt5_signal needs a non-empty H1 frame")
     targets = list(targets or [])
-    risk = abs(entry - stop)
+    risk = (abs(entry - broker_stop) if broker_stop is not None
+            else abs(entry - stop))
+    shown_score = score_text(decision_score, fallback=score)
     clock = entry_clock or (verdict or {}).get("entry_clock") or "M15"
     bias_d1 = (verdict or {}).get("bias_d1", 0)
     bias_h4 = (verdict or {}).get("bias_h4", 0)
@@ -889,24 +937,29 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
     fig = plt.figure(figsize=(16, 13), dpi=_DPI)
     fig.patch.set_facecolor(theme["bg"])
     fig.suptitle(f"{instrument} · MT5 signal · {playbook} · "
-                 f"score {score:.0f}",
+                 f"{shown_score}",
                  fontsize=13, color=theme["text"], x=0.02, ha="left")
     gs = fig.add_gridspec(3, 1, height_ratios=[2.2, 2.2, 1.8],
                           hspace=0.45, left=0.05, right=0.97,
                           top=0.93, bottom=0.05)
     axes = [fig.add_subplot(gs[i]) for i in range(3)]
 
+    h1_role = panel_role("H1", playbook=playbook, entry_clock=clock)
+    h1_title = f"H1 — {h1_role}"
+    if trigger != "?":
+        h1_title += f": {trigger}"
     panels = [
         # (frame, window, title, zone band?, marker label, is H1 panel?)
         (h4, h4_window,
          f"H4 — structure · D1 bias {bias_d1:+d} · H4 bias {bias_h4:+d}",
          True, None, False),
-        (h1, window, f"H1 — trigger: {trigger}", False,
-         f"TRIGGER {trigger}", True),
+        (h1, window, h1_title, False,
+         f"TRIGGER {trigger}" if trigger != "?" else None, True),
         (entry_frame, entry_window, f"{clock} — entry", False, "ENTRY",
          False),
     ]
     verdict_box_done = False
+    label_specs: list[tuple] = []
     for ax, (frame, win, title, show_zone, marker, is_h1) in zip(axes, panels):
         ax.set_facecolor(theme["bg"])
         ax.tick_params(colors=theme["text"], labelsize=8)
@@ -952,13 +1005,15 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                 _mt5_premium_discount(ax, x_lo, x_hi, fib_range[0],
                                       fib_range[1], theme)
             _mt5_fib(ax, x_hi, fib_levels, ote_band, theme)
-        _mt5_trade_levels(ax, x_hi, entry=entry, stop=stop,
-                          targets=targets, direction=direction, risk=risk,
-                          fill_price=fill_price, theme=theme)
         lo_v, hi_v = _mt5_panel_ylim(
-            view, entry=entry, stop=stop, targets=targets,
-            fill_price=fill_price, zone=zone if show_zone else None)
+            view, entry=entry, stop=stop, broker_stop=broker_stop,
+            targets=targets, fill_price=fill_price,
+            zone=zone if show_zone else None)
         ax.set_ylim(lo_v, hi_v)
+        label_specs.append((ax, x_hi, _mt5_trade_levels(
+            ax, x_hi, entry=entry, stop=stop, broker_stop=broker_stop,
+            targets=targets, direction=direction, risk=risk,
+            fill_price=fill_price, theme=theme)))
         if marker is not None:
             last = len(view) - 1
             ax.axvspan(last - 0.5, last + 0.5, color="#7e57c2",
@@ -976,18 +1031,33 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
         # Verdict box on the first available panel (H4 preferred).
         if not verdict_box_done:
             vlines = [f"{arrow} {instrument} — {playbook} · "
-                      f"score {score:.0f}"]
+                      f"{shown_score}"]
             if verdict is not None:
                 vlines.append(
-                    f"D1 {bias_d1:+d} / H4 {bias_h4:+d} / {trigger} / "
-                    f"{clock}")
-                vlines.append(
-                    f"AMD: {verdict.get('amd_phase', '?')} · "
-                    f"QM: {(verdict.get('qm') or {}).get('status', '?')} · "
-                    f"vol: {(verdict.get('volume') or {}).get('volume_ratio', '?')}")
-            vlines.append(f"Entry {_fmt(entry)} · Stop {_fmt(stop)}"
-                          + (f" · Fill {_fmt(fill_price)}"
-                             if fill_price is not None else ""))
+                    f"D1 {bias_d1:+d} / H4 {bias_h4:+d}"
+                    + (f" / {trigger}" if trigger != "?" else "")
+                    + f" / {clock}")
+                vparts = []
+                amd = verdict.get("amd_phase")
+                if amd not in (None, "?"):
+                    vparts.append(f"AMD: {amd}")
+                qm_status = (verdict.get("qm") or {}).get("status")
+                if qm_status not in (None, "?"):
+                    vparts.append(f"QM: {qm_status}")
+                vol = (verdict.get("volume") or {}).get("volume_ratio")
+                if vol not in (None, "?"):
+                    vparts.append(f"vol: {vol}")
+                if vparts:
+                    vlines.append(" · ".join(vparts))
+            stop_line = (f"Entry {_fmt(entry)} · Stop {_fmt(stop)} "
+                         "(structural)")
+            if broker_stop is not None:
+                stop_line += f" · Broker SL {_fmt(broker_stop)}"
+            else:
+                stop_line += " · Broker SL pending at placement"
+            if fill_price is not None:
+                stop_line += f" · Fill {_fmt(fill_price)}"
+            vlines.append(stop_line)
             ax.text(0.008, 0.992, "\n".join(vlines),
                     transform=ax.transAxes, va="top", ha="left",
                     fontsize=8.6, family="monospace",
@@ -1004,6 +1074,12 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
              if hasattr(ts[i], "strftime") else str(ts[i])
              for i in ticks], fontsize=8)
         ax.set_ylabel("Price", fontsize=9, color=theme["text"])
+
+    # Labels last: a canvas draw finalizes axes positions, so the
+    # de-collision pass measures real pixels, not estimates.
+    fig.canvas.draw()
+    for ax, x_hi_panel, specs in label_specs:
+        _mt5_trade_labels(ax, x_hi_panel, specs)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=_DPI, facecolor=theme["bg"],
