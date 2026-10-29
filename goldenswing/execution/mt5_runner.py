@@ -11524,6 +11524,7 @@ class MT5Runner:
                                fill_price=float(pos.entry_price),
                                entry_bar=fill_bar,
                                broker_sl=float(state.sl),
+                               playbook=state.playbook,
                                **_narr_kwargs)
         if _narr_state is not None:
             self._narrative_states[int(pos.ticket)] = _narr_state
