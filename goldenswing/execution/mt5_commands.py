@@ -31,12 +31,14 @@ from pathlib import Path
 
 from ..feed.tick_log import export_tick_history
 from ..feed.mt5 import MT5Feed
+from ..alerts import commands as _alerts_commands
 from ..alerts.commands import (CommandContext, CommandResult,
                                CommandRouter, build_zip_bundle,
                                fmt_code, fmt_feed_line,
                                fmt_next_keyboard, fmt_none, fmt_pnl,
                                fmt_progress, fmt_r, fmt_section,
-                               next_button_rows)
+                               last_journal_manifest,
+                               next_button_rows, write_journal_slice)
 from .mt5_config import (EXECUTE_PLAYBOOK_NAMES, SHADOW_PLAYBOOK_NAMES,
                         describe_change, parse_set)
 
@@ -1041,7 +1043,23 @@ def _mt5_results_md(ctx: CommandContext, scope: str, manifest: dict) -> str:
              f"journal: {manifest.get('journal', '(none)')}",
              f"feed: {manifest.get('feed', '(no status)')}",
              f"last_bar: {manifest.get('last_bar_time') or '(unknown)'}",
-             f"last_price: {manifest.get('last_price') or '(unknown)'}", ""]
+             f"last_price: {manifest.get('last_price') or '(unknown)'}"]
+    build = manifest.get("engine_build")
+    if build:
+        lines.append(
+            f"engine_build: {build.get('commit')} "
+            f"(dirty_tree: {build.get('dirty_tree')}, "
+            f"config: {build.get('config_fingerprint')}, "
+            f"booted: {build.get('ts')})")
+    jslice = manifest.get("journal_slice")
+    if jslice:
+        lines.append(
+            f"journal_slice: {jslice.get('arcname')} — the full journal "
+            f"({jslice.get('source')}, {jslice.get('source_bytes')} bytes) "
+            f"exceeds the 20MB file cap; the slice carries its newest "
+            f"{jslice.get('records')} records "
+            f"({jslice.get('first_ts')} → {jslice.get('last_ts')})")
+    lines.append("")
     if ctx.journal is None:
         lines += ["## Results", "", "(no journal attached — no trade stats)", ""]
     else:
@@ -1129,12 +1147,39 @@ def build_mt5_harvest_bundle(ctx: CommandContext, scope: str = "all"
         "last_bar_time": ctx.last_bar_time,
         "last_price": ctx.last_price,
     }
+    # Step 12a: stamp the build that wrote the journal (its last boot
+    # manifest) and, when the journal exceeds the per-file cap, slice
+    # its newest records so the bundle never carries zero journal —
+    # the SL-move sequence lives in the journal and nowhere else.
+    extra_files: list[tuple[Path, str]] | None = None
+    journal_file = Path(ctx.journal_path) if ctx.journal_path else None
+    if journal_file is not None and journal_file.is_file():
+        build = last_journal_manifest(journal_file)
+        if build:
+            manifest_base["engine_build"] = build
+        if any("journal" in p.name for p in chosen):
+            size = journal_file.stat().st_size
+            cap = _alerts_commands.HARVEST_MAX_FILE_BYTES
+            if size > cap:
+                budget = min(_alerts_commands.HARVEST_JOURNAL_SLICE_BYTES,
+                             cap - 65536)
+                if budget > 0:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    slice_path = out_dir / f"{journal_file.stem}_slice.jsonl"
+                    prov = write_journal_slice(journal_file, slice_path,
+                                               budget)
+                    if prov:
+                        extra_files = [(slice_path, slice_path.name)]
+                        manifest_base["journal_slice"] = {
+                            "arcname": slice_path.name,
+                            "source": journal_file.name,
+                            "source_bytes": size, **prov}
     journal_only = [p for p in chosen if "journal" in p.name]
     return build_zip_bundle(
         out_dir=out_dir, zip_prefix="goldenswing-mt5-harvest",
         files=chosen, data_dir=data_dir, manifest_base=manifest_base,
         results_md_fn=lambda m: _mt5_results_md(ctx, scope, m),
-        slim_files=journal_only)
+        slim_files=journal_only, extra_files=extra_files)
 
 
 @mt5_command("/harvest", "harvest MT5 journal + state + tick CSVs + results as one ZIP")

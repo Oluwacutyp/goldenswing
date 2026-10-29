@@ -472,6 +472,10 @@ def _report(ctx: CommandContext, args: list[str]) -> CommandResult:
 HARVEST_MAX_FILE_BYTES = 20 * 1024 * 1024
 HARVEST_MAX_ZIP_BYTES = 45 * 1024 * 1024
 HARVEST_SCOPES = ("all", "journal", "state", "results")
+#: When a journal exceeds the per-file cap, a slice of its newest
+#: records rides instead (step 12a): a harvest must never carry zero
+#: journal — the SL-move sequence lives there and nowhere else.
+HARVEST_JOURNAL_SLICE_BYTES = 18 * 1024 * 1024
 
 
 def _sha256_file(path: Path) -> str:
@@ -480,6 +484,118 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _scan_last_manifest(src: Path) -> tuple[bytes | None, dict | None]:
+    """The journal's LAST manifest record, found by scanning the file
+    backwards in chunks (never loading a multi-MB journal whole).
+    Returns (raw_line, parsed_subset) or (None, None)."""
+    try:
+        size = src.stat().st_size
+    except OSError:
+        return None, None
+    if size == 0:
+        return None, None
+    chunk = 1 << 20
+    pos = size
+    leftover = b""
+    try:
+        with src.open("rb") as fh:
+            while pos > 0:
+                start = max(0, pos - chunk)
+                fh.seek(start)
+                block = fh.read(pos - start) + leftover
+                pos = start
+                lines = block.split(b"\n")
+                leftover = lines[0] if pos > 0 else b""
+                for ln in reversed(lines[1:] if pos > 0 else lines):
+                    if b'"manifest"' not in ln:
+                        continue
+                    try:
+                        rec = json.loads(ln)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if isinstance(rec, dict) and rec.get("type") == "manifest":
+                        return ln, {
+                            "commit": rec.get("commit"),
+                            "dirty_tree": rec.get("dirty_tree"),
+                            "config_fingerprint": rec.get("config_fingerprint"),
+                            "ts": rec.get("ts"),
+                        }
+    except OSError:
+        return None, None
+    return None, None
+
+
+def last_journal_manifest(src: Path) -> dict | None:
+    """{commit, dirty_tree, config_fingerprint, ts} of the journal's
+    most recent boot manifest — which build wrote this journal."""
+    return _scan_last_manifest(src)[1]
+
+
+def write_journal_slice(src: Path, out_path: Path,
+                        max_bytes: int) -> dict | None:
+    """Write the NEWEST complete records of a JSONL journal to
+    ``out_path``, newest-window-first selection under ``max_bytes``.
+
+    The window is a strict tail of the file on record boundaries —
+    except that the journal's last manifest record is prepended when
+    the window itself contains none, so the slice always says which
+    build produced it (provenance flags this).  Returns provenance
+    {records, bytes, first_ts, last_ts, manifest_prepended} or None
+    when nothing could be sliced."""
+    try:
+        size = src.stat().st_size
+    except OSError:
+        return None
+    if max_bytes <= 0 or size == 0:
+        return None
+    read_from = max(0, size - max_bytes - 8192)
+    try:
+        with src.open("rb") as fh:
+            fh.seek(read_from)
+            raw = fh.read()
+    except OSError:
+        return None
+    if read_from > 0:
+        nl = raw.find(b"\n")
+        if nl < 0:
+            return None
+        raw = raw[nl + 1:]
+    lines = [ln for ln in raw.split(b"\n") if ln.strip()]
+    chosen: list[bytes] = []
+    total = 0
+    for ln in reversed(lines):
+        total += len(ln) + 1
+        if total > max_bytes and chosen:
+            break
+        chosen.append(ln)
+    chosen.reverse()
+    if not chosen:
+        return None
+    manifest_prepended = False
+    if not any(b'"manifest"' in ln for ln in chosen):
+        mline, _ = _scan_last_manifest(src)
+        if mline is not None and mline not in chosen:
+            chosen.insert(0, mline)
+            manifest_prepended = True
+
+    def _ts(ln: bytes):
+        try:
+            rec = json.loads(ln)
+            return rec.get("ts") if isinstance(rec, dict) else None
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    payload = b"\n".join(chosen) + b"\n"
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(payload)
+    except OSError:
+        return None
+    return {"records": len(chosen), "bytes": len(payload),
+            "first_ts": _ts(chosen[0]), "last_ts": _ts(chosen[-1]),
+            "manifest_prepended": manifest_prepended}
 
 
 def _harvest_candidates(ctx: CommandContext) -> tuple[Path, list[Path]]:
@@ -616,7 +732,8 @@ def _harvest_results_md(ctx: CommandContext, scope: str,
 def build_zip_bundle(*, out_dir: Path, zip_prefix: str,
                      files: list[Path], data_dir: Path,
                      manifest_base: dict, results_md_fn,
-                     slim_files: list[Path] | None = None
+                     slim_files: list[Path] | None = None,
+                     extra_files: list[tuple[Path, str]] | None = None
                      ) -> tuple[Path, dict]:
     """Generic bundle-ZIP writer shared by the OANDA + MT5 /harvest.
 
@@ -624,13 +741,17 @@ def build_zip_bundle(*, out_dir: Path, zip_prefix: str,
     called with ``files``/``skipped`` already filled in.  Same caps as
     the OANDA /harvest: 20MB/file, 45MB ZIP; oversize rebuilds the
     slim fallback (``slim_files`` + RESULTS.md + manifest) once.
-    Returns (zip_path, manifest).
+    ``extra_files`` are (path, arcname) pairs written after the main
+    files under their given names — generated evidence (e.g. a
+    journal slice) that is not a plain data-dir file; they ride the
+    slim fallback too.  Returns (zip_path, manifest).
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     manifest: dict = {**manifest_base, "files": [], "skipped": [],
                       "fallback_slim": False}
+    extras = list(extra_files or [])
 
     def _write_zip(zip_path: Path, file_list: list[Path]) -> dict:
         entries: list[dict] = []
@@ -641,6 +762,17 @@ def build_zip_bundle(*, out_dir: Path, zip_prefix: str,
                     arc = str(p.relative_to(data_dir))
                 except ValueError:
                     arc = p.name
+                size = p.stat().st_size
+                if size > HARVEST_MAX_FILE_BYTES:
+                    skipped.append({"arcname": arc,
+                                    "reason": f"{size} bytes > 20MB cap"})
+                    continue
+                zf.write(p, arc)
+                entries.append({"arcname": arc, "bytes": size,
+                                "sha256": _sha256_file(p)})
+            for p, arc in extras:
+                if not p.is_file():
+                    continue
                 size = p.stat().st_size
                 if size > HARVEST_MAX_FILE_BYTES:
                     skipped.append({"arcname": arc,

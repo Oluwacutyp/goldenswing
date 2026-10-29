@@ -306,6 +306,83 @@ def test_mt5_harvest_caps_skip_oversize_file(tmp_path, monkeypatch):
         assert "mt5_ticks_20261014.csv" not in zf.namelist()
 
 
+def _raw_journal(tmp_path, n_notes=1500):
+    """A journal file written as raw JSONL: one boot manifest, then
+    many note records (the SL-move notes are the payload that must
+    never be lost), then a close."""
+    import json as _json
+    path = tmp_path / "mt5_journal.jsonl"
+    lines = [_json.dumps({
+        "ts": "2026-10-20T00:00:00+00:00", "type": "manifest",
+        "commit": "abc1234", "dirty_tree": False,
+        "config_fingerprint": "fp123"})]
+    for i in range(n_notes):
+        lines.append(_json.dumps({
+            "ts": f"2026-10-20T01:{i % 60:02d}:00+00:00", "type": "note",
+            "text": f"mt5 tick: ticket 777 SL -> 400{i % 10}.00 "
+                    f"(profit_lock) seq {i}"}))
+    lines.append(_json.dumps({
+        "ts": "2026-10-20T02:00:00+00:00", "type": "close",
+        "ticket": 777, "r_net": 0.8}))
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_mt5_harvest_oversize_journal_rides_as_slice(tmp_path, monkeypatch):
+    # Step 12a: a journal over the per-file cap must still ride the
+    # harvest — as a newest-records slice — and the bundle must say
+    # which build wrote it.
+    import goldenswing.alerts.commands as C
+    monkeypatch.setattr(C, "HARVEST_MAX_FILE_BYTES", 200_000)
+    path = _raw_journal(tmp_path, n_notes=3000)
+    assert path.stat().st_size > 200_000
+    ctx = CommandContext(journal=None, journal_path=path,
+                         reports_dir=tmp_path / "reports")
+    zip_path, manifest = build_mt5_harvest_bundle(ctx, "all")
+    with zipfile.ZipFile(zip_path) as zf:
+        names = set(zf.namelist())
+        assert "mt5_journal.jsonl" not in names
+        assert "mt5_journal_slice.jsonl" in names
+        raw = zf.read("mt5_journal_slice.jsonl").decode()
+        results = zf.read("RESULTS.md").decode()
+    slice_lines = [ln for ln in raw.splitlines() if ln.strip()]
+    assert slice_lines
+    import json as _json
+    for ln in slice_lines:
+        _json.loads(ln)  # every slice line is a complete record
+    assert _json.loads(slice_lines[-1])["type"] == "close"
+    assert manifest["journal_slice"]["source_bytes"] == \
+        path.stat().st_size
+    assert manifest["journal_slice"]["records"] == len(slice_lines)
+    assert manifest["engine_build"]["commit"] == "abc1234"
+    assert "engine_build: abc1234" in results
+    assert "journal_slice: mt5_journal_slice.jsonl" in results
+    assert any(s["arcname"] == "mt5_journal.jsonl"
+               for s in manifest["skipped"])
+
+
+def test_journal_slice_helpers(tmp_path):
+    from goldenswing.alerts.commands import (last_journal_manifest,
+                                             write_journal_slice)
+    path = _raw_journal(tmp_path, n_notes=50)
+    # Generous budget: the whole file rides, no prepend needed.
+    out = tmp_path / "slice_all.jsonl"
+    prov = write_journal_slice(path, out, 10 * 1024 * 1024)
+    assert prov is not None and prov["manifest_prepended"] is False
+    assert prov["records"] == 52
+    assert last_journal_manifest(path)["commit"] == "abc1234"
+    # Tight budget: only a tail fits; the manifest is prepended so
+    # the slice still names its build.
+    out2 = tmp_path / "slice_tail.jsonl"
+    prov2 = write_journal_slice(path, out2, 400)
+    assert prov2 is not None and prov2["manifest_prepended"] is True
+    import json as _json
+    first = _json.loads(out2.read_text().splitlines()[0])
+    assert first["type"] == "manifest"
+    last = _json.loads(out2.read_text().splitlines()[-1])
+    assert last["type"] == "close"
+
+
 # ------------------------------------------------------------ tick CSV
 def test_tick_csv_rows_match_ticks_fed(tmp_path):
     script = [(2000.0, 2000.30, 0), (2000.10, 2000.40, 1)]
