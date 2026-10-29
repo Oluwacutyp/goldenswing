@@ -6046,7 +6046,17 @@ class MT5Runner:
             acted = self._runner_partial(
                 ticket, pos, 0.5, "pre_print_trim", stats, mid) \
                 or acted
-        if mode in ("be", "be_trim"):
+        if mode in ("be", "be_trim") and \
+                self.tick_manager.is_fixed_bracket(int(ticket)):
+            # Step 13: fixed-bracket positions keep their placement
+            # stop into the print — no breakeven securing.  Journaled
+            # (never silent) via the management log.
+            self._log_management(
+                ticket, pos, "pre_print_be_skipped",
+                f"mt5 pre-print: ticket {ticket} stop NOT secured "
+                f"to breakeven into {ev.title} — fixed-bracket "
+                f"playbook (step 13)")
+        elif mode in ("be", "be_trim"):
             # Stop to breakeven via the ordinary action path (the
             # tick manager books it, the pool syncs in _manage_tick
             # style below).
@@ -9829,8 +9839,17 @@ class MT5Runner:
             elif d < 0 and mid < inv < level:
                 level, roll_note = inv, f"funding {e.kind}"
         moved = False
-        if eff is not None and ((d == 1 and level > eff)
-                                or (d == -1 and level < eff)):
+        if eff is not None and self.tick_manager.is_fixed_bracket(
+                int(ticket)) and ((d == 1 and level > eff)
+                                  or (d == -1 and level < eff)):
+            # Step 13: a layer fill does NOT roll a fixed-bracket
+            # position's stop — the placement bracket stands.
+            self.journal.log_note(
+                f"mt5 layer: ticket {ticket} stop roll to "
+                f"{roll_note} SKIPPED — fixed-bracket playbook "
+                f"(step 13)")
+        elif eff is not None and ((d == 1 and level > eff)
+                                  or (d == -1 and level < eff)):
             res = self.executor.modify_sl(ticket, level)
             if res.ok:
                 self.tick_manager.apply(

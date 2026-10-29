@@ -133,8 +133,17 @@ def test_qm5_progress_tick_moves_no_stop(tmp_path):
 
 
 def test_qm5_best_r_arm_still_fires(tmp_path):
+    # Step 13 (2026-10-29) supersedes this for live qm_m5: the
+    # playbook now rides a fixed bracket, so NO arm fires.  This
+    # test lifts the bracket to isolate step 10's mechanism — with
+    # the bracket off, the 1R best-R arm is still there underneath
+    # (removing a playbook from fixed_bracket_playbooks restores
+    # exactly step-10 behaviour).
+    from dataclasses import replace
     ex = FakeExecutor()
     runner = _runner(tmp_path, ex)
+    runner.tick_manager.tick_cfg = replace(
+        runner.tick_manager.tick_cfg, fixed_bracket_playbooks=())
     _open(runner, playbook="qm_m5", targets=(2040.0,))
     runner._manage_tick(2023.0, {"tick_actions": 0},
                         bid=2023.0, ask=2023.2)

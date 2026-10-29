@@ -107,11 +107,16 @@ def test_pending_filled_qm5_progress_arm_stays_off(tmp_path):
     # NOT fire for a pending-filled qm_m5 position.
     actions = tm.on_tick(ticket, 4028.40)
     assert not any(a.kind == "modify_sl" for a in actions)
-    # The 1R arm still fires: mid 4026.50 = best_r 1.04.
+    # Step 13 (2026-10-29) supersedes the step-10 expectation that
+    # the 1R arm still fires for qm_m5: the playbook now rides a
+    # fixed bracket, so even a 1R excursion (mid 4026.50 = best_r
+    # 1.04) moves NO stop.  Threading still decides this — the
+    # fixed-bracket gate keys off the same threaded playbook this
+    # test exists to prove (see the fvg_limit control below, whose
+    # progress arm still fires, and test_step13's bracket-lifted
+    # control, where the 1R arm returns).
     actions = tm.on_tick(ticket, 4026.50)
-    locks = [a for a in actions
-             if a.kind == "modify_sl" and a.reason == "profit_lock"]
-    assert locks and abs(locks[0].level - 4028.62) < 0.05
+    assert not any(a.kind == "modify_sl" for a in actions)
 
 
 def test_pending_filled_other_playbook_keeps_progress_arm(tmp_path):

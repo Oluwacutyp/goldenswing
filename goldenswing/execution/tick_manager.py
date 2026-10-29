@@ -106,6 +106,23 @@ class TickConfig:
     #: protective stop are unaffected, and other playbooks keep
     #: the progress arm.
     profit_lock_progress_excluded_playbooks: tuple[str, ...] = ("qm_m5",)
+    #: Step 13 (2026-10-29, owner's pick after the Oct 29 journal
+    #: evidence): FIXED-BRACKET playbooks — no post-entry stop
+    #: tightening of any kind.  Profit-lock, breakeven, the R-trail
+    #: and the Chandelier never fire; the position rides its
+    #: placement bracket (buffered structural SL + broker TP) to
+    #: the exit.  The Oct 29 trades showed the lock and the trail
+    #: closing qm_m5 winners well short of their targets (+0.53R
+    #: and +0.80R against targets at +1.10R / +1.52R, and the
+    #: trail banking +1.05R after price missed TP by ~1pt); the
+    #: owner ordered a controlled demo test of the pure bracket.
+    #: Closes are NOT management moves and stay live: the initial
+    #: stop, panic, holding caps, layer stops, timeouts.  Partials
+    #: close volume without moving the stop and also stay.
+    #: Supersedes step 10's narrower progress-arm exclusion for
+    #: the listed playbooks (the exclusion still governs any
+    #: playbook removed from this list later).
+    fixed_bracket_playbooks: tuple[str, ...] = ("qm_m5",)
     #: Chandelier trailing (owner's TrailingStopEngine): once the
     #: excursion reaches ``chandelier_activation_r``, the stop is the
     #: best price since entry minus ``chandelier_atr_mult`` x ATR
@@ -575,6 +592,16 @@ class TickManager:
         st = self._states.get(ticket)
         return st.effective_stop if st is not None else None
 
+    def is_fixed_bracket(self, ticket: int) -> bool:
+        """Step 13: True when this position's playbook rides a
+        fixed bracket (no post-entry stop tightening).  Runner
+        paths that move stops outside ``on_tick`` (news pre-print
+        breakeven, layer-fill rolls) consult this BEFORE touching
+        the broker stop."""
+        st = self._states.get(ticket)
+        return st is not None and \
+            st.playbook in self.tick_cfg.fixed_bracket_playbooks
+
     # ---------------------------------------------------------------- layers
     def layers(self, ticket: int) -> list[Layer]:
         """Entry legs of a position (base first).  Copy — mutate via
@@ -734,6 +761,13 @@ class TickManager:
                 actions.append(TickAction("partial", level=pos.partial_price,
                                           volume=vol, reason="partial"))
 
+        # Step 13: fixed-bracket playbooks get NO SL-tightening
+        #    candidates at all — the placement bracket is the whole
+        #    exit policy.  Partial actions computed above still
+        #    stand (they close volume; they never move the stop).
+        if st.playbook in tcfg.fixed_bracket_playbooks:
+            return actions
+
         # 4/5. SL-tightening candidates — at most ONE SL move per
         #    tick, and it is the TIGHTEST candidate that improves on
         #    the current stop.  Breakeven, profit-lock, the R-trail,
@@ -851,6 +885,13 @@ class TickManager:
             return
         pos = st.pos
         if action.kind == "modify_sl" and action.level is not None:
+            if st.playbook in self.tick_cfg.fixed_bracket_playbooks:
+                # Step 13 defense in depth: a fixed-bracket position's
+                # stop is never booked as moved, whatever path built
+                # the action.  (Decision points gate before the
+                # broker is touched; this keeps the book honest if
+                # one is ever missed.)
+                return
             st.broker_sl = float(action.level)
             # A success closes the failure window for this level:
             # the next candidate (if any) starts with a fresh budget.
