@@ -606,6 +606,56 @@ class MT5Executor(Executor):
             message=f"modify failed: {mt5.last_error() if res is None else res.comment}",
             retcode=int(res.retcode) if res is not None else None)
 
+    #: MT5 DEAL_REASON_* -> journal words.
+    _DEAL_REASONS = {0: "client", 1: "mobile", 2: "web", 3: "expert",
+                     4: "sl", 5: "tp", 6: "rollover", 7: "vmargin",
+                     8: "split"}
+
+    def closing_deal(self, ticket: int) -> dict | None:
+        """The broker's closing deal for a position, from history.
+
+        Step 12d (2026-10-29): reconcile used to price a vanished
+        position's exit from the current tick snapshot — the
+        2026-10-28 TP fill at 4046.19 was journalled as 4042.89
+        (+0.50R instead of +1.14R).  The OUT deal carries the true
+        fill price and the broker's own reason (SL/TP/...).
+        Returns {"price", "profit", "reason", "time"} or None when
+        history has no closing deal (yet) — callers fall back to
+        the snapshot and say so."""
+        mt5 = self._lib()
+        if mt5 is None:
+            return None
+        deals = None
+        try:
+            deals = mt5.history_deals_get(position=int(ticket))
+        except Exception:
+            deals = None
+        if not deals:
+            try:
+                import datetime as _dt
+                _to = _dt.datetime.now() + _dt.timedelta(days=1)
+                _from = _to - _dt.timedelta(days=30)
+                window = mt5.history_deals_get(_from, _to)
+                deals = [d for d in (window or [])
+                         if int(getattr(d, "position_id", 0) or 0)
+                         == int(ticket)]
+            except Exception:
+                return None
+        if not deals:
+            return None
+        outs = [d for d in deals
+                if int(getattr(d, "entry", 0) or 0) in (1, 2, 3)]
+        if not outs:
+            return None
+        d = max(outs, key=lambda x: float(getattr(x, "time", 0) or 0))
+        return {
+            "price": float(getattr(d, "price", 0.0) or 0.0),
+            "profit": float(getattr(d, "profit", 0.0) or 0.0),
+            "reason": self._DEAL_REASONS.get(
+                int(getattr(d, "reason", -1) or -1), "other"),
+            "time": int(getattr(d, "time", 0) or 0),
+        }
+
     def sl_constraints(self, symbol: str) -> dict | None:
         """MT5 symbol_info stops/freeze levels (points) + point size."""
         mt5 = self._lib()

@@ -2519,6 +2519,30 @@ class MT5Runner:
                         self._record_close(ticket, price, "scalp_cap",
                                            stats)
 
+    def _broker_close_price(self, ticket: int,
+                            fallback: float) -> tuple[float, str | None]:
+        """Step 12d: price a vanished position's exit from the
+        broker's closing DEAL when history has it — the tick
+        snapshot mis-recorded exits by up to 0.64R (2026-10-28:
+        a TP fill at 4046.19 journalled as 4042.89).  Returns
+        (price, provenance note); the snapshot stays the fallback
+        (older executor, history lag) and the note says which
+        source priced the exit, so misses stay countable."""
+        getter = getattr(self.executor, "closing_deal", None)
+        if getter is None:
+            return fallback, None
+        try:
+            deal = getter(int(ticket))
+        except Exception:
+            return fallback, None
+        if not deal or not float(deal.get("price") or 0.0):
+            return fallback, None
+        price = float(deal["price"])
+        return price, (
+            f"mt5 close: ticket {ticket} exit priced from the "
+            f"broker deal ({deal.get('reason') or 'deal'} @ "
+            f"{price:.2f}); tick snapshot was {fallback:.2f}")
+
     def _reconcile(self, price: float, stats: dict) -> None:
         """MT5 positions_get is the truth: drop broker-closed, adopt ours."""
         try:
@@ -2528,7 +2552,12 @@ class MT5Runner:
             return
         for ticket in list(self.tick_manager.tickets()):
             if ticket not in live:
-                self._record_close(ticket, price, "broker_closed", stats)
+                close_price, deal_note = self._broker_close_price(
+                    ticket, price)
+                if deal_note:
+                    self.journal.log_note(deal_note)
+                self._record_close(ticket, close_price,
+                                   "broker_closed", stats)
         # Positions that match a tracked pending order are NOT adopted
         # here: _reconcile_pending below handles them as FILLS (full
         # open record + fill chart), not as bare adoptions — adopting
