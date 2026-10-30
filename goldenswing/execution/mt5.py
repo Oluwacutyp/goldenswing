@@ -43,7 +43,9 @@ def select_order_type(*, direction: int, price: float,
                       zone: dict | None = None,
                       atr: float = 0.0,
                       urgency: float | None = None,
-                      profile: dict | None = None) -> tuple[str, float, str]:
+                      profile: dict | None = None,
+                      intent_family: str | None = None
+                      ) -> tuple[str, float, str]:
     """Setup-dependent order selection — the real-trader entry rule.
 
     A real trader picks the order type by where price is vs the
@@ -85,6 +87,18 @@ def select_order_type(*, direction: int, price: float,
     ``(kind, level, reason)``; ``level`` is the pending price for
     limit/stop, the current price for market, ``0.0`` for invalid.
     A missing/zero ``entry_ref`` falls back to market (legacy).
+
+    Step 15 (owner rulings 2026-10-30 §2): ``intent_family`` carries
+    the setup's DECLARED entry thesis.  ``"market"`` (confirmed
+    breakout / displacement continuation / immediate reaction) never
+    rests a limit: geometry that would park the entry as a pullback
+    or no-chase limit returns MARKET instead, the urgency downgrade
+    is skipped, and an entry still ahead of price stays a STOP
+    (stop-entry on the unbroken level).  ``"limit"`` (pullback /
+    mitigation / return-to-zone) and ``None`` keep the geometric
+    behaviour above verbatim — ``None`` is every legacy caller.
+    The zone-failed INVALID verdict binds both families: when the
+    premise is gone, no thesis resurrects it.
     """
     if entry_ref <= 0:
         return "market", float(price), "no entry_ref: market at price"
@@ -113,7 +127,11 @@ def select_order_type(*, direction: int, price: float,
             # downgrades MARKET to LIMIT at the POI — pay the level,
             # not the market, where liquidity is thick.  Urgency
             # never upgrades a limit to a market (no-chase).
-            if urgency is not None and urgency < 70.0 \
+            # Step 15: a MARKET-thesis setup (intent_family="market")
+            # is exempt from the downgrade — its premise is the
+            # trigger firing, not resting at the level.
+            if intent_family != "market" \
+                    and urgency is not None and urgency < 70.0 \
                     and profile is not None \
                     and profile.get("poc") is not None:
                 tol_px = 0.25 * float(atr) if atr and atr > 0 else 0.0
@@ -129,11 +147,30 @@ def select_order_type(*, direction: int, price: float,
             return ("market", float(price),
                     f"at level: price {price:.2f} within {tol:.2f} of "
                     f"entry {entry_ref:.2f}, trigger confirmed")
+        if intent_family == "market":
+            # Step 15 (rulings 2026-10-30 §2): the setup's thesis IS
+            # the displacement that already ran past the level — a
+            # resting limit contradicts the premise (the Oct 30
+            # cascade failure shape, where a continuation candidate
+            # was parked as a limit and never filled).  The thesis,
+            # declared per playbook, sanctions the market entry; the
+            # no-chase rule protects LIMIT-thesis setups, whose
+            # premise is the return to the level.
+            return ("market", float(price),
+                    f"past POI: price {price:.2f} already past entry "
+                    f"{entry_ref:.2f} — execution intent MARKET "
+                    f"(displacement continuation): entry at market, "
+                    f"no resting limit")
         return ("limit", float(entry_ref),
                 f"past POI: price {price:.2f} already past entry "
                 f"{entry_ref:.2f} — resting limit at POI, never chase")
     if direction > 0:
         if entry_ref < price - tol:
+            if intent_family == "market":
+                return ("market", float(price),
+                        f"continuation: entry {entry_ref:.2f} behind "
+                        f"price {price:.2f} — the break already ran; "
+                        f"execution intent MARKET, no resting limit")
             return ("limit", float(entry_ref),
                     f"pullback: entry {entry_ref:.2f} below price "
                     f"{price:.2f} — limit at POI")
@@ -141,6 +178,11 @@ def select_order_type(*, direction: int, price: float,
                 f"breakout: entry {entry_ref:.2f} above price "
                 f"{price:.2f} — stop beyond level")
     if entry_ref > price + tol:
+        if intent_family == "market":
+            return ("market", float(price),
+                    f"continuation: entry {entry_ref:.2f} behind "
+                    f"price {price:.2f} — the break already ran; "
+                    f"execution intent MARKET, no resting limit")
         return ("limit", float(entry_ref),
                 f"pullback: entry {entry_ref:.2f} above price "
                 f"{price:.2f} — limit at POI")

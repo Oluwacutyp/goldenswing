@@ -600,6 +600,52 @@ class MT5RunnerConfig:
             self.hot_scalp_db_path = self.journal_path.parent / "hot_scalp_setups.db"
 
 
+def execution_intent_for(pb_name: str, sig=None) -> dict:
+    """Step 15 (owner rulings 2026-10-30 §2): a candidate's DECLARED
+    execution intent — which order family its entry thesis calls for.
+
+    Returns {"family": "limit" | "market", "basis": str}.  The
+    registry is the declaration of record for roster playbooks
+    (PlaybookSpec.entry_thesis); the routing taxonomy names the
+    rest: a ``breakout`` playbook/signal rides the break itself,
+    hot_scalp is market-shape only by its v1 design, and
+    breakout-shaped sleeve kinds are displacement entries.
+    Everything else — every pullback / mitigation / retracement /
+    return-to-zone premise, declared or not — is the limit family:
+    the entry rests at the setup's level and a miss is the thesis
+    fulfilled, never a chase.  Pure: no state, no I/O.
+    """
+    name = str(pb_name or "")
+    kind = str(getattr(sig, "kind", "") or "")
+    if name == "breakout" or kind == "breakout":
+        return {"family": "market",
+                "basis": "confirmed breakout — the entry rides "
+                         "the break of structure itself"}
+    if kind in ("wedge_breakout", "squeeze_breakout"):
+        return {"family": "market",
+                "basis": f"{kind}: displacement breakout entry"}
+    if name == "hot_scalp":
+        return {"family": "market",
+                "basis": "hot scalp v1 is market-shape only"}
+    for spec in PLAYBOOK_REGISTRY:
+        if spec.name == name:
+            if spec.entry_thesis == "market":
+                return {"family": "market",
+                        "basis": f"{name} declares a market thesis "
+                                 "(immediate reaction / displacement "
+                                 "continuation — entry on the "
+                                 "trigger, per the playbook's own "
+                                 "definition)"}
+            return {"family": "limit",
+                    "basis": f"{name} declares a limit thesis "
+                             "(pullback / mitigation / "
+                             "return-to-zone — the entry rests at "
+                             "the level)"}
+    return {"family": "limit",
+            "basis": "default limit thesis (pullback / "
+                     "return-to-zone)"}
+
+
 @dataclass
 class PendingOrderState:
     """One pending LIMIT / STOP the engine is responsible for.
@@ -1928,6 +1974,11 @@ class MT5Runner:
         }
         if provenance is not None:
             out["provenance"] = provenance
+        # Step 15: the candidate's declared execution intent rides
+        # every funnel record whose route stamped it on the signal.
+        _intent = getattr(sig, "execution_intent", None)
+        if _intent is not None:
+            out["execution_intent"] = dict(_intent)
         return out
 
     def _journal_manifest(self) -> None:
@@ -7287,6 +7338,9 @@ class MT5Runner:
             atr=atr_m5, index=self._current_h1_bar(),
             score=float(candidate.get("score") or 0.0),
             execution_eligible=True)
+        # Step 15: stamp the declared execution intent (market
+        # family — hot scalp v1 is market-shape only).
+        sig.execution_intent = execution_intent_for("hot_scalp", sig)
         pb = SimpleNamespace(name="hot_scalp")
         tracked_before = set(self.tick_manager.tickets())
         self._last_tick = dict(tick)
@@ -8902,6 +8956,11 @@ class MT5Runner:
                         pb.name, -10 ** 9) \
                     < self.cfg.signal_gap_bars:
                 continue
+            # Step 15: stamp the candidate's declared execution
+            # intent — every funnel record for this candidate
+            # carries it (_candidate_dict reads the attribute) and
+            # the shared order path enforces it at selection.
+            sig.execution_intent = execution_intent_for(pb.name, sig)
             # ---- P3 style/family + journey pre-pass -------------
             # The style bucket picks the floated clocks + the
             # open-space floor row; the family is the posture unit.
@@ -11028,7 +11087,8 @@ class MT5Runner:
                           funding_events: list | None = None,
                           score=None, zone_d: dict | None = None,
                           funding=None,
-                          signal_ctx: dict | None = None
+                          signal_ctx: dict | None = None,
+                          intent: dict | None = None
                           ) -> None:
         """Setup-dependent order selection + placement.
 
@@ -11084,6 +11144,47 @@ class MT5Runner:
                 f"mt5: order refused {pb.name}: market closed "
                 f"({open_reason})")
             return
+        # Step 15 duplicate guard (rulings 2026-10-30 §2): the SAME
+        # parent thesis expressed by two playbooks must not create
+        # duplicate orders merely because they prefer different
+        # execution methods.  A thesis twin = a working PENDING in
+        # the same direction at the same entry level (within the
+        # selector's at-level tolerance, 0.25 x ATR): one playbook
+        # rests a limit there, another reaches for a market fill at
+        # the same level — the second order is refused.  Different
+        # levels are different setups: the desk legitimately works
+        # an inversion pending and a judas/turtle market entry on
+        # the same frame (pinned by the telegram-control suite),
+        # and the one-PENDING rule in _place_pending_order still
+        # caps resting orders at one.
+        if not is_layer and self._pending_orders:
+            _tol = 0.25 * float(getattr(sig, "atr", 0.0) or 0.0)
+            _twin = None
+            for _w in self._pending_orders.values():
+                if int(_w.direction) == int(sig.direction) and \
+                        abs(float(_w.level)
+                            - float(sig.entry_ref)) <= _tol:
+                    _twin = _w
+                    break
+            if _twin is not None:
+                stats["duplicate_working_order"] = stats.get(
+                    "duplicate_working_order", 0) + 1
+                self._record_blocked(
+                    f"duplicate working order: {_twin.playbook} "
+                    f"{_twin.kind} pending (ticket {_twin.ticket}) "
+                    f"already working the same thesis — direction "
+                    f"{int(sig.direction):+d} at level "
+                    f"{float(_twin.level):.2f} vs candidate entry "
+                    f"{float(sig.entry_ref):.2f}; {pb.name} refused "
+                    "(execution method is not a second order)",
+                    pb.name)
+                self.journal.log_note(
+                    f"mt5: order refused {pb.name}: already "
+                    f"holding/pending — duplicate working order "
+                    f"({_twin.playbook} {_twin.kind} pending ticket "
+                    f"{_twin.ticket} at the same level "
+                    f"{float(_twin.level):.2f})")
+                return
         # News pause (base orders only): no NEW entries inside a
         # high-impact window.  Layers are management of a held
         # position, never paused.  Confirm-fired orders re-check
@@ -11340,11 +11441,26 @@ class MT5Runner:
             _profile = volume_profile(_h1)
         except Exception:
             _urgency, _profile = None, None
+        # Step 15: the candidate's DECLARED execution intent steers
+        # selection (the caller's resolved intent wins; the signal's
+        # stamped intent is next; the resolver is the fallback).
+        # Layers are position management, not candidates — no intent,
+        # legacy geometry.
+        _intent = intent
+        if _intent is None and not is_layer:
+            _intent = (getattr(sig, "execution_intent", None)
+                       or execution_intent_for(pb.name, sig))
         kind, level, reason = select_order_type(
             direction=int(sig.direction), price=price,
             entry_ref=float(sig.entry_ref),
             zone=(verdict or {}).get("zone"), atr=float(sig.atr),
-            urgency=_urgency, profile=_profile)
+            urgency=_urgency, profile=_profile,
+            intent_family=(_intent or {}).get("family"))
+        if _intent is not None:
+            self.journal.log_note(
+                f"mt5: execution intent {pb.name}: "
+                f"family={_intent.get('family')} — "
+                f"{_intent.get('basis')}; selected {kind}: {reason}")
         # Limit ladder (opt-in): stagger the LIMIT across rungs
         # from the playbook level to the adverse zone edge.  Rung 0
         # is placed now (replaces the single-pending level + lots);
@@ -12356,6 +12472,10 @@ class MT5Runner:
                 if cand.signal_index <= self._qm_m5_last_logged:
                     continue  # already evaluated on an earlier scan
                 sig = cand.outcome.signal
+                # Step 15: stamp the declared execution intent
+                # (QM = limit thesis: entry at the QM level).
+                sig.execution_intent = execution_intent_for(
+                    "qm_m5", sig)
                 lc = dict(getattr(sig, "live_context", None) or {})
                 touch = {"direction": int(cand.direction),
                          "touch_ts": m5_df.index[cand.signal_index],
@@ -13185,6 +13305,10 @@ class MT5Runner:
                 self._qm_d1_last_logged = max(
                     self._qm_d1_last_logged, int(cand.signal_index))
                 sig = cand.outcome.signal
+                # Step 15: stamp the declared execution intent
+                # (QM = limit thesis: entry at the QM level).
+                sig.execution_intent = execution_intent_for(
+                    "qm_d1", sig)
                 lc = dict(getattr(sig, "live_context", None) or {})
                 touch = {"direction": int(cand.direction),
                          "touch_ts": d1_df.index[cand.signal_index],

@@ -87,6 +87,18 @@ class PlaybookSpec:
     #: the §G range scans stay journal-only shadow.
     validity_bars: int = 6
     trigger_kind: str = "h1_trigger_fire"
+    #: Step 15 (owner rulings 2026-10-30 §2): the playbook's declared
+    #: ENTRY THESIS — "limit" (the setup enters when price returns to
+    #: its level: pullback / mitigation / retracement / return-to-zone)
+    #: or "market" (the setup's premise is the trigger firing itself:
+    #: confirmed breakout / displacement continuation / immediate
+    #: reaction — a resting limit contradicts the premise).  The order
+    #: path journals the intent per candidate and enforces the family
+    #: in select_order_type.  Default "limit": every roster playbook's
+    #: own definition is a level-return premise except v_reversal,
+    #: which declares "market" below (its definition enters on the
+    #: reclaim bar's close).
+    entry_thesis: str = "limit"
 
 
 #: The registry, in canonical display order: the H1-clocked roster
@@ -110,7 +122,7 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     PlaybookSpec("turtle_soup", TurtleSoupPlaybook, "H1",
                  ROUTE_H1_ROSTER),
     PlaybookSpec("v_reversal", VReversalPlaybook, "H1",
-                 ROUTE_H1_ROSTER),
+                 ROUTE_H1_ROSTER, entry_thesis="market"),
     PlaybookSpec("retracement_trap", RetracementTrapPlaybook, "H1",
                  ROUTE_H1_ROSTER),
     PlaybookSpec("order_block", OrderBlockPlaybook, "H1",
@@ -131,7 +143,7 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     PlaybookSpec("range_compression_breakout",
                  RangeCompressionBreakoutPlaybook,
                  "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1",
-                 shadow_evaluation=True),
+                 shadow_evaluation=True, entry_thesis="market"),
     PlaybookSpec("narrative", NarrativePlaybook, "H1",
                  ROUTE_H1_ROSTER),
     # Native-clock routes: evaluated by dedicated runner paths on
