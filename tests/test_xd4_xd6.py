@@ -274,7 +274,10 @@ def test_xd6_live_signal_generators_see_closed_bars_only(tmp_path):
             "setup": {}}
     captured = {}
 
-    def _capture(h1, t, states, years, verdict, stats, forming=None):
+    # Step 14: _run_live_signal also passes lifecycle_routing —
+    # the capture accepts (and ignores) extra kwargs.
+    def _capture(h1, t, states, years, verdict, stats, forming=None,
+                 **_kw):
         captured["h1"] = h1
         captured["t"] = t
         captured["verdict"] = verdict

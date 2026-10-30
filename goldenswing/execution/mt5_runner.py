@@ -174,6 +174,9 @@ from .assessment_render import (is_shadow_record as
                                 _render_assessment)
 from . import candidate_lifecycle as _lifecycle
 from . import journal_audit as _journal_audit
+from . import setup_lifecycle as _setup_lc
+from .setup_lifecycle import (SetupLifecycleStore as _SetupStore,
+                              TrackedSetup as _TrackedSetup)
 from .friction_gate import (
     FRICTION_REASON_CODE as _FRICTION_CODE,
     assess_entry_friction as _assess_friction)
@@ -758,6 +761,24 @@ class MT5Runner:
         # (ticket, reason, level): a stood-down level notes once
         # per side-invalid window, never once per tick.
         self._sl_stood_down: set = set()
+        # Setup lifecycle (owner rulings 2026-10-30 §1): scan-detected
+        # roster setups persist across restarts so a later trigger
+        # fire can route them to execution evaluation.  A store that
+        # cannot be read starts empty with a loud note — the journal
+        # still holds every detection event, so nothing vanishes
+        # silently.
+        self._setup_store: _SetupStore | None = None
+        try:
+            _lc_path = getattr(self.cfg, "setup_lifecycle_path",
+                               None) or (
+                self.cfg.journal_path.parent
+                / "setup_lifecycle.json")
+            self._setup_store = _SetupStore(_lc_path)
+        except Exception as _lc_exc:
+            self.journal.log_note(
+                "setup_lifecycle: persistent setup store "
+                f"unavailable ({_lc_exc}) — scan setups will not "
+                "persist this run")
         # Hot Scalp is a separate, persistent research sleeve. Setup storage
         # lives beside the journal so two runner processes on this EC2 host
         # share identity and atomic trigger claims. Failure disables this
@@ -1659,6 +1680,206 @@ class MT5Runner:
             if stage == "fired" else "not_eligible",
             reason_code=reason_code, reason=reason,
             trigger_stage=stage)
+
+    # ------------------------------------------- setup lifecycle (§1)
+    def _journal_setup_event(self, setup, stage: str,
+                             detail: str = "") -> None:
+        """One setup-lifecycle funnel record (kind=setup_event).
+
+        The chain candidate_detected -> setup_armed ->
+        trigger_fired -> execution_evaluated -> order_submitted
+        -> filled / rejected / expired / invalidated, every link
+        carrying the stable setup ID and parent setup ID (owner
+        rulings 2026-10-30 §1: a fired trigger — and a detected
+        setup — must never disappear between analysis and
+        execution)."""
+        self._emit_eval(
+            playbook=setup.playbook, kind="setup_event",
+            evaluation_clock="setup_lifecycle",
+            intended_tf=setup.trigger_tf,
+            actual_input_tf=setup.trigger_tf,
+            outcome=("candidate_emitted"
+                     if stage in (_setup_lc.STAGE_DETECTED,
+                                  _setup_lc.STAGE_ARMED,
+                                  _setup_lc.STAGE_TRIGGER_FIRED,
+                                  _setup_lc.STAGE_SUBMITTED,
+                                  _setup_lc.STAGE_FILLED)
+                     else "not_eligible"),
+            reason_code="", reason=detail, trigger_stage=stage,
+            candidate={"direction": int(setup.direction),
+                       "entry": float(setup.entry_ref),
+                       "stop": float(setup.invalidation),
+                       "targets": [float(x) for x in setup.targets]},
+            evidence={"setup_id": setup.setup_id,
+                      "parent_setup_id": setup.parent_setup_id,
+                      "lifecycle_stage": stage,
+                      "route": setup.route,
+                      "trigger_kind": setup.trigger_kind,
+                      "validity_bars": int(setup.validity_bars),
+                      "expiry_ts": setup.expiry_ts,
+                      "formation_ts": setup.formation_ts,
+                      "touch_ts": setup.touch_ts},
+            source="setup_lifecycle")
+
+    def _transition_setup(self, setup, stage: str,
+                          detail: str = "", **kw) -> None:
+        """Move a tracked setup and journal the transition."""
+        if self._setup_store is None:
+            return
+        ev = self._setup_store.transition(
+            setup.setup_id, stage, ts=str(self._evaluation_now()),
+            detail=detail, **kw)
+        if ev is not None:
+            self._journal_setup_event(setup, stage, detail)
+
+    def _rebuild_setup_signal(self, setup, t: int):
+        """The detector's candidate, rebuilt from its persisted
+        fields — the persisted setup is evaluated at fire time,
+        not re-detected fresh (a fresh-only filter is exactly
+        what starved the Oct 30 scan setups)."""
+        from ..golden.detector import GoldenSignal
+        sig = GoldenSignal(
+            index=int(t), timestamp=setup.touch_ts,
+            direction=int(setup.direction),
+            score=float(setup.score), kind=str(setup.kind or ""),
+            factors=list(setup.factors),
+            entry_zone=(tuple(setup.entry_zone)
+                        if setup.entry_zone else (0.0, 0.0)),
+            entry_ref=float(setup.entry_ref),
+            invalidation=float(setup.invalidation),
+            targets=[float(x) for x in setup.targets],
+            atr=float(setup.atr),
+            sweep_index=setup.sweep_index)
+        if setup.live_context:
+            sig.live_context = dict(setup.live_context)
+        return sig
+
+    def _setup_provenance(self, setup, h1, t: int) -> dict:
+        """Provenance for a lifecycle-routed candidate: the
+        candidate's origin is the live-close scan that detected
+        it (eligibility is computed from THAT origin and the
+        touch's age at fire time); this record's evaluation
+        source is the trigger path that routed it."""
+        touch_age = None
+        if setup.touch_ts is not None and 0 <= t < len(h1):
+            try:
+                touch_age = int(
+                    (pd.Timestamp(h1.index[t])
+                     - pd.Timestamp(setup.touch_ts))
+                    / pd.Timedelta(hours=1))
+            except Exception:
+                touch_age = None
+        eligible, code, _why = _lifecycle.assess_eligibility(
+            source=_lifecycle.SOURCE_LIVE_CLOSE,
+            touch_age_bars=touch_age,
+            validity_window_bars=int(setup.validity_bars))
+        return _lifecycle.provenance_block(
+            key=setup.setup_id, formation_ts=setup.formation_ts,
+            touch_ts=setup.touch_ts, created_ts=setup.created_ts,
+            evaluated_bar_ts=(h1.index[t] if 0 <= t < len(h1)
+                              else None),
+            evaluation_ts=self._evaluation_now(),
+            source=_lifecycle.SOURCE_TRIGGER_PATH,
+            touch_age_bars=touch_age,
+            validity_window_bars=int(setup.validity_bars),
+            eligible=eligible, eligibility_code=code)
+
+    _SETUP_TF_DELTAS = {
+        "M5": pd.Timedelta(minutes=5),
+        "M15": pd.Timedelta(minutes=15),
+        "M30": pd.Timedelta(minutes=30),
+        "H1": pd.Timedelta(hours=1),
+        "H4": pd.Timedelta(hours=4),
+        "D1": pd.Timedelta(days=1)}
+
+    def _register_scan_setup(self, spec, sig, prov, *, frame, t,
+                             formation_ts, eval_now,
+                             intended_tf) -> None:
+        """Persist one scan-detected candidate as a tracked
+        setup (owner rulings 2026-10-30 §1).  Detection happens
+        at the level on a live close, so the setup arms
+        immediately; its declared trigger is a same-direction
+        h1_trigger fire inside its validity window."""
+        clean_ctx, _dropped = _setup_lc.sanitize_context(
+            getattr(sig, "live_context", None))
+        touch_ts = frame.index[t]
+        delta = self._SETUP_TF_DELTAS.get(
+            str(intended_tf), pd.Timedelta(hours=1))
+        setup = _TrackedSetup(
+            setup_id=prov["instance_key"],
+            parent_setup_id=prov["instance_key"],
+            playbook=spec.name, route=spec.route,
+            direction=int(sig.direction),
+            kind=str(getattr(sig, "kind", "") or ""),
+            score=float(getattr(sig, "score", 0.0) or 0.0),
+            factors=list(getattr(sig, "factors", None) or []),
+            entry_zone=[float(x) for x in (
+                getattr(sig, "entry_zone", (0.0, 0.0))
+                or (0.0, 0.0))],
+            entry_ref=float(sig.entry_ref),
+            invalidation=float(sig.invalidation),
+            targets=[float(x) for x in (sig.targets or [])],
+            atr=float(getattr(sig, "atr", 0.0) or 0.0),
+            sweep_index=getattr(sig, "sweep_index", None),
+            live_context=clean_ctx,
+            formation_ts=(str(formation_ts)
+                          if formation_ts is not None else None),
+            touch_ts=str(touch_ts), created_ts=str(eval_now),
+            trigger_kind=str(getattr(
+                spec, "trigger_kind", "h1_trigger_fire")),
+            trigger_tf=str(intended_tf),
+            validity_bars=int(getattr(spec, "validity_bars", 6)),
+            expiry_ts=str(touch_ts + delta
+                          * int(getattr(spec, "validity_bars",
+                                        6))))
+        if self._setup_store.register(setup, ts=str(eval_now)):
+            self._journal_setup_event(
+                setup, _setup_lc.STAGE_DETECTED,
+                f"scan-detected {setup.playbook} "
+                f"{setup.direction:+d} @ {setup.entry_ref:.2f} — "
+                "registered for trigger routing (the scan itself "
+                "holds no order authority)")
+            self._transition_setup(
+                setup, _setup_lc.STAGE_ARMED,
+                f"armed: trigger {setup.trigger_kind} "
+                f"(same-direction h1_trigger fire) within "
+                f"{setup.validity_bars} {setup.trigger_tf} bars; "
+                f"invalidation {setup.invalidation:.2f}; "
+                f"expiry {setup.expiry_ts}")
+
+    def _upkeep_setups(self, h1) -> None:
+        """Per-H1-close lifecycle upkeep: a tracked setup whose
+        invalidation level has been CLOSED beyond, or whose
+        validity window has lapsed, leaves the active set
+        through a journaled terminal transition — never a
+        silent drop.  Runs on every roster close-eval cycle,
+        including the warm-start cycle (setups persisted across
+        a restart meet their expiry here, journaled)."""
+        if self._setup_store is None or h1 is None or not len(h1):
+            return
+        last_bar = h1.index[-1]
+        close = float(h1.iloc[-1]["close"])
+        for setup in self._setup_store.active(armed_only=True):
+            if setup.expiry_ts is not None:
+                try:
+                    if pd.Timestamp(last_bar) >= pd.Timestamp(
+                            setup.expiry_ts):
+                        self._transition_setup(
+                            setup, _setup_lc.STAGE_EXPIRED,
+                            f"validity window lapsed: touch "
+                            f"{setup.touch_ts}, expiry "
+                            f"{setup.expiry_ts}, last closed bar "
+                            f"{last_bar}")
+                        continue
+                except Exception:
+                    pass
+            inv = float(setup.invalidation)
+            if (int(setup.direction) > 0 and close < inv) or \
+                    (int(setup.direction) < 0 and close > inv):
+                self._transition_setup(
+                    setup, _setup_lc.STAGE_INVALIDATED,
+                    f"close rule: {setup.trigger_tf} close "
+                    f"{close:.2f} beyond invalidation {inv:.2f}")
 
     @staticmethod
     def _candidate_dict(sig, breakdown: dict | None = None,
@@ -7515,8 +7736,135 @@ class MT5Runner:
             f"bars only (last closed {h1_closed.index[-1]}); "
             f"forming bar {forming['open_time']} labelled "
             "reaction-only")
-        self._run_signal_path(h1_closed, t, states, years, verdict,
-                              stats, forming=forming_record)
+        # Setup lifecycle (owner rulings 2026-10-30 §1): the fire
+        # gets a guaranteed disposition — after the signal path
+        # runs, an execution_evaluated trigger record states what
+        # the fire produced (records emitted, lifecycle setups
+        # routed and their outcomes), including when the path
+        # raises.  A fired trigger must never disappear between
+        # analysis and execution again (the 2026-10-30 03:30
+        # hole).
+        _seq0 = self._funnel_seq
+        _routing: dict = {}
+        _fire_dir = int(verdict.get("direction")
+                        or pend.get("direction") or 0)
+        try:
+            self._run_signal_path(h1_closed, t, states, years,
+                                  verdict, stats,
+                                  forming=forming_record,
+                                  lifecycle_routing=_routing)
+        except Exception:
+            self._emit_trigger_event(
+                "execution_evaluated", "path.exception",
+                f"fire {_fire_dir:+d}: signal path raised — "
+                f"routed setups so far: {sorted(_routing)}")
+            raise
+        _frags = self._apply_lifecycle_routing(_routing, _fire_dir)
+        _armed_waiting = 0
+        if self._setup_store is not None and _fire_dir in (1, -1):
+            _armed_waiting = len(self._setup_store.active(
+                direction=_fire_dir, armed_only=True))
+        self._emit_trigger_event(
+            "execution_evaluated", "",
+            f"fire {_fire_dir:+d}: signal path emitted "
+            f"{self._funnel_seq - _seq0} funnel records; "
+            "lifecycle routing: "
+            f"{'; '.join(_frags) if _frags else 'no armed setups routed'}; "
+            f"armed setups remaining in direction: "
+            f"{_armed_waiting}")
+
+    def _apply_lifecycle_routing(self, routing: dict,
+                                 direction: int) -> list[str]:
+        """Advance routed setups' lifecycles from one fire's
+        routing results (owner rulings 2026-10-30 §1).  Returns
+        one summary fragment per routed setup for the fire's
+        disposition record.  A setup that was evaluated but
+        neither ordered nor refused (parked in PullbackWatch,
+        execute-list narrowed, layer evaluation with no order)
+        returns to armed — it stays live for a later fire inside
+        its validity window; the shared order path's
+        one-position / pending guards remain the final word
+        against duplicates."""
+        out: list[str] = []
+        if self._setup_store is None:
+            return out
+        for _name, res in routing.items():
+            setup = self._setup_store.get(res.get("setup_id") or "")
+            if setup is None or not setup.armed:
+                continue
+            status = res.get("status")
+            if status == "skipped_disabled":
+                out.append(
+                    f"{setup.setup_id}: not routed (playbook "
+                    "disabled; stays armed)")
+                continue
+            self._transition_setup(
+                setup, _setup_lc.STAGE_TRIGGER_FIRED,
+                f"h1_trigger fired {direction:+d} — routed to "
+                "execution evaluation")
+            if status == "exception":
+                self._transition_setup(
+                    setup, _setup_lc.STAGE_EVALUATED,
+                    "evaluation raised — see the playbook's "
+                    "exception record")
+                self._transition_setup(
+                    setup, _setup_lc.STAGE_ARMED,
+                    "re-armed after evaluation exception (still "
+                    "within validity)")
+                out.append(
+                    f"{setup.setup_id}: evaluation exception; "
+                    "re-armed")
+                continue
+            terms = res.get("terminals") or []
+            if not terms:
+                self._transition_setup(
+                    setup, _setup_lc.STAGE_EVALUATED,
+                    "no terminal decision produced")
+                self._transition_setup(
+                    setup, _setup_lc.STAGE_ARMED,
+                    "re-armed after evaluation with no decision "
+                    "(still within validity)")
+                out.append(
+                    f"{setup.setup_id}: evaluated, no decision; "
+                    "re-armed")
+                continue
+            term = terms[0]
+            result = term.get("result")
+            ores = term.get("order_result")
+            code = term.get("reason_code") or ""
+            detail = (f"decision {result}"
+                      + (f" ({code})" if code else "")
+                      + (f"; order {ores}" if ores else ""))
+            self._transition_setup(
+                setup, _setup_lc.STAGE_EVALUATED, detail)
+            if ores in ("filled", "layer_filled"):
+                self._transition_setup(
+                    setup, _setup_lc.STAGE_FILLED, detail,
+                    alert_id=term.get("alert_id"))
+                out.append(f"{setup.setup_id}: filled")
+            elif ores in ("placed_pending", "layer_pending"):
+                self._transition_setup(
+                    setup, _setup_lc.STAGE_SUBMITTED, detail,
+                    alert_id=term.get("alert_id"))
+                out.append(
+                    f"{setup.setup_id}: order submitted ({ores})")
+            elif result == "refused" or ores in (
+                    "refused_in_order_path", "rejected"):
+                self._transition_setup(
+                    setup, _setup_lc.STAGE_REJECTED, detail,
+                    alert_id=term.get("alert_id"))
+                out.append(
+                    f"{setup.setup_id}: rejected "
+                    f"({code or result})")
+            else:
+                self._transition_setup(
+                    setup, _setup_lc.STAGE_ARMED,
+                    f"re-armed after evaluation ({detail}; "
+                    "still within validity)")
+                out.append(
+                    f"{setup.setup_id}: evaluated ({result}); "
+                    "re-armed")
+        return out
 
     def _live_verdict(self, pend: dict, tick: dict,
                       h1_closed: pd.DataFrame, states, t: int) -> dict:
@@ -8288,7 +8636,9 @@ class MT5Runner:
     def _run_signal_path(self, h1: pd.DataFrame, t: int,
                          states, years: float, verdict: dict,
                          stats: dict,
-                         forming: dict | None = None) -> None:
+                         forming: dict | None = None,
+                         lifecycle_routing: dict | None = None
+                         ) -> None:
         """Verdict -> playbooks -> gate -> order (shared signal path).
 
         The verdict may come from a closed H1 bar (legacy) or from a
@@ -8412,6 +8762,29 @@ class MT5Runner:
                             context=self._decision_context())
         except Exception:
             pass
+        # Setup lifecycle routing (owner rulings 2026-10-30 §1):
+        # armed scan-detected setups in the fired direction are
+        # evaluated in this pass from their PERSISTED candidates
+        # (oldest first, one per playbook per fire — the store
+        # owns identity).  Expired-but-not-yet-upkept setups are
+        # skipped here and expire on the next close's upkeep.
+        _lc_candidates: dict = {}
+        if lifecycle_routing is not None \
+                and self._setup_store is not None:
+            _lc_dir = int((verdict or {}).get("direction", 0) or 0)
+            if _lc_dir in (1, -1) and t < len(h1):
+                for _s in self._setup_store.active(
+                        direction=_lc_dir, armed_only=True):
+                    if _s.playbook in _lc_candidates:
+                        continue
+                    if _s.expiry_ts is not None:
+                        try:
+                            if pd.Timestamp(_s.expiry_ts) \
+                                    <= h1.index[t]:
+                                continue
+                        except Exception:
+                            pass
+                    _lc_candidates[_s.playbook] = _s
         for pb in self._get_playbooks():
             if pb.name in (self.cfg.disabled_playbooks or ()):
                 # Kill switch (/set) — not evaluated (A14).  FUNNEL:
@@ -8423,12 +8796,37 @@ class MT5Runner:
                     reason_code="path.kill_switch",
                     reason="disabled via /set kill switch — "
                            "not evaluated")
+                if lifecycle_routing is not None \
+                        and pb.name in _lc_candidates:
+                    lifecycle_routing[pb.name] = {
+                        "status": "skipped_disabled",
+                        "setup_id":
+                            _lc_candidates[pb.name].setup_id,
+                        "terminals": []}
                 continue
             try:
-                self._run_one_playbook(pb, sig_ctx=(ctx, engine),
-                                       h1=h1, t=t, verdict=verdict,
-                                       stats=stats, zone_d=zone_d,
-                                       funding=funding)
+                _inj = _lc_candidates.get(pb.name)
+                _terms = self._run_one_playbook(
+                    pb, sig_ctx=(ctx, engine),
+                    h1=h1, t=t, verdict=verdict,
+                    stats=stats, zone_d=zone_d,
+                    funding=funding,
+                    injected_sig=(self._rebuild_setup_signal(_inj, t)
+                                  if _inj is not None else None),
+                    injected_provenance=(
+                        self._setup_provenance(_inj, h1, t)
+                        if _inj is not None else None),
+                    injected_setup_id=(_inj.setup_id
+                                       if _inj is not None else None),
+                    injected_parent_setup_id=(
+                        _inj.parent_setup_id
+                        if _inj is not None else None))
+                if lifecycle_routing is not None \
+                        and _inj is not None:
+                    lifecycle_routing[pb.name] = {
+                        "status": "evaluated",
+                        "setup_id": _inj.setup_id,
+                        "terminals": _terms or []}
             except Exception as exc:
                 # A crashing playbook never kills the signal path.
                 self._record_blocked(
@@ -8445,9 +8843,19 @@ class MT5Runner:
                     outcome="exception",
                     reason_code="path.exception",
                     reason=f"{type(exc).__name__}: {exc}")
+                if lifecycle_routing is not None \
+                        and pb.name in _lc_candidates:
+                    lifecycle_routing[pb.name] = {
+                        "status": "exception",
+                        "setup_id":
+                            _lc_candidates[pb.name].setup_id,
+                        "terminals": []}
 
     def _run_one_playbook(self, pb, *, sig_ctx, h1, t, verdict, stats,
-                          zone_d=None, funding=None) -> None:
+                          zone_d=None, funding=None,
+                          injected_sig=None, injected_provenance=None,
+                          injected_setup_id=None,
+                          injected_parent_setup_id=None):
         """One playbook through the REWORK decision flow (spec §3).
 
         Per signal: Asymmetry Score (live/asymmetry.py) -> hard
@@ -8467,16 +8875,31 @@ class MT5Runner:
         # evaluation and gets one (evaluated-and-empty must be
         # distinguishable from never-called).
         _funnel_seq0 = self._funnel_seq
+        # Setup lifecycle (owner rulings 2026-10-30 §1): when a
+        # persisted setup is routed into this evaluation, its
+        # terminal decisions are collected and returned so the
+        # caller can advance the setup's lifecycle.  Normal
+        # (fresh-detection) calls ignore the return value.
+        injected_terminals: list = []
         # Range playbooks need the native H4 frame (threaded in
         # here — no H4-resample fallback anywhere on this path).
         if hasattr(pb, "set_h4_frame"):
             pb.set_h4_frame(self._stack.frames.get("H4"))
         # Positional, as before: playbook live_signal signatures name
         # the frame parameter differently (df / h1).
-        sigs = pb.live_signal(ctx.states, t, h1) or []
+        if injected_sig is not None:
+            # Lifecycle routing: the persisted candidate IS the
+            # signal — no fresh re-detection, no signal-gap
+            # dedupe (the lifecycle store owns this setup's
+            # identity and dedupe).
+            sigs = [injected_sig]
+        else:
+            sigs = pb.live_signal(ctx.states, t, h1) or []
         for sig in sigs:
             alert_id = f"MT5-{pb.name}-{sig.index}"
-            if sig.index - self._last_sig_bar.get(pb.name, -10 ** 9) \
+            if injected_sig is None and \
+                    sig.index - self._last_sig_bar.get(
+                        pb.name, -10 ** 9) \
                     < self.cfg.signal_gap_bars:
                 continue
             # ---- P3 style/family + journey pre-pass -------------
@@ -8544,6 +8967,12 @@ class MT5Runner:
                 scenarios.  Built from closure state at emit
                 time; observation-only — no value here is read
                 by any decision."""
+                if injected_sig is not None:
+                    injected_terminals.append(
+                        {"result": result,
+                         "reason_code": reason_code or "",
+                         "order_result": order_result,
+                         "alert_id": alert_id})
                 dec = {"result": result,
                        "reason_code": reason_code or None,
                        "reason": reason}
@@ -8687,6 +9116,23 @@ class MT5Runner:
                 if rejected_alternatives:
                     dec["rejected_alternatives"] = list(
                         rejected_alternatives)
+                _ev = {"route": "h1_trigger",
+                       "hierarchy": hier_rec,
+                       "observed": _observed,
+                       "inferred": _inferred,
+                       "supporting": _sup,
+                       "contradictory": _con,
+                       "evidence_groups": _groups,
+                       "independent_evidence_groups":
+                           sorted(_groups)}
+                if injected_sig is not None:
+                    # The decision record joins the setup's
+                    # lifecycle chain by ID (owner rulings
+                    # 2026-10-30 §1).
+                    _ev["setup_id"] = injected_setup_id
+                    _ev["parent_setup_id"] = \
+                        injected_parent_setup_id
+                    _ev["lifecycle_routed"] = True
                 return self._emit_eval(
                     playbook=pb.name,
                     evaluation_clock="h1_trigger",
@@ -8695,7 +9141,10 @@ class MT5Runner:
                     last_bar_ts=h1.index[t] if t < len(h1) else None,
                     outcome="candidate_emitted",
                     reason_code=reason_code, reason=reason,
-                    candidate=self._candidate_dict(sig, breakdown),
+                    candidate=self._candidate_dict(
+                        sig, breakdown,
+                        injected_provenance
+                        if injected_sig is not None else None),
                     decision=dec,
                     # Phase 2 (addendum B/C wiring): the HTF
                     # hierarchy context was computed for every
@@ -8709,16 +9158,10 @@ class MT5Runner:
                     # alignment/journey), itemized supporting vs
                     # contradictory evidence with correlation
                     # groups — the same shape the native routes
-                    # journal.
-                    evidence={"route": "h1_trigger",
-                              "hierarchy": hier_rec,
-                              "observed": _observed,
-                              "inferred": _inferred,
-                              "supporting": _sup,
-                              "contradictory": _con,
-                              "evidence_groups": _groups,
-                              "independent_evidence_groups":
-                                  sorted(_groups)},
+                    # journal.  (Built as _ev above so a
+                    # lifecycle-routed record can join its
+                    # setup's chain by ID.)
+                    evidence=_ev,
                     source="trigger_path")
 
             hier_rec = {
@@ -9378,6 +9821,8 @@ class MT5Runner:
                                "or every signal was skipped by "
                                "the signal-gap dedupe before "
                                "reaching a decision"}]})
+        return (injected_terminals
+                if injected_sig is not None else None)
 
     # ------------------------------------------------------------- layering
     # Scale-in onto ONE position: a confirming setup in the same
@@ -11323,6 +11768,25 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5 pending cancelled: ticket {ticket} "
                 f"{state.kind} @ {state.level:.2f} ({reason})")
+            # Setup lifecycle (owner rulings 2026-10-30 §1): a
+            # routed setup's cancelled order resolves its
+            # order_submitted stage — expiry-shaped cancels are
+            # terminal; other cancels return the setup to armed
+            # inside its validity window.
+            if self._setup_store is not None:
+                _lcs = self._setup_store.by_alert_id(
+                    state.alert_id)
+                if _lcs is not None and \
+                        _lcs.stage == _setup_lc.STAGE_SUBMITTED:
+                    if "expir" in str(reason).lower():
+                        self._transition_setup(
+                            _lcs, _setup_lc.STAGE_EXPIRED,
+                            f"pending cancelled: {reason}")
+                    else:
+                        self._transition_setup(
+                            _lcs, _setup_lc.STAGE_ARMED,
+                            f"pending cancelled ({reason}) — "
+                            "setup re-armed within validity")
             return True
         # Cancel failed: did it fill in the meantime?
         try:
@@ -11429,6 +11893,18 @@ class MT5Runner:
         position closed before the pending filled, the layer falls
         back to opening a fresh base position.
         """
+        # Setup lifecycle (owner rulings 2026-10-30 §1): a routed
+        # setup whose pending filled resolves to FILLED.
+        if self._setup_store is not None:
+            _lcs = self._setup_store.by_alert_id(state.alert_id)
+            if _lcs is not None and \
+                    _lcs.stage == _setup_lc.STAGE_SUBMITTED:
+                self._transition_setup(
+                    _lcs, _setup_lc.STAGE_FILLED,
+                    f"pending filled: ticket "
+                    f"{getattr(pos, 'ticket', '?')}",
+                    ticket=int(getattr(pos, "ticket", 0) or 0)
+                    or None)
         # Slippage: adverse fill vs the pending level (long filled
         # above it, short below it), in ATR units.  Adopted pendings
         # (restart) have no signal — no ATR, no sample.
@@ -13407,6 +13883,25 @@ class MT5Runner:
                                   detector_facts=
                                   _journal_audit.detector_facts(
                                       sig, frame))})
+            # Setup lifecycle (owner rulings 2026-10-30 §1): a
+            # non-shadow roster candidate is REGISTERED, not
+            # just journaled — it persists with its trigger,
+            # invalidation and expiry facts so a later trigger
+            # fire can route it to execution evaluation.  The
+            # scan itself still never orders; shadow (§G)
+            # candidates are never registered.
+            if not shadow and self._setup_store is not None \
+                    and source == _lifecycle.SOURCE_LIVE_CLOSE:
+                try:
+                    self._register_scan_setup(
+                        spec, sig, prov, frame=frame, t=t,
+                        formation_ts=_formation_ts,
+                        eval_now=_eval_now,
+                        intended_tf=intended_tf)
+                except Exception as _reg_exc:
+                    self.journal.log_note(
+                        f"setup_lifecycle: registration failed "
+                        f"for {name}: {_reg_exc}")
 
     def _run_roster_close_evals(self, stats: dict | None = None,
                                 *, source: str) -> None:
@@ -13424,6 +13919,9 @@ class MT5Runner:
                 self.journal.log_note(
                     f"mt5: roster close eval failed for "
                     f"{spec.name}: {exc}")
+        # Setup lifecycle upkeep (owner rulings 2026-10-30 §1):
+        # expiry / close-rule invalidation for tracked setups.
+        self._upkeep_setups(h1)
 
     def _run_range_family(self, stage: str,
                           stats: dict | None = None, *,

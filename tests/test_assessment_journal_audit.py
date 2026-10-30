@@ -255,8 +255,13 @@ def _sweep_candidate(runner, frame, source):
     runner._sweep_eval_one(
         spec, frame, clock="h1_close", intended_tf="H1",
         actual_tf="H1", source=source, shadow=False)
+    # Step 14 (owner rulings 2026-10-30 §1): a live-close sweep
+    # candidate now ALSO journals setup_event records (outcome
+    # candidate_emitted) as it registers — this helper pins the
+    # sweep's own playbook_eval record, so it filters by kind.
     recs = [r for r in _evals(runner, "fvg_midline")
-            if r["outcome"] == "candidate_emitted"]
+            if r["outcome"] == "candidate_emitted"
+            and r.get("kind") == "playbook_eval"]
     assert recs
     return recs[-1]
 

@@ -79,6 +79,14 @@ class PlaybookSpec:
     manageable: bool = True
     refinement_tf: str | None = None
     shadow_evaluation: bool = False
+    #: Setup-lifecycle contract (owner rulings 2026-10-30 §1):
+    #: how many native-clock bars a scan-detected candidate stays
+    #: a live, routable setup, and which trigger routes it.  Only
+    #: the H1 roster's scheduled scans register setups in v1;
+    #: native routes keep their candidate_lifecycle windows and
+    #: the §G range scans stay journal-only shadow.
+    validity_bars: int = 6
+    trigger_kind: str = "h1_trigger_fire"
 
 
 #: The registry, in canonical display order: the H1-clocked roster

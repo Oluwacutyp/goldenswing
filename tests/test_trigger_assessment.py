@@ -191,11 +191,17 @@ def test_sweep_candidate_observed_objects(tmp_path):
     runner._sweep_eval_one(
         spec, frame, clock="h1_close", intended_tf="H1",
         actual_tf="H1", source="live_close", shadow=False)
+    # Step 14 (owner rulings 2026-10-30 §1): the sweep now also
+    # journals setup_event records as the candidate registers —
+    # this test pins the sweep's own playbook_eval record.
     recs = [r for r in _evals(runner, "fvg_midline")
-            if r["outcome"] == "candidate_emitted"]
+            if r["outcome"] == "candidate_emitted"
+            and r.get("kind") == "playbook_eval"]
     assert recs
     rec = recs[-1]
-    # Terminal truth unchanged: observed, never routed.
+    # Terminal truth unchanged: the SCAN record still reads
+    # observed / not routed from the scan (routing happens at
+    # trigger-fire time, never from the scan itself).
     assert rec["decision"]["result"] == "observed"
     assert rec["reason_code"] == "path.trigger_not_fired"
     assert rec["decision"]["execution_eligible"] is False
