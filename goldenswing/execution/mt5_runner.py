@@ -941,6 +941,12 @@ class MT5Runner:
             loss_cooldown_sec=float(self.cfg.loss_cooldown_sec),
             win_cooldown_sec=float(self.cfg.win_cooldown_sec),
             fingerprint_ttl_sec=float(self.cfg.fingerprint_ttl_sec)))
+        # Step 17: alert_id -> (setup_key, trigger_key) for orders
+        # this process placed, so a close can feed the entry gate
+        # the closed trade's parent-setup + trigger identity (the
+        # same-thesis revalidation claim checks against them).
+        # In-memory per run, like the gate itself.
+        self._open_identity: dict[str, tuple[str, str]] = {}
         self._playbooks: list | None = None
         self._engine: ConfluenceEngine | None = None
         self._stack: TimeframeStack | None = None
@@ -3257,7 +3263,11 @@ class MT5Runner:
         # not the remainder leg's — a trade that banked a win then
         # stopped the remainder at a smaller loss is a WIN.
         try:
-            self.entry_gate.record_close(time.time(), total_r > 0)
+            _ident = self._open_identity.pop(
+                str(getattr(pos, "alert_id", "") or ""), ("", ""))
+            self.entry_gate.record_close(
+                time.time(), total_r > 0,
+                setup_key=_ident[0], trigger_key=_ident[1])
         except Exception:
             pass
         # Narrative STATE 7: a narrative trade's close finalizes the
@@ -7384,6 +7394,13 @@ class MT5Runner:
         # Step 15: stamp the declared execution intent (market
         # family — hot scalp v1 is market-shape only).
         sig.execution_intent = execution_intent_for("hot_scalp", sig)
+        # Step 17: parent identity = the hot-scalp setup; trigger
+        # identity = this trigger event (the store row's
+        # triggered/touched stamp; the promotion tick as fallback).
+        sig.setup_key = f"hot_scalp:{sid}"
+        sig.trigger_key = (
+            f"hot_scalp:{sid}@"
+            f"{candidate.get('triggered_at') or candidate.get('touched_at') or tick.get('time')}")
         pb = SimpleNamespace(name="hot_scalp")
         tracked_before = set(self.tick_manager.tickets())
         self._last_tick = dict(tick)
@@ -9023,6 +9040,18 @@ class MT5Runner:
             # carries it (_candidate_dict reads the attribute) and
             # the shared order path enforces it at selection.
             sig.execution_intent = execution_intent_for(pb.name, sig)
+            # Step 17: a lifecycle-routed candidate carries its
+            # parent setup identity + this fire's trigger identity
+            # (the Step-14 trigger_event identity: setup @ fire
+            # bar) — the same-thesis revalidation claim at the
+            # entry gate is built from them.  Native candidates
+            # carry no parent identity and stay under the flat
+            # cooldown, exactly as before.
+            if injected_setup_id:
+                sig.setup_key = str(injected_setup_id)
+                sig.trigger_key = (
+                    f"{injected_setup_id}@"
+                    f"{h1.index[t] if 0 <= t < len(h1) else t}")
             # ---- P3 style/family + journey pre-pass -------------
             # The style bucket picks the floated clocks + the
             # open-space floor row; the family is the posture unit.
@@ -11170,6 +11199,17 @@ class MT5Runner:
                 f"symbol={self.cfg.symbol} "
                 f"feed={type(self.feed).__name__}]")
 
+    def _record_open_identity(self, request, sig) -> None:
+        """Step 17: remember a placed order's parent-setup +
+        trigger identity under its alert_id, so the close path
+        can feed the entry gate the identity of the trade that
+        closed (the revalidation claim checks against it)."""
+        alert_id = str(getattr(request, "alert_id", "") or "")
+        if alert_id:
+            self._open_identity[alert_id] = (
+                str(getattr(sig, "setup_key", "") or ""),
+                str(getattr(sig, "trigger_key", "") or ""))
+
     def _place_live_order(self, pb, sig, stats: dict,
                           verdict: dict | None = None,
                           entry_bar: int | None = None,
@@ -11332,7 +11372,9 @@ class MT5Runner:
                 pb.name, int(sig.direction), float(sig.entry_ref),
                 float(sig.invalidation))
             ok, gate_reason = self.entry_gate.check_new_entry(
-                time.time(), fingerprint)
+                time.time(), fingerprint,
+                setup_key=str(getattr(sig, "setup_key", "") or ""),
+                trigger_key=str(getattr(sig, "trigger_key", "") or ""))
             if not ok:
                 stats[f"gate_{gate_reason}"] = stats.get(
                     f"gate_{gate_reason}", 0) + 1
@@ -11340,6 +11382,19 @@ class MT5Runner:
                     f"mt5: order refused {pb.name}: entry gate "
                     f"{gate_reason}")
                 return
+            if gate_reason == "revalidated":
+                # Step 17 (rulings 2026-10-30 §5): a NEW trigger
+                # under the SAME parent setup whose previous
+                # attempt closed inside the cooldown window —
+                # the flat cooldown is lifted for this candidate
+                # only; every downstream control still applies.
+                stats["gate_revalidated"] = stats.get(
+                    "gate_revalidated", 0) + 1
+                self.journal.log_note(
+                    f"mt5: entry-gate cooldown lifted by "
+                    f"same-thesis revalidation {pb.name}: setup "
+                    f"{getattr(sig, 'setup_key', '')}, trigger "
+                    f"{getattr(sig, 'trigger_key', '')}")
         # Friday close (base orders only): no NEW swing entries late
         # Friday.  Layers are management, never blocked.  The clock
         # is the tick clock, falling back to the wall clock.
@@ -11639,6 +11694,7 @@ class MT5Runner:
                 funding_events=funding_events, score=score)
             if placed and fingerprint:
                 self.entry_gate.record_open(time.time(), fingerprint)
+                self._record_open_identity(track_request, sig)
             return
         _t0 = time.monotonic()
         res = executor.place_order(request)
@@ -11661,6 +11717,7 @@ class MT5Runner:
             return
         if fingerprint:
             self.entry_gate.record_open(time.time(), fingerprint)
+            self._record_open_identity(track_request, sig)
         _narr_state, _narr_kwargs = self._narrative_fill_plan(sig, fill)
         h1 = self._stack.frames["H1"]
         self.tick_manager.open(ticket=int(res.ticket),
@@ -12872,6 +12929,16 @@ class MT5Runner:
         # backstop can see it (an explicit False anywhere
         # upstream refuses the order at the boundary).
         sig.execution_eligible = True
+        # Step 17: the candidate's parent identity is its
+        # candidate_lifecycle instance; its trigger identity is
+        # the touch event itself (instance @ pattern_touch_ts) —
+        # a NEW touch of the same QM instance is a new trigger,
+        # a re-evaluation of the same touch is not.
+        if provenance and provenance.get("instance_key"):
+            sig.setup_key = str(provenance["instance_key"])
+            sig.trigger_key = (
+                f"{provenance['instance_key']}@"
+                f"{provenance.get('pattern_touch_ts') or last_bar_ts}")
         _src = (provenance or {}).get("source")
         stop_dist = abs(entry - stop)
         tick = self._last_tick or {}
@@ -13582,6 +13649,14 @@ class MT5Runner:
         # Phase 2: eligibility stamp for the order-path backstop
         # (this route only receives eligible candidates).
         sig.execution_eligible = True
+        # Step 17: same identity stamping as the qm_m5 route —
+        # parent = the candidate_lifecycle instance, trigger =
+        # the touch event.
+        if provenance and provenance.get("instance_key"):
+            sig.setup_key = str(provenance["instance_key"])
+            sig.trigger_key = (
+                f"{provenance['instance_key']}@"
+                f"{provenance.get('pattern_touch_ts') or ''}")
         _src = (provenance or {}).get("source")
         direction = int(sig.direction)
         entry = float(sig.entry_ref)

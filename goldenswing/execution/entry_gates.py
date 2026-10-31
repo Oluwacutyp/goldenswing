@@ -57,12 +57,31 @@ class EntryGate:
         self._hour_counts: dict[str, int] = {}
         self._last_close_at: float | None = None
         self._last_close_won: bool = False
+        # Step 17 (rulings 2026-10-30 §5): WHICH setup closed and
+        # on which trigger — the identity the flat cooldown used
+        # to throw away.  A same-thesis revalidation claim is
+        # checked against these.
+        self._last_close_setup_key: str = ""
+        self._last_close_trigger_key: str = ""
         self._fingerprints: dict[str, float] = {}
 
     # ------------------------------------------------------------ check
-    def check_new_entry(self, now: float, fingerprint: str,
+    def check_new_entry(self, now: float, fingerprint: str, *,
+                        setup_key: str = "",
+                        trigger_key: str = "",
                         ) -> tuple[bool, str]:
-        """(ok, reason) — reason is "" when ok, else the gate name."""
+        """(ok, reason) — reason is "" when ok, else the gate name.
+
+        Step 17: when the flat cooldown would refuse, a
+        same-thesis REVALIDATION claim lifts it — the caller
+        presents the candidate's parent setup identity
+        (``setup_key``) and its own trigger-event identity
+        (``trigger_key``); the lift requires the setup to be the
+        one whose trade just closed and the trigger to be a NEW
+        event (a re-fire of the same trigger keeps the closed
+        trade's trigger_key and stays refused).  A lifted check
+        returns (True, "revalidated") so the caller can journal
+        the lift; caps and fingerprint dedup are never lifted."""
         cfg = self.cfg
         day = datetime.fromtimestamp(now, tz=timezone.utc).date().isoformat()
         hour = datetime.fromtimestamp(
@@ -74,15 +93,21 @@ class EntryGate:
         if cfg.max_hourly_trades > 0 and \
                 self._hour_counts.get(hour, 0) >= cfg.max_hourly_trades:
             return False, "cap_hourly"
+        revalidated = False
         if self._last_close_at is not None:
             cd = cfg.win_cooldown_sec if self._last_close_won \
                 else cfg.loss_cooldown_sec
             if cd > 0 and now - self._last_close_at < cd:
-                return False, "cooldown"
+                if setup_key and trigger_key \
+                        and setup_key == self._last_close_setup_key \
+                        and trigger_key != self._last_close_trigger_key:
+                    revalidated = True
+                else:
+                    return False, "cooldown"
         seen = self._fingerprints.get(fingerprint)
         if seen is not None and now - seen < cfg.fingerprint_ttl_sec:
             return False, "duplicate"
-        return True, ""
+        return True, "revalidated" if revalidated else ""
 
     # ----------------------------------------------------------- record
     def record_open(self, now: float, fingerprint: str) -> None:
@@ -94,9 +119,18 @@ class EntryGate:
         self._hour_counts[hour] = self._hour_counts.get(hour, 0) + 1
         self._fingerprints[fingerprint] = now
 
-    def record_close(self, now: float, won: bool) -> None:
+    def record_close(self, now: float, won: bool, *,
+                     setup_key: str = "",
+                     trigger_key: str = "") -> None:
         self._last_close_at = now
         self._last_close_won = bool(won)
+        # Step 17: remember the closed trade's parent setup +
+        # trigger identity — the next same-thesis claim is
+        # validated against them.  (The parent's risk history
+        # itself lives in RiskGuards/RiskPool and is never reset
+        # by anything here.)
+        self._last_close_setup_key = str(setup_key or "")
+        self._last_close_trigger_key = str(trigger_key or "")
 
     # ------------------------------------------------------------ prune
     def _prune(self, now: float, day: str, hour: str) -> None:
