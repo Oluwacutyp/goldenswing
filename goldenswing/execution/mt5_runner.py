@@ -9848,7 +9848,7 @@ class MT5Runner:
             # path (log_signal above records score=float(sig.score)),
             # so passing it explicitly is the journal score, not a
             # placeholder; no broker stop exists pre-order.
-            png, _path = self._build_chart(
+            pngs, _paths = self._build_chart(
                 sig, verdict, alert_id=alert_id, playbook=pb.name,
                 decision_score=float(sig.score))
             _, view_path = self._build_signal_view(
@@ -9860,7 +9860,7 @@ class MT5Runner:
                 f"entry~{sig.entry_ref:.1f} stop~{sig.invalidation:.1f} "
                 f"conf={conf:.0f}"
                 + (f"\n\n{reasoning}" if reasoning else ""),
-                chart_png=png, html_path=view_path)
+                chart_pngs=pngs, html_path=view_path)
             # Manipulation / liquidity-test filter (entry
             # selection, NOT a veto): a signal chasing past
             # a level whose most recent test failed is
@@ -11846,7 +11846,7 @@ class MT5Runner:
         # alongside the signal chart and attached to the fill alert.
         # Step 7: decision score + broker stop mirror the fill record
         # logged just above (score.total or sig.score; stop0).
-        png, _path = self._build_chart(
+        pngs, _paths = self._build_chart(
             sig, verdict, alert_id=request.alert_id, playbook=pb.name,
             fill_price=fill, suffix="-fill",
             decision_score=(float(score.total)
@@ -11862,7 +11862,7 @@ class MT5Runner:
             f"MT5 FILL {pb.name} {'+' if sig.direction > 0 else '-'}1 "
             f"{lots} lots @ {fill:.2f} SL {stop0:.2f} "
             f"(ticket {res.ticket})",
-            chart_png=png, html_path=view_path)
+            chart_pngs=pngs, html_path=view_path)
 
     # ------------------------------------------------------- pending orders
     # A pending LIMIT / STOP is a broker order waiting for the market:
@@ -12054,7 +12054,7 @@ class MT5Runner:
         # only when the market reaches it.
         # Step 7: decision score + broker stop mirror the pending
         # record (score.total or None; the pending order's stop).
-        png, _path = self._build_chart(
+        pngs, _paths = self._build_chart(
             sig, verdict, alert_id=request.alert_id, playbook=pb.name,
             suffix="-pending",
             decision_score=(float(score.total)
@@ -12071,7 +12071,7 @@ class MT5Runner:
             f"{'+' if sig.direction > 0 else '-'}1 "
             f"{request.volume} lots @ {level:.2f} "
             f"SL {request.stop_loss:.2f} (ticket {res.ticket})",
-            chart_png=png, html_path=view_path)
+            chart_pngs=pngs, html_path=view_path)
         return True
 
     def _cancel_pending(self, ticket: int, reason: str,
@@ -12474,10 +12474,10 @@ class MT5Runner:
         # Step 7: decision score is the recorded placed_score, or
         # unavailable when none was recorded (never the sleeve
         # placeholder); broker stop is the filled position's SL.
-        png = None
+        pngs = None
         view_path = None
         if sig is not None and getattr(state, "verdict", None) is not None:
-            png, _path = self._build_chart(
+            pngs, _paths = self._build_chart(
                 sig, state.verdict, alert_id=state.alert_id,
                 playbook=state.playbook, fill_price=float(pos.entry_price),
                 suffix="-fill",
@@ -12497,7 +12497,7 @@ class MT5Runner:
             f"{volume} lots @ {float(pos.entry_price):.2f} "
             f"SL {state.sl:.2f} (ticket {pos.ticket})"
             + (" — PARTIAL" if partial else ""),
-            chart_png=png, html_path=view_path)
+            chart_pngs=pngs, html_path=view_path)
 
     def _adopt_existing_pending(self, executor: MT5Executor) -> None:
         """Adopt broker pending orders with our magic (restart sync)."""
@@ -14417,13 +14417,54 @@ class MT5Runner:
                 "fib_range": fib_range, "ote_band": ote_band,
                 "fib_info": fib_info}
 
+    def _qm_pattern_for_chart(self, sig, verdict,
+                              playbook: str) -> dict | None:
+        """Chart QM geometry, released ONLY for a confirmed,
+        this-signal QM (the stale-touch guard):
+
+        - native QM routes (qm_m5 / qm_d1): the signal IS the
+          pattern — geometry from the signal's own live_context
+          (its own touch; no staleness question exists);
+        - every other route: geometry from the verdict's QM
+          annotation ONLY when its status is "qm_confirmed"
+          (direction-ok AND recent per hierarchy._qm_leg's own
+          semantics).  A stale or against-bias touch's pattern
+          NEVER lands on another signal's chart.
+
+        Returns {head, neckline, level, direction, touch_ts} or
+        None (draw nothing)."""
+        if playbook in ("qm_m5", "qm_d1"):
+            lc = dict(getattr(sig, "live_context", None) or {})
+            head, neck = lc.get("head"), lc.get("neckline")
+            if head is None or neck is None:
+                return None
+            level = lc.get("qm_level")
+            return {"head": float(head), "neckline": float(neck),
+                    "level": (float(level)
+                              if level is not None else None),
+                    "direction": int(sig.direction),
+                    "touch_ts": None}
+        qm = (verdict or {}).get("qm") or {}
+        if qm.get("status") != "qm_confirmed":
+            return None
+        head, neck = qm.get("head"), qm.get("neckline")
+        if head is None or neck is None:
+            return None
+        level = qm.get("qm_level")
+        return {"head": float(head), "neckline": float(neck),
+                "level": (float(level)
+                          if level is not None else None),
+                "direction": int(qm.get("direction") or 0),
+                "touch_ts": qm.get("touch_ts")}
+
     def _build_chart(self, sig, verdict: dict | None, *,
                      alert_id: str, playbook: str = "",
                      fill_price: float | None = None,
                      suffix: str = "",
                      decision_score: float | None = None,
-                     broker_stop: float | None = None) -> tuple[bytes | None, Path | None]:
-        """Chart PNG for a signal/fill: the WHOLE hierarchy stack
+                     broker_stop: float | None = None) -> tuple[list[bytes] | None, list | None]:
+        """Chart PNGs for a signal/fill (THREE, one per panel —
+        owner order 2026-10-31): the WHOLE hierarchy stack
         (H4 structure / H1 trigger / entry-TF entry) + levels + verdict
         + the studies the reasoning used: nearby cache zones, the
         feature pipeline's auto-Fib + dealing range on H1, and
@@ -14473,7 +14514,7 @@ class MT5Runner:
                               if st["fib_range"] is not None else None),
                 },
             }
-            png = render_mt5_signal(
+            panel_pngs = render_mt5_signal(
                 h1, zone=zone, entry=entry,
                 stop=float(sig.invalidation),
                 targets=[float(x) for x in (sig.targets or [])],
@@ -14487,10 +14528,20 @@ class MT5Runner:
                 entry_clock=entry_clock,
                 style=self.cfg.chart_style,
                 nearby_zones=st["nearby"], fib_levels=st["fib_levels"],
-                fib_range=st["fib_range"], ote_band=st["ote_band"])
-            path = self._charts_dir / f"{alert_id}{suffix}.png"
-            path.write_bytes(png)
-            return png, path
+                fib_range=st["fib_range"], ote_band=st["ote_band"],
+                qm_pattern=self._qm_pattern_for_chart(
+                    sig, verdict, playbook))
+            # Owner order 2026-10-31: the chart is THREE PNGs
+            # (H4 / H1 / entry panels) — one file each, in panel
+            # order, next to the journal.
+            paths = []
+            for _tag, _panel_png in zip(("h4", "h1", "entry"),
+                                        panel_pngs):
+                _p = self._charts_dir / \
+                    f"{alert_id}{suffix}-{_tag}.png"
+                _p.write_bytes(_panel_png)
+                paths.append(_p)
+            return panel_pngs, paths
         except Exception as exc:
             self.journal.log_note(
                 f"mt5: chart build failed for {alert_id}: {exc}")
@@ -14533,6 +14584,8 @@ class MT5Runner:
                 nearby_zones=st["nearby"], fib_levels=st["fib_levels"],
                 fib_range=st["fib_range"], ote_band=st["ote_band"],
                 fib_info=st["fib_info"], alert_id=alert_id,
+                qm_pattern=self._qm_pattern_for_chart(
+                    sig, verdict, playbook),
                 instrument=self.cfg.symbol, fill_price=fill_price,
                 signal_time=datetime.now(timezone.utc).isoformat())
             path = self._charts_dir / f"{alert_id}{suffix}.html"
@@ -14702,6 +14755,7 @@ class MT5Runner:
 
     def _send_alert(self, text: str, *,
                     chart_png: bytes | None = None,
+                    chart_pngs: list[bytes] | None = None,
                     html_path: Path | None = None,
                     reply_markup: dict | None = None) -> None:
         """Send a text alert, with the chart photo when one is attached.
@@ -14719,7 +14773,21 @@ class MT5Runner:
         """
         for sender in self.senders:
             try:
-                if chart_png and hasattr(sender, "send_photo"):
+                if chart_pngs and hasattr(sender, "send_photo"):
+                    # 3-PNG charts (owner order 2026-10-31): the
+                    # H4 panel carries the alert text; the H1 and
+                    # entry panels follow with their own captions.
+                    _caps = [text, "H1 — trigger / context",
+                             "Entry timeframe — entry"]
+                    for _i, _panel_png in enumerate(chart_pngs):
+                        res = sender.send_photo(
+                            _panel_png,
+                            _caps[_i] if _i < len(_caps) else "")
+                        if not getattr(res, "delivered", False):
+                            self._note_tg_failure(
+                                f"alert photo {_i + 1} send failed: "
+                                f"{res.detail}")
+                elif chart_png and hasattr(sender, "send_photo"):
                     res = sender.send_photo(chart_png, text)
                     if not getattr(res, "delivered", False):
                         self._note_tg_failure(

@@ -757,13 +757,16 @@ def _mt5_edge_labels(ax, x_hi, specs: list[dict]) -> None:
 def _mt5_panel_ylim(view, *, entry: float, stop: float,
                     broker_stop: float | None = None,
                     targets: list[float], fill_price: float | None,
-                    zone: dict | None) -> tuple[float, float]:
+                    zone: dict | None,
+                    extra: list[float] | None = None,
+                    ) -> tuple[float, float]:
     """Y limits from the panel's own candles + the shared levels."""
     l = view["low"].to_numpy(dtype=float)
     h = view["high"].to_numpy(dtype=float)
     lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
     span = max(hi_v - lo_v, 1e-9)
-    cand = [lo_v, hi_v, stop, entry] + list(targets)
+    cand = [lo_v, hi_v, stop, entry] + list(targets) \
+        + [float(v) for v in (extra or []) if v is not None]
     if broker_stop is not None:
         cand.append(broker_stop)
     if fill_price is not None:
@@ -890,6 +893,67 @@ def _mt5_fib(ax, x_hi, fib_levels, ote_band, theme) -> list[dict]:
     return specs
 
 
+#: The QM pattern's color family — one hue, three linestyles,
+#: distinct from zones (amber), fib (gold-brown), sessions and
+#: the trade levels.
+_QM_COLOR = "#8e24aa"
+
+
+def _mt5_qm_pattern(ax, x_hi, pattern: dict, view_index,
+                    theme) -> list[dict]:
+    """Draw the QM pattern's geometry on the entry panel: head
+    (dotted), neckline (dashed) and the QM level (dash-dot),
+    plus a touch marker when the touch bar is inside the view.
+
+    Labels come back as specs for the shared post-draw
+    de-collision pass (``_mt5_edge_labels``) — the QM labels
+    obey the same whole-surface rule as every other label set.
+    The caller owns the guard: ``pattern`` arrives only for a
+    confirmed, this-signal QM (see the runner's
+    _qm_pattern_for_chart); the renderer draws what it is
+    given, like every other study."""
+    specs: list[dict] = []
+    head = pattern.get("head")
+    neckline = pattern.get("neckline")
+    level = pattern.get("level")
+    if head is not None:
+        ax.axhline(float(head), color=_QM_COLOR, linewidth=0.9,
+                   linestyle=(0, (1, 2)), zorder=2)
+        specs.append({"value": float(head),
+                      "text": f" QM HEAD {_fmt(float(head))} ",
+                      "color": _QM_COLOR, "bold": True, "size": 7.5})
+    if neckline is not None:
+        ax.axhline(float(neckline), color=_QM_COLOR, linewidth=0.9,
+                   linestyle=(0, (5, 3)), zorder=2)
+        specs.append({"value": float(neckline),
+                      "text": f" QM NECKLINE {_fmt(float(neckline))} ",
+                      "color": _QM_COLOR, "bold": True, "size": 7.5})
+    if level is not None:
+        ax.axhline(float(level), color=_QM_COLOR, linewidth=0.8,
+                   linestyle=(0, (6, 2, 1, 2)), zorder=2)
+        specs.append({"value": float(level),
+                      "text": f" QM LEVEL {_fmt(float(level))} ",
+                      "color": _QM_COLOR, "bold": False, "size": 7.5})
+    touch_ts = pattern.get("touch_ts")
+    if touch_ts is not None and view_index is not None:
+        try:
+            pos = view_index.get_loc(pd.Timestamp(touch_ts))
+            if isinstance(pos, (int, np.integer)):
+                ax.axvline(float(pos), color=_QM_COLOR, linewidth=0.8,
+                           linestyle=(0, (2, 2)), alpha=0.75, zorder=1)
+                ax.text(float(pos), 0.985, " QM TOUCH ",
+                        transform=ax.get_xaxis_transform(),
+                        ha="center", va="top", fontsize=7.5,
+                        color="#ffffff", fontweight="bold",
+                        bbox=dict(boxstyle="round,pad=0.2",
+                                  facecolor=_QM_COLOR,
+                                  edgecolor="none", alpha=0.9),
+                        zorder=6)
+        except (KeyError, TypeError, ValueError):
+            pass  # touch outside the visible window: lines only
+    return specs
+
+
 def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                        entry: float, stop: float,
                        targets: list[float] | None = None,
@@ -909,11 +973,15 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                        nearby_zones: list[dict] | None = None,
                        fib_levels: list[tuple[float, float]] | None = None,
                        fib_range: tuple[float, float] | None = None,
-                       ote_band: tuple[float, float] | None = None) -> bytes:
+                       ote_band: tuple[float, float] | None = None,
+                       qm_pattern: dict | None = None) -> list[bytes]:
     """Render the MT5 multi-timeframe signal chart to PNG bytes.
 
-    Three stacked panels (H4 structure / H1 trigger / entry-TF entry),
-    all sharing the same trade levels.  ``h1`` is required; ``h4`` and
+    THREE PNGs, one per panel (H4 structure / H1 trigger /
+    entry-TF entry), all sharing the same trade levels — owner
+    order 2026-10-31 ("It should be 3 PNG"): each timeframe is
+    its own full-size image, not a squished third of one tall
+    stack.  ``h1`` is required; ``h4`` and
     ``entry_frame`` are optional — a missing frame renders its panel
     with an explicit "unavailable" label, never with invented bars.
     ``entry_clock`` defaults to the verdict's entry clock (M15/M30).
@@ -936,7 +1004,11 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
     - ``fib_levels`` auto-Fib retracements + ``ote_band`` (H1 panel),
       computed by the engine's feature pipeline on the H1 frame;
     - ``fib_range`` dealing-range premium/discount shading (H1 panel);
-    - killzone session shading (all panels, from bar timestamps).
+    - killzone session shading (all panels, from bar timestamps);
+    - ``qm_pattern`` — the signal's own QM geometry (head /
+      neckline / level / touch) on the entry panel, when the
+      caller passes it.  The caller owns the staleness guard:
+      a pattern is passed only for a confirmed, this-signal QM.
     """
     if style not in _MT5_STYLES:
         raise ValueError(
@@ -956,16 +1028,6 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
     arrow = "▲ LONG" if direction == 1 else "▼ SHORT" if direction == -1 \
         else "FLAT"
 
-    fig = plt.figure(figsize=(16, 13), dpi=_DPI)
-    fig.patch.set_facecolor(theme["bg"])
-    fig.suptitle(f"{instrument} · MT5 signal · {playbook} · "
-                 f"{shown_score}",
-                 fontsize=13, color=theme["text"], x=0.02, ha="left")
-    gs = fig.add_gridspec(3, 1, height_ratios=[2.2, 2.2, 1.8],
-                          hspace=0.45, left=0.05, right=0.97,
-                          top=0.93, bottom=0.05)
-    axes = [fig.add_subplot(gs[i]) for i in range(3)]
-
     h1_role = panel_role("H1", playbook=playbook, entry_clock=clock)
     h1_title = f"H1 — {h1_role}"
     if trigger != "?":
@@ -981,8 +1043,24 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
          False),
     ]
     verdict_box_done = False
-    label_specs: list[tuple] = []
-    for ax, (frame, win, title, show_zone, marker, is_h1) in zip(axes, panels):
+    panel_pngs: list[bytes] = []
+    for _pi, (frame, win, title, show_zone, marker, is_h1) \
+            in enumerate(panels):
+        is_entry_panel = _pi == 2
+        # One figure per panel (the 3-PNG order): full width,
+        # readable height, the shared header line on each so a
+        # saved or forwarded panel still names its signal.
+        fig = plt.figure(figsize=(16, 5.6), dpi=_DPI)
+        fig.patch.set_facecolor(theme["bg"])
+        fig.suptitle(f"{instrument} · MT5 signal · {playbook} · "
+                     f"{shown_score}",
+                     fontsize=12, color=theme["text"], x=0.02,
+                     ha="left")
+        ax = fig.add_subplot(1, 1, 1)
+        fig.subplots_adjust(left=0.05, right=0.97, top=0.84,
+                            bottom=0.13)
+        panel_specs: list[dict] = []
+        panel_x_hi = 0.0
         ax.set_facecolor(theme["bg"])
         ax.tick_params(colors=theme["text"], labelsize=8)
         for spine in ax.spines.values():
@@ -999,6 +1077,12 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                     color=theme["text"], alpha=0.8)
             ax.set_xticks([])
             ax.set_yticks([])
+            _buf = io.BytesIO()
+            fig.savefig(_buf, format="png", dpi=_DPI,
+                        facecolor=theme["bg"],
+                        metadata={"Software": "GoldenSwing charts"})
+            plt.close(fig)
+            panel_pngs.append(_buf.getvalue())
             continue
         view = frame.iloc[-win:]
         xs = np.arange(len(view), dtype=float)
@@ -1028,15 +1112,24 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                                       fib_range[1], theme)
             study_specs += _mt5_fib(ax, x_hi, fib_levels, ote_band,
                                     theme)
+        qm_extra: list[float] = []
+        if is_entry_panel and qm_pattern:
+            study_specs += _mt5_qm_pattern(
+                ax, x_hi, qm_pattern, view.index, theme)
+            qm_extra = [float(qm_pattern[k]) for k in
+                        ("head", "neckline", "level")
+                        if qm_pattern.get(k) is not None]
         lo_v, hi_v = _mt5_panel_ylim(
             view, entry=entry, stop=stop, broker_stop=broker_stop,
             targets=targets, fill_price=fill_price,
-            zone=zone if show_zone else None)
+            zone=zone if show_zone else None,
+            extra=qm_extra)
         ax.set_ylim(lo_v, hi_v)
-        label_specs.append((ax, x_hi, _mt5_trade_levels(
+        panel_x_hi = x_hi
+        panel_specs = _mt5_trade_levels(
             ax, x_hi, entry=entry, stop=stop, broker_stop=broker_stop,
             targets=targets, direction=direction, risk=risk,
-            fill_price=fill_price, theme=theme) + study_specs))
+            fill_price=fill_price, theme=theme) + study_specs
         if marker is not None:
             last = len(view) - 1
             ax.axvspan(last - 0.5, last + 0.5, color="#7e57c2",
@@ -1098,14 +1191,14 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
              for i in ticks], fontsize=8)
         ax.set_ylabel("Price", fontsize=9, color=theme["text"])
 
-    # Labels last: a canvas draw finalizes axes positions, so the
-    # de-collision pass measures real pixels, not estimates.
-    fig.canvas.draw()
-    for ax, x_hi_panel, specs in label_specs:
-        _mt5_edge_labels(ax, x_hi_panel, specs)
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=_DPI, facecolor=theme["bg"],
-                metadata={"Software": "GoldenSwing charts"})
-    plt.close(fig)
-    return buf.getvalue()
+        # Labels last: a canvas draw finalizes axes positions, so
+        # the de-collision pass measures real pixels, not estimates.
+        fig.canvas.draw()
+        _mt5_edge_labels(ax, panel_x_hi, panel_specs)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=_DPI,
+                    facecolor=theme["bg"],
+                    metadata={"Software": "GoldenSwing charts"})
+        plt.close(fig)
+        panel_pngs.append(buf.getvalue())
+    return panel_pngs

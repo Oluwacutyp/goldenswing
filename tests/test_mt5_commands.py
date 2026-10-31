@@ -427,8 +427,9 @@ def test_chart_png_carries_real_levels():
     png_a = render_mt5_signal(
         h1, zone=zone, entry=4155.0, stop=4145.0, targets=[4175.0],
         direction=1, verdict=verdict, playbook="fvg_midline", score=72)
-    assert png_a[:8] == b"\x89PNG\r\n\x1a\n"
-    assert len(png_a) > 10_000  # a real chart, not an empty canvas
+    assert len(png_a) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in png_a)
+    assert sum(len(p) for p in png_a) > 10_000  # real charts
     # Levels flow into the render: a different entry changes the bytes.
     png_b = render_mt5_signal(
         h1, zone=zone, entry=4165.0, stop=4145.0, targets=[4175.0],
@@ -438,13 +439,14 @@ def test_chart_png_carries_real_levels():
     png_c = render_mt5_signal(
         h1, zone=None, entry=4155.0, stop=4145.0, targets=[4175.0],
         direction=-1, verdict=None, playbook="fvg_midline", score=72)
-    assert png_c[:8] == b"\x89PNG\r\n\x1a\n"
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in png_c)
     # Fill marker renders.
     png_d = render_mt5_signal(
         h1, zone=zone, entry=4155.0, stop=4145.0, targets=[4175.0],
         direction=1, verdict=verdict, playbook="fvg_midline", score=72,
         fill_price=4155.5)
-    assert png_d[:8] == b"\x89PNG\r\n\x1a\n" and png_d != png_a
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in png_d) \
+        and png_d != png_a
 
 
 def test_runner_build_chart_saves_png(tmp_path):
@@ -461,11 +463,16 @@ def test_runner_build_chart_saves_png(tmp_path):
                "volume": {"volume_ratio": 1.0},
                "zone": {"kind": "support", "level": 1995.0,
                         "top": 1997.0, "bottom": 1993.0, "index": 50}}
-    png, path = runner._build_chart(sig, verdict, alert_id="MT5-test-100",
-                                    playbook="fvg_midline")
-    assert png is not None and png[:8] == b"\x89PNG\r\n\x1a\n"
-    assert path is not None and path.exists()
-    assert path.name == "MT5-test-100.png"
+    pngs, paths = runner._build_chart(sig, verdict,
+                                      alert_id="MT5-test-100",
+                                      playbook="fvg_midline")
+    assert pngs is not None and len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in pngs)
+    assert paths is not None and len(paths) == 3
+    assert all(p.exists() for p in paths)
+    assert [p.name for p in paths] == [
+        "MT5-test-100-h4.png", "MT5-test-100-h1.png",
+        "MT5-test-100-entry.png"]
 
 
 def test_runner_alert_sends_photo_when_chart_present(tmp_path):

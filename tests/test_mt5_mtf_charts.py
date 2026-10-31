@@ -62,14 +62,18 @@ def _full_chart(**kw):
     return render_mt5_signal(**args)
 
 
-def test_full_stack_chart_has_three_panels():
-    png = _full_chart()
-    assert png[:8] == b"\x89PNG\r\n\x1a\n"
-    assert len(png) > 10_000  # a real chart, not an empty canvas
-    arr = plt.imread(io.BytesIO(png))
-    # 1600x1300 figure: three stacked panels, non-blank.
-    assert arr.shape[0] >= 1200 and arr.shape[1] == 1600
-    assert float(arr.std()) > 0.01
+def test_full_stack_chart_is_three_pngs():
+    # Owner order 2026-10-31: "It should be 3 PNG" — one full-size
+    # image per timeframe panel, never one tall stacked figure.
+    pngs = _full_chart()
+    assert len(pngs) == 3
+    for png in pngs:
+        assert png[:8] == b"\x89PNG\r\n\x1a\n"
+        assert len(png) > 10_000  # a real chart, not an empty canvas
+        arr = plt.imread(io.BytesIO(png))
+        # 1600 wide, single-panel height, non-blank.
+        assert arr.shape[1] == 1600 and 400 <= arr.shape[0] <= 700
+        assert float(arr.std()) > 0.01
 
 
 def test_levels_flow_into_stack_render():
@@ -89,36 +93,36 @@ def test_levels_flow_into_stack_render():
 def test_missing_h4_panel_labeled_not_faked():
     png_full = _full_chart()
     png_no_h4 = _full_chart(h4=None)
-    assert png_no_h4[:8] == b"\x89PNG\r\n\x1a\n"
-    assert len(png_no_h4) > 10_000
+    assert png_no_h4[0][:8] == b"\x89PNG\r\n\x1a\n"
+    assert sum(len(p) for p in png_no_h4) > 10_000
     # Missing H4 changes the render (labeled panel) but never crashes.
     assert png_no_h4 != png_full
     # An empty H4 frame behaves like a missing one — no invented bars.
     empty_h4 = _frame(80, "4h", 4160.0).iloc[:0]
     png_empty = _full_chart(h4=empty_h4)
-    assert png_empty[:8] == b"\x89PNG\r\n\x1a\n"
+    assert png_empty[0][:8] == b"\x89PNG\r\n\x1a\n"
     assert png_empty != png_full
 
 
 def test_missing_entry_frame_labeled_not_faked():
     png_full = _full_chart()
     png_no_entry = _full_chart(entry_frame=None)
-    assert png_no_entry[:8] == b"\x89PNG\r\n\x1a\n"
+    assert png_no_entry[2][:8] == b"\x89PNG\r\n\x1a\n"
     assert png_no_entry != png_full
 
 
 def test_entry_clock_m30_panel():
-    png = _full_chart(
+    pngs = _full_chart(
         entry_frame=_frame(120, "30min", 4160.0),
         verdict=_verdict(entry_clock="M30"))
-    assert png[:8] == b"\x89PNG\r\n\x1a\n"
-    assert len(png) > 10_000
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in pngs)
+    assert sum(len(p) for p in pngs) > 10_000
 
 
 def test_blueprint_style_and_bad_style():
     png_classic = _full_chart()
     png_blue = _full_chart(style="blueprint")
-    assert png_blue[:8] == b"\x89PNG\r\n\x1a\n"
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in png_blue)
     assert png_blue != png_classic
     with pytest.raises(ValueError):
         _full_chart(style="line")
@@ -162,11 +166,13 @@ def test_runner_passes_h4_and_entry_frames(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "goldenswing.execution.mt5_runner.render_mt5_signal", recorder)
-    png, path = runner._build_chart(
+    pngs, paths = runner._build_chart(
         _sig(), _verdict(), alert_id="MT5-test-100",
         playbook="fvg_midline")
-    assert png is not None and png[:8] == b"\x89PNG\r\n\x1a\n"
-    assert path is not None and path.exists()
+    assert pngs is not None and len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in pngs)
+    assert paths is not None and len(paths) == 3
+    assert all(p.exists() for p in paths)
     # The runner passed the whole stack, not just H1.
     assert seen["h4"] is not None and len(seen["h4"]) > 0
     assert seen["entry_frame"] is not None and len(seen["entry_frame"]) > 0
@@ -179,20 +185,22 @@ def test_runner_chart_without_h4_still_builds(tmp_path):
     frames = dict(runner._stack.frames)
     frames.pop("H4", None)
     runner._stack = TimeframeStack.from_frames(frames)
-    png, path = runner._build_chart(
+    pngs, paths = runner._build_chart(
         _sig(), _verdict(), alert_id="MT5-test-noh4",
         playbook="fvg_midline")
-    assert png is not None and png[:8] == b"\x89PNG\r\n\x1a\n"
-    assert path is not None and path.exists()
+    assert pngs is not None and len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in pngs)
+    assert paths is not None and all(p.exists() for p in paths)
 
 
 def test_runner_chart_blueprint_style(tmp_path):
     runner = _runner(tmp_path, chart_style="blueprint")
-    png, path = runner._build_chart(
+    pngs, paths = runner._build_chart(
         _sig(), _verdict(), alert_id="MT5-test-blue",
         playbook="fvg_midline")
-    assert png is not None and png[:8] == b"\x89PNG\r\n\x1a\n"
-    png_classic, _ = _runner(tmp_path)._build_chart(
+    assert pngs is not None and len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in pngs)
+    pngs_classic, _ = _runner(tmp_path)._build_chart(
         _sig(), _verdict(), alert_id="MT5-test-cl",
         playbook="fvg_midline")
-    assert png != png_classic
+    assert pngs != pngs_classic

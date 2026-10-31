@@ -174,22 +174,25 @@ def test_png_renders_with_decision_score_and_broker_stop():
     h1 = _frame(200, "2026-10-26", "h")
     h4 = _frame(100, "2026-10-20", "4h")
     m5 = _frame(100, "2026-10-28", "5min")
-    png = render_mt5_signal(
+    pngs = render_mt5_signal(
         h1, zone={"top": 4060.0, "bottom": 4050.0, "kind": "support"},
         entry=4057.9, stop=4055.9, targets=[4062.7], direction=1,
         verdict={"entry_clock": "M5", "bias_d1": 1, "bias_h4": 1,
                  "trigger": "sweep_reversal"},
         playbook="qm_m5", decision_score=32.71, broker_stop=4054.4,
         h4=h4, entry_frame=m5)
-    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 10_000
+    assert len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" and len(p) > 10_000
+               for p in pngs)
 
 
 def test_png_renders_without_score_or_broker_stop():
     h1 = _frame(200, "2026-10-26", "h")
-    png = render_mt5_signal(
+    pngs = render_mt5_signal(
         h1, zone=None, entry=4057.9, stop=4055.9, targets=[4062.7],
         direction=1, verdict={"entry_clock": "M15"}, playbook="qm_m5")
-    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in pngs)
 
 
 def test_png_close_levels_do_not_crash_label_pass():
@@ -197,13 +200,15 @@ def test_png_close_levels_do_not_crash_label_pass():
     # the labels; the de-collision pass must still render a PNG.
     h1 = _frame(200, "2026-10-26", "h")
     m5 = _frame(60, "2026-10-28", "5min")
-    png = render_mt5_signal(
+    pngs = render_mt5_signal(
         h1, zone=None, entry=4057.9, stop=4057.4,
         targets=[4058.4, 4059.0], direction=1,
         verdict={"entry_clock": "M5"}, playbook="qm_m5",
         decision_score=32.71, broker_stop=4057.0,
         entry_frame=m5)
-    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 10_000
+    assert len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" and len(p) > 10_000
+               for p in pngs)
 
 
 # --- runner seam ----------------------------------------------------------

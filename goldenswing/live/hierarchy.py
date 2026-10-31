@@ -638,13 +638,23 @@ def _entry_event_window(entry_frame: pd.DataFrame, bias: int,
 def _qm_leg(qm_touch: dict | None, bias: int, asof) -> dict:
     """QM M5 leg: annotation, never a gate."""
     out = {"present": False, "direction_ok": False, "recent": False,
-           "status": "qm_absent", "touch_ts": None, "direction": 0}
+           "status": "qm_absent", "touch_ts": None, "direction": 0,
+           # Chart geometry (the pattern the annotation refers
+           # to): carried so the signal chart can DRAW the QM
+           # pattern for a confirmed annotation.  The drawing
+           # guard lives with the chart caller — only a
+           # qm_confirmed annotation's geometry may be drawn;
+           # these fields alone authorize nothing.
+           "head": None, "neckline": None, "qm_level": None}
     if not qm_touch:
         return out
     out["present"] = True
     direction = int(qm_touch.get("direction", 0))
     out["direction"] = direction
     out["direction_ok"] = direction == bias and direction != 0
+    for _key in ("head", "neckline", "qm_level"):
+        _val = qm_touch.get(_key)
+        out[_key] = float(_val) if _val is not None else None
     touch_ts = qm_touch.get("touch_ts") or qm_touch.get("touch_time")
     if touch_ts is not None:
         touch_ts = pd.Timestamp(touch_ts)

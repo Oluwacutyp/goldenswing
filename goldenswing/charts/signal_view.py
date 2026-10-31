@@ -154,7 +154,8 @@ def build_signal_view_html(*, frames, entry: float, stop: float,
                            ote_band, fib_info, alert_id: str,
                            instrument: str = "XAUUSD",
                            fill_price: float | None = None,
-                           signal_time: str | None = None) -> str:
+                           signal_time: str | None = None,
+                           qm_pattern: dict | None = None) -> str:
     """Render the self-contained signal view page (HTML string).
 
     Step 7: the page shows the DECISION score (``decision_score``;
@@ -207,6 +208,12 @@ def build_signal_view_html(*, frames, entry: float, stop: float,
             "entry_clock": entry_clock,
         },
         "zone": zone_d,
+        "qm": ({"head": float(qm_pattern["head"]),
+                "neckline": float(qm_pattern["neckline"]),
+                "level": (float(qm_pattern["level"])
+                          if qm_pattern.get("level") is not None
+                          else None)}
+               if qm_pattern else None),
         "nearby": [{"level": float(z["level"]),
                     "tier": str(z.get("tier", "")),
                     "side": str(z.get("side", ""))}
@@ -267,7 +274,7 @@ canvas{display:block;width:100%;height:520px;touch-action:none}
 <h1 id="title">Signal view</h1><div id="meta"></div>
 <div id="tfs">{buttons}</div>
 <div><button id="theme-btn">Light theme</button></div>
-<div id="toggles"><label><input type="checkbox" id="ov-zone" checked> Zone</label><label><input type="checkbox" id="ov-nearby" checked> Nearby levels</label><label><input type="checkbox" id="ov-fib" checked> Fib + OTE</label><label><input type="checkbox" id="ov-prem" checked> Premium/Discount</label><label><input type="checkbox" id="ov-sess" checked> Sessions</label><label><input type="checkbox" id="ov-levels" checked> Entry/SL/TP</label></div>
+<div id="toggles"><label><input type="checkbox" id="ov-zone" checked> Zone</label><label><input type="checkbox" id="ov-nearby" checked> Nearby levels</label><label><input type="checkbox" id="ov-fib" checked> Fib + OTE</label><label><input type="checkbox" id="ov-prem" checked> Premium/Discount</label><label><input type="checkbox" id="ov-sess" checked> Sessions</label><label><input type="checkbox" id="ov-levels" checked> Entry/SL/TP</label><label><input type="checkbox" id="ov-qm" checked> QM pattern</label></div>
 <div id="wrap"><canvas id="cv" width="900" height="520"></canvas></div>
 <div id="readout">Hover a candle for its values. Scroll to zoom, drag to pan, double-click to reset.</div>
 <h2>Analysis on this timeframe</h2><div id="analysis"></div>
@@ -296,7 +303,7 @@ function showTF(t){tf=t;resetWin();document.querySelectorAll('button.tf').forEac
 function yRange(bs,lo,hi){let mn=Infinity,mx=-Infinity;
   for(let i=lo;i<hi;i++){mn=Math.min(mn,bs[i][3]);mx=Math.max(mx,bs[i][2])}
   const span=Math.max(mx-mn,1e-9);
-  [D.meta.entry,D.meta.stop].concat(D.meta.broker_stop===null?[]:[D.meta.broker_stop]).concat(D.meta.targets).concat(D.zone?[D.zone.top,D.zone.bottom]:[]).forEach(v=>{
+  [D.meta.entry,D.meta.stop].concat(D.meta.broker_stop===null?[]:[D.meta.broker_stop]).concat(D.meta.targets).concat(D.zone?[D.zone.top,D.zone.bottom]:[]).concat(D.qm?[D.qm.head,D.qm.neckline].concat(D.qm.level===null?[]:[D.qm.level]):[]).forEach(v=>{
     if(v>=mn-1.6*span&&v<=mx+1.6*span){mn=Math.min(mn,v);mx=Math.max(mx,v)}});
   const pad=0.07*(mx-mn);return [mn-pad,mx+pad];}
 function draw(){const bs=bars();if(!bs.length)return;
@@ -326,6 +333,10 @@ function draw(){const bs=bars();if(!bs.length)return;
     ctx.beginPath();ctx.moveTo(0,Y(l[1]));ctx.lineTo(W,Y(l[1]));ctx.stroke();ctx.setLineDash([]);
     ctx.fillStyle='#8d6e00';ctx.font='11px monospace';ctx.fillText(l[0].toFixed(3),W-70,Y(l[1])-2);});
     if(D.fib.ote){ctx.fillStyle='rgba(141,110,0,0.12)';ctx.fillRect(0,Y(D.fib.ote[1]),W,Y(D.fib.ote[0])-Y(D.fib.ote[1]));}}
+  if(ov('ov-qm')&&D.qm){const QM='#8e24aa';ctx.strokeStyle=QM;ctx.fillStyle=QM;ctx.font='11px monospace';
+    const ql=(v,dash,lab)=>{ctx.lineWidth=0.9;ctx.setLineDash(dash);ctx.beginPath();ctx.moveTo(0,Y(v));ctx.lineTo(W,Y(v));ctx.stroke();ctx.setLineDash([]);ctx.fillText(lab+' '+fmt(v),W-170,Y(v)-2);};
+    ql(D.qm.head,[2,2],'QM HEAD');ql(D.qm.neckline,[5,3],'QM NECKLINE');
+    if(D.qm.level!==null)ql(D.qm.level,[6,2,2,2],'QM LEVEL');}
   const bw=Math.max(2,(W/n)*0.7);
   for(let i=lo;i<hi;i++){const b=bs[i],up=b[4]>=b[1],col=up?UP:DN;
     ctx.strokeStyle=col;ctx.fillStyle=col;ctx.lineWidth=1;
@@ -375,7 +386,7 @@ window.addEventListener('mousemove',e=>{if(dragX===null)return;
 window.addEventListener('mouseup',()=>{dragX=null;});
 cv.addEventListener('dblclick',()=>{resetWin();draw();});
 document.querySelectorAll('button.tf').forEach(b=>b.addEventListener('click',()=>showTF(b.dataset.tf)));
-['ov-zone','ov-nearby','ov-fib','ov-prem','ov-sess','ov-levels'].forEach(id=>
+['ov-zone','ov-nearby','ov-fib','ov-prem','ov-sess','ov-levels','ov-qm'].forEach(id=>
   document.getElementById(id).addEventListener('change',draw));
 document.getElementById('theme-btn').addEventListener('click',()=>
   setTheme(document.body.dataset.theme==='dark'?'light':'dark'));

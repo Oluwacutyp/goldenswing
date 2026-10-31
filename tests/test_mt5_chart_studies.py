@@ -71,7 +71,7 @@ def test_zones_to_study_dicts_tolerates_missing_attrs():
 
 def test_render_with_all_studies_is_a_png():
     h1, h4, m15 = _frames()
-    png = render_mt5_signal(
+    pngs = render_mt5_signal(
         h1, zone=ZONE, entry=4012.0, stop=3995.0, targets=[4040.0],
         direction=1, verdict={"entry_clock": "M15"}, playbook="test",
         score=80.0, h4=h4, entry_frame=m15,
@@ -81,25 +81,30 @@ def test_render_with_all_studies_is_a_png():
                        "side": "support"}],
         fib_levels=[(0.382, 4030.0), (0.5, 4020.0), (0.618, 4010.0)],
         fib_range=(3990.0, 4060.0), ote_band=(4005.0, 4018.0))
-    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 10_000
+    assert len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" and len(p) > 10_000
+               for p in pngs)
 
 
 def test_render_without_studies_unchanged_back_compat():
     """Old callers pass no studies: same chart as before, no crash."""
     h1, h4, m15 = _frames()
-    png = render_mt5_signal(
+    pngs = render_mt5_signal(
         h1, zone=ZONE, entry=4012.0, stop=3995.0, targets=[4040.0],
         direction=1, verdict={"entry_clock": "M15"}, playbook="test",
         score=80.0, h4=h4, entry_frame=m15)
-    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 10_000
+    assert len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" and len(p) > 10_000
+               for p in pngs)
 
 
 def test_render_partial_studies_do_not_crash():
     h1, _, _ = _frames()
-    png = render_mt5_signal(
+    pngs = render_mt5_signal(
         h1, zone=None, entry=4012.0, stop=3995.0, direction=-1,
         fib_levels=[(0.5, 4020.0)])
-    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in pngs)
 
 
 def test_study_draw_helpers_add_artists():
@@ -166,7 +171,7 @@ def test_render_with_clustered_levels_is_a_png():
     """Full render path with the clustered Oct 28 shape: no crash,
     valid PNG."""
     h1, h4, m15 = _frames()
-    png = render_mt5_signal(
+    pngs = render_mt5_signal(
         h1, zone=None, entry=4040.5, stop=4035.9, targets=[4046.2],
         direction=1, verdict={"entry_clock": "M15"}, playbook="qm_m5",
         decision_score=27.0, broker_stop=4035.2, fill_price=4040.3,
@@ -177,7 +182,9 @@ def test_render_with_clustered_levels_is_a_png():
                        "side": "support"}],
         fib_levels=[(0.618, 4041.0), (0.786, 4038.5)],
         fib_range=(3990.0, 4060.0), ote_band=(4048.0, 4050.0))
-    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 10_000
+    assert len(pngs) == 3
+    assert all(p[:8] == b"\x89PNG\r\n\x1a\n" and len(p) > 10_000
+               for p in pngs)
 
 
 def test_session_shading_spans_a_weekday():
