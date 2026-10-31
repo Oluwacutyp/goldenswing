@@ -189,7 +189,8 @@ from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
                                 ROSTER_SPECS, ROSTER_SPECS_H1,
                                 decay_exempt as _decay_exempt,
-                                native_tf_of as _native_tf)
+                                native_tf_of as _native_tf,
+                                spec_for as _spec_for)
 from .risk import RiskConfig, RiskGuards
 from .tick_manager import (DEFAULT_TIME_EXIT_BARS, TickAction, TickConfig,
                           TickManager, sl_level_valid)
@@ -598,6 +599,48 @@ class MT5RunnerConfig:
                 "1", "true", "yes", "on")
         if self.hot_scalp_db_path is None:
             self.hot_scalp_db_path = self.journal_path.parent / "hot_scalp_setups.db"
+
+
+def _flip_premise_for(pb_name: str) -> str:
+    """Step 16: the playbook's declared flip premise from the
+    registry ("" = no declaration — the flip is weighed evidence
+    only for this playbook)."""
+    spec = _spec_for(pb_name)
+    return (getattr(spec, "flip_premise", "")
+            if spec is not None else "")
+
+
+def direction_flip_block(score, pb_name: str, *,
+                         refused: bool,
+                         evidence: dict | None = None) -> dict:
+    """Step 16 (owner rulings 2026-10-30 §3): the decision record's
+    direction-flip block for a candidate whose asymmetry score
+    flipped — the flip's evidence, its stance for THIS candidate,
+    and, when the candidate proceeded, the pre-Step-16
+    counterfactual (the live shadow comparison: the journal itself
+    measures what the old blanket veto would have killed).
+
+    ``refused`` is True only for the declared-premise refusal (the
+    sole surviving flip refusal); the premise text comes from the
+    playbook's registry declaration, never invented here.  Pure:
+    no state, no I/O."""
+    ev = (evidence if evidence is not None
+          else getattr(score, "flip_evidence", None) or {})
+    block = {
+        "pivot": ev.get("pivot"),
+        "breach_atr": ev.get("breach_atr"),
+        "opposite_total": ev.get("opposite_total"),
+        "own_total": (None if bool(getattr(score, "flipped", False))
+                      else float(score.total)),
+        "score_frame": ev.get("score_frame"),
+    }
+    if refused:
+        block["stance"] = "premise_invalidation"
+        block["premise"] = _flip_premise_for(pb_name)
+    else:
+        block["stance"] = "evidence"
+        block["pre_step16_rule"] = "would have refused direction.flip"
+    return block
 
 
 def execution_intent_for(pb_name: str, sig=None) -> dict:
@@ -8249,7 +8292,26 @@ class MT5Runner:
             adr_applies=(_posture_mod.family_of(playbook)
                          == "continuation"),
             day_levels=self._day_levels())
-        return score_asymmetry(ctx, allow_flip=not at_zone)
+        score = score_asymmetry(ctx, allow_flip=not at_zone)
+        if score.flipped:
+            # Step 16 (owner rulings 2026-10-30 §3): the flip is
+            # EVIDENCE, not a verdict.  Re-price the candidate's OWN
+            # direction with the structure block zeroed — the
+            # at-zone treatment, generalized — so no consumer ever
+            # reads the opposite side's total as this candidate's
+            # funding (the roster floor, the PullbackWatch re-score
+            # comparison, the qm_d1 journal's headline score).  The
+            # flip costs the trade its entire structure share; its
+            # evidence (pivot, breach, the opposite side's total,
+            # the score frame) rides the returned score.
+            own = score_asymmetry(ctx, allow_flip=False)
+            if own.flip_evidence is not None:
+                own.flip_evidence = {
+                    **own.flip_evidence,
+                    "opposite_total": float(score.total),
+                    "score_frame": clock.score_tf}
+            score = own
+        return score
 
     def _clock_for_signal(self, style_key: str, frames: dict):
         """The S12 floated clock for one style: volatility regime
@@ -9006,6 +9068,13 @@ class MT5Runner:
                 breakdown["posture"] = self._posture.name
             if self._day_ctx is not None:
                 breakdown["day_type"] = self._day_ctx.day_type
+            # Step 16 (rulings §3): the flip FACT for this candidate.
+            # Production scores arrive repriced to the candidate's
+            # own direction with flip_evidence attached (_score_for);
+            # a directly-injected flipped score double is honored
+            # the same way via the second disjunct.
+            flip_ev = getattr(score, "flip_evidence", None)
+            was_flipped = flip_ev is not None or bool(score.flipped)
             self._last_scores[pb.name] = breakdown
             self._last_score = breakdown
 
@@ -9068,6 +9137,17 @@ class MT5Runner:
                 dec.setdefault(
                     "floor_authority",
                     _FLOOR_AUTHORITY["h1_roster"])
+                if was_flipped:
+                    # Step 16: every flipped candidate's decision
+                    # record carries the flip block — stance
+                    # "premise_invalidation" only when THIS emit is
+                    # the declared-premise refusal (the sole
+                    # direction.flip producer left), "evidence"
+                    # otherwise, with the pre-Step-16 counterfactual
+                    # as the live shadow comparison.
+                    dec["direction_flip"] = direction_flip_block(
+                        score, pb.name,
+                        refused=(reason_code == "direction.flip"))
                 # --- assessment objects (burn-down #1) --------
                 _dir = int(sig.direction)
                 _entry = float(sig.entry_ref)
@@ -9084,7 +9164,7 @@ class MT5Runner:
                            or []):
                     _note(_sup, f"{pb.name}_signal",
                           f"signal factor: {_f}")
-                if bool(score.flipped):
+                if was_flipped:
                     _note(_con, "asymmetry_score",
                           "asymmetry score flipped: the weighed "
                           "structure funds the opposite side")
@@ -9141,7 +9221,7 @@ class MT5Runner:
                 _inferred = {
                     "score_total": float(score.total),
                     "score_components": breakdown,
-                    "score_flipped": bool(score.flipped),
+                    "score_flipped": was_flipped,
                     "regime": (verdict or {}).get("regime"),
                     "posture": (self._posture.name
                                 if self._posture is not None
@@ -9166,7 +9246,7 @@ class MT5Runner:
                      "status": (
                          "funded by the weighed evidence — the "
                          "asymmetry score flipped to this side"
-                         if bool(score.flipped) else
+                         if was_flipped else
                          "not funded — no opposite-side "
                          "candidate from this playbook at this "
                          "bar; the score did not flip")}]
@@ -9229,12 +9309,23 @@ class MT5Runner:
                 "trigger": (verdict or {}).get("trigger"),
                 "entry_clock": (verdict or {}).get("entry_clock"),
             }
-            if score.flipped:
-                # The score object is for the OTHER side: it can
-                # never fund this direction (spec §2.1 flip rule).
-                reason = ("asymmetry_flip: close through the last "
-                          "defended pivot — structure funds the "
-                          "opposite side only")
+            if was_flipped and _flip_premise_for(pb.name):
+                # Step 16 (rulings §3): the ONLY surviving flip
+                # refusal — a NAMED, declared premise invalidation,
+                # with its evidence.  (The blanket §2.1 veto is
+                # gone: an undeclared flip is weighed evidence —
+                # the repriced score already zeroed the structure
+                # share, the CON note + opposing scenario +
+                # direction_flip block are on the record, and the
+                # candidate proceeds to the hard lines and floor.)
+                _fe = flip_ev or {}
+                reason = (
+                    f"premise_invalidation[{pb.name}]: "
+                    f"{_flip_premise_for(pb.name)} — evidence: "
+                    f"close through defended pivot "
+                    f"{float(_fe.get('pivot', 0.0)):.2f} by "
+                    f"{float(_fe.get('breach_atr', 0.0)):.2f} ATR "
+                    f"(score frame {_fe.get('score_frame') or '?'})")
                 self._record_blocked(reason, pb.name)
                 self.journal.log_note(
                     f"mt5: {pb.name} signal refused: {reason}")
@@ -12736,8 +12827,11 @@ class MT5Runner:
            supporting AND contradictory observations named.  HTF
            conditions are CONTEXTUAL EVIDENCE on this route —
            weighed, never silent vetoes (gates-vs-scores law).
-           The one weighed refusal is the score's own flip: the
-           candidate's evidence, weighed, funds the opposite side.
+           The score's own flip is weighed evidence too (owner
+           rulings 2026-10-30 §3): it zeroes the candidate's
+           structure share, stands as the funded opposing
+           scenario, and refuses ONLY on a named, declared
+           premise invalidation — qm_m5 declares none.
         2. HARD STOPS remain only for trade-existence FACTS:
            invalid stop geometry, stale data, and the shared hard
            lines (the playbook's own fact re-verification, the
@@ -12815,6 +12909,14 @@ class MT5Runner:
         breakdown["clock_reason"] = "qm_m5 native M5 route (§2)"
         if self._posture is not None:
             breakdown["posture"] = self._posture.name
+        # Step 16 (rulings §3): the flip FACT for this candidate —
+        # production scores arrive repriced with flip_evidence
+        # attached (_score_for); a directly-injected flipped
+        # double is honored the same way.
+        flip_ev = getattr(score, "flip_evidence", None)
+        if flip_ev is not None:
+            flip_ev = {**flip_ev, "score_frame": "M5"}
+        was_flipped = flip_ev is not None or bool(score.flipped)
         journey = self._journey_context(
             direction=direction, price=entry, stop_dist=stop_dist,
             zone_d=None, atr=atr_m5)
@@ -12853,7 +12955,7 @@ class MT5Runner:
             _note(contradictory, "htf_structure",
                   f"against structural D1 bias {bias_d1:+d} "
                   "(weighed as evidence, not a veto)")
-        if bool(score.flipped):
+        if was_flipped:
             _note(contradictory, "asymmetry_score",
                   "asymmetry score flipped: the weighed structure "
                   "funds the opposite side")
@@ -12890,7 +12992,7 @@ class MT5Runner:
             "inferred": {
                 "score_total": float(score.total),
                 "score_components": breakdown,
-                "score_flipped": bool(score.flipped),
+                "score_flipped": was_flipped,
                 "regime": verdict["regime"],
                 "posture": post.name if post is not None else None,
                 "alignment": getattr(self._alignment,
@@ -12923,7 +13025,7 @@ class MT5Runner:
             {"scenario": f"take the {-direction:+d} side (the "
                          "flip side)",
              "status": ("funded by the weighed evidence — score "
-                        "flipped" if bool(score.flipped) else
+                        "flipped" if was_flipped else
                         "not funded by the weighed evidence")},
         ]
         candidate = self._candidate_dict(sig, breakdown, provenance)
@@ -12990,7 +13092,13 @@ class MT5Runner:
                               eligible=False,
                               execution_code=(
                                   code if analytical_qualified
-                                  else None))},
+                                  else None)),
+                          **({"direction_flip":
+                              direction_flip_block(
+                                  score, "qm_m5",
+                                  refused=(code == "direction.flip"),
+                                  evidence=flip_ev)}
+                             if was_flipped else {})},
                 evidence=evidence, source=_src)
 
         hard_checks: list[dict] = []
@@ -13030,17 +13138,28 @@ class MT5Runner:
                 "on dead data",
                 hard_checks)
             return
-        # WEIGHED refusal — the score's own flip.  Not a checklist
-        # item: the candidate's evidence, weighed, funds the
-        # opposite side; the record carries the full vector so
-        # the judgment is auditable as a judgment.
-        if bool(score.flipped):
+        # Step 16 (rulings §3): the score's flip is weighed
+        # EVIDENCE on this route like every other contextual
+        # reading — it zeroed the candidate's structure share in
+        # the repriced score, it is named in the contradictory
+        # evidence, its side stands as the funded opposing
+        # scenario, and the decision record carries the
+        # direction_flip block with the pre-Step-16
+        # counterfactual.  The ONLY flip refusal left is a NAMED,
+        # declared premise invalidation (registry flip_premise);
+        # qm_m5 declares none — its premise invalidation is its
+        # own stop beyond the head, enforced as a fact by the
+        # shared order path, not by this context read.
+        if was_flipped and _flip_premise_for("qm_m5"):
+            _fe = flip_ev or {}
             _refuse(
                 "direction.flip",
-                "weighed judgment: the asymmetry evidence is "
-                "flipped — structure funds the opposite side "
-                "only; this candidate's own evidence contradicts "
-                "it",
+                f"premise_invalidation[qm_m5]: "
+                f"{_flip_premise_for('qm_m5')} — evidence: close "
+                f"through defended pivot "
+                f"{float(_fe.get('pivot', 0.0)):.2f} by "
+                f"{float(_fe.get('breach_atr', 0.0)):.2f} ATR "
+                f"(score frame M5)",
                 hard_checks)
             return
         # FACT 3 — the shared hard lines: the playbook's own fact
@@ -13221,7 +13340,17 @@ class MT5Runner:
                     "abstain on HTF disagreement — rejected: HTF "
                     "context is weighed evidence on this route, "
                     "not a veto (gates-vs-scores law)",
-                ]},
+                    *(["abstain on the score flip — rejected: "
+                       "the flip is weighed evidence (rulings "
+                       "2026-10-30 §3), not a veto; it zeroed the "
+                       "structure share and stands as the funded "
+                       "opposing scenario on this record"]
+                      if was_flipped else []),
+                ],
+                **({"direction_flip": direction_flip_block(
+                        score, "qm_m5", refused=False,
+                        evidence=flip_ev)}
+                   if was_flipped else {})},
             evidence=evidence, source=_src)
         self._announce_assessment(_rec)
         return _ocode

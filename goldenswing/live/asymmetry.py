@@ -127,6 +127,11 @@ class AsymmetryScore:
     flipped: bool
     components: dict = field(default_factory=dict)  # name -> result
     weights: dict = field(default_factory=dict)
+    #: Step 16: when the structure block flipped, the evidence for
+    #: it — {"direction", "pivot", "breach_atr", "opposite_total"}
+    #: (opposite_total None when no re-score was taken).  Consumers
+    #: weigh this; the score itself never gates.
+    flip_evidence: dict | None = None
 
     def component(self, name: str) -> float:
         r = self.components.get(name)
@@ -147,6 +152,16 @@ class AsymmetryScore:
                          for k, v in r.subs.items()},
                 "flags": list(r.flags),
             }
+        if self.flip_evidence:
+            fe = self.flip_evidence
+            out["flip_evidence"] = {
+                "direction": int(fe.get("direction", self.direction)),
+                "pivot": round(float(fe.get("pivot", 0.0)), 3),
+                "breach_atr": round(float(fe.get("breach_atr", 0.0)),
+                                    3),
+                "opposite_total": (
+                    None if fe.get("opposite_total") is None
+                    else round(float(fe["opposite_total"]), 2))}
         return out
 
 
@@ -209,8 +224,19 @@ def _structure(ctx: ScoreContext, max_points: float) -> ComponentResult:
             else (after > last_price + breach)
         if bool(through.any()):
             res.flags.append("structure_flip")
+            # Step 16: the flip's EVIDENCE rides the result — the
+            # defended pivot and how far closes ran through it —
+            # so a consumer can name what flipped instead of
+            # inheriting a bare verdict.
+            if ctx.direction > 0:
+                excursion = float(last_price - after.min())
+            else:
+                excursion = float(after.max() - last_price)
             res.subs = {"spacing": 0.0, "frequency": 0.0,
-                        "defense": 0.0, "flip": 1.0}
+                        "defense": 0.0, "flip": 1.0,
+                        "pivot": float(last_price),
+                        "breach_atr": (excursion / ctx.atr
+                                       if ctx.atr > 0 else 0.0)}
             return res
     # --- spacing: median inter-pivot distance (formation ATR)
     # blended with the live distance to the last defended pivot
@@ -700,6 +726,21 @@ def score_asymmetry(ctx: ScoreContext, *,
     if weights:
         w.update(weights)
     struct = COMPONENTS["structure"](ctx, w.get("structure", 30.0))
+
+    def _flip_evidence(opposite_total: float | None) -> dict | None:
+        # Step 16: the first-pass structure result carries the
+        # flip's evidence (pivot + breach); keep it on whichever
+        # score leaves this function — the old code discarded it
+        # on the flip branch, leaving consumers a bare verdict.
+        if "structure_flip" not in struct.flags:
+            return None
+        return {"direction": int(ctx.direction),
+                "pivot": float(struct.subs.get("pivot", 0.0)),
+                "breach_atr": float(struct.subs.get("breach_atr",
+                                                    0.0)),
+                "opposite_total": (None if opposite_total is None
+                                   else float(opposite_total))}
+
     if "structure_flip" in struct.flags and not allow_flip:
         struct.points = 0.0
         struct.flags.append("structure_flip_against")
@@ -714,7 +755,8 @@ def score_asymmetry(ctx: ScoreContext, *,
         return AsymmetryScore(total=float(total),
                               direction=ctx.direction,
                               flipped=False, components=components,
-                              weights=w)
+                              weights=w,
+                              flip_evidence=_flip_evidence(None))
     if "structure_flip" in struct.flags and not getattr(
             ctx, "_flip_guard", False):
         flipped_ctx = ScoreContext(
@@ -731,6 +773,7 @@ def score_asymmetry(ctx: ScoreContext, *,
         flipped_ctx._flip_guard = True  # type: ignore[attr-defined]
         out = score_asymmetry(flipped_ctx, weights=weights)
         out.flipped = True
+        out.flip_evidence = _flip_evidence(out.total)
         return out
     components = {"structure": struct}
     total = struct.points

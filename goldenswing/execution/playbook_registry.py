@@ -99,6 +99,24 @@ class PlaybookSpec:
     #: which declares "market" below (its definition enters on the
     #: reclaim bar's close).
     entry_thesis: str = "limit"
+    #: Step 16 (owner rulings 2026-10-30 §3): the playbook's declared
+    #: FLIP PREMISE — the premise, in the playbook's own words, that
+    #: an asymmetry structure flip (a close through the last
+    #: defended pivot on the score frame) invalidates.  Non-empty =
+    #: a flip hard-refuses for this playbook, with the premise NAMED
+    #: and the flip evidence journaled on the refusal.  Empty (the
+    #: default, and every playbook today) = the flip is weighed
+    #: evidence only: it zeroes the candidate's structure share and
+    #: is recorded as the strongest opposing scenario, never a veto.
+    #: Declaration discipline: declare ONLY where the playbook's own
+    #: definition states the defended-structure close-through kills
+    #: the setup.  Every registered playbook's premise invalidation
+    #: is its own declared level (the signal's invalidation / the
+    #: zone's far edge), already enforced by the setup lifecycle
+    #: (Step 14) and the hard lines — the score flip is a
+    #: floated-clock context read, not the playbook's own level, so
+    #: no playbook declares one.
+    flip_premise: str = ""
 
 
 #: The registry, in canonical display order: the H1-clocked roster

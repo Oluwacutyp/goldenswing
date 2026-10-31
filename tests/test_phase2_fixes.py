@@ -703,9 +703,12 @@ def test_competing_scenarios_coexist_on_the_record(
         tmp_path, monkeypatch):
     """Both scenarios are on the record: the taken side
     (selected) and the flip side (not funded).  When the score
-    DOES flip, the record shows the other scenario selected by
-    the weighed evidence and this side refused — nothing is
-    silently suppressed."""
+    DOES flip, the flip side stands as the funded opposing
+    scenario — and (Step 16, rulings 2026-10-30 §3) the flip is
+    weighed evidence, NOT a refusal: the candidate is decided by
+    the hard facts, and the record carries the direction_flip
+    block with the pre-Step-16 counterfactual.  Nothing is
+    silently suppressed on either side."""
     runner = _wire(_qm_runner(tmp_path), _m5_fixture())
     runner._run_qm_m5(_m5_fixture(), {})
     dec = _candidate_records(runner)[0]["decision"]
@@ -713,21 +716,47 @@ def test_competing_scenarios_coexist_on_the_record(
     assert len(scen) == 2
     assert scen[0]["status"] == "selected"
     assert "not funded" in scen[1]["status"]
-    # Flip case.
-    class _FlipScore(_FakeScore):
-        flipped = True
+    # Flip case — production shape: _score_for reprices the
+    # candidate's OWN direction (structure share zeroed) and the
+    # flip's evidence rides the score.
+    class _RepricedFlipScore(_FakeScore):
+        flipped = False
+        flip_evidence = {"direction": -1, "pivot": 4016.53,
+                         "breach_atr": 0.42,
+                         "opposite_total": 64.0,
+                         "score_frame": "M5"}
     import tempfile
     from pathlib import Path as _P
     tmp2 = _P(tempfile.mkdtemp())
     runner2 = _wire(_qm_runner(tmp2), _m5_fixture())
-    runner2._score_for = lambda **kw: _FlipScore(70.0, 25.0, 15.0)
+    runner2._score_for = lambda **kw: _RepricedFlipScore(
+        41.0, 0.0, 15.0)
     runner2._run_qm_m5(_m5_fixture(), {})
-    assert runner2.executor.orders == []
     dec2 = _candidate_records(runner2)[0]["decision"]
-    assert dec2["result"] == "refused"
-    assert dec2["reason_code"] == "direction.flip"
-    assert "selected by the weighed evidence" in \
+    assert dec2["result"] == "accepted"
+    assert dec2["reason_code"] != "direction.flip"
+    assert "funded by the weighed evidence" in \
         dec2["competing_scenarios"][1]["status"]
+    flip_block = dec2["direction_flip"]
+    assert flip_block["stance"] == "evidence"
+    assert flip_block["pre_step16_rule"] == \
+        "would have refused direction.flip"
+    assert flip_block["pivot"] == 4016.53
+    assert flip_block["opposite_total"] == 64.0
+    assert flip_block["own_total"] == 41.0
+    # Defensive shape: a bare flipped=True double (no
+    # flip_evidence) is also evidence, never a flip refusal.
+    class _BareFlipScore(_FakeScore):
+        flipped = True
+    tmp3 = _P(tempfile.mkdtemp())
+    runner3 = _wire(_qm_runner(tmp3), _m5_fixture())
+    runner3._score_for = lambda **kw: _BareFlipScore(
+        70.0, 25.0, 15.0)
+    runner3._run_qm_m5(_m5_fixture(), {})
+    dec3 = _candidate_records(runner3)[0]["decision"]
+    assert dec3["result"] == "accepted"
+    assert dec3["reason_code"] != "direction.flip"
+    assert dec3["direction_flip"]["stance"] == "evidence"
 
 
 # --------------------------- addendum B/E: SMT timestamp alignment
