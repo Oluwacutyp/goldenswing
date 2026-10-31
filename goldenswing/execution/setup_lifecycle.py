@@ -94,6 +94,14 @@ class TrackedSetup:
     atr: float = 0.0
     sweep_index: int | None = None
     live_context: dict = field(default_factory=dict)
+    #: Step 18 (owner rulings 2026-10-30 §4): the setup's
+    #: declared management block (management_horizon,
+    #: management_policy_id, management_policy_version,
+    #: management_context_timeframe, management_invalidation,
+    #: management_target) — resolved at registration from the
+    #: registry declaration + the signal, persisted with the
+    #: setup, and carried into the position at fill.
+    management: dict = field(default_factory=dict)
     formation_ts: str | None = None
     touch_ts: str | None = None
     created_ts: str | None = None

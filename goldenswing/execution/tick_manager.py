@@ -322,6 +322,8 @@ class TickManager:
              broker_sl: float | None = None,
              now: float | None = None,
              playbook: str = "",
+             management_horizon: str = "",
+             management_policy_id: str = "",
              narrative_plan: dict | None = None,
              narrative_atr: float = 0.0,
              narrative_choch_extreme: float | None = None,
@@ -345,6 +347,12 @@ class TickManager:
                                  entry_bar=entry_bar)
         pos.is_scalp = bool(getattr(request, "is_scalp", False))
         pos.opened_at = float(now) if now is not None else time.time()
+        # Step 18: the declared management horizon + policy ride
+        # onto the position — the close record names them, and
+        # the policy id must agree with the playbook-derived
+        # resolution (asserted in the step-18 acceptance tests).
+        pos.management_horizon = str(management_horizon or "")
+        pos.management_policy_id = str(management_policy_id or "")
         self._states[ticket] = _TickState(
             pos=pos, broker_sl=(float(broker_sl) if broker_sl is not None
                                 else pos.stop0),

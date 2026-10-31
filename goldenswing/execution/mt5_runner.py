@@ -189,6 +189,10 @@ from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
                                 ROSTER_SPECS, ROSTER_SPECS_H1,
                                 decay_exempt as _decay_exempt,
+                                management_horizon_for as
+                                _management_horizon_for,
+                                management_policy_for as
+                                _management_policy_for,
                                 native_tf_of as _native_tf,
                                 spec_for as _spec_for)
 from .risk import RiskConfig, RiskGuards
@@ -687,6 +691,37 @@ def execution_intent_for(pb_name: str, sig=None) -> dict:
     return {"family": "limit",
             "basis": "default limit thesis (pullback / "
                      "return-to-zone)"}
+
+
+def management_block_for(pb_name: str, sig=None) -> dict:
+    """Step 18 (owner rulings 2026-10-30 §4): a candidate's
+    DECLARED management block — the six persisted fields.
+
+    The horizon comes from the registry declaration (the
+    playbook's thesis clock family, never its entry timeframe);
+    the policy is resolved by the registry's resolution point
+    (only established, tested rule sets resolve today); the
+    context timeframe is the playbook's native (generation)
+    clock — the frame its thesis is managed against; the
+    invalidation and target ride from the signal itself.
+    Pure: no state, no I/O."""
+    name = str(pb_name or "")
+    spec = _spec_for(name) if name else None
+    policy_id, policy_version = _management_policy_for(name)
+    targets = list(getattr(sig, "targets", None) or [])
+    inval = getattr(sig, "invalidation", None)
+    return {
+        "management_horizon": _management_horizon_for(name),
+        "management_policy_id": policy_id,
+        "management_policy_version": int(policy_version),
+        "management_context_timeframe": (
+            spec.native_tf if spec is not None
+            else "M5" if name == "hot_scalp" else ""),
+        "management_invalidation": (
+            float(inval) if inval is not None else None),
+        "management_target": (
+            float(targets[0]) if targets else None),
+    }
 
 
 @dataclass
@@ -1917,6 +1952,7 @@ class MT5Runner:
             atr=float(getattr(sig, "atr", 0.0) or 0.0),
             sweep_index=getattr(sig, "sweep_index", None),
             live_context=clean_ctx,
+            management=management_block_for(spec.name, sig),
             formation_ts=(str(formation_ts)
                           if formation_ts is not None else None),
             touch_ts=str(touch_ts), created_ts=str(eval_now),
@@ -2028,6 +2064,9 @@ class MT5Runner:
         _intent = getattr(sig, "execution_intent", None)
         if _intent is not None:
             out["execution_intent"] = dict(_intent)
+        _mgmt = getattr(sig, "management", None)
+        if _mgmt is not None:
+            out["management"] = dict(_mgmt)
         return out
 
     def _journal_manifest(self) -> None:
@@ -3225,7 +3264,13 @@ class MT5Runner:
         self._det_journal("trade_closed", {
             "alert_id": pos.alert_id, "ticket": ticket,
             "exit": price, "reason": reason,
-            "pnl_money": float(pnl_money), "r_net": float(total_r)},
+            "pnl_money": float(pnl_money), "r_net": float(total_r),
+            # Step 18: the horizon + policy that managed the
+            # position, named on its close record.
+            "management_horizon": str(
+                getattr(pos, "management_horizon", "") or ""),
+            "management_policy_id": str(
+                getattr(pos, "management_policy_id", "") or "")},
             idempotency_key=f"close-{pos.alert_id}-{ticket}")
         self.journal.log_note(
             f"mt5 close: ticket {ticket} {display} at {price:.2f} "
@@ -7401,6 +7446,10 @@ class MT5Runner:
         sig.trigger_key = (
             f"hot_scalp:{sid}@"
             f"{candidate.get('triggered_at') or candidate.get('touched_at') or tick.get('time')}")
+        # Step 18: the declared management block (scalp
+        # horizon, standard policy — hot scalp is NOT
+        # fixed-bracket; only qm_m5 is).
+        sig.management = management_block_for("hot_scalp", sig)
         pb = SimpleNamespace(name="hot_scalp")
         tracked_before = set(self.tick_manager.tickets())
         self._last_tick = dict(tick)
@@ -9052,6 +9101,10 @@ class MT5Runner:
                 sig.trigger_key = (
                     f"{injected_setup_id}@"
                     f"{h1.index[t] if 0 <= t < len(h1) else t}")
+            # Step 18: stamp the declared management block —
+            # every funnel record carries it and the order path
+            # hands it to the tracked position at fill.
+            sig.management = management_block_for(pb.name, sig)
             # ---- P3 style/family + journey pre-pass -------------
             # The style bucket picks the floated clocks + the
             # open-space floor row; the family is the posture unit.
@@ -11720,11 +11773,18 @@ class MT5Runner:
             self._record_open_identity(track_request, sig)
         _narr_state, _narr_kwargs = self._narrative_fill_plan(sig, fill)
         h1 = self._stack.frames["H1"]
+        _mgmt = getattr(sig, "management", None) or {}
         self.tick_manager.open(ticket=int(res.ticket),
                                request=track_request, fill_price=fill,
                                entry_bar=len(h1) - 1 if entry_bar is None
                                else entry_bar, broker_sl=stop0,
                                playbook=pb.name,
+                               management_horizon=str(
+                                   _mgmt.get("management_horizon")
+                                   or ""),
+                               management_policy_id=str(
+                                   _mgmt.get("management_policy_id")
+                                   or ""),
                                **_narr_kwargs)
         if _narr_state is not None:
             self._narrative_states[int(res.ticket)] = _narr_state
@@ -12281,11 +12341,17 @@ class MT5Runner:
                                              fill_bar)
             _narr_state, _narr_kwargs = self._narrative_fill_plan(
                 getattr(state, "sig", None), float(pos.entry_price))
+            _mgmt = getattr(getattr(state, "sig", None),
+                            "management", None) or {}
             self.tick_manager.open(
                 ticket=int(pos.ticket), request=track,
                 fill_price=float(pos.entry_price),
                 entry_bar=fill_bar, broker_sl=float(state.sl),
                 playbook=state.playbook,
+                management_horizon=str(
+                    _mgmt.get("management_horizon") or ""),
+                management_policy_id=str(
+                    _mgmt.get("management_policy_id") or ""),
                 **_narr_kwargs)
             if _narr_state is not None:
                 self._narrative_states[int(pos.ticket)] = _narr_state
@@ -12308,11 +12374,19 @@ class MT5Runner:
                                          fill_bar)
         _narr_state, _narr_kwargs = self._narrative_fill_plan(
             getattr(state, "sig", None), float(pos.entry_price))
+        _mgmt = getattr(getattr(state, "sig", None),
+                        "management", None) or {}
         self.tick_manager.open(ticket=int(pos.ticket), request=track,
                                fill_price=float(pos.entry_price),
                                entry_bar=fill_bar,
                                broker_sl=float(state.sl),
                                playbook=state.playbook,
+                               management_horizon=str(
+                                   _mgmt.get("management_horizon")
+                                   or ""),
+                               management_policy_id=str(
+                                   _mgmt.get("management_policy_id")
+                                   or ""),
                                **_narr_kwargs)
         if _narr_state is not None:
             self._narrative_states[int(pos.ticket)] = _narr_state
@@ -12939,6 +13013,9 @@ class MT5Runner:
             sig.trigger_key = (
                 f"{provenance['instance_key']}@"
                 f"{provenance.get('pattern_touch_ts') or last_bar_ts}")
+        # Step 18: the declared management block (qm_m5: scalp
+        # horizon, fixed_bracket_v1 policy).
+        sig.management = management_block_for("qm_m5", sig)
         _src = (provenance or {}).get("source")
         stop_dist = abs(entry - stop)
         tick = self._last_tick or {}
@@ -13657,6 +13734,9 @@ class MT5Runner:
             sig.trigger_key = (
                 f"{provenance['instance_key']}@"
                 f"{provenance.get('pattern_touch_ts') or ''}")
+        # Step 18: the declared management block (qm_d1: swing
+        # horizon, standard policy).
+        sig.management = management_block_for("qm_d1", sig)
         _src = (provenance or {}).get("source")
         direction = int(sig.direction)
         entry = float(sig.entry_ref)

@@ -88,6 +88,12 @@ class TrackedPosition:
     #: "pnl"} — the audit trail for the close total and the
     #: volume-weighted total R (live/exit.realized_r).
     banked_legs: list = field(default_factory=list)
+    #: Step 18 (rulings 2026-10-30 §4): the declared management
+    #: horizon + resolved policy managing this position, stamped
+    #: at fill from the candidate's management block.  Adopted
+    #: positions carry neither (their setup is unknown) — "" both.
+    management_horizon: str = ""
+    management_policy_id: str = ""
 
     @property
     def active_stop(self) -> float:

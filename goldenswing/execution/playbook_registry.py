@@ -117,6 +117,23 @@ class PlaybookSpec:
     #: floated-clock context read, not the playbook's own level, so
     #: no playbook declares one.
     flip_premise: str = ""
+    #: Step 18 (owner rulings 2026-10-30 §4): the playbook's
+    #: declared MANAGEMENT HORIZON — "scalp" | "intraday" |
+    #: "swing" — determined by the setup's thesis, structural
+    #: objective, intended holding period and target timeframe,
+    #: NOT by its entry timeframe.  Grounding (the multi-TF
+    #: hierarchy doctrine: Swing D1 / Intraday H4 / Scalp H1):
+    #: the H1 roster and the H4 range family run H4-context
+    #: theses with session/day objectives — intraday, hence the
+    #: default; the native routes declare their own (qm_m5 is
+    #: an M5-clock scalp system; qm_d1's QM objective is a
+    #: multi-day D1 structure — swing).  The horizon selects
+    #: the management POLICY at the resolution point
+    #: (management_policy_for); policies are built only from
+    #: established, tested rule sets — new horizon-specific
+    #: parameters require chronological, cost-aware demo
+    #: evaluation before they may resolve here (rulings §4).
+    management_horizon: str = "intraday"
 
 
 #: The registry, in canonical display order: the H1-clocked roster
@@ -167,8 +184,10 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # Native-clock routes: evaluated by dedicated runner paths on
     # their own frames (M5 closes / D1 closes).  They are NOT in
     # the H1 roster — feeding them H1 bars was the qm_m5 defect.
-    PlaybookSpec("qm_m5", QMM5Playbook, "M5", ROUTE_NATIVE),
-    PlaybookSpec("qm_d1", QMD1Playbook, "D1", ROUTE_NATIVE),
+    PlaybookSpec("qm_m5", QMM5Playbook, "M5", ROUTE_NATIVE,
+                 management_horizon="scalp"),
+    PlaybookSpec("qm_d1", QMD1Playbook, "D1", ROUTE_NATIVE,
+                 management_horizon="swing"),
 )
 
 _BY_NAME: dict[str, PlaybookSpec] = {s.name: s
@@ -258,6 +277,50 @@ MANAGEABLE_NAMES: tuple[str, ...] = tuple(
 def spec_for(name: str) -> PlaybookSpec | None:
     """The registry entry for ``name`` (None when unregistered)."""
     return _BY_NAME.get(str(name))
+
+
+#: Step 18: the management horizons a setup may declare.
+MANAGEMENT_HORIZONS: tuple[str, ...] = ("scalp", "intraday", "swing")
+
+#: Step 18: management policies, by id -> version.  A policy is a
+#: named, versioned bundle of ESTABLISHED, tested management
+#: rules (rulings 2026-10-30 §4: no invented R thresholds, ATR
+#: multipliers or point distances):
+#: - "fixed_bracket_v1": Step 13's rule set — the placement
+#:   bracket only (initial structural stop + broker target; no
+#:   profit-lock / breakeven / trail / Chandelier movement).
+#: - "standard_v1": the desk's standing TickConfig exactly as
+#:   the runner constructs it (earned breakeven, profit lock,
+#:   R-trail, Chandelier, tiered partials).
+MANAGEMENT_POLICIES: dict[str, int] = {
+    "fixed_bracket_v1": 1,
+    "standard_v1": 1,
+}
+
+
+def management_policy_for(name: str) -> tuple[str, int]:
+    """Step 18: resolve a playbook's management policy
+    (policy_id, version).  qm_m5's fixed bracket is the only
+    playbook-specific rule set in force; every other playbook —
+    registered or not (hot_scalp) — resolves to the standard
+    policy.  A horizon-specific policy may be added here ONLY
+    after chronological, cost-aware demo evaluation (rulings
+    §4); the horizon declaration travels with the setup either
+    way, so that promotion needs no re-plumbing."""
+    if str(name) == "qm_m5":
+        return "fixed_bracket_v1", MANAGEMENT_POLICIES["fixed_bracket_v1"]
+    return "standard_v1", MANAGEMENT_POLICIES["standard_v1"]
+
+
+def management_horizon_for(name: str) -> str:
+    """Step 18: a playbook's declared management horizon.
+    Unregistered names (hot_scalp) declare through their route:
+    hot scalp is a scalp system by construction; anything else
+    unregistered falls back to the registry default."""
+    spec = _BY_NAME.get(str(name))
+    if spec is not None:
+        return spec.management_horizon
+    return "scalp" if str(name) == "hot_scalp" else "intraday"
 
 
 def native_tf_of(name: str) -> str | None:
