@@ -314,6 +314,17 @@ class MT5RunnerConfig:
     # never change a decision (test-pinned on/off identity).  The
     # flag exists so a test (or a forensic A/B) can prove that.
     funnel_enabled: bool = True
+    # JUDGMENT CORE (owner rulings 2026-10-23; build ordered
+    # 2026-11-02): shadow evaluation of every candidate-bearing
+    # funnel record — market-state estimation -> competing
+    # scenarios -> evidence evaluation -> take/abstain, journaled
+    # as judgment_shadow records.  OBSERVATION-ONLY in v1: the
+    # verdict never steers, sizes, gates or vetoes an order (hard
+    # risk invariants stay outside the model, in risk/friction);
+    # first promotion (M5 route only) needs a separate approval.
+    judgment_shadow_enabled: bool = True
+    judgment_min_expected_r: float = 0.05
+    judgment_min_confidence: float = 0.15
     deterministic_dir: Path | None = None  # default: <journal parent>/deterministic
     risk_state_path: Path = DATA_DIR / "mt5_risk_state.json"
     kill_switch_path: Path = DATA_DIR / "mt5_KILL"
@@ -1645,6 +1656,51 @@ class MT5Runner:
                 if isinstance(_av, dict) \
                         and _av.get("verdict") == "qualified":
                     slot["qualified"] += 1
+        # Judgment core shadow (owner rulings 2026-10-23; build
+        # ordered 2026-11-02): every candidate-bearing LIVE record
+        # also gets a judgment_shadow record — the judgment core's
+        # take/abstain on the SAME inputs the gate stack decided
+        # on, so the two models can be compared against outcomes.
+        # It reads only this record; it can never steer, size,
+        # gate or veto an order.  Warmup/replay records are
+        # skipped (their bar is historical — a shadow verdict
+        # stamped on them would misdescribe the dataset).
+        if candidate is not None and decision is not None \
+                and kind != "trigger_event" \
+                and source != "warmup_scan" \
+                and getattr(self.cfg, "judgment_shadow_enabled",
+                            True):
+            try:
+                from .judgment import (JudgmentConfig,
+                                       evaluate_judgment)
+                _judgment = evaluate_judgment(
+                    candidate=candidate, decision=decision,
+                    evidence=evidence,
+                    context=self._decision_context(),
+                    config=JudgmentConfig(
+                        min_expected_r=float(getattr(
+                            self.cfg, "judgment_min_expected_r",
+                            0.05)),
+                        min_confidence=float(getattr(
+                            self.cfg, "judgment_min_confidence",
+                            0.15))))
+                self.journal.append({
+                    "type": "judgment_shadow",
+                    "ts": str(_eval_now),
+                    "run_id": self._run_id,
+                    "playbook": playbook,
+                    "intended_tf": intended_tf,
+                    "gate_result": decision.get("result"),
+                    "gate_order_result":
+                        decision.get("order_result"),
+                    "gate_reason_code":
+                        decision.get("reason_code")
+                        or reason_code or None,
+                    "judgment": _judgment})
+            except Exception as exc:
+                self.journal.log_note(
+                    f"mt5: judgment shadow failed for "
+                    f"{playbook}: {type(exc).__name__}: {exc}")
         return record
 
     def _census_for_record(self, *, intended_tf, actual_input_tf,
@@ -2115,6 +2171,21 @@ class MT5Runner:
                     "risk_pct": self.cfg.risk_pct,
                     "min_score": self.cfg.min_score,
                     "floor_authority": dict(_FLOOR_AUTHORITY),
+                    # Judgment core (2026-11-02): shadow mode is
+                    # the only mode v1 ships; promotion is a
+                    # separate owner approval, never a config flip
+                    # smuggled in here.
+                    "judgment_core": {
+                        "mode": "shadow",
+                        "enabled": bool(getattr(
+                            self.cfg, "judgment_shadow_enabled",
+                            True)),
+                        "min_expected_r": float(getattr(
+                            self.cfg, "judgment_min_expected_r",
+                            0.05)),
+                        "min_confidence": float(getattr(
+                            self.cfg, "judgment_min_confidence",
+                            0.15))},
                 }})
         except Exception:
             pass
