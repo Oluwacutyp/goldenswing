@@ -55,6 +55,11 @@ class ForecastRanks:
     close: float
     ranks: dict[int, dict[str, float]]  # horizon -> {"up":, "dn":}
     horizons: tuple[int, ...] = ()
+    # F1: per-model raw probabilities behind each rank
+    # ({horizon: {"up": [p, ...], "dn": [p, ...]}}) — the outlook
+    # reads their spread as ensemble disagreement.  Empty when a
+    # scorer did not carry them; disagreement then reports absent.
+    model_probs: dict = field(default_factory=dict)
 
     def rank(self, horizon: int, direction: str) -> float:
         return float(self.ranks.get(horizon, {}).get(direction, float("nan")))

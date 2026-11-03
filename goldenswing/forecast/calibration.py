@@ -31,6 +31,13 @@ missing:
 
 Pure core: the runner owns cadence, journaling and persistence
 calls; everything here is a function of its inputs.
+
+F1 (2026-11-03) extends resolution: :func:`realized_outcomes`
+captures the realized endpoint return and excursions per horizon
+alongside the barrier-race outcome, and the state gains a bounded
+``samples`` ring (one entry per resolved forecast-horizon) — the
+conditioning pool the outlook (forecast/outlook.py) estimates
+from, and the raw material F3 scores the outlook against.
 """
 from __future__ import annotations
 
@@ -106,6 +113,22 @@ def magnitude_block(horizons: dict) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _bar_position(record: dict, h1: pd.DataFrame) -> int | None:
+    """The forecast bar's position in the frame (None when the
+    bar is not in the frame at all).  Shared by the label
+    resolution and the F1 realized-outcome capture so both read
+    the same windows."""
+    bar_time = record.get("bar_time")
+    if bar_time is None:
+        return None
+    ts = pd.Timestamp(bar_time)
+    index = h1.index
+    if ts not in index:
+        return None
+    return int(len(index) - 1 - index[::-1].get_loc(ts)) \
+        if index.duplicated().any() else int(index.get_loc(ts))
+
+
 def resolve_record(record: dict, h1: pd.DataFrame,
                    atr_values: np.ndarray) -> dict | None:
     """Resolve a journaled forecast against realized H1 bars.
@@ -118,15 +141,9 @@ def resolve_record(record: dict, h1: pd.DataFrame,
     label is unknowable (non-finite ATR at the forecast bar —
     the training pipeline calls those unknown too, never 0).
     Horizons still inside their window are simply absent."""
-    bar_time = record.get("bar_time")
-    if bar_time is None:
+    pos = _bar_position(record, h1)
+    if pos is None:
         return None
-    ts = pd.Timestamp(bar_time)
-    index = h1.index
-    if ts not in index:
-        return None
-    pos = int(len(index) - 1 - index[::-1].get_loc(ts)) \
-        if index.duplicated().any() else int(index.get_loc(ts))
     out: dict[str, Any] = {}
     void: list[int] = []
     for key in (record.get("horizons") or {}):
@@ -151,6 +168,61 @@ def resolve_record(record: dict, h1: pd.DataFrame,
                              "y_dn": int(row["y_dn"])}
     if void:
         out["void"] = void
+    return out
+
+
+#: Cap on the resolved-sample ring in the calibration state —
+#: the F1 outlook's conditioning pool.  Bounded so the state
+#: file stays small; the oldest samples age out first.
+SAMPLE_RING_CAP = 1500
+
+
+def realized_outcomes(record: dict, h1: pd.DataFrame) -> dict:
+    """F1: realized endpoint return + excursions per horizon for
+    a journaled forecast — the resolution side of the outlook.
+
+    Same windows :func:`resolve_record` labels.  Returns
+    ``{str(h): {"ret_pct": float, "run_up": float, "run_dn":
+    float}}`` for every registered horizon whose full window has
+    elapsed: ``ret_pct`` is the endpoint return % (close[t+h] vs
+    close[t]); ``run_up`` = max high in the window − close[t]
+    and ``run_dn`` = close[t] − min low in the window — the two
+    direction-neutral excursion primitives from which F3 derives
+    direction-relative favourable/adverse and scores point
+    error, interval coverage and excursion quality against the
+    journaled outlook.  Horizons still inside their window are
+    absent; an unknown bar returns {}."""
+    pos = _bar_position(record, h1)
+    if pos is None:
+        return {}
+    close = h1["close"].to_numpy(dtype=float)
+    high = h1["high"].to_numpy(dtype=float)
+    low = h1["low"].to_numpy(dtype=float)
+    ref = close[pos]
+    if not np.isfinite(ref) or ref <= 0:
+        return {}
+    out: dict[str, Any] = {}
+    for key in (record.get("horizons") or {}):
+        try:
+            horizon = int(key)
+            spec_for(horizon)
+        except (ValueError, KeyError):
+            continue  # unregistered geometry: never measured ad hoc
+        if pos + horizon >= len(h1):
+            continue  # window still open
+        window_hi = high[pos + 1: pos + horizon + 1]
+        window_lo = low[pos + 1: pos + horizon + 1]
+        end_close = close[pos + horizon]
+        if not (np.isfinite(end_close)
+                and np.isfinite(window_hi).all()
+                and np.isfinite(window_lo).all()):
+            continue
+        out[str(horizon)] = {
+            "ret_pct": round(
+                float((end_close / ref - 1.0) * 100.0), 4),
+            "run_up": round(float(window_hi.max() - ref), 2),
+            "run_dn": round(float(ref - window_lo.min()), 2),
+        }
     return out
 
 
@@ -273,7 +345,11 @@ class CalibrationBook:
 def fresh_state() -> dict[str, Any]:
     return {"pending": [], "book": {}, "resolved_total": 0,
             "since_summary": 0, "last_summary_day": None,
-            "last_cycle_bar": None, "dropped": 0, "void": 0}
+            "last_cycle_bar": None, "dropped": 0, "void": 0,
+            # F1: resolved-sample ring — one entry per resolved
+            # (forecast, horizon) with its journaled ranks and
+            # realized outcomes; the outlook's conditioning pool.
+            "samples": []}
 
 
 def load_state(path: Path) -> tuple[dict[str, Any], bool]:

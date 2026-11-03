@@ -396,16 +396,21 @@ def score_last_row(frames: dict, bundle: dict) -> tuple[dict | None, str]:
     keep = list(bundle["features"])
     Xrow = row.reindex(columns=keep)
     ranks: dict[int, dict[str, float]] = {}
+    model_probs: dict[int, dict[str, list]] = {}
     for h in sorted(bundle["horizons"], key=lambda k: int(k)):
         h = int(h)
         entry = bundle["horizons"][h] \
             if h in bundle["horizons"] else bundle["horizons"][str(h)]
         ranks[h] = {}
+        model_probs[h] = {}
         for dname in ("up", "dn"):
             ps = [np.asarray(m.predict_proba(Xrow.to_numpy(dtype=float)),
                              dtype=float)[:, 1]
                   for m in entry["models"][dname].values()]
             p = float(np.mean(ps)) if ps else float("nan")
+            # F1: keep the per-model spread the mean hides — the
+            # outlook's disagreement measure reads it.
+            model_probs[h][dname] = [float(x) for x in ps]
             q = bundle["ref_quantiles"][h][dname] \
                 if h in bundle["ref_quantiles"] \
                 else bundle["ref_quantiles"][str(h)][dname]
@@ -415,6 +420,7 @@ def score_last_row(frames: dict, bundle: dict) -> tuple[dict | None, str]:
         close=float(h1["close"].iloc[-1]),
         ranks=ranks,
         horizons=tuple(sorted(ranks)),
+        model_probs=model_probs,
     ), "forecast scored"
 
 

@@ -351,6 +351,15 @@ class MT5RunnerConfig:
     # the shadow record.  Evidence only (the forecast doctrine):
     # never sizing, gating or vetoing.
     judgment_forecast_evidence_enabled: bool = True
+    # FORECAST F1: the outlook — every journaled forecast record
+    # carries an empirical outlook block (direction, point price,
+    # interval, expected move, excursions; probabilities only
+    # where the live band history has earned them — see
+    # forecast/outlook.py).  This flag gates only the 🔮 CARD
+    # RENDERING (alert + /status lead with the numbers); the
+    # journal block is written regardless.  Journal/render only:
+    # no order path reads the outlook.
+    forecast_outlook_card_enabled: bool = True
     judgment_thesis_ttl_hours: float = 24.0
     judgment_thesis_min_margin: float = 0.08
     deterministic_dir: Path | None = None  # default: <journal parent>/deterministic
@@ -971,6 +980,9 @@ class MT5Runner:
         self._forecast_last_scored_bar = None
         self._forecast_last_scored_h1_bar = None
         self._forecast_no_d1_noted = False
+        # F1: the last outlook block built (for /status); the
+        # journal holds the durable copy on each forecast record.
+        self._forecast_last_outlook = None
         # Deterministic engine runtime (bridge).  Best-effort: if it
         # fails to initialise, the legacy journal path continues and
         # the failure is noted — the live loop never dies on it.
@@ -2093,6 +2105,82 @@ class MT5Runner:
         except Exception:  # noqa: BLE001 - bookkeeping only
             pass
 
+    def _forecast_outlook_for(self, record, frames, ranks,
+                              generated_at):
+        """F1: build the outlook block for a just-scored forecast
+        record (forecast/outlook.py owns the estimation).  Inputs:
+        the record's ranks + close, the H1 frame (unconditional
+        distributions; its ATR for the barrier levels), the
+        calibration state's resolved-sample ring, and the scored
+        row's per-model probabilities (disagreement).  Returns
+        None only when there is no H1 frame to estimate from —
+        thin data is reported INSIDE the block per horizon,
+        never as a missing block.  Journal-side only: nothing on
+        an order path reads the block."""
+        try:
+            h1 = frames.get("H1") if isinstance(frames, dict) \
+                else None
+            if h1 is None or len(h1) == 0:
+                return None
+            atr_value = None
+            try:
+                from ..reader.indicators import atr as _atr_series
+                _av = _atr_series(h1).to_numpy(dtype=float)
+                if len(_av) and math.isfinite(float(_av[-1])):
+                    atr_value = float(_av[-1])
+            except Exception:  # noqa: BLE001 — barriers just omit
+                atr_value = None
+            from ..forecast.outlook import build_outlook
+            st = self._forecast_cal_state()
+            return build_outlook(
+                ranks=record.get("horizons") or {},
+                close=record.get("close"),
+                atr=atr_value,
+                samples=st.get("samples") or [],
+                h1=h1,
+                model_probs=getattr(ranks, "model_probs", None),
+                created=str(generated_at),
+                data_cutoff=str(record.get("bar_time") or ""),
+                model_version=record.get("model_version"),
+                feature_set=record.get("feature_set"))
+        except Exception as exc:  # noqa: BLE001 — record still journals
+            self.journal.log_note(
+                f"forecast outlook unavailable: {exc}")
+            return None
+
+    def _forecast_journal(self, record, frames, ranks, cadence,
+                          generated_at, text):
+        """F1: attach the outlook block, journal the forecast
+        record, register it for calibration, and — when the
+        outlook card flag is on — render the alert text from the
+        outlook (numbers lead; the legacy rank card stands when
+        the flag is off or no outlook could be built).  Returns
+        the text to send."""
+        outlook = self._forecast_outlook_for(
+            record, frames, ranks, generated_at)
+        if outlook is not None:
+            record["outlook"] = outlook
+            self._forecast_last_outlook = outlook
+        self.journal.append({
+            "type": "forecast", "cadence": cadence,
+            "generated_at": str(generated_at), **record})
+        self._forecast_cal_register(record, cadence)
+        if text is not None and outlook is not None and getattr(
+                self.cfg, "forecast_outlook_card_enabled", True):
+            try:
+                from ..forecast.mt5 import notable
+                from ..forecast.outlook import render_card
+                text = render_card(
+                    close=record.get("close"),
+                    bar_time=record.get("bar_time"),
+                    outlook=outlook,
+                    ranks=record.get("horizons") or {},
+                    headline=notable(ranks)
+                    if ranks is not None else None)
+            except Exception:  # noqa: BLE001 — legacy card stands
+                pass
+        return text
+
     def _forecast_calibration_cycle(self) -> None:
         """On each fresh H1 bar: resolve due forecast horizons
         against realized bars, fold them into the calibration
@@ -2117,7 +2205,8 @@ class MT5Runner:
                 self._forecast_cal_save()
                 return
             from ..forecast.calibration import (
-                CalibrationBook, resolve_record)
+                SAMPLE_RING_CAP, CalibrationBook, realized_outcomes,
+                resolve_record)
             from ..reader.indicators import atr as _atr_series
             atr_values = _atr_series(h1).to_numpy(dtype=float)
             book = CalibrationBook(st.get("book") or {})
@@ -2142,6 +2231,34 @@ class MT5Runner:
                 void_now = [h for h in resolution.get("void", [])
                             if str(h) not in entry["resolved"]]
                 if newly:
+                    # F1: realized endpoint return + excursions
+                    # ride the same reconciliation record, and
+                    # each resolved horizon joins the sample ring
+                    # the outlook conditions on (ranks from the
+                    # journaled forecast, outcomes realized here).
+                    realized = realized_outcomes(entry, h1)
+                    samples = st.get("samples")
+                    if not isinstance(samples, list):
+                        samples = []
+                        st["samples"] = samples
+                    for _h, _o in newly.items():
+                        _r = realized.get(_h) or {}
+                        _o.update(_r)
+                        if not _r:
+                            continue
+                        _pair = (entry.get("horizons") or {}).get(
+                            _h) or {}
+                        samples.append({
+                            "bar_time": entry["bar_time"],
+                            "horizon": int(_h),
+                            "up": _pair.get("up"),
+                            "dn": _pair.get("dn"),
+                            "ret_pct": _r["ret_pct"],
+                            "run_up": _r["run_up"],
+                            "run_dn": _r["run_dn"],
+                            "y_up": _o.get("y_up"),
+                            "y_dn": _o.get("y_dn")})
+                    del samples[:-SAMPLE_RING_CAP]
                     book.add(entry, newly)
                     st["resolved_total"] += len(newly)
                     st["since_summary"] += len(newly)
@@ -4286,6 +4403,15 @@ class MT5Runner:
                 + (" · ".join(parts) if parts else "no gating ranks"))
         else:
             lines.append("  last evaluation: none yet")
+        # F1: the last outlook's numbers under the ranks — the
+        # section leads with the outlook once one exists.
+        outlook = getattr(self, "_forecast_last_outlook", None)
+        if outlook is not None:
+            try:
+                from ..forecast.outlook import render_status_lines
+                lines.extend(render_status_lines(outlook))
+            except Exception:  # noqa: BLE001 — status must not die
+                pass
         if st["training_running"]:
             lines.append("  training: running in the background")
         if st["last_error"]:
@@ -4362,10 +4488,11 @@ class MT5Runner:
             text, note, record = self._forecaster.score_and_record(
                 frames)
             if record is not None:
-                self.journal.append({
-                    "type": "forecast", "cadence": "D1",
-                    "generated_at": str(day), **record})
-                self._forecast_cal_register(record, "D1")
+                _last = getattr(
+                    self._forecaster, "_last_evaluation", None)
+                text = self._forecast_journal(
+                    record, frames, _last[1] if _last else None,
+                    "D1", day, text)
             if text is not None:
                 self.journal.log_note(
                     f"forecast alert @ {day}: {note}")
@@ -4390,10 +4517,13 @@ class MT5Runner:
                     text2, note2, record2 = \
                         self._forecaster.score_and_record(frames)
                     if record2 is not None:
-                        self.journal.append({
-                            "type": "forecast", "cadence": "H1",
-                            "generated_at": str(h1_bar), **record2})
-                        self._forecast_cal_register(record2, "H1")
+                        _last2 = getattr(
+                            self._forecaster, "_last_evaluation",
+                            None)
+                        text2 = self._forecast_journal(
+                            record2, frames,
+                            _last2[1] if _last2 else None,
+                            "H1", h1_bar, text2)
                     if text2 is not None:
                         self.journal.log_note(
                             f"forecast alert @ {h1_bar}: {note2}")
