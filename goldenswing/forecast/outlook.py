@@ -71,6 +71,12 @@ from .labels import spec_for
 
 #: Method name + version stamped on every outlook block.
 OUTLOOK_METHOD = "f1-empirical-v1"
+#: F2 method stamp (forecast/trained.py): the per-horizon method
+#: of a horizon answered by a GRADUATED trained estimator, and
+#: the block-level method when at least one horizon is.  The
+#: block stamp never claims more than the horizons under it —
+#: each horizon names its own source.
+TRAINED_METHOD = "f2-trained-v1"
 #: Nominal coverage of the prediction interval (central quantiles).
 INTERVAL_COVERAGE = 0.80
 #: Floors for the empirical samples.  MIN_PROB_N follows the E3
@@ -203,12 +209,63 @@ def _disagreement(model_probs: Any, horizon: int) -> float | None:
 # ── the outlook block ───────────────────────────────────────────
 
 
+def _apply_trained(out: dict, entry: dict | None) -> None:
+    """F2: fold one horizon's trained estimate into its F1 block.
+
+    GRADUATED (the live probability book has earned it — see
+    forecast/trained.py): the trained fields replace the
+    estimation keys WHOLE.  Nothing is field-blended: direction,
+    point, interval, excursions, probabilities and method all
+    come from the one source, and the block says which.  The
+    ensemble disagreement (a fact about the ranker, not about
+    either estimator) is preserved.
+
+    NOT graduated: F1's fields stand untouched and the trained
+    probabilities ride as ``trained_shadow`` — journaled, resolved
+    into the probability book, rendered nowhere — until the book
+    graduates the horizon."""
+    if not isinstance(entry, dict):
+        return
+    meta = entry.get("meta") or {}
+    out["trained"] = {
+        "version": meta.get("version"),
+        "trained_at": meta.get("trained_at"),
+        "trained_through": meta.get("trained_through"),
+        "graduated": bool(entry.get("graduated")),
+    }
+    fields = entry.get("fields")
+    if entry.get("graduated") and isinstance(fields, dict):
+        disagreement = out.get("disagreement")
+        for key, value in fields.items():
+            out[key] = value
+        out["disagreement"] = disagreement
+    elif isinstance(entry.get("shadow"), dict):
+        out["trained_shadow"] = entry["shadow"]
+
+
 def horizon_outlook(*, horizon: int, up_rank: float | None,
                     dn_rank: float | None, close: float | None,
                     atr: float | None, samples: list,
                     h1: pd.DataFrame | None,
-                    disagreement: float | None) -> dict:
-    """One horizon's outlook.  Every estimated field is None with
+                    disagreement: float | None,
+                    trained_entry: dict | None = None) -> dict:
+    """One horizon's outlook: F1 empirical estimation, with the
+    F2 trained estimate folded in per _apply_trained when the
+    runner supplies one."""
+    out = _horizon_outlook_f1(
+        horizon=horizon, up_rank=up_rank, dn_rank=dn_rank,
+        close=close, atr=atr, samples=samples, h1=h1,
+        disagreement=disagreement)
+    _apply_trained(out, trained_entry)
+    return out
+
+
+def _horizon_outlook_f1(*, horizon: int, up_rank: float | None,
+                        dn_rank: float | None, close: float | None,
+                        atr: float | None, samples: list,
+                        h1: pd.DataFrame | None,
+                        disagreement: float | None) -> dict:
+    """F1 estimation proper.  Every estimated field is None with
     ``unavailable_reason`` set when the data cannot carry it."""
     out: dict[str, Any] = {
         "direction": None, "point_price": None, "interval": None,
@@ -355,13 +412,19 @@ def build_outlook(*, ranks: dict, close: float | None,
                   created: str | None = None,
                   data_cutoff: str | None = None,
                   model_version: Any = None,
-                  feature_set: Any = None) -> dict:
+                  feature_set: Any = None,
+                  trained: dict | None = None) -> dict:
     """The whole outlook block for one journaled forecast record.
 
     ``ranks`` is the record's journaled shape ``{str(h): {"up",
     "dn"}}``; ``samples`` is the calibration state's resolved-
     sample ring; ``model_probs`` the forecaster's per-model raw
-    probabilities for the scored row (disagreement only)."""
+    probabilities for the scored row (disagreement only).
+    ``trained`` (F2, optional) is the trained estimator's
+    per-horizon output ``{"version", "trained_at",
+    "trained_through", "horizons": {str(h): entry}}`` — see
+    _apply_trained for how an entry folds in.  Without it the
+    block is exactly the F1 block."""
     horizons: dict[str, Any] = {}
     expiry: dict[str, Any] = {}
     cutoff = None
@@ -370,27 +433,44 @@ def build_outlook(*, ranks: dict, close: float | None,
             cutoff = pd.Timestamp(data_cutoff)
         except Exception:  # noqa: BLE001 — expiry just omits
             cutoff = None
+    trained_horizons = (trained or {}).get("horizons") or {}
     for key in sorted((ranks or {}).keys(), key=lambda k: int(k)):
         h = int(key)
         pair = ranks.get(key) or {}
+        entry = trained_horizons.get(str(h)) \
+            or trained_horizons.get(h)
         horizons[str(h)] = horizon_outlook(
             horizon=h, up_rank=_f(pair.get("up")),
             dn_rank=_f(pair.get("dn")), close=close, atr=atr,
             samples=samples, h1=h1,
-            disagreement=_disagreement(model_probs, h))
+            disagreement=_disagreement(model_probs, h),
+            trained_entry=entry)
         expiry[str(h)] = (str(cutoff + pd.Timedelta(hours=h))
                           if cutoff is not None else None)
-    return {
-        "method": OUTLOOK_METHOD,
+    graduated = [key for key, ho in horizons.items()
+                 if ho.get("method") == TRAINED_METHOD]
+    block: dict[str, Any] = {
+        "method": TRAINED_METHOD if graduated else OUTLOOK_METHOD,
         "created": created,
         "data_cutoff": data_cutoff,
         "model_version": model_version,
         "feature_set": feature_set,
         "interval_coverage": INTERVAL_COVERAGE,
-        "point_estimator": "mean of the estimation sample",
+        "point_estimator": (
+            "trained median (0.5 quantile) on graduated horizons; "
+            "mean of the estimation sample elsewhere"
+            if graduated else "mean of the estimation sample"),
         "expiry": expiry,
         "horizons": horizons,
     }
+    if trained:
+        block["trained"] = {
+            "version": trained.get("version"),
+            "trained_at": trained.get("trained_at"),
+            "trained_through": trained.get("trained_through"),
+            "graduated_horizons": graduated,
+        }
+    return block
 
 
 # ── rendering (deterministic text; no LLM anywhere) ─────────────
@@ -444,6 +524,61 @@ def contradiction_line(horizons: dict) -> str | None:
             f"the clocks disagree across horizons")
 
 
+def contradiction_narration(horizons: dict) -> str | None:
+    """F2: the split, explained — deterministically, from the
+    computed fields only (no LLM, no invented cause).  Which
+    horizons oppose and by how much, whether the split is a
+    near-vs-far clock split, where ensemble disagreement peaks,
+    and which side carries the heavier expected move.  None when
+    the horizons do not materially disagree (the same test as
+    contradiction_line)."""
+    rows: list[tuple[int, str, str, float, float | None]] = []
+    for key, ho in (horizons or {}).items():
+        if not ho or ho.get("expected_move_pct") is None:
+            continue
+        if ho.get("direction") not in ("UP", "DOWN"):
+            continue
+        rows.append((int(key), tag_for(int(key)),
+                     str(ho["direction"]),
+                     float(ho["expected_move_pct"]),
+                     _f(ho.get("disagreement"))))
+    ups = [r for r in rows if r[2] == "UP"]
+    dns = [r for r in rows if r[2] == "DOWN"]
+    if not ups or not dns:
+        return None
+    up_top = max(ups, key=lambda r: r[3])
+    dn_top = min(dns, key=lambda r: r[3])
+    parts = [
+        f"the split in numbers: {up_top[1]} expects "
+        f"{up_top[3]:+.2f}% while {dn_top[1]} expects "
+        f"{dn_top[3]:+.2f}%"]
+    near = [r for r in rows if r[0] <= 24]
+    far = [r for r in rows if r[0] >= 168]
+    if near and far:
+        near_mean = sum(r[3] for r in near) / len(near)
+        far_mean = sum(r[3] for r in far) / len(far)
+        if (near_mean > 0) != (far_mean > 0):
+            parts.append(
+                f"it is a clock split — near horizons "
+                f"({'/'.join(r[1] for r in near)}) average "
+                f"{near_mean:+.2f}% against far horizons "
+                f"({'/'.join(r[1] for r in far)}) at "
+                f"{far_mean:+.2f}%, so the short clocks and the "
+                f"long clocks are reading different moves, not "
+                f"the same move at different sizes")
+    heavier = up_top if abs(up_top[3]) >= abs(dn_top[3]) else dn_top
+    parts.append(
+        f"the heavier read is {heavier[1]} {heavier[2]} at "
+        f"{heavier[3]:+.2f}% expected")
+    spread = [(r[1], r[4]) for r in rows if r[4] is not None]
+    if spread:
+        tag, val = max(spread, key=lambda p: p[1])
+        parts.append(
+            f"ensemble disagreement peaks at {tag} ({val:.2f}) — "
+            f"the models argue most on that clock")
+    return "split read: " + "; ".join(parts) + "."
+
+
 def _ranks_aux_line(ranks: dict) -> str:
     parts = []
     for key in sorted((ranks or {}).keys(), key=lambda k: int(k)):
@@ -480,14 +615,25 @@ def render_card(*, close: float | None, bar_time: Any,
     split = contradiction_line(horizons)
     if split:
         lines.append(split)
+        story = contradiction_narration(horizons)
+        if story:
+            lines.append(story)
     lines.append(_ranks_aux_line(ranks))
     if any_uncalibrated:
         lines.append(
             "probabilities uncalibrated where no P line shows — "
             "the resolved history in that rank band is still thin")
-    lines.append(
-        f"outlook: {OUTLOOK_METHOD} — empirical distributions, "
-        f"intervals at {INTERVAL_COVERAGE:.0%} nominal coverage")
+    method = (outlook or {}).get("method") or OUTLOOK_METHOD
+    if method == OUTLOOK_METHOD:
+        lines.append(
+            f"outlook: {OUTLOOK_METHOD} — empirical distributions, "
+            f"intervals at {INTERVAL_COVERAGE:.0%} nominal coverage")
+    else:
+        lines.append(
+            f"outlook: {method} — trained estimators on graduated "
+            f"horizons (each horizon names its method), empirical "
+            f"elsewhere, intervals at {INTERVAL_COVERAGE:.0%} "
+            f"nominal coverage")
     return "\n".join(lines)
 
 
@@ -504,4 +650,7 @@ def render_status_lines(outlook: dict) -> list[str]:
     split = contradiction_line(horizons)
     if split:
         lines.append("    " + split)
+        story = contradiction_narration(horizons)
+        if story:
+            lines.append("    " + story)
     return lines

@@ -170,8 +170,15 @@ def test_forecast_cannot_touch_orders():
     # withhold one evidence vote, so this reader is a forecast
     # service function in the same sense as the others.  Any
     # OTHER new reader still fails this pin.
+    # F2 (2026-11-03): _forecast_trained_service reads ONLY the
+    # forecaster's bundle_path to locate the trained-estimator
+    # artifact beside the ensemble bundle — a forecast service
+    # function in the same sense; F2 output is shadow/research
+    # only and no order, sizing or risk path reads it.  Any
+    # OTHER new reader still fails this pin.
     allowed = {"__init__", "run", "forecast_line", "forecast_train_now",
-               "_maybe_forecast_alert", "_forecast_feed_for"}
+               "_maybe_forecast_alert", "_forecast_feed_for",
+               "_forecast_trained_service"}
     runner = Path("goldenswing/execution/mt5_runner.py").read_text()
     lines = runner.splitlines()
     for i, line in enumerate(lines):

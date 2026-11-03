@@ -349,7 +349,12 @@ def fresh_state() -> dict[str, Any]:
             # F1: resolved-sample ring — one entry per resolved
             # (forecast, horizon) with its journaled ranks and
             # realized outcomes; the outlook's conditioning pool.
-            "samples": []}
+            "samples": [],
+            # F2: the LIVE probability book (forecast/trained.py
+            # ProbabilityBook data) — stated probabilities by
+            # source, resolved against realized direction classes;
+            # graduation reads the trained source from here.
+            "prob_book": {}}
 
 
 def load_state(path: Path) -> tuple[dict[str, Any], bool]:

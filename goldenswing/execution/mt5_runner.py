@@ -360,6 +360,21 @@ class MT5RunnerConfig:
     # journal block is written regardless.  Journal/render only:
     # no order path reads the outlook.
     forecast_outlook_card_enabled: bool = True
+    # FORECAST F2: trained estimators under the outlook — per
+    # horizon a direction classifier + barrier classifiers +
+    # quantile/excursion regressors over the same MTF features,
+    # isotonic-calibrated on walk-forward out-of-fold predictions
+    # (forecast/trained.py).  SHADOW first: their probabilities
+    # are journaled and resolved into the live probability book
+    # (in the calibration state, beside the rank book) and a
+    # horizon's outlook switches source only when the book
+    # graduates it (n >= 60 trained resolutions, ECE <= 0.10);
+    # the record names the source per horizon.  Retraining is
+    # evaluated on the calibration cycle (500 new H1 bars / 21
+    # days), runs in a background thread, swaps atomically, and
+    # a failure leaves the previous artifact live.  Journal/
+    # render only, like F1: no order path reads any of it.
+    forecast_trained_enabled: bool = True
     judgment_thesis_ttl_hours: float = 24.0
     judgment_thesis_min_margin: float = 0.08
     deterministic_dir: Path | None = None  # default: <journal parent>/deterministic
@@ -983,6 +998,13 @@ class MT5Runner:
         # F1: the last outlook block built (for /status); the
         # journal holds the durable copy on each forecast record.
         self._forecast_last_outlook = None
+        # F2: the trained-estimator service (lazy — artifact lives
+        # beside the ensemble bundle) + retrain bookkeeping.  The
+        # train outcome is journaled by the calibration cycle on
+        # the tick thread, never by the worker thread.
+        self._forecast_trained = None
+        self._f2_training = False
+        self._f2_train_result = None
         # Deterministic engine runtime (bridge).  Best-effort: if it
         # fails to initialise, the legacy journal path continues and
         # the failure is noted — the live loop never dies on it.
@@ -2095,15 +2117,75 @@ class MT5Runner:
             if any(p.get("bar_time") == bar_time
                    for p in st["pending"]):
                 return
+            from ..forecast.trained import stated_probabilities
             st["pending"].append({
                 "bar_time": bar_time, "cadence": cadence,
                 "horizons": record.get("horizons") or {},
                 "magnitude": record.get("magnitude") or {},
+                # F2: the outlook's stated probabilities (trained
+                # rendered/shadow, else empirical) — resolved into
+                # the live probability book by the cycle.
+                "stated": stated_probabilities(
+                    record.get("outlook")),
                 "resolved": []})
             del st["pending"][:-400]
             self._forecast_cal_save()
         except Exception:  # noqa: BLE001 - bookkeeping only
             pass
+
+    def _forecast_trained_service(self):  # type: ignore[no-untyped-def]
+        """F2: the trained-estimator service, built lazily — its
+        artifact lives beside the ensemble bundle (same data
+        directory, its own file)."""
+        svc = getattr(self, "_forecast_trained", None)
+        if svc is not None:
+            return svc
+        from pathlib import Path
+
+        from ..forecast.trained import TrainedOutlook
+        bundle = Path(self._forecaster.bundle_path)
+        svc = TrainedOutlook(
+            bundle.parent / "forecast_trained_v1.joblib")
+        self._forecast_trained = svc
+        return svc
+
+    def _forecast_trained_param(self, frames, close, atr_value,
+                                st):  # type: ignore[no-untyped-def]
+        """F2: the ``trained`` argument for build_outlook — per
+        horizon the estimator's fields + shadow probabilities,
+        with the graduation verdict read from the LIVE
+        probability book.  Fields substitute only where the book
+        has graduated the horizon (build_outlook enforces that);
+        everywhere else the shadow earns its record.  None when
+        F2 is off or no artifact can answer."""
+        try:
+            if not getattr(
+                    self.cfg, "forecast_trained_enabled", True):
+                return None
+            from ..forecast.trained import ProbabilityBook
+            book = ProbabilityBook(st.get("prob_book") or {})
+            svc = self._forecast_trained_service()
+            preds = svc.predict(frames, close=close, atr=atr_value,
+                                book=book)
+            if not preds:
+                return None
+            art, _note = svc.artifact()
+            horizons = {}
+            for h, pred in preds.items():
+                ok, info = book.graduated(h)
+                horizons[str(h)] = {
+                    **pred, "graduated": bool(ok),
+                    "graduation": info}
+            return {
+                "version": (art or {}).get("version"),
+                "trained_at": (art or {}).get("trained_at"),
+                "trained_through": (art or {}).get(
+                    "trained_through"),
+                "horizons": horizons}
+        except Exception as exc:  # noqa: BLE001 — F1 block stands
+            self.journal.log_note(
+                f"forecast trained outlook unavailable: {exc}")
+            return None
 
     def _forecast_outlook_for(self, record, frames, ranks,
                               generated_at):
@@ -2142,7 +2224,9 @@ class MT5Runner:
                 created=str(generated_at),
                 data_cutoff=str(record.get("bar_time") or ""),
                 model_version=record.get("model_version"),
-                feature_set=record.get("feature_set"))
+                feature_set=record.get("feature_set"),
+                trained=self._forecast_trained_param(
+                    frames, record.get("close"), atr_value, st))
         except Exception as exc:  # noqa: BLE001 — record still journals
             self.journal.log_note(
                 f"forecast outlook unavailable: {exc}")
@@ -2201,15 +2285,21 @@ class MT5Runner:
             if bar == st.get("last_cycle_bar"):
                 return
             st["last_cycle_bar"] = bar
+            # F2: retrain evaluation + finished-train journaling
+            # run even with nothing pending — the triggers are
+            # bars and age, not only resolutions.
+            self._forecast_f2_cycle(stack.frames, h1, st)
             if not st["pending"]:
                 self._forecast_cal_save()
                 return
             from ..forecast.calibration import (
                 SAMPLE_RING_CAP, CalibrationBook, realized_outcomes,
                 resolve_record)
+            from ..forecast.trained import ProbabilityBook
             from ..reader.indicators import atr as _atr_series
             atr_values = _atr_series(h1).to_numpy(dtype=float)
             book = CalibrationBook(st.get("book") or {})
+            prob_book = ProbabilityBook(st.get("prob_book") or {})
             changed = False
             remaining = []
             for entry in st["pending"]:
@@ -2258,6 +2348,28 @@ class MT5Runner:
                             "run_dn": _r["run_dn"],
                             "y_up": _o.get("y_up"),
                             "y_dn": _o.get("y_dn")})
+                        # F2: the forecast's stated probabilities
+                        # resolve into the live probability book,
+                        # against the direction class realized
+                        # under the deadband the forecast stated.
+                        _stated = (entry.get("stated")
+                                   or {}).get(_h)
+                        if _stated:
+                            from ..forecast.trained import (
+                                direction_class)
+                            if prob_book.add(
+                                    int(_h),
+                                    str(_stated.get("source")
+                                        or ""),
+                                    {k: _stated.get(k)
+                                     for k in ("up", "dn",
+                                               "neutral")},
+                                    direction_class(
+                                        _r.get("ret_pct"),
+                                        _stated.get(
+                                            "deadband_pct"))):
+                                st["prob_book"] = prob_book.data
+                                changed = True
                     del samples[:-SAMPLE_RING_CAP]
                     book.add(entry, newly)
                     st["resolved_total"] += len(newly)
@@ -2300,6 +2412,73 @@ class MT5Runner:
         except Exception as exc:  # noqa: BLE001 — tick-loop guard
             self.journal.log_note(
                 f"mt5: forecast calibration cycle failed: {exc}")
+
+    def _forecast_f2_cycle(self, frames, h1, st) -> None:
+        """F2 retrain cadence, evaluated on the calibration
+        cycle: journal a finished background train, then start a
+        new one when the artifact is missing/stale (500 new H1
+        bars / 21 days — needs_retrain owns the rule).  Training
+        runs in a daemon thread on a copy of the frames; the
+        artifact swap is atomic and a failed train leaves the
+        previous artifact live, its failure journaled here on the
+        next cycle.  Never raises into the tick loop."""
+        try:
+            if not getattr(
+                    self.cfg, "forecast_trained_enabled", True):
+                return
+            result = getattr(self, "_f2_train_result", None)
+            if result is not None:
+                self._f2_train_result = None
+                ok, note = result
+                self.journal.append({
+                    "type": "forecast_trained_training",
+                    "ok": bool(ok), "note": str(note)})
+            if getattr(self, "_f2_training", False):
+                return
+            import datetime as _dt
+
+            from ..forecast.trained import needs_retrain
+            svc = self._forecast_trained_service()
+            art, _note = svc.artifact()
+            need, _reason = needs_retrain(
+                art, h1.index,
+                _dt.datetime.now(_dt.timezone.utc))
+            if not need:
+                return
+            from ..forecast.mtf import (
+                MIN_USABLE_ROWS_TRAIN, build_mtf_frame)
+            try:
+                usable = len(build_mtf_frame(frames))
+            except Exception:  # noqa: BLE001 — retried next cycle
+                return
+            if usable < MIN_USABLE_ROWS_TRAIN:
+                return
+            self._f2_training = True
+            frames_copy = dict(frames)
+            path = svc.path
+
+            def _run() -> None:
+                try:
+                    from ..forecast.trained import train_trained
+                    summary = train_trained(frames_copy, path)
+                    self._f2_train_result = (
+                        True,
+                        f"trained through "
+                        f"{summary['trained_through']} "
+                        f"({summary['train_rows']} rows; horizons "
+                        f"{summary['horizons']})")
+                except Exception as exc:  # noqa: BLE001 — recorded
+                    self._f2_train_result = (
+                        False, f"training failed: {exc}")
+                finally:
+                    self._f2_training = False
+
+            import threading
+            threading.Thread(
+                target=_run, name="forecast-f2-train",
+                daemon=True).start()
+        except Exception:  # noqa: BLE001 — bookkeeping only
+            pass
 
     def _judgment_audit_cycle(self) -> None:
         """On each fresh H1 bar: reconcile what's due, flag the
@@ -4412,6 +4591,34 @@ class MT5Runner:
                 lines.extend(render_status_lines(outlook))
             except Exception:  # noqa: BLE001 — status must not die
                 pass
+        # F2: the live probability book — per horizon, whether
+        # the trained estimator has graduated, is still earning
+        # its record in shadow, or has no artifact yet.
+        try:
+            if getattr(self.cfg, "forecast_trained_enabled", True):
+                from ..forecast.trained import (
+                    ProbabilityBook, render_prob_book_lines)
+                book = ProbabilityBook(
+                    self._forecast_cal_state().get("prob_book")
+                    or {})
+                svc = self._forecast_trained_service()
+                art, _note = svc.artifact()
+                art_horizons = {
+                    int(k) for k in (art or {}).get("horizons")
+                    or {}}
+                states = {}
+                for h in (12, 24, 72, 168, 360):
+                    ok, _info = book.graduated(h)
+                    if ok and art is not None:
+                        states[h] = "graduated"
+                    elif h in art_horizons:
+                        states[h] = "shadow"
+                    else:
+                        states[h] = "no artifact"
+                lines.extend(render_prob_book_lines(
+                    book.view(), states))
+        except Exception:  # noqa: BLE001 — status must not die
+            pass
         if st["training_running"]:
             lines.append("  training: running in the background")
         if st["last_error"]:
