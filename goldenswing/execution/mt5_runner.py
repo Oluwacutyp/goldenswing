@@ -325,6 +325,13 @@ class MT5RunnerConfig:
     judgment_shadow_enabled: bool = True
     judgment_min_expected_r: float = 0.05
     judgment_min_confidence: float = 0.15
+    # JUDGMENT CORE S2 (owner spec 2026-11-02): the five-scenario
+    # market read + thesis maintenance above S1 — also shadow-only,
+    # journaled as judgment_thesis records; the thesis never steers
+    # an order either.
+    judgment_thesis_enabled: bool = True
+    judgment_thesis_ttl_hours: float = 24.0
+    judgment_thesis_min_margin: float = 0.08
     deterministic_dir: Path | None = None  # default: <journal parent>/deterministic
     risk_state_path: Path = DATA_DIR / "mt5_risk_state.json"
     kill_switch_path: Path = DATA_DIR / "mt5_KILL"
@@ -1701,7 +1708,78 @@ class MT5Runner:
                 self.journal.log_note(
                     f"mt5: judgment shadow failed for "
                     f"{playbook}: {type(exc).__name__}: {exc}")
+        # Judgment core S2 (owner spec 2026-11-02): the five-scenario
+        # market read + the maintained thesis, fed by the same cycle
+        # (decision context + the desk's rolling candidate flow).
+        # Shadow-only like S1: journal events, never order authority.
+        if candidate is not None and decision is not None \
+                and kind != "trigger_event" \
+                and source != "warmup_scan" \
+                and getattr(self.cfg, "judgment_thesis_enabled",
+                            True):
+            try:
+                self._judgment_thesis_cycle(
+                    candidate=candidate, decision=decision,
+                    playbook=playbook, ts=_eval_now)
+            except Exception as exc:
+                self.journal.log_note(
+                    f"mt5: judgment thesis failed for "
+                    f"{playbook}: {type(exc).__name__}: {exc}")
         return record
+
+    def _judgment_thesis_cycle(self, *, candidate, decision,
+                               playbook, ts) -> None:
+        """One S2 cycle: tally the desk's candidate flow, price the
+        five scenarios off the decision context, update the thesis
+        keeper, journal its events as ``judgment_thesis`` records.
+        Lazily initialised so runner construction order is
+        untouched.  Shadow-only: events are journal paper, never
+        order authority."""
+        import time as _time
+
+        keeper = getattr(self, "_thesis_keeper", None)
+        if keeper is None:
+            from .judgment_thesis import ThesisConfig, ThesisKeeper
+
+            keeper = ThesisKeeper(ThesisConfig(
+                ttl_hours=float(getattr(
+                    self.cfg, "judgment_thesis_ttl_hours", 24.0)),
+                min_margin=float(getattr(
+                    self.cfg, "judgment_thesis_min_margin", 0.08))))
+            self._thesis_keeper = keeper
+            self._thesis_flow: list = []
+        flow_rows = self._thesis_flow
+        direction = int(candidate.get("direction") or 0)
+        _av = decision.get("analytical_verdict") or {}
+        qualified = (isinstance(_av, dict)
+                     and _av.get("verdict") == "qualified") \
+            or decision.get("result") == "qualified"
+        flow_rows.append((direction, bool(qualified)))
+        del flow_rows[:-50]
+        flow = {
+            "evaluated_long": sum(1 for d, _q in flow_rows if d == 1),
+            "evaluated_short": sum(1 for d, _q in flow_rows
+                                   if d == -1),
+            "qualified_long": sum(1 for d, q in flow_rows
+                                  if d == 1 and q),
+            "qualified_short": sum(1 for d, q in flow_rows
+                                   if d == -1 and q),
+        }
+        from .judgment_thesis import assess_market
+
+        assessment = assess_market(
+            context=self._decision_context(), flow=flow)
+        events = keeper.update(
+            assessment, ts=_time.time(), candidate=candidate,
+            playbook=playbook)
+        for event in events:
+            payload = dict(event)
+            payload["cycle_ts"] = payload.pop("ts", None)
+            self.journal.append({
+                "type": "judgment_thesis",
+                "ts": str(ts),
+                "run_id": self._run_id,
+                **payload})
 
     def _census_for_record(self, *, intended_tf, actual_input_tf,
                            source) -> dict | None:
@@ -2185,7 +2263,13 @@ class MT5Runner:
                             0.05)),
                         "min_confidence": float(getattr(
                             self.cfg, "judgment_min_confidence",
-                            0.15))},
+                            0.15)),
+                        "thesis": (
+                            self._thesis_keeper.status()
+                            if getattr(self, "_thesis_keeper",
+                                       None) is not None
+                            else {"active": False,
+                                  "closed_total": 0})},
                 }})
         except Exception:
             pass
