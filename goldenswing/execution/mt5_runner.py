@@ -325,6 +325,14 @@ class MT5RunnerConfig:
     judgment_shadow_enabled: bool = True
     judgment_min_expected_r: float = 0.05
     judgment_min_confidence: float = 0.15
+    # JUDGMENT CORE S3 (owner spec 2026-11-02): outcome
+    # reconciliation + self-audit — shadow judgments and theses are
+    # measured against forward price action, calibration is
+    # bucketed from outcomes (never decorative), and material H1
+    # moves the desk never evaluated are flagged as missed
+    # opportunities.  Audit only: reads bars and journals; never
+    # steers, sizes, gates or vetoes.
+    judgment_audit_enabled: bool = True
     # JUDGMENT CORE S2 (owner spec 2026-11-02): the five-scenario
     # market read + thesis maintenance above S1 — also shadow-only,
     # journaled as judgment_thesis records; the thesis never steers
@@ -1673,6 +1681,11 @@ class MT5Runner:
         # gate or veto an order.  Warmup/replay records are
         # skipped (their bar is historical — a shadow verdict
         # stamped on them would misdescribe the dataset).
+        if candidate is not None and kind != "trigger_event" \
+                and source != "warmup_scan":
+            # S3: this bar counts as EVALUATED for the
+            # missed-opportunity audit, whatever the desk decided.
+            self._audit_mark_evaluated(_eval_now)
         if candidate is not None and decision is not None \
                 and kind != "trigger_event" \
                 and source != "warmup_scan" \
@@ -1705,6 +1718,9 @@ class MT5Runner:
                         decision.get("reason_code")
                         or reason_code or None,
                     "judgment": _judgment})
+                self._audit_register_shadow(
+                    _judgment, candidate, _eval_now,
+                    playbook=playbook)
             except Exception as exc:
                 self.journal.log_note(
                     f"mt5: judgment shadow failed for "
@@ -1781,6 +1797,306 @@ class MT5Runner:
                 "ts": str(ts),
                 "run_id": self._run_id,
                 **payload})
+        self._audit_sync_thesis()
+
+    # ---- Judgment self-audit (S3) ---------------------------------
+    def _audit_state_path(self):  # type: ignore[no-untyped-def]
+        from pathlib import Path
+
+        return (Path(self.cfg.journal_path).parent
+                / "judgment_audit_state.json")
+
+    def _audit_state(self) -> dict:
+        st = getattr(self, "_judgment_audit_state", None)
+        if st is not None:
+            return st
+        st = {"pending": [], "thesis_pending": {},
+              "evaluated_bars": [], "audited_bars": [],
+              "calibration": {},
+              "tallies": {"take_n": 0, "take_hits": 0,
+                          "abstain_n": 0, "abstain_would_hit": 0,
+                          "missed_opportunities": 0,
+                          "thesis_n": 0, "thesis_hits": 0,
+                          "dropped": 0},
+              "reconciled_total": 0, "since_summary": 0,
+              "last_summary_bar": None}
+        path = self._audit_state_path()
+        try:
+            if path.exists():
+                loaded = json.loads(path.read_text())
+                if isinstance(loaded, dict):
+                    for key, value in loaded.items():
+                        st[key] = value
+        except Exception as exc:  # noqa: BLE001 - quarantine + fresh
+            try:
+                path.rename(path.with_suffix(".corrupt"))
+            except Exception:  # noqa: BLE001
+                pass
+            self.journal.log_note(
+                f"mt5: judgment audit state unreadable ({exc}) — "
+                f"quarantined, starting fresh")
+        self._judgment_audit_state = st
+        return st
+
+    def _audit_save(self) -> None:
+        try:
+            path = self._audit_state_path()
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                self._audit_state(), separators=(",", ":")))
+            tmp.replace(path)
+        except Exception as exc:  # noqa: BLE001 - audit must not die
+            _log.error("judgment audit state save failed: %s", exc)
+
+    def _audit_mark_evaluated(self, ts) -> None:  # type: ignore[no-untyped-def]
+        try:
+            if not getattr(self.cfg, "judgment_audit_enabled", True):
+                return
+            bar = str(pd.Timestamp(ts).floor("h"))
+            st = self._audit_state()
+            bars = st["evaluated_bars"]
+            if bar not in bars:
+                bars.append(bar)
+                del bars[:-336]
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            pass
+
+    def _audit_register_shadow(self, judgment, candidate, ts,  # type: ignore[no-untyped-def]
+                               *, playbook) -> None:
+        try:
+            if not getattr(self.cfg, "judgment_audit_enabled", True):
+                return
+            direction = int(candidate.get("direction") or 0)
+            if direction not in (1, -1):
+                return
+
+            def _f(key):  # type: ignore[no-untyped-def]
+                try:
+                    value = float(candidate.get(key))
+                    return value if value == value else None
+                except (TypeError, ValueError):
+                    return None
+
+            entry = _f("entry")
+            if entry is None:
+                last = getattr(self, "_last_tick", None) or {}
+                entry = last.get("mid") or last.get("bid")
+                entry = float(entry) if entry else None
+            if entry is None:
+                return
+            ts_pd = pd.Timestamp(ts)
+            from .judgment_audit import HORIZONS_H
+
+            st = self._audit_state()
+            st["pending"].append({
+                "kind": "shadow", "ts": str(ts_pd),
+                "playbook": playbook, "direction": direction,
+                "decision": judgment.get("decision"),
+                "expected_r": judgment.get("expected_r"),
+                "confidence": judgment.get("confidence"),
+                "entry": entry, "stop": _f("stop"),
+                "due": {str(h): str(ts_pd + pd.Timedelta(hours=h))
+                        for h in HORIZONS_H},
+                "done": []})
+            overflow = len(st["pending"]) - 500
+            if overflow > 0:
+                del st["pending"][:overflow]
+                st["tallies"]["dropped"] += overflow
+            self._audit_save()
+        except Exception:  # noqa: BLE001 - registration is evidence
+            pass
+
+    def _audit_sync_thesis(self) -> None:
+        try:
+            if not getattr(self.cfg, "judgment_audit_enabled", True):
+                return
+            keeper = getattr(self, "_thesis_keeper", None)
+            if keeper is None:
+                return
+            status = keeper.status()
+            st = self._audit_state()
+            pending = st["thesis_pending"]
+            last = getattr(self, "_last_tick", None) or {}
+            mid = last.get("mid") or last.get("bid")
+            if not mid:
+                return
+            active_id = (str(status.get("id"))
+                         if status.get("active") else None)
+            from .judgment_audit import forward_outcome
+
+            h1 = (self._stack.frames.get("H1")
+                  if getattr(self, "_stack", None) is not None
+                  else None)
+            atr = float(_atr14(h1) or 0.0) if h1 is not None \
+                and len(h1) >= 15 else 0.0
+            # A pending thesis that is no longer the active one has
+            # closed (invalidated / superseded / expired / faded) —
+            # reconcile it against the price now.
+            for tid, item in list(pending.items()):
+                if tid == active_id:
+                    continue
+                direction = int(item.get("direction") or 0)
+                if direction not in (1, -1):
+                    del pending[tid]
+                    continue
+                outcome = forward_outcome(
+                    direction, float(item["price"]), float(mid), atr)
+                st["tallies"]["thesis_n"] += 1
+                if outcome["hit"]:
+                    st["tallies"]["thesis_hits"] += 1
+                self.journal.append({
+                    "type": "judgment_audit_event",
+                    "kind": "thesis_outcome",
+                    "thesis_id": tid,
+                    "scenario": item.get("scenario"),
+                    "direction": direction,
+                    "entry_price": item["price"],
+                    "exit_price": float(mid),
+                    **outcome})
+                del pending[tid]
+            if active_id and active_id not in pending:
+                pending[active_id] = {
+                    "scenario": status.get("scenario"),
+                    "direction": status.get("direction"),
+                    "created_ts": status.get("created_ts"),
+                    "price": float(mid)}
+            self._audit_save()
+        except Exception:  # noqa: BLE001 - sync is evidence only
+            pass
+
+    def _judgment_audit_cycle(self) -> None:
+        """On each fresh H1 bar: reconcile what's due, flag the
+        material bar nobody evaluated, and periodically journal the
+        calibration summary.  Never raises into the tick loop."""
+        try:
+            if not getattr(self.cfg, "judgment_audit_enabled", True):
+                return
+            stack = getattr(self, "_stack", None)
+            if stack is None:
+                return
+            h1 = stack.frames.get("H1")
+            if h1 is None or len(h1) < 15:
+                return
+            bar = h1.index[-1]
+            if bar == getattr(self, "_audit_last_h1_bar", None):
+                return
+            self._audit_last_h1_bar = bar
+            from .judgment_audit import (
+                calibration_add,
+                calibration_view,
+                forward_outcome,
+                missed_opportunity,
+            )
+
+            st = self._audit_state()
+            atr = float(_atr14(h1) or 0.0)
+            bar_ts = pd.Timestamp(bar)
+            row = h1.iloc[-1]
+            # Missed opportunity: the just-closed bar.
+            bar_key = str(bar_ts.floor("h"))
+            if bar_key not in st["audited_bars"]:
+                st["audited_bars"].append(bar_key)
+                del st["audited_bars"][:-336]
+                miss = missed_opportunity(
+                    bar_open=float(row["open"]),
+                    bar_close=float(row["close"]), atr=atr,
+                    evaluated=bar_key in st["evaluated_bars"])
+                if miss is not None:
+                    st["tallies"]["missed_opportunities"] += 1
+                    self.journal.append({
+                        "type": "judgment_audit_event",
+                        "kind": "missed_opportunity",
+                        "bar": bar_key, "run_id": self._run_id,
+                        **miss})
+            # Reconcile due shadow judgments against H1 closes.
+            closes = h1["close"]
+            still_pending = []
+            for item in st["pending"]:
+                done = set(item.get("done") or [])
+                for horizon, due in (item.get("due") or {}).items():
+                    if horizon in done:
+                        continue
+                    due_ts = pd.Timestamp(due)
+                    after = closes[closes.index >= due_ts]
+                    if not len(after):
+                        continue
+                    exit_price = float(after.iloc[0])
+                    outcome = forward_outcome(
+                        int(item["direction"]), float(item["entry"]),
+                        exit_price, atr)
+                    stop = item.get("stop")
+                    realized_r = None
+                    if stop is not None and float(stop) != float(
+                            item["entry"]):
+                        realized_r = round(
+                            outcome["move"]
+                            / abs(float(item["entry"]) - float(stop)),
+                            4)
+                    self.journal.append({
+                        "type": "judgment_reconciliation",
+                        "judged_ts": item["ts"],
+                        "playbook": item.get("playbook"),
+                        "direction": item["direction"],
+                        "decision": item.get("decision"),
+                        "horizon_h": int(horizon),
+                        "entry": item["entry"],
+                        "exit_price": exit_price,
+                        "realized_r": realized_r,
+                        **outcome})
+                    tallies = st["tallies"]
+                    if item.get("decision") == "take":
+                        tallies["take_n"] += 1
+                        if outcome["hit"]:
+                            tallies["take_hits"] += 1
+                    else:
+                        tallies["abstain_n"] += 1
+                        if outcome["hit"]:
+                            tallies["abstain_would_hit"] += 1
+                    if realized_r is not None:
+                        calibration_add(
+                            st["calibration"],
+                            confidence=float(
+                                item.get("confidence") or 0.0),
+                            expected_r=item.get("expected_r"),
+                            realized_r=realized_r)
+                    st["reconciled_total"] += 1
+                    st["since_summary"] += 1
+                    done.add(horizon)
+                item["done"] = sorted(done)
+                if len(done) < len(item.get("due") or {}):
+                    still_pending.append(item)
+            st["pending"] = still_pending
+            # Periodic summary: every 50 reconciliations, or the
+            # first cycle of a new day with anything to report.
+            last_summary = st.get("last_summary_bar")
+            day_changed = (last_summary is None
+                           or str(bar_ts.date())
+                           != str(pd.Timestamp(last_summary).date()))
+            if st["since_summary"] >= 50 or (
+                    day_changed and st["reconciled_total"] > 0):
+                st["last_summary_bar"] = str(bar_ts)
+                st["since_summary"] = 0
+                self.journal.append({
+                    "type": "judgment_audit",
+                    "bar": bar_key, "run_id": self._run_id,
+                    "calibration": calibration_view(st["calibration"]),
+                    "tallies": dict(st["tallies"]),
+                    "reconciled_total": st["reconciled_total"],
+                    # Evidence classes and their measurement state —
+                    # as data, so no reader mistakes an unmeasured
+                    # class for a measured one (audit finding D).
+                    "evidence_validation": {
+                        "judgment_scenarios": "measured_here",
+                        "forecast_ensemble": (
+                            "journaled_e1; calibration lands with "
+                            "the E2 large-move objective"),
+                        "chart_patterns": (
+                            "unmeasured — validation queued in the "
+                            "S4 chronological harness"),
+                    }})
+            self._audit_save()
+        except Exception as exc:  # noqa: BLE001 - audit never breaks
+            _log.error("judgment audit cycle failed: %s", exc)
 
     def _census_for_record(self, *, intended_tf, actual_input_tf,
                            source) -> dict | None:
@@ -2270,7 +2586,16 @@ class MT5Runner:
                             if getattr(self, "_thesis_keeper",
                                        None) is not None
                             else {"active": False,
-                                  "closed_total": 0})},
+                                  "closed_total": 0}),
+                        # S3 self-audit: outcomes, not opinions.
+                        "audit": {
+                            "tallies": dict(
+                                self._audit_state()["tallies"]),
+                            "reconciled_total":
+                                self._audit_state()[
+                                    "reconciled_total"],
+                            "pending": len(
+                                self._audit_state()["pending"])}},
                 }})
         except Exception:
             pass
@@ -2749,6 +3074,11 @@ class MT5Runner:
             # changed. Forecasts never touch orders — this call reads
             # bars and sends an alert, nothing else.
             self._maybe_forecast_alert()
+            # Judgment self-audit (S3): reconciles shadow judgments
+            # and theses against closed H1 bars, and flags material
+            # bars the desk never evaluated.  H1-cursor gated,
+            # journal-only, never in the order path.
+            self._judgment_audit_cycle()
             # Live evaluation clock: touch arms, family confirms on
             # entry-TF closes.  H1 closes never gate evaluation.
             self._evaluate_live_tick(tick, stats)
