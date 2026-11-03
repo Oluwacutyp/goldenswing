@@ -345,6 +345,12 @@ class MT5RunnerConfig:
     # Journal-only: reads bars and journals; forecasts never
     # touch orders and calibration never tunes anything live.
     forecast_calibration_enabled: bool = True
+    # FORECAST E3: the ensemble's read feeds the judgment core
+    # as ONE evidence group — weighed only when E2's live
+    # calibration has earned trust, otherwise journal-only on
+    # the shadow record.  Evidence only (the forecast doctrine):
+    # never sizing, gating or vetoing.
+    judgment_forecast_evidence_enabled: bool = True
     judgment_thesis_ttl_hours: float = 24.0
     judgment_thesis_min_margin: float = 0.08
     deterministic_dir: Path | None = None  # default: <journal parent>/deterministic
@@ -1701,9 +1707,14 @@ class MT5Runner:
             try:
                 from .judgment import (JudgmentConfig,
                                        evaluate_judgment)
+                _feed_block, _judgment_evidence = \
+                    self._forecast_feed_for(
+                        candidate=candidate, evidence=evidence,
+                        intended_tf=intended_tf,
+                        eval_now=_eval_now)
                 _judgment = evaluate_judgment(
                     candidate=candidate, decision=decision,
-                    evidence=evidence,
+                    evidence=_judgment_evidence,
                     context=self._decision_context(),
                     config=JudgmentConfig(
                         min_expected_r=float(getattr(
@@ -1724,6 +1735,9 @@ class MT5Runner:
                     "gate_reason_code":
                         decision.get("reason_code")
                         or reason_code or None,
+                    # E3: what the forecast feed said at this
+                    # evaluation, verbatim — weighed or not.
+                    "forecast_evidence": _feed_block,
                     "judgment": _judgment})
                 self._audit_register_shadow(
                     _judgment, candidate, _eval_now,
@@ -1978,6 +1992,53 @@ class MT5Runner:
     # rates), the training-distribution counterpart of
     # forecast.evaluate.calibration.  State persists beside the
     # journal, atomically, corrupt-quarantined — the S3 pattern.
+
+    def _forecast_feed_for(self, *, candidate, evidence,
+                           intended_tf, eval_now):
+        """E3: (feed block | None, evidence to judge with).
+
+        The block is built from the forecaster's last scored bar;
+        it is merged into the evidence (one weighed group) only
+        when fresh AND calibration-trusted — see
+        forecast_evidence.py for the gate.  Any failure returns
+        (None, the untouched evidence): the feed is evidence,
+        never a dependency of the shadow path."""
+        try:
+            if not getattr(
+                    self.cfg,
+                    "judgment_forecast_evidence_enabled", True):
+                return None, evidence
+            forecaster = getattr(self, "_forecaster", None)
+            last = getattr(forecaster, "_last_evaluation", None)
+            if forecaster is None or last is None:
+                return None, evidence
+            bar_time, ranks = last
+            try:
+                fresh = pd.Timestamp(bar_time) >= (
+                    pd.Timestamp(eval_now)
+                    - pd.Timedelta(hours=2))
+            except Exception:  # noqa: BLE001 - freshness unknown
+                fresh = False
+            from .forecast_evidence import (
+                forecast_block, horizon_for_tf,
+                merge_into_evidence)
+            book_view = None
+            try:
+                from ..forecast.calibration import CalibrationBook
+                book_view = CalibrationBook(
+                    self._forecast_cal_state().get("book")
+                    or {}).view()
+            except Exception:  # noqa: BLE001 - trust stays unproven
+                book_view = None
+            block = forecast_block(
+                ranks=ranks,
+                direction=int(
+                    (candidate or {}).get("direction") or 0),
+                horizon=horizon_for_tf(intended_tf),
+                fresh=fresh, book_view=book_view)
+            return block, merge_into_evidence(evidence, block)
+        except Exception:  # noqa: BLE001 - never bend the shadow
+            return None, evidence
 
     def _forecast_cal_state_path(self):  # type: ignore[no-untyped-def]
         from pathlib import Path

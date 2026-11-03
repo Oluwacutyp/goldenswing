@@ -163,8 +163,15 @@ def test_forecast_cannot_touch_orders():
 
     # Warm start lives in run() (startup training) — a forecast
     # service call site, not an order path.
+    # E3 (2026-11-03): _forecast_feed_for reads the last scored
+    # ranks to build the judgment core's forecast EVIDENCE — the
+    # judgment core is shadow-only (its verdicts never reach an
+    # order, sizing or risk path) and the feed can only add or
+    # withhold one evidence vote, so this reader is a forecast
+    # service function in the same sense as the others.  Any
+    # OTHER new reader still fails this pin.
     allowed = {"__init__", "run", "forecast_line", "forecast_train_now",
-               "_maybe_forecast_alert"}
+               "_maybe_forecast_alert", "_forecast_feed_for"}
     runner = Path("goldenswing/execution/mt5_runner.py").read_text()
     lines = runner.splitlines()
     for i, line in enumerate(lines):

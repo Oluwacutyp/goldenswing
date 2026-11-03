@@ -70,6 +70,11 @@ GROUP_WEIGHTS: dict[str, float] = {
     "journey_geometry": 1.25,
     "zone_context": 1.0,
     "funding_events": 1.0,
+    # E3: the forecast ensemble's vote, when live calibration
+    # has earned it (forecast_evidence.py owns the trust gate;
+    # an untrusted feed is recorded on the shadow record with
+    # no decision weight and never reaches this table's use).
+    "forecast_ensemble": 1.0,
 }
 DEFAULT_GROUP_WEIGHT = 1.0
 #: The asymmetry score's own vote: its margin over the floor,
