@@ -147,6 +147,52 @@ class SetupStore:
         except sqlite3.Error as exc:
             raise SetupStoreError(f"could not mark setup touched: {exc}") from exc
 
+    def extend_expiry(self, setup_id: str, new_expires_at: Any,
+                      now: Any) -> bool:
+        """Extend an armed/touched setup's expiry (approach TTL).
+
+        Guarded exactly like mark_touched: only a live setup can be
+        extended, the payload's zone bookkeeping (expires_at +
+        extensions count) moves with the column, and the caller
+        learns whether the extension actually landed."""
+        try:
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT payload_json FROM hot_scalp_setups "
+                    "WHERE setup_id=? AND status IN ('armed','touched')",
+                    (str(setup_id),)).fetchone()
+                if row is None:
+                    return False
+                payload = json.loads(row["payload_json"])
+                payload["expires_at"] = self._now_text(new_expires_at)
+                # The count lives at payload level (rows armed
+                # before the zone object existed have no zone dict —
+                # they must not become infinitely extendable); the
+                # zone mirrors it when present.
+                zone = payload.get("zone")
+                count = int(payload.get("extensions") or 0)
+                if isinstance(zone, dict):
+                    count = max(count,
+                                int(zone.get("extensions") or 0))
+                count += 1
+                payload["extensions"] = count
+                if isinstance(zone, dict):
+                    zone["expires_at"] = payload["expires_at"]
+                    zone["extensions"] = count
+                cur = con.execute(
+                    """UPDATE hot_scalp_setups
+                       SET expires_at=?, payload_json=?, updated_at=?,
+                           version=version+1
+                       WHERE setup_id=? AND status IN ('armed','touched')""",
+                    (self._now_text(new_expires_at),
+                     json.dumps(payload, sort_keys=True,
+                                separators=(",", ":"), default=str),
+                     self._now_text(now), str(setup_id)))
+            return cur.rowcount == 1
+        except (sqlite3.Error, ValueError) as exc:
+            raise SetupStoreError(
+                f"could not extend setup expiry: {exc}") from exc
+
     def terminate(self, setup_id: str, status: str, reason: str, now: Any) -> bool:
         allowed = {"expired", "invalidated", "blocked", "shadow_triggered", "order_reconciled"}
         if status not in allowed:

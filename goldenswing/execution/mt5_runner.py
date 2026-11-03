@@ -948,6 +948,7 @@ class MT5Runner:
             DATA_DIR / "forecast_models.joblib")
         self._forecaster = MT5Forecaster(bundle_path=_bundle)
         self._forecast_last_scored_bar = None
+        self._forecast_last_scored_h1_bar = None
         self._forecast_no_d1_noted = False
         # Deterministic engine runtime (bridge).  Best-effort: if it
         # fails to initialise, the legacy journal path continues and
@@ -3427,6 +3428,27 @@ class MT5Runner:
             "management_policy_id": str(
                 getattr(pos, "management_policy_id", "") or "")},
             idempotency_key=f"close-{pos.alert_id}-{ticket}")
+        # Chain stage: outcome — a Hot Scalp position's close
+        # completes its candidate chain (step-17 identity maps the
+        # alert back to its setup).  Evidence only; never breaks
+        # the close path.
+        try:
+            _ident = (getattr(self, "_open_identity", {}) or {}).get(
+                str(getattr(pos, "alert_id", "") or ""), ("", ""))
+            if str(_ident[0]).startswith("hot_scalp:"):
+                _sid = str(_ident[0]).split(":", 1)[1]
+                self._hs_chain(
+                    chain_id=_sid,
+                    parent_id=(getattr(self, "_hs_parents", {})
+                               or {}).get(_sid),
+                    stage="outcome", status="closed",
+                    tick=None,
+                    fields={"ticket": ticket, "exit_price": price,
+                            "reason": reason,
+                            "pnl_money": float(pnl_money),
+                            "r_net": float(total_r)})
+        except Exception:  # noqa: BLE001 - outcome link is evidence
+            pass
         self.journal.log_note(
             f"mt5 close: ticket {ticket} {display} at {price:.2f} "
             f"({total_r:+.2f}R)")
@@ -3771,16 +3793,55 @@ class MT5Runner:
                 return
             self._forecast_last_scored_bar = day
             frames = self._stack.frames
-            if not frames.get("H1") or len(frames["H1"]) < 50:
+            # NOTE: `not frames.get("H1")` on a DataFrame raises
+            # "truth value of a DataFrame is ambiguous" — that one
+            # expression silently killed every forecast alert from
+            # 2026-10-26 on (18 journal failures) before scoring
+            # ever ran.  Identity/length checks only, here and
+            # everywhere a frame is handled.
+            h1_frame = frames.get("H1")
+            if h1_frame is None or len(h1_frame) < 50:
                 return
             thread, note = self._forecaster.maybe_train(frames)
             if thread is not None:
                 self.journal.log_note(f"forecast: {note}")
-            text, note = self._forecaster.maybe_alert(frames)
+            text, note, record = self._forecaster.score_and_record(
+                frames)
+            if record is not None:
+                self.journal.append({
+                    "type": "forecast", "cadence": "D1",
+                    "generated_at": str(day), **record})
             if text is not None:
                 self.journal.log_note(
                     f"forecast alert @ {day}: {note}")
                 self._send_alert(text)
+        except Exception as exc:  # noqa: BLE001 — tick-loop guard
+            self.journal.log_note(
+                f"forecast alert failed (loop continues): {exc}")
+        # Intraday scoring (continuous-cadence doctrine: D1 closes
+        # gate TRAINING, never inference) — independent of the D1
+        # block above: every fresh H1 bar is scored and journaled,
+        # so the ensemble produces a continuous, timestamped
+        # forecast record (the Nov 3 audit's runtime-proof
+        # requirement).  Alerts stay crossing-only inside the
+        # forecaster, so hourly scoring cannot spam.
+        try:
+            frames = self._stack.frames
+            h1_frame = frames.get("H1")
+            if h1_frame is not None and len(h1_frame) >= 50:
+                h1_bar = h1_frame.index[-1]
+                if h1_bar != self._forecast_last_scored_h1_bar:
+                    self._forecast_last_scored_h1_bar = h1_bar
+                    text2, note2, record2 = \
+                        self._forecaster.score_and_record(frames)
+                    if record2 is not None:
+                        self.journal.append({
+                            "type": "forecast", "cadence": "H1",
+                            "generated_at": str(h1_bar), **record2})
+                    if text2 is not None:
+                        self.journal.log_note(
+                            f"forecast alert @ {h1_bar}: {note2}")
+                        self._send_alert(text2)
         except Exception as exc:  # noqa: BLE001 — tick-loop guard
             self.journal.log_note(
                 f"forecast alert failed (loop continues): {exc}")
@@ -7429,6 +7490,18 @@ class MT5Runner:
                 "reason_code": event.get("reason_code"),
                 "execution_authority": "shadow_only",
                 "research_only": True,
+                # The research stream's own label stays — and the
+                # live path's disposition travels WITH the record,
+                # so no reader ever has to guess whether a candidate
+                # from this stream was also evaluated for execution
+                # (Nov 3 audit finding A).  The canonical lifecycle
+                # is the candidate_chain record emitted just below.
+                "live_path": {
+                    "promotion_enabled": bool(
+                        self.cfg.hot_scalp_live_enabled),
+                    "chain_id": event.get("setup_id")
+                    or (event.get("setup") or {}).get("setup_id"),
+                },
                 "details": event,
             }
             try:
@@ -7436,6 +7509,7 @@ class MT5Runner:
             except Exception as exc:
                 # If journaling fails, this sleeve remains non-executable.
                 _log.error("hot_scalp: journal write failed: %s", exc)
+            self._hs_chain_from_event(event, tick)
             if name in ("setup_armed", "candidate_shadow", "candidate_blocked",
                         "setup_invalidated", "setup_expired", "scan_degraded"):
                 try:
@@ -7447,6 +7521,96 @@ class MT5Runner:
                 except Exception:
                     pass
         return events
+
+    # ---- unified candidate chain (Nov 3 audit finding A) --------
+    _HS_CHAIN_STAGES = {
+        "setup_armed": "armed",
+        "setup_touched": "zone_touched",
+        "setup_extended": "extended",
+        "candidate_shadow": "triggered",
+        "candidate_blocked": "blocked",
+        "setup_invalidated": "invalidated",
+        "setup_expired": "expired",
+    }
+
+    def _hs_chain(self, *, chain_id, parent_id, stage, status,
+                  tick, fields=None) -> None:
+        """One canonical lifecycle record per transition.
+
+        The research stream and the live execution stream used to
+        describe the same candidate in two vocabularies — a
+        promoted candidate still read as ``shadow_only`` in its
+        research record, and the live path's refusals were free-text
+        notes.  The chain is the single auditable thread: parent
+        thesis → child setup → zone → trigger → judgment →
+        execution intent → friction/broker outcome → (later)
+        outcome.  Every record carries explicit authority and
+        execution-status fields.  Best-effort: a chain write failure
+        never breaks the tick loop (and never grants authority)."""
+        if not chain_id:
+            return
+        record = {
+            "type": "candidate_chain",
+            "chain_id": str(chain_id),
+            "parent_id": parent_id,
+            "stage": stage,
+            "execution_status": status,
+            "authority": {
+                "research_stream": "shadow_only",
+                "live_promotion": bool(
+                    getattr(self.cfg, "hot_scalp_live_enabled", False)),
+            },
+            "run_id": getattr(self, "_run_id", None),
+            "timestamp": str((tick or {}).get("time")),
+            "symbol": str(getattr(self.cfg, "symbol", "XAUUSD")),
+        }
+        if fields:
+            record.update(fields)
+        try:
+            self.journal.append(record)
+        except Exception as exc:  # noqa: BLE001 - chain is evidence
+            _log.error("hot_scalp chain write failed: %s", exc)
+
+    def _hs_chain_from_event(self, event: dict, tick: dict) -> None:
+        name = str(event.get("event", ""))
+        stage = self._HS_CHAIN_STAGES.get(name)
+        if stage is None:
+            return
+        setup = event.get("setup") or {}
+        chain_id = event.get("setup_id") or setup.get("setup_id")
+        parent_id = (event.get("parent_setup_id")
+                     or setup.get("parent_setup_id"))
+        parents = getattr(self, "_hs_parents", None)
+        if parents is None:
+            parents = self._hs_parents = {}
+        if chain_id and parent_id:
+            parents[str(chain_id)] = str(parent_id)
+        elif chain_id:
+            parent_id = parents.get(str(chain_id))
+        fields: dict = {"reason_code": event.get("reason_code")}
+        if name == "setup_armed":
+            fields.update({
+                "strategy": setup.get("strategy"),
+                "direction": setup.get("direction"),
+                "zone": setup.get("zone"),
+                "stop": setup.get("stop"),
+                "expires_at": setup.get("expires_at"),
+                "cost_viability": setup.get("cost_viability"),
+            })
+        elif name == "candidate_shadow":
+            fields.update({
+                "strategy": event.get("strategy"),
+                "direction": event.get("direction"),
+                "entry_reference": event.get("entry_reference"),
+                "structural_stop": event.get("structural_stop"),
+                "target_reference": event.get("target_reference"),
+                "spread": event.get("spread"),
+                "score": event.get("score"),
+                "targets": event.get("targets"),
+            })
+        self._hs_chain(chain_id=chain_id, parent_id=parent_id,
+                       stage=stage, status=stage, tick=tick,
+                       fields=fields)
 
     def _promote_hot_scalp_candidate(self, candidate: dict, tick: dict,
                                      stats: dict) -> bool:
@@ -7481,10 +7645,19 @@ class MT5Runner:
         """
         sid = str(candidate.get("setup_id") or "")
         engine = getattr(self, "_hot_scalp", None)
+        parent_id = candidate.get("parent_setup_id")
+
+        def _chain(stage, status, fields=None):
+            self._hs_chain(chain_id=sid, parent_id=parent_id,
+                           stage=stage, status=status, tick=tick,
+                           fields=fields)
+
         if not self.cfg.hot_scalp_live_enabled:
             self.journal.log_note(
                 f"mt5: hot_scalp promotion refused {sid}: "
                 f"live authority OFF (hot_scalp_live_enabled=False)")
+            _chain("promotion", "refused",
+                   {"reason_code": "promotion.live_authority_off"})
             return False
         if engine is None:
             return False
@@ -7493,6 +7666,8 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: hot_scalp promotion refused {sid}: claim owned "
                 f"by another process ({claim.get('claimant')})")
+            _chain("promotion", "refused",
+                   {"reason_code": "promotion.claim_owned_elsewhere"})
             return False
 
         def _resolve(exists: bool) -> bool:
@@ -7509,6 +7684,8 @@ class MT5Runner:
         if self.cfg.paused:
             self.journal.log_note(
                 f"mt5: hot_scalp promotion refused {sid}: runner paused")
+            _chain("promotion", "refused",
+                   {"reason_code": "promotion.runner_paused"})
             _resolve(False)
             return False
         # Flat-only v1: a candidate while holding is not a layer
@@ -7517,6 +7694,8 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: hot_scalp promotion refused {sid}: holding — "
                 f"scalp layering not yet promoted (flat-only v1)")
+            _chain("promotion", "refused",
+                   {"reason_code": "promotion.flat_only_holding"})
             _resolve(False)
             return False
         # V2 pre-submit broker check: the broker must agree we are
@@ -7529,11 +7708,15 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: hot_scalp promotion withheld {sid}: broker "
                 f"lookup failed ({exc}) — claim left claimed")
+            _chain("promotion", "withheld",
+                   {"reason_code": "promotion.broker_lookup_failed"})
             return False
         if broker_before:
             self.journal.log_note(
                 f"mt5: hot_scalp promotion refused {sid}: broker "
                 f"shows an untracked magic position — claim left claimed")
+            _chain("promotion", "refused",
+                   {"reason_code": "promotion.broker_untracked_position"})
             return False
         # Cost-envelope re-check at the promotion tick: the spread
         # that was tight at trigger time may have widened since.
@@ -7551,6 +7734,9 @@ class MT5Runner:
                 f"mt5: hot_scalp promotion refused {sid}: cost "
                 f"envelope unverifiable or exceeded at promotion "
                 f"(spread={spread}, m1_atr={atr1})")
+            _chain("promotion", "refused",
+                   {"reason_code": "promotion.cost_envelope",
+                    "spread": spread, "m1_atr": atr1})
             _resolve(False)
             return False
         # Market-shape-only v1: promotion runs on the trigger tick,
@@ -7582,12 +7768,22 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: hot_scalp promotion refused {sid}: order "
                 f"shape is {kind}, not market (market-shape-only v1)")
+            _chain("promotion", "refused",
+                   {"reason_code": "promotion.order_shape_not_market",
+                    "order_shape": kind})
             _resolve(False)
             return False
+        _staged = candidate.get("targets") or {}
+        _sig_targets = [float(_staged[k]) for k in ("tp1", "tp2")
+                        if isinstance(_staged, dict)
+                        and _staged.get(k)]
+        if not _sig_targets:
+            _sig_targets = [float(candidate.get("target_reference")
+                                  or 0.0)]
         sig = SimpleNamespace(
             direction=direction, entry_ref=entry_ref,
             invalidation=float(candidate.get("structural_stop") or 0.0),
-            targets=[float(candidate.get("target_reference") or 0.0)],
+            targets=_sig_targets,
             atr=atr_m5, index=self._current_h1_bar(),
             score=float(candidate.get("score") or 0.0),
             execution_eligible=True)
@@ -7606,6 +7802,48 @@ class MT5Runner:
         # fixed-bracket; only qm_m5 is).
         sig.management = management_block_for("hot_scalp", sig)
         pb = SimpleNamespace(name="hot_scalp")
+        # Chain stage: judgment.  The Judgment Core's market read at
+        # promotion time, recorded as EVIDENCE on the chain — the
+        # promotion does not take orders from it (shadow posture
+        # stands); the chain simply stops being blind to what the
+        # wider system believed when this candidate was decided.
+        _judgment_fields: dict = {
+            "intent": {"shape": kind, "direction": direction,
+                       "entry_reference": entry_ref,
+                       "stop": float(candidate.get("structural_stop")
+                                     or 0.0),
+                       "targets": candidate.get("targets")
+                       or [candidate.get("target_reference")],
+                       "management": sig.management},
+        }
+        try:
+            from .judgment_thesis import assess_market
+
+            _flow_rows = getattr(self, "_thesis_flow", []) or []
+            _flow = {
+                "evaluated_long": sum(
+                    1 for d, _q in _flow_rows if d == 1),
+                "evaluated_short": sum(
+                    1 for d, _q in _flow_rows if d == -1),
+                "qualified_long": sum(
+                    1 for d, q in _flow_rows if d == 1 and q),
+                "qualified_short": sum(
+                    1 for d, q in _flow_rows if d == -1 and q),
+            }
+            _assessment = assess_market(
+                context=self._decision_context(), flow=_flow)
+            _judgment_fields["market_read"] = {
+                "winner": _assessment.get("winner"),
+                "winner_p": _assessment.get("winner_p"),
+                "scenarios": _assessment.get("scenarios"),
+            }
+            _keeper = getattr(self, "_thesis_keeper", None)
+            if _keeper is not None:
+                _judgment_fields["thesis"] = _keeper.status()
+        except Exception as exc:  # noqa: BLE001 - evidence only
+            _judgment_fields["market_read_error"] = (
+                f"{type(exc).__name__}: {exc}")
+        _chain("judgment", "evaluated", _judgment_fields)
         tracked_before = set(self.tick_manager.tickets())
         self._last_tick = dict(tick)
         # score=None on purpose: _place_live_order's score parameter
@@ -7618,7 +7856,23 @@ class MT5Runner:
         tracked_new = set(self.tick_manager.tickets()) - tracked_before
         if not tracked_new:
             # Nothing placed: the shared path refused it (gated and
-            # journalled there).  The setup stays live.
+            # journalled there — the refusal note carries the exact
+            # gate, e.g. risk.friction).  The chain records the
+            # disposition WITH the geometry that decided it, so the
+            # next audit reads the answer here instead of
+            # reconstructing it from three streams.
+            _stop_distance = abs(
+                float(candidate.get("structural_stop") or 0.0)
+                - entry_ref)
+            _chain("execution", "refused_by_order_path", {
+                "reason_code": "execution.order_path_refused",
+                "spread": spread,
+                "stop_distance": _stop_distance,
+                "friction_ratio": (
+                    spread / _stop_distance
+                    if spread is not None and _stop_distance > 0
+                    else None),
+                "friction_limit": 0.10})
             _resolve(False)
             return False
         try:
@@ -7629,13 +7883,19 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: hot_scalp fill recorded {sid} but broker "
                 f"confirmation lookup failed ({exc}) — claim left claimed")
+            _chain("execution", "fill_unconfirmed",
+                   {"reason_code": "execution.broker_lookup_failed"})
             return False
         if not broker_after:
             self.journal.log_note(
                 f"mt5: hot_scalp fill recorded {sid} but broker "
                 f"shows no new magic position — claim left claimed")
+            _chain("execution", "fill_unconfirmed",
+                   {"reason_code": "execution.broker_no_position"})
             return False
         _resolve(True)
+        _chain("execution", "filled",
+               {"tickets": sorted(str(t) for t in tracked_new)})
         self.journal.log_note(
             f"mt5: hot_scalp promoted {sid}: order reconciled at "
             f"broker (claim resolved)")

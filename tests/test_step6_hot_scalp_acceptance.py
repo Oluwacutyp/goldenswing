@@ -93,11 +93,15 @@ def test_setup_expires_and_never_candidates(tmp_path):
     frames = _frames()
     # First tick alive (mid outside the zone, no touch); second
     # tick past the TTL must expire the setup, not candidate it.
+    # (The second tick is FAR from the zone on purpose: a price
+    # approaching the zone now earns bounded TTL extensions —
+    # Nov 3 audit build, pinned in test_hot_scalp_zones — so an
+    # expiry assertion needs a price that is not approaching.)
     events = _events(engine, frames, [
         {"time": "2026-10-27T00:50:10Z", "mid": 99.0,
          "bid": 98.99, "ask": 99.01},
-        {"time": "2026-10-27T00:50:30Z", "mid": 100.30,
-         "bid": 100.29, "ask": 100.31},
+        {"time": "2026-10-27T00:50:30Z", "mid": 103.0,
+         "bid": 102.99, "ask": 103.01},
     ])
     assert any(e.get("event") == "setup_expired"
                and e.get("reason_code") == "setup.expired"

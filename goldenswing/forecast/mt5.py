@@ -245,6 +245,42 @@ class MT5Forecaster:
         self._last_evaluation = (ranks.bar_time, ranks)
         return self._decide(ranks)
 
+    def score_and_record(
+        self, frames: dict
+    ) -> tuple[str | None, str, dict | None]:
+        """Score once and return the structured record of what was
+        scored (E1: journaled, versioned forecasts).
+
+        ``record`` is None when no scoring happened — no bundle, or
+        scoring failed; the failure stays visible in ``_last_error``
+        and the note, never dressed up as a forecast.  The record
+        carries every supported horizon's ranks, the model version
+        and training provenance from the bundle itself, and whether
+        the independent alert evaluation fired — prediction
+        generation and alerting are separate facts and are recorded
+        as such (Nov 3 audit acceptance)."""
+        text, note = self.maybe_alert(frames)
+        if self._last_error is not None \
+                or self._last_evaluation is None:
+            return text, note, None
+        bar_time, ranks = self._last_evaluation
+        bundle, _bundle_note = self._load_bundle()
+        meta = bundle if isinstance(bundle, dict) else {}
+        record = {
+            "bar_time": str(bar_time),
+            "close": ranks.close,
+            "horizons": {
+                str(h): {"up": ranks.rank(h, "up"),
+                         "dn": ranks.rank(h, "dn")}
+                for h in ranks.horizons},
+            "model_version": meta.get("version"),
+            "feature_set": meta.get("feature_set"),
+            "trained_through": meta.get("trained_through"),
+            "alert_fired": text is not None,
+            "note": note,
+        }
+        return text, note, record
+
     def status_dict(self, *, h1_bars: int | None = None) -> dict:
         """Real runtime forecast status for /status. Every value is
         read from the live bundle / live state — nothing hard-coded.

@@ -54,6 +54,23 @@ class HotScalpConfig:
     fresh_m1_seconds: float = 120.0
     fresh_m5_seconds: float = 600.0
     fresh_m15_seconds: float = 1200.0
+    # Zone-arrival entries (owner order 2026-11-03, Nina geometry):
+    # a candidate may trigger AT the zone on a qualifying reaction,
+    # without waiting for a cross of the level — displacement moves
+    # slice through zones without reclaiming them.  The proven
+    # cross/reclaim trigger stays armed alongside; first to satisfy
+    # its reaction requirement wins, and the mode is recorded on
+    # every candidate so the two are measured separately.
+    arrival_trigger_enabled: bool = True
+    # Friction viability is ESTIMATED at arming against the shared
+    # order path's invariant (spread / stop distance); the gate
+    # itself is never consulted or moved by this sleeve.
+    friction_limit: float = 0.10
+    # A setup whose price is approaching its zone (within this many
+    # M5 ATRs) earns TTL extensions instead of expiring while the
+    # opportunity is still forming — prepared, not chasing.
+    approach_band_atr_m5: float = 1.0
+    approach_extension_max: int = 3
 
     def __post_init__(self):
         if self.max_setup_age_minutes <= 0:
@@ -119,6 +136,10 @@ def _setup_payload(*, symbol: str, strategy: str, direction: int,
     formed = _utc(formation_ts)
     setup_id = _stable_setup_id(symbol, strategy, direction, formed,
                                 level, stop)
+    zlo, zhi = float(min(zone_low, zone_high)), float(
+        max(zone_low, zone_high))
+    expires = (formed + pd.Timedelta(
+        minutes=cfg.max_setup_age_minutes)).isoformat()
     return {
         "setup_id": setup_id,
         "parent_setup_id": _stable_parent_id(symbol, strategy, direction, structure_ts),
@@ -127,16 +148,38 @@ def _setup_payload(*, symbol: str, strategy: str, direction: int,
         "direction": int(direction),
         "formation_ts": formed.isoformat(),
         "armed_ts": now.isoformat(),
-        "expires_at": (formed + pd.Timedelta(
-            minutes=cfg.max_setup_age_minutes)).isoformat(),
+        "expires_at": expires,
         "level": float(level),
-        "zone_low": float(min(zone_low, zone_high)),
-        "zone_high": float(max(zone_low, zone_high)),
+        "zone_low": zlo,
+        "zone_high": zhi,
         "stop": float(stop),
         "structure_ts": _utc(structure_ts).isoformat(),
         "context_direction": int(context_direction),
         "atr_m5": float(atr_m5),
         "description": str(description),
+        # The zone as an analytical object (owner order 2026-11-03):
+        # not a pair of numbers — a formation with a reason, bounds,
+        # freshness, a touch state, a reaction requirement, an
+        # invalidation and an expiry.  The flat fields above stay
+        # for existing consumers; this is the canonical object.
+        "zone": {
+            "low": zlo,
+            "high": zhi,
+            "level": float(level),
+            "formation": str(description),
+            "formed_at": formed.isoformat(),
+            "freshness_s": max(
+                0.0, (now - formed).total_seconds()),
+            "state": "armed",
+            "reaction": {
+                "required": True,
+                "min_strength": 0.55,
+                "modes": ["arrival", "cross_reclaim"],
+            },
+            "invalidation": float(stop),
+            "expires_at": expires,
+            "extensions": 0,
+        },
     }
 
 
@@ -307,24 +350,38 @@ def build_hot_scalp_setups(symbol: str, frames: dict[str, pd.DataFrame],
     return list(unique.values())[-cfg.max_active_setups:]
 
 
-def _target_from_structure(m5: pd.DataFrame, direction: int,
-                           entry: float) -> float | None:
-    """Nearest confirmed opposing swing beyond the actual tick entry."""
+def _targets_from_structure(m5: pd.DataFrame, direction: int,
+                            entry: float) -> list[float]:
+    """Opposing structural levels beyond the entry, nearest first.
+
+    TP1 is the nearest opposing swing; TP2 the next one out.  The
+    runner leg beyond TP2 is open (no structural level) by design.
+    """
     try:
         highs, lows = find_swings(m5["high"].to_numpy(dtype=float),
                                   m5["low"].to_numpy(dtype=float), 3)
-        levels = [float(p) for _, p in (highs if direction > 0 else lows)
-                  if (float(p) > entry if direction > 0 else float(p) < entry)]
+        levels = sorted(
+            (float(p) for _, p in (highs if direction > 0 else lows)
+             if (float(p) > entry if direction > 0
+                 else float(p) < entry)),
+            reverse=direction < 0)
         if levels:
-            return min(levels) if direction > 0 else max(levels)
+            return levels
     except (ValueError, TypeError, IndexError, KeyError):
         pass
     recent = m5.tail(60)
     if direction > 0:
         candidates = recent.loc[recent["high"] > entry, "high"]
-        return float(candidates.min()) if len(candidates) else None
+        return [float(candidates.min())] if len(candidates) else []
     candidates = recent.loc[recent["low"] < entry, "low"]
-    return float(candidates.max()) if len(candidates) else None
+    return [float(candidates.max())] if len(candidates) else []
+
+
+def _target_from_structure(m5: pd.DataFrame, direction: int,
+                           entry: float) -> float | None:
+    """Nearest confirmed opposing swing beyond the actual tick entry."""
+    targets = _targets_from_structure(m5, direction, entry)
+    return targets[0] if targets else None
 
 
 class HotScalpResearchEngine:
@@ -387,6 +444,35 @@ class HotScalpResearchEngine:
             scan_key = (str(_utc(m5.index[-1])), str(_utc(m15.index[-1])))
             if self._last_setup_scan_key != scan_key:
                 for setup in build_hot_scalp_setups(symbol, frames, now_ts, self.cfg):
+                    # Cost viability at ARMING (Nov 3 audit C): with
+                    # the spread as it stands now, could the best
+                    # fill inside this zone ever pass the friction
+                    # invariant?  Best fill = the zone edge FARTHEST
+                    # from the stop (largest honest stop distance).
+                    # The estimate is recorded on the setup; the
+                    # shared path's gate remains the only arbiter at
+                    # order time — this only stops the desk from
+                    # treating a structurally uneconomic zone as a
+                    # live candidate in silence.
+                    _bid, _ask = tick.get("bid"), tick.get("ask")
+                    if _bid is not None and _ask is not None:
+                        _spread = float(_ask) - float(_bid)
+                        _best = max(
+                            abs(float(setup["zone_low"])
+                                - float(setup["stop"])),
+                            abs(float(setup["zone_high"])
+                                - float(setup["stop"])))
+                        _ratio = (_spread / _best
+                                  if _best > 0 else None)
+                        setup["cost_viability"] = {
+                            "spread_at_arm": _spread,
+                            "best_stop_distance": _best,
+                            "friction_ratio_best": _ratio,
+                            "friction_limit": self.cfg.friction_limit,
+                            "viable": bool(
+                                _ratio is not None
+                                and _ratio <= self.cfg.friction_limit),
+                        }
                     result = self.store.arm(setup)
                     if result["inserted"]:
                         event_payload = {"event": "setup_armed", "setup": setup,
@@ -419,6 +505,38 @@ class HotScalpResearchEngine:
                 status = row["status"]
                 expires = _utc(setup["expires_at"])
                 if now_ts >= expires:
+                    # Approach extension: a setup whose price is
+                    # approaching its zone has not failed — it is
+                    # still forming.  Expiring it here is how the
+                    # sleeve kept missing session moves (Nov 3
+                    # diagnosis): the zone died minutes before price
+                    # arrived.  Bounded: a fixed number of
+                    # extensions, each one journaled.
+                    _zone = setup.get("zone") or {}
+                    _extensions = int(
+                        setup.get("extensions")
+                        or _zone.get("extensions") or 0)
+                    _zlo = float(setup["zone_low"])
+                    _zhi = float(setup["zone_high"])
+                    _dist = (0.0 if _zlo <= mid <= _zhi else min(
+                        abs(mid - _zlo), abs(mid - _zhi)))
+                    _band = (self.cfg.approach_band_atr_m5
+                             * float(setup.get("atr_m5") or 0.0))
+                    if _extensions < self.cfg.approach_extension_max \
+                            and _band > 0 and _dist <= _band:
+                        _new_expires = now_ts + pd.Timedelta(
+                            minutes=self.cfg.max_setup_age_minutes)
+                        if self.store.extend_expiry(
+                                sid, _new_expires, now_ts):
+                            events.append({
+                                "event": "setup_extended",
+                                "setup_id": sid,
+                                "reason_code": "setup.approach_extension",
+                                "extensions": _extensions + 1,
+                                "distance_to_zone": _dist,
+                                "new_expires_at":
+                                    _new_expires.isoformat()})
+                            continue
                     if self.store.terminate(sid, "expired", "setup TTL elapsed", now_ts):
                         events.append({"event": "setup_expired", "setup_id": sid,
                                        "reason_code": "setup.expired"})
@@ -450,8 +568,6 @@ class HotScalpResearchEngine:
                 level = float(setup["level"])
                 crossed = ((direction > 0 and prev_mid <= level < mid) or
                            (direction < 0 and prev_mid >= level > mid))
-                if not crossed:
-                    continue
                 bar_range = max(float(forming.get("high", mid)) -
                                 float(forming.get("low", mid)), 1e-12)
                 if direction > 0:
@@ -459,6 +575,19 @@ class HotScalpResearchEngine:
                 else:
                     reaction_strength = (float(forming.get("high", mid)) - mid) / bar_range
                 if reaction_strength < 0.55:
+                    continue
+                if crossed:
+                    trigger_mode = "cross_reclaim"
+                elif self.cfg.arrival_trigger_enabled \
+                        and float(setup["zone_low"]) <= mid \
+                        <= float(setup["zone_high"]):
+                    # Zone-arrival (Nina shape): price is IN the
+                    # zone and the forming bar reacts the trade's
+                    # way.  Displacement moves slice through zones
+                    # without reclaiming them; requiring a cross
+                    # first was the Nov 3 trigger-shape miss.
+                    trigger_mode = "arrival"
+                else:
                     continue
 
                 bid, ask = tick.get("bid"), tick.get("ask")
@@ -482,7 +611,8 @@ class HotScalpResearchEngine:
                                        "spread": spread, "atr_m1": atr1})
                     continue
 
-                target = _target_from_structure(m5, direction, mid)
+                targets = _targets_from_structure(m5, direction, mid)
+                target = targets[0] if targets else None
                 if target is None:
                     if self.store.terminate(sid, "blocked",
                                             "no opposing structural target beyond entry",
@@ -540,7 +670,20 @@ class HotScalpResearchEngine:
                     "trigger_ts": now_ts.isoformat(),
                     "invalidation_ts": None,
                     "expiry_ts": setup["expires_at"],
-                    "trigger_source": "live_tick_reclaim",
+                    "trigger_mode": trigger_mode,
+                    "trigger_source": (
+                        "live_tick_arrival" if trigger_mode == "arrival"
+                        else "live_tick_reclaim"),
+                    # Staged objectives (Nina sleeve): TP1 nearest
+                    # opposing structure, TP2 the next level out,
+                    # and an open runner beyond — levels from the
+                    # market's own swings, never invented distances.
+                    "targets": {
+                        "tp1": float(targets[0]),
+                        "tp2": (float(targets[1])
+                                if len(targets) > 1 else None),
+                        "runner": "open",
+                    },
                     "stacking_policy": {
                         "supported_modes": ["pyramid", "same_setup"],
                         "max_layers": StackingConfig().max_layers,
