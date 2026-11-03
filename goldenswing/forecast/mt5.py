@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .calibration import magnitude_block
 from .mtf import (
     BUNDLE_VERSION,
     MIN_USABLE_ROWS_TRAIN,
@@ -266,13 +267,18 @@ class MT5Forecaster:
         bar_time, ranks = self._last_evaluation
         bundle, _bundle_note = self._load_bundle()
         meta = bundle if isinstance(bundle, dict) else {}
+        horizon_ranks = {
+            str(h): {"up": ranks.rank(h, "up"),
+                     "dn": ranks.rank(h, "dn")}
+            for h in ranks.horizons}
         record = {
             "bar_time": str(bar_time),
             "close": ranks.close,
-            "horizons": {
-                str(h): {"up": ranks.rank(h, "up"),
-                         "dn": ranks.rank(h, "dn")}
-                for h in ranks.horizons},
+            "horizons": horizon_ranks,
+            # E2: the large-move read as its own journaled fact —
+            # move pressure / lean / conviction per horizon,
+            # derived from the same ranks (see calibration.py).
+            "magnitude": magnitude_block(horizon_ranks),
             "model_version": meta.get("version"),
             "feature_set": meta.get("feature_set"),
             "trained_through": meta.get("trained_through"),

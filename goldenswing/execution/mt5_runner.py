@@ -338,6 +338,13 @@ class MT5RunnerConfig:
     # journaled as judgment_thesis records; the thesis never steers
     # an order either.
     judgment_thesis_enabled: bool = True
+    # FORECAST E2: live calibration — journaled forecasts are
+    # resolved against the bars that actually followed (the label
+    # barrier race) and folded into rank-band calibration, and
+    # each record carries the large-move magnitude read.
+    # Journal-only: reads bars and journals; forecasts never
+    # touch orders and calibration never tunes anything live.
+    forecast_calibration_enabled: bool = True
     judgment_thesis_ttl_hours: float = 24.0
     judgment_thesis_min_margin: float = 0.08
     deterministic_dir: Path | None = None  # default: <journal parent>/deterministic
@@ -1964,6 +1971,158 @@ class MT5Runner:
         except Exception:  # noqa: BLE001 - sync is evidence only
             pass
 
+    # ── Forecast calibration (E2) ─────────────────────────────
+    # Journaled forecasts are registered when written and resolved
+    # on later H1 bars under the label barrier race; the book is
+    # the LIVE calibration (rank bands vs realized resolution
+    # rates), the training-distribution counterpart of
+    # forecast.evaluate.calibration.  State persists beside the
+    # journal, atomically, corrupt-quarantined — the S3 pattern.
+
+    def _forecast_cal_state_path(self):  # type: ignore[no-untyped-def]
+        from pathlib import Path
+
+        return (Path(self.cfg.journal_path).parent
+                / "forecast_calibration_state.json")
+
+    def _forecast_cal_state(self) -> dict:
+        st = getattr(self, "_forecast_calibration_state", None)
+        if st is not None:
+            return st
+        from ..forecast.calibration import load_state
+        st, quarantined = load_state(self._forecast_cal_state_path())
+        if quarantined:
+            self.journal.log_note(
+                "mt5: forecast calibration state unreadable — "
+                "quarantined, starting fresh")
+        self._forecast_calibration_state = st
+        return st
+
+    def _forecast_cal_save(self) -> None:
+        from ..forecast.calibration import save_state
+        try:
+            save_state(self._forecast_cal_state_path(),
+                       self._forecast_cal_state())
+        except Exception as exc:  # noqa: BLE001 - bookkeeping only
+            _log.error(
+                "forecast calibration state save failed: %s", exc)
+
+    def _forecast_cal_register(self, record, cadence) -> None:
+        """Register a just-journaled forecast for resolution.
+        Deduped by bar_time: the D1 and H1 sites can journal the
+        same scored bar, and one forecast counts once."""
+        try:
+            if not getattr(
+                    self.cfg, "forecast_calibration_enabled", True):
+                return
+            st = self._forecast_cal_state()
+            bar_time = str(record.get("bar_time") or "")
+            if not bar_time:
+                return
+            if any(p.get("bar_time") == bar_time
+                   for p in st["pending"]):
+                return
+            st["pending"].append({
+                "bar_time": bar_time, "cadence": cadence,
+                "horizons": record.get("horizons") or {},
+                "magnitude": record.get("magnitude") or {},
+                "resolved": []})
+            del st["pending"][:-400]
+            self._forecast_cal_save()
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            pass
+
+    def _forecast_calibration_cycle(self) -> None:
+        """On each fresh H1 bar: resolve due forecast horizons
+        against realized bars, fold them into the calibration
+        book, journal reconciliations and periodic summaries.
+        Never raises into the tick loop."""
+        try:
+            if not getattr(
+                    self.cfg, "forecast_calibration_enabled", True):
+                return
+            stack = getattr(self, "_stack", None)
+            if stack is None:
+                return
+            h1 = stack.frames.get("H1")
+            if h1 is None or len(h1) < 20:
+                return
+            st = self._forecast_cal_state()
+            bar = str(h1.index[-1])
+            if bar == st.get("last_cycle_bar"):
+                return
+            st["last_cycle_bar"] = bar
+            if not st["pending"]:
+                self._forecast_cal_save()
+                return
+            from ..forecast.calibration import (
+                CalibrationBook, resolve_record)
+            from ..reader.indicators import atr as _atr_series
+            atr_values = _atr_series(h1).to_numpy(dtype=float)
+            book = CalibrationBook(st.get("book") or {})
+            changed = False
+            remaining = []
+            for entry in st["pending"]:
+                resolution = resolve_record(entry, h1, atr_values)
+                if resolution is None:
+                    # Bar unknown to the frame: if the frame has
+                    # moved past it, its window fell out of the
+                    # live history — dropped, counted, never
+                    # resolved on invented data.
+                    if pd.Timestamp(entry["bar_time"]) < h1.index[0]:
+                        st["dropped"] += 1
+                        changed = True
+                        continue
+                    remaining.append(entry)
+                    continue
+                newly = {h: o for h, o in resolution.items()
+                         if h != "void"
+                         and h not in entry["resolved"]}
+                void_now = [h for h in resolution.get("void", [])
+                            if str(h) not in entry["resolved"]]
+                if newly:
+                    book.add(entry, newly)
+                    st["resolved_total"] += len(newly)
+                    st["since_summary"] += len(newly)
+                    entry["resolved"] = sorted(
+                        set(entry["resolved"]) | set(newly),
+                        key=int)
+                    self.journal.append({
+                        "type": "forecast_reconciliation",
+                        "bar_time": entry["bar_time"],
+                        "cadence": entry.get("cadence"),
+                        "horizons": newly})
+                    changed = True
+                if void_now:
+                    st["void"] += len(void_now)
+                    entry["resolved"] = sorted(
+                        set(entry["resolved"])
+                        | {str(h) for h in void_now}, key=int)
+                    changed = True
+                if len(entry["resolved"]) < len(
+                        entry.get("horizons") or {}):
+                    remaining.append(entry)
+            st["pending"] = remaining
+            st["book"] = book.data
+            today = bar[:10]
+            if st["since_summary"] >= 50 or (
+                    st["since_summary"] > 0
+                    and st.get("last_summary_day")
+                    not in (None, today)):
+                self.journal.append({
+                    "type": "forecast_calibration",
+                    "resolved_total": st["resolved_total"],
+                    "dropped": st["dropped"], "void": st["void"],
+                    **book.view()})
+                st["since_summary"] = 0
+                st["last_summary_day"] = today
+                changed = True
+            if changed:
+                self._forecast_cal_save()
+        except Exception as exc:  # noqa: BLE001 — tick-loop guard
+            self.journal.log_note(
+                f"mt5: forecast calibration cycle failed: {exc}")
+
     def _judgment_audit_cycle(self) -> None:
         """On each fresh H1 bar: reconcile what's due, flag the
         material bar nobody evaluated, and periodically journal the
@@ -3079,6 +3238,10 @@ class MT5Runner:
             # bars the desk never evaluated.  H1-cursor gated,
             # journal-only, never in the order path.
             self._judgment_audit_cycle()
+            # Forecast calibration (E2): resolve journaled
+            # forecasts against realized H1 bars on the same
+            # cadence.  Journal-only, never in the order path.
+            self._forecast_calibration_cycle()
             # Live evaluation clock: touch arms, family confirms on
             # entry-TF closes.  H1 closes never gate evaluation.
             self._evaluate_live_tick(tick, stats)
@@ -4141,6 +4304,7 @@ class MT5Runner:
                 self.journal.append({
                     "type": "forecast", "cadence": "D1",
                     "generated_at": str(day), **record})
+                self._forecast_cal_register(record, "D1")
             if text is not None:
                 self.journal.log_note(
                     f"forecast alert @ {day}: {note}")
@@ -4168,6 +4332,7 @@ class MT5Runner:
                         self.journal.append({
                             "type": "forecast", "cadence": "H1",
                             "generated_at": str(h1_bar), **record2})
+                        self._forecast_cal_register(record2, "H1")
                     if text2 is not None:
                         self.journal.log_note(
                             f"forecast alert @ {h1_bar}: {note2}")
