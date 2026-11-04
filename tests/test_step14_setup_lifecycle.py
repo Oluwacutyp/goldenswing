@@ -143,7 +143,13 @@ def _sweep(runner, frame, *, source="live_close", shadow=False,
 
 
 def test_scan_candidate_registers_setup(tmp_path):
-    runner, frame = _scan_runner(tmp_path)
+    # Amended for WS3 (2026-11-04): this test pins the LEGACY
+    # (handoff flag OFF) scan record — observed-only.  With the
+    # flag on (the default), the same registration happens and
+    # the record carries the instance's registered disposition;
+    # that behavior is pinned in tests/test_h1_trigger_handoff.py.
+    runner, frame = _scan_runner(
+        tmp_path, h1_trigger_handoff_enabled=False)
     _sweep(runner, frame)
     store = runner._setup_store
     active = store.active()
@@ -166,7 +172,13 @@ def test_scan_candidate_registers_setup(tmp_path):
 
 
 def test_warmup_and_shadow_scans_register_nothing(tmp_path):
-    runner, frame = _scan_runner(tmp_path)
+    # Amended for WS3 (2026-11-04): pinned under the LEGACY
+    # (handoff flag OFF) behavior — warmup scans never register
+    # in any mode, and shadow (§G) candidates register only with
+    # the handoff on, as preserved shadow instances (pinned in
+    # tests/test_h1_trigger_handoff.py).
+    runner, frame = _scan_runner(
+        tmp_path, h1_trigger_handoff_enabled=False)
     _sweep(runner, frame, source="warmup_scan")
     _sweep(runner, frame, source="live_close", shadow=True)
     assert runner._setup_store.active() == []

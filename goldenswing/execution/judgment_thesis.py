@@ -644,22 +644,59 @@ class ThesisKeeper:
         self.active["children"].append(child)
         return child, True
 
+    def adopt_child(self, candidate: dict | None, playbook: str,
+                    ts: float) -> dict | None:
+        """Adopt an aligned candidate as a child of the live
+        thesis and return the ``thesis_child_registered`` event
+        for a NEW child (None when there is no live thesis, the
+        candidate is not a child, or the child was already
+        registered).  The update cycle journals the event
+        itself; WS3's scan path calls this directly so a
+        persisted setup instance can carry its parent link from
+        birth — a later cycle re-registration of the same child
+        is the silent refresh, exactly as before, so the event
+        is journaled exactly once either way."""
+        child, is_new = self._register_child(candidate, playbook,
+                                             ts)
+        if child is None or not is_new or self.active is None:
+            return None
+        return {
+            "event": "thesis_child_registered", "ts": ts,
+            "thesis_id": self.active["id"],
+            "version": self.active["version"],
+            "scenario": self.active["scenario"],
+            "direction": self.active["direction"],
+            "child": child}
+
+    def child_link(self, *, playbook: str = "", direction: int = 0,
+                   entry=None, stop=None) -> dict | None:
+        """The parent link for a candidate the live thesis has
+        already adopted as a child — the same identity
+        ``_register_child`` dedupes on (playbook, direction,
+        entry, stop).  Returns {"thesis_id", "thesis_version"}
+        or None.  Read-only: this never registers anything."""
+        if self.active is None:
+            return None
+        name = playbook
+        for child in self.active.get("children") or []:
+            if child.get("playbook") == name \
+                    and int(child.get("direction") or 0) \
+                    == int(direction or 0) \
+                    and child.get("entry") == entry \
+                    and child.get("stop") == stop:
+                return {"thesis_id": self.active["id"],
+                        "thesis_version": self.active["version"]}
+        return None
+
     def _adopt(self, events: list[dict],
                candidate: dict | None, playbook: str,
                ts: float) -> None:
         """Register the cycle's candidate under the live thesis
         (if any); a NEW child is journaled so the decision trace
         thesis -> child exists on the record."""
-        child, is_new = self._register_child(candidate, playbook,
-                                             ts)
-        if child is not None and is_new and self.active is not None:
-            events.append({
-                "event": "thesis_child_registered", "ts": ts,
-                "thesis_id": self.active["id"],
-                "version": self.active["version"],
-                "scenario": self.active["scenario"],
-                "direction": self.active["direction"],
-                "child": child})
+        event = self.adopt_child(candidate, playbook, ts)
+        if event is not None:
+            events.append(event)
 
     def _revise_standing(self, assessment: dict, ts: float,
                          events: list[dict]) -> None:

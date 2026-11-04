@@ -556,6 +556,25 @@ class MT5RunnerConfig:
     # The shared friction gate and the geometry floor are NOT
     # moved by this switch.
     hot_scalp_multi_target_enabled: bool = True
+    # H1 trigger handoff (owner approval 2026-11-04, workstream
+    # 3): the door between the scheduled scans and the streaming
+    # trigger path.  A scan candidate is registered as a
+    # persistent setup instance carrying its parent thesis link
+    # (WS1 child registration), the scan record carries the
+    # instance's registered disposition instead of the legacy
+    # observed-only one (the legacy disposition is journaled
+    # alongside for comparison), trigger fires bind the
+    # CORRESPONDING armed instance (entry-zone bracket, then
+    # nearest entry, then oldest), and §G shadow candidates are
+    # preserved as shadow instances — never routed, but their
+    # trigger-stage disposition and terminal state are journaled
+    # instead of the setup vanishing.  DEFAULT ON (deployment
+    # ruling, same posture as WS1/WS2); config-file/env-
+    # overridable (GS_H1_TRIGGER_HANDOFF=0), never /set-editable.
+    # OFF restores the legacy behavior byte-identically.  The
+    # friction gate, sizing and every hard safeguard are NOT
+    # moved by this switch.
+    h1_trigger_handoff_enabled: bool = True
     # DXY correlation (owner's-bot floor): the XAUUSD vs DXYm
     # correlation is confluence context (Ghost Sentinel bands,
     # bounded ±0.5) — never a gate leg.  A dead DXY feed degrades
@@ -693,6 +712,10 @@ class MT5RunnerConfig:
         if env_mt is not None:
             self.hot_scalp_multi_target_enabled = \
                 env_mt.strip().lower() in ("1", "true", "yes", "on")
+        env_hh = os.environ.get("GS_H1_TRIGGER_HANDOFF")
+        if env_hh is not None:
+            self.h1_trigger_handoff_enabled = \
+                env_hh.strip().lower() in ("1", "true", "yes", "on")
         if self.hot_scalp_db_path is None:
             self.hot_scalp_db_path = self.journal_path.parent / "hot_scalp_setups.db"
 
@@ -1921,6 +1944,15 @@ class MT5Runner:
         events = keeper.update(
             assessment, ts=_time.time(), candidate=candidate,
             playbook=playbook, price=_price)
+        self._journal_thesis_events(events, ts)
+        self._audit_sync_thesis()
+
+    def _journal_thesis_events(self, events, ts) -> None:
+        """Journal keeper events as ``judgment_thesis`` records
+        (the cycle's own append shape).  Shared with the WS3
+        scan path, which adopts a scan candidate as a thesis
+        child ahead of registration so the event lands exactly
+        once in exactly this shape."""
         for event in events:
             payload = dict(event)
             payload["cycle_ts"] = payload.pop("ts", None)
@@ -1929,7 +1961,16 @@ class MT5Runner:
                 "ts": str(ts),
                 "run_id": self._run_id,
                 **payload})
-        self._audit_sync_thesis()
+
+    def _handoff_enabled(self) -> bool:
+        """WS3 (owner approval 2026-11-04): the H1 trigger
+        handoff — registered scan dispositions, thesis-linked
+        setup instances, corresponding-instance trigger binding
+        and shadow-instance preservation.  Default ON per the
+        deployment ruling; OFF restores the legacy behavior
+        byte-identically."""
+        return bool(getattr(
+            self.cfg, "h1_trigger_handoff_enabled", True))
 
     # ---- Judgment self-audit (S3) ---------------------------------
     def _audit_state_path(self):  # type: ignore[no-untyped-def]
@@ -2867,6 +2908,25 @@ class MT5Runner:
         rulings 2026-10-30 §1: a fired trigger — and a detected
         setup — must never disappear between analysis and
         execution)."""
+        evidence = {"setup_id": setup.setup_id,
+                    "parent_setup_id": setup.parent_setup_id,
+                    "lifecycle_stage": stage,
+                    "route": setup.route,
+                    "trigger_kind": setup.trigger_kind,
+                    "validity_bars": int(setup.validity_bars),
+                    "expiry_ts": setup.expiry_ts,
+                    "formation_ts": setup.formation_ts,
+                    "touch_ts": setup.touch_ts}
+        if self._handoff_enabled():
+            # WS3 trace completeness: every link of the chain
+            # also carries the parent thesis link (WS1 child
+            # registration) and the shadow marker, so the full
+            # chain — thesis -> setup -> trigger -> judgment ->
+            # execution -> broker outcome — reconstructs from
+            # the journal alone.
+            evidence["thesis_id"] = setup.thesis_id
+            evidence["thesis_version"] = setup.thesis_version
+            evidence["shadow"] = bool(setup.shadow)
         self._emit_eval(
             playbook=setup.playbook, kind="setup_event",
             evaluation_clock="setup_lifecycle",
@@ -2884,15 +2944,7 @@ class MT5Runner:
                        "entry": float(setup.entry_ref),
                        "stop": float(setup.invalidation),
                        "targets": [float(x) for x in setup.targets]},
-            evidence={"setup_id": setup.setup_id,
-                      "parent_setup_id": setup.parent_setup_id,
-                      "lifecycle_stage": stage,
-                      "route": setup.route,
-                      "trigger_kind": setup.trigger_kind,
-                      "validity_bars": int(setup.validity_bars),
-                      "expiry_ts": setup.expiry_ts,
-                      "formation_ts": setup.formation_ts,
-                      "touch_ts": setup.touch_ts},
+            evidence=evidence,
             source="setup_lifecycle")
 
     def _transition_setup(self, setup, stage: str,
@@ -2966,20 +3018,24 @@ class MT5Runner:
         "H4": pd.Timedelta(hours=4),
         "D1": pd.Timedelta(days=1)}
 
-    def _register_scan_setup(self, spec, sig, prov, *, frame, t,
-                             formation_ts, eval_now,
-                             intended_tf) -> None:
-        """Persist one scan-detected candidate as a tracked
-        setup (owner rulings 2026-10-30 §1).  Detection happens
-        at the level on a live close, so the setup arms
-        immediately; its declared trigger is a same-direction
-        h1_trigger fire inside its validity window."""
+    def _build_scan_setup(self, spec, sig, prov, *, frame, t,
+                          formation_ts, eval_now, intended_tf,
+                          shadow: bool = False,
+                          thesis_link: dict | None = None):
+        """Construct the tracked setup a scan candidate becomes
+        (owner rulings 2026-10-30 §1).  Detection happens at the
+        level on a live close, so the setup arms immediately;
+        its declared trigger is a same-direction h1_trigger fire
+        inside its validity window.  ``thesis_link`` / ``shadow``
+        are the WS3 stamps (parent thesis link from the WS1
+        child registration; §G shadow-route marker) — both None /
+        False on the legacy path, so the instance is unchanged."""
         clean_ctx, _dropped = _setup_lc.sanitize_context(
             getattr(sig, "live_context", None))
         touch_ts = frame.index[t]
         delta = self._SETUP_TF_DELTAS.get(
             str(intended_tf), pd.Timedelta(hours=1))
-        setup = _TrackedSetup(
+        return _TrackedSetup(
             setup_id=prov["instance_key"],
             parent_setup_id=prov["instance_key"],
             playbook=spec.name, route=spec.route,
@@ -3006,7 +3062,22 @@ class MT5Runner:
             validity_bars=int(getattr(spec, "validity_bars", 6)),
             expiry_ts=str(touch_ts + delta
                           * int(getattr(spec, "validity_bars",
-                                        6))))
+                                        6))),
+            thesis_id=(thesis_link or {}).get("thesis_id"),
+            thesis_version=(thesis_link or {}).get(
+                "thesis_version"),
+            shadow=bool(shadow))
+
+    def _register_scan_setup(self, spec, sig, prov, *, frame, t,
+                             formation_ts, eval_now,
+                             intended_tf) -> None:
+        """Persist one scan-detected candidate as a tracked
+        setup (legacy path — WS3 flag off; identical to the
+        pre-handoff behavior)."""
+        setup = self._build_scan_setup(
+            spec, sig, prov, frame=frame, t=t,
+            formation_ts=formation_ts, eval_now=eval_now,
+            intended_tf=intended_tf)
         if self._setup_store.register(setup, ts=str(eval_now)):
             self._journal_setup_event(
                 setup, _setup_lc.STAGE_DETECTED,
@@ -3021,6 +3092,71 @@ class MT5Runner:
                 f"{setup.validity_bars} {setup.trigger_tf} bars; "
                 f"invalidation {setup.invalidation:.2f}; "
                 f"expiry {setup.expiry_ts}")
+
+    def _register_scan_setup_handoff(self, spec, sig, prov, *,
+                                     frame, t, formation_ts,
+                                     eval_now, intended_tf,
+                                     shadow, thesis_link):
+        """WS3 registration (flag on): persist the scan
+        candidate as a setup instance stamped with its parent
+        thesis link and (for §G routes) its shadow marker, and
+        journal detected + armed.  Returns the tracked instance
+        (existing or new) so the scan's evaluation record can
+        carry the instance's real disposition; None when the
+        registration itself failed (the caller then falls back
+        to the honest legacy disposition on its record)."""
+        try:
+            setup = self._build_scan_setup(
+                spec, sig, prov, frame=frame, t=t,
+                formation_ts=formation_ts, eval_now=eval_now,
+                intended_tf=intended_tf, shadow=shadow,
+                thesis_link=thesis_link)
+            is_new = self._setup_store.register(
+                setup, ts=str(eval_now))
+        except Exception as exc:  # noqa: BLE001 — surface, degrade
+            self.journal.log_note(
+                f"setup_lifecycle: handoff registration failed "
+                f"for {spec.name}: {type(exc).__name__}: {exc}")
+            return None
+        if not is_new:
+            # Dedupe: the re-scan found the same setup — the
+            # existing instance carries the disposition.
+            return self._setup_store.get(setup.setup_id) or setup
+        if shadow:
+            detected_detail = (
+                f"scan-detected {setup.playbook} "
+                f"{setup.direction:+d} @ {setup.entry_ref:.2f} — "
+                "shadow route: preserved as a tracked instance "
+                "(never routed; trigger-stage disposition and "
+                "terminal state journaled on this instance)")
+            armed_detail = (
+                f"armed (shadow): trigger {setup.trigger_kind} "
+                f"fires in this direction are observed against "
+                f"this instance for accounting only — no order "
+                f"authority; invalidation "
+                f"{setup.invalidation:.2f}; "
+                f"expiry {setup.expiry_ts}")
+        else:
+            detected_detail = (
+                f"scan-detected {setup.playbook} "
+                f"{setup.direction:+d} @ {setup.entry_ref:.2f} — "
+                "registered for trigger routing (the scan itself "
+                "holds no order authority)")
+            armed_detail = (
+                f"armed: trigger {setup.trigger_kind} "
+                f"(same-direction h1_trigger fire) within "
+                f"{setup.validity_bars} {setup.trigger_tf} bars; "
+                f"invalidation {setup.invalidation:.2f}; "
+                f"expiry {setup.expiry_ts}")
+        if setup.thesis_id:
+            detected_detail += (
+                f"; parent thesis {setup.thesis_id} "
+                f"v{setup.thesis_version}")
+        self._journal_setup_event(
+            setup, _setup_lc.STAGE_DETECTED, detected_detail)
+        self._transition_setup(
+            setup, _setup_lc.STAGE_ARMED, armed_detail)
+        return setup
 
     def _upkeep_setups(self, h1) -> None:
         """Per-H1-close lifecycle upkeep: a tracked setup whose
@@ -9357,8 +9493,11 @@ class MT5Runner:
         _frags = self._apply_lifecycle_routing(_routing, _fire_dir)
         _armed_waiting = 0
         if self._setup_store is not None and _fire_dir in (1, -1):
+            # WS3: shadow instances are never routable, so they
+            # do not count as "armed setups remaining" here.
             _armed_waiting = len(self._setup_store.active(
-                direction=_fire_dir, armed_only=True))
+                direction=_fire_dir, armed_only=True,
+                shadow=False))
         self._emit_trigger_event(
             "execution_evaluated", "",
             f"fire {_fire_dir:+d}: signal path emitted "
@@ -10247,6 +10386,33 @@ class MT5Runner:
         except Exception:
             pass
 
+    def _select_lifecycle_candidate(self, setups, verdict):
+        """WS3 trigger binding (owner approval 2026-11-04):
+        which armed instance of a playbook a fire routes.  The
+        CORRESPONDING instance wins — the one whose entry zone
+        brackets the fire's own entry price; failing that, the
+        nearest entry; ties (and fires with no usable price)
+        fall back to the OLDEST instance, the pre-handoff rule.
+        ``setups`` arrives in the store's order (oldest first).
+        """
+        if len(setups) == 1:
+            return setups[0]
+        try:
+            entry = float((verdict or {}).get("entry"))
+        except (TypeError, ValueError):
+            entry = None
+        if entry is None or not math.isfinite(entry):
+            return setups[0]
+        for s in setups:
+            zone = list(getattr(s, "entry_zone", None) or [])
+            if len(zone) == 2:
+                lo, hi = float(min(zone)), float(max(zone))
+                if hi > lo and lo <= entry <= hi:
+                    return s
+        return min(
+            setups,
+            key=lambda s: abs(float(s.entry_ref) - entry))
+
     def _run_signal_path(self, h1: pd.DataFrame, t: int,
                          states, years: float, verdict: dict,
                          stats: dict,
@@ -10382,14 +10548,42 @@ class MT5Runner:
         # (oldest first, one per playbook per fire — the store
         # owns identity).  Expired-but-not-yet-upkept setups are
         # skipped here and expire on the next close's upkeep.
+        # WS3 (2026-11-04): with the handoff on and several
+        # instances of one playbook armed, the fire binds the
+        # CORRESPONDING instance (entry-zone bracket, then
+        # nearest entry — see _select_lifecycle_candidate);
+        # shadow instances are never routed in any mode.
         _lc_candidates: dict = {}
         if lifecycle_routing is not None \
                 and self._setup_store is not None:
             _lc_dir = int((verdict or {}).get("direction", 0) or 0)
             if _lc_dir in (1, -1) and t < len(h1):
+                _handoff = self._handoff_enabled()
+                _by_playbook: dict = {}
                 for _s in self._setup_store.active(
                         direction=_lc_dir, armed_only=True):
-                    if _s.playbook in _lc_candidates:
+                    if getattr(_s, "shadow", False):
+                        # WS3: a shadow (§G) instance is
+                        # preserved, never routed — in EVERY
+                        # mode (the authority restriction is
+                        # intrinsic to the instance, not to the
+                        # flag).  With the handoff on, the fire
+                        # is also journaled as the instance's
+                        # trigger-stage disposition, so the
+                        # shadow chain does not end at the scan
+                        # record either.
+                        if _handoff:
+                            self._journal_setup_event(
+                                _s,
+                                _setup_lc.STAGE_TRIGGER_OBSERVED,
+                                f"h1_trigger fired {_lc_dir:+d} "
+                                f"({(verdict or {}).get('trigger', '')})"
+                                f" — shadow route: trigger "
+                                f"observed for accounting; the "
+                                f"instance is preserved but never "
+                                f"routed (no order authority); it "
+                                f"remains armed until "
+                                f"invalidation or expiry")
                         continue
                     if _s.expiry_ts is not None:
                         try:
@@ -10398,7 +10592,15 @@ class MT5Runner:
                                 continue
                         except Exception:
                             pass
-                    _lc_candidates[_s.playbook] = _s
+                    _by_playbook.setdefault(
+                        _s.playbook, []).append(_s)
+                for _pb_name, _group in _by_playbook.items():
+                    if _handoff and len(_group) > 1:
+                        _lc_candidates[_pb_name] = \
+                            self._select_lifecycle_candidate(
+                                _group, verdict)
+                    else:
+                        _lc_candidates[_pb_name] = _group[0]
         for pb in self._get_playbooks():
             if pb.name in (self.cfg.disabled_playbooks or ()):
                 # Kill switch (/set) — not evaluated (A14).  FUNNEL:
@@ -15552,7 +15754,17 @@ class MT5Runner:
         journaled as OBSERVED candidates — evaluated, truthfully
         ineligible for execution from this route (the trigger
         path / native route remains the order authority; the §G
-        range routes are shadow)."""
+        range routes are shadow).
+
+        WS3 (owner approval 2026-11-04, flag
+        ``h1_trigger_handoff_enabled``, default ON): the
+        candidate is registered as a persistent setup instance
+        BEFORE the record is emitted — stamped with its parent
+        thesis link (WS1 child registration) and, for the §G
+        routes, a shadow marker — and this record carries the
+        instance's registered disposition (legacy disposition
+        journaled alongside).  Flag OFF restores the account
+        above byte-identically."""
         name = spec.name
         last_bar_ts = (frame.index[-1]
                        if frame is not None and len(frame) else None)
@@ -15685,6 +15897,71 @@ class MT5Runner:
                 evaluation_ts=_eval_now, source=source,
                 touch_age_bars=0, validity_window_bars=0,
                 eligible=False, eligibility_code=code)
+            candidate_dict = self._candidate_dict(sig, None, prov)
+            # WS3 (owner approval 2026-11-04): with the handoff
+            # enabled, the candidate is registered as a setup
+            # instance BEFORE this scan's record is emitted, so
+            # the record carries the instance's real disposition
+            # instead of the legacy observed-only one.  The
+            # candidate is adopted as a thesis child FIRST (the
+            # WS1 linkage — same playbook/direction/entry/stop
+            # identity the judgment cycle uses), so the instance
+            # is stamped with its parent thesis link at birth;
+            # the adoption event is journaled once, here, and
+            # the cycle inside the record's own _emit_eval finds
+            # the child already registered (silent refresh).
+            _handoff = (self._handoff_enabled()
+                        and self._setup_store is not None
+                        and source == _lifecycle.SOURCE_LIVE_CLOSE)
+            _setup = None
+            _thesis_link = None
+            if _handoff:
+                _keeper = getattr(self, "_thesis_keeper", None)
+                if _keeper is not None and bool(getattr(
+                        self.cfg, "judgment_thesis_enabled",
+                        True)):
+                    _adopt_ev = _keeper.adopt_child(
+                        candidate_dict, name, ts=time.time())
+                    if _adopt_ev is not None:
+                        self._journal_thesis_events(
+                            [_adopt_ev], _eval_now)
+                        _thesis_link = {
+                            "thesis_id": _adopt_ev["thesis_id"],
+                            "thesis_version":
+                                _adopt_ev["version"]}
+                    else:
+                        _thesis_link = _keeper.child_link(
+                            playbook=name,
+                            direction=int(sig.direction),
+                            entry=float(sig.entry_ref),
+                            stop=float(sig.invalidation))
+                _setup = self._register_scan_setup_handoff(
+                    spec, sig, prov, frame=frame, t=t,
+                    formation_ts=_formation_ts,
+                    eval_now=_eval_now,
+                    intended_tf=intended_tf, shadow=shadow,
+                    thesis_link=_thesis_link)
+            # The record's disposition: the legacy observed /
+            # shadow account, replaced (flag on, instance
+            # preserved, non-shadow route) by the instance's
+            # registered disposition — with the legacy
+            # disposition journaled alongside for comparison.
+            _disp_code = code
+            _disp_why = why
+            _registered = (_handoff and _setup is not None
+                           and not shadow)
+            if _registered:
+                _disp_code = "path.setup_registered"
+                _disp_why = (
+                    f"scheduled scan found a candidate on the "
+                    f"closing bar; registered as setup "
+                    f"{_setup.setup_id} and armed for trigger "
+                    f"routing — the scan itself holds no order "
+                    f"authority; the instance persists until "
+                    f"its trigger fires, its invalidation "
+                    f"closes, or its validity window lapses "
+                    f"(see the setup lifecycle records and "
+                    f"Trigger decision)")
             # Burn-down #1: an observed candidate carries the
             # same assessment objects the native routes produce
             # — itemized evidence with correlation groups (the
@@ -15721,67 +15998,138 @@ class MT5Runner:
             _obs = dict(evidence.get("observed") or {})
             _obs.update({"entry": _entry, "stop": _stop,
                          "stop_dist": abs(_entry - _stop)})
+            if _registered:
+                _scenario_status = (
+                    f"registered as setup {_setup.setup_id} "
+                    f"(stage {_setup.stage}) — order authority "
+                    f"belongs to the trigger path; the instance "
+                    f"persists until its trigger fires, its "
+                    f"invalidation closes, or its validity "
+                    f"window lapses")
+            elif shadow:
+                _scenario_status = (
+                    "observed, not routed — §G shadow "
+                    "evaluation: journaled for grading, this "
+                    "route holds no order authority")
+            else:
+                _scenario_status = (
+                    "observed, not routed — order authority "
+                    "belongs to the trigger path, which did "
+                    "not fire")
+            decision = {
+                "result": ("registered" if _registered else
+                           "shadow" if shadow else "observed"),
+                "reason_code": _disp_code, "reason": _disp_why,
+                "execution_eligible": False,
+                "order_result": ("pending_trigger" if _registered
+                                 else "not_attempted"),
+                "competing_scenarios": [
+                    {"scenario": f"take the {_dir:+d} "
+                                 f"{name} setup at "
+                                 f"{_entry:.2f}",
+                     "status": _scenario_status},
+                    {"scenario": f"take the "
+                                 f"{-_dir:+d} side",
+                     "status": "not funded — no "
+                               "opposite-side signal "
+                               "at the closing bar"}],
+                **_verdict_blocks(
+                    analytical="not_evaluated",
+                    eligible=False,
+                    execution_code=_disp_code)}
+            if _registered:
+                # The instance's real disposition chain, with
+                # the legacy observed disposition journaled
+                # alongside as the shadow comparison (WS2 idiom).
+                decision["setup_id"] = _setup.setup_id
+                decision["lifecycle_stage"] = _setup.stage
+                decision["thesis_id"] = _setup.thesis_id
+                decision["legacy_disposition"] = {
+                    "result": "observed",
+                    "order_result": "not_attempted",
+                    "reason_code": "path.trigger_not_fired"}
+            elif _handoff and _setup is not None:
+                # Shadow preservation: the disposition
+                # vocabulary is unchanged, but the record now
+                # names the preserved instance.
+                decision["setup_id"] = _setup.setup_id
+            _rec_evidence = {
+                **evidence, "observed": _obs,
+                "supporting": _sup,
+                "contradictory": _con,
+                "evidence_groups": _groups,
+                "independent_evidence_groups":
+                    sorted(_groups),
+                "provenance": prov,
+                # Journal auditability (owner,
+                # 2026-10-26): the complete trigger
+                # account — route authority, source
+                # eligibility, the scan's explicit
+                # non-evaluation of the trigger path,
+                # and the detector's own facts.
+                "trigger_decision":
+                    _journal_audit.trigger_decision_block(
+                        route=spec.route, source=source,
+                        reason_code=_disp_code, shadow=shadow,
+                        detector_facts=
+                        _journal_audit.detector_facts(
+                            sig, frame))}
+            if _handoff and _setup is not None:
+                _rec_evidence["setup_id"] = _setup.setup_id
+                _rec_evidence["parent_setup_id"] = \
+                    _setup.parent_setup_id
+                _rec_evidence["thesis_id"] = _setup.thesis_id
             self._emit_eval(
                 **base, outcome="candidate_emitted",
-                reason_code=code, reason=why,
-                candidate=self._candidate_dict(sig, None, prov),
-                decision={"result": ("shadow" if shadow
-                                     else "observed"),
-                          "reason_code": code, "reason": why,
-                          "execution_eligible": False,
-                          "order_result": "not_attempted",
-                          "competing_scenarios": [
-                              {"scenario": f"take the {_dir:+d} "
-                                           f"{name} setup at "
-                                           f"{_entry:.2f}",
-                               "status": (
-                                   "observed, not routed — §G "
-                                   "shadow evaluation: journaled "
-                                   "for grading, this route "
-                                   "holds no order authority"
-                                   if shadow else
-                                   "observed, not routed — "
-                                   "order authority belongs to "
-                                   "the trigger path, which did "
-                                   "not fire")},
-                              {"scenario": f"take the "
-                                           f"{-_dir:+d} side",
-                               "status": "not funded — no "
-                                         "opposite-side signal "
-                                         "at the closing bar"}],
-                          **_verdict_blocks(
-                              analytical="not_evaluated",
-                              eligible=False,
-                              execution_code=code)},
-                evidence={**evidence, "observed": _obs,
-                          "supporting": _sup,
-                          "contradictory": _con,
-                          "evidence_groups": _groups,
-                          "independent_evidence_groups":
-                              sorted(_groups),
-                          "provenance": prov,
-                          # Journal auditability (owner,
-                          # 2026-10-26): the complete trigger
-                          # account — route authority, source
-                          # eligibility, the scan's explicit
-                          # non-evaluation of the trigger path,
-                          # and the detector's own facts.
-                          "trigger_decision":
-                              _journal_audit.trigger_decision_block(
-                                  route=spec.route, source=source,
-                                  reason_code=code, shadow=shadow,
-                                  detector_facts=
-                                  _journal_audit.detector_facts(
-                                      sig, frame))})
-            # Setup lifecycle (owner rulings 2026-10-30 §1): a
-            # non-shadow roster candidate is REGISTERED, not
-            # just journaled — it persists with its trigger,
-            # invalidation and expiry facts so a later trigger
-            # fire can route it to execution evaluation.  The
-            # scan itself still never orders; shadow (§G)
-            # candidates are never registered.
-            if not shadow and self._setup_store is not None \
+                reason_code=_disp_code, reason=_disp_why,
+                candidate=candidate_dict,
+                decision=decision, evidence=_rec_evidence)
+            if _handoff:
+                # The judgment cycle inside this record's own
+                # _emit_eval may have created the keeper / adopted
+                # the child just now (the keeper is lazily built
+                # by the cycle) — re-resolve the link and stamp
+                # the instance so the chain is complete.
+                if _setup is not None \
+                        and _setup.thesis_id is None:
+                    _keeper = getattr(self, "_thesis_keeper",
+                                      None)
+                    if _keeper is not None:
+                        _link2 = _keeper.child_link(
+                            playbook=name,
+                            direction=int(sig.direction),
+                            entry=float(sig.entry_ref),
+                            stop=float(sig.invalidation))
+                        if _link2:
+                            self._setup_store.stamp_thesis(
+                                _setup.setup_id,
+                                _link2["thesis_id"],
+                                _link2["thesis_version"])
+                            _setup.thesis_id = \
+                                _link2["thesis_id"]
+                            _setup.thesis_version = \
+                                _link2["thesis_version"]
+                            self._journal_setup_event(
+                                _setup, _setup.stage,
+                                f"parent thesis link recorded: "
+                                f"{_link2['thesis_id']} "
+                                f"v{_link2['thesis_version']} "
+                                f"(adopted by the judgment "
+                                f"cycle of this scan's own "
+                                f"record)")
+            elif not shadow and self._setup_store is not None \
                     and source == _lifecycle.SOURCE_LIVE_CLOSE:
+                # Setup lifecycle (owner rulings 2026-10-30
+                # §1): a non-shadow roster candidate is
+                # REGISTERED, not just journaled — it persists
+                # with its trigger, invalidation and expiry
+                # facts so a later trigger fire can route it to
+                # execution evaluation.  The scan itself still
+                # never orders; shadow (§G) candidates are
+                # never registered.  (Legacy path — WS3 flag
+                # off; with the flag on, registration happened
+                # above, before the record, and §G candidates
+                # are preserved as shadow instances instead.)
                 try:
                     self._register_scan_setup(
                         spec, sig, prov, frame=frame, t=t,

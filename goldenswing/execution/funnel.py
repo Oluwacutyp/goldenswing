@@ -105,6 +105,10 @@ _CODE_TO_CATEGORY = {
     "path.warmup_ineligible": CATEGORY_NOT_EVALUATED,
     "path.duplicate_instance": CATEGORY_NOT_EVALUATED,
     "path.trigger_not_fired": CATEGORY_NOT_EVALUATED,
+    # WS3 (2026-11-04): the scan candidate was registered as a
+    # persistent setup instance and armed for trigger routing —
+    # still not evaluated for execution by the scan itself.
+    "path.setup_registered": CATEGORY_NOT_EVALUATED,
     "path.shadow_route": CATEGORY_NOT_EVALUATED,
     "path.trigger_not_fired": CATEGORY_NOT_EVALUATED,
     "path.manipulation_blocked": CATEGORY_QUALITY,
@@ -388,9 +392,13 @@ def assessment_block(*, outcome: str,
         if bucket == "ordered":
             verdict = "signal"
         elif code in ("path.trigger_not_fired",
+                      "path.setup_registered",
                       "path.shadow_route"):
             # Observed-only records (roster sweep / §G shadow):
             # a setup was seen and deliberately not acted on.
+            # WS3: a registered setup is still a watch from the
+            # scan's seat — its chain unfolds on the lifecycle
+            # records, not on this one.
             verdict = "watch"
         elif bucket == "ineligible":
             verdict = ("expired" if code in (

@@ -38,6 +38,26 @@ The contract this module owns:
   routed candidate passes through the same decision flow and
   shared order path as any fresh candidate — every gate intact.
   Shadow-evaluation routes are never registered here.
+
+WS3 ADDENDUM (owner approval 2026-11-04, workstream 3 — H1
+trigger handoff; runner flag ``h1_trigger_handoff_enabled``):
+
+- THESIS LINK: a registered setup now also carries its parent
+  thesis link (``thesis_id`` / ``thesis_version``), resolved
+  through the Judgment Core's own child registration (the WS1
+  linkage — same playbook/direction/entry/stop identity), so
+  the journal chain reads parent thesis -> child setup ->
+  armed -> trigger -> judgment -> execution -> broker outcome
+  from the records alone.
+
+- SHADOW PRESERVATION: §G shadow-route candidates are now
+  registered too, marked ``shadow=True``.  Preservation is not
+  authority: a shadow setup is NEVER routed to execution
+  evaluation (the routing selection excludes it in every mode),
+  but it no longer vanishes after its scan record — a
+  same-direction trigger fire journals a ``trigger_observed``
+  disposition on the instance, and upkeep still ends it through
+  a journaled expiry / invalidation.
 """
 from __future__ import annotations
 
@@ -68,6 +88,13 @@ ACTIVE_STAGES = frozenset(
 #: The trigger that routes an armed roster setup in v1: the
 #: h1_trigger streaming path fires in the setup's direction.
 TRIGGER_H1_FIRE = "h1_trigger_fire"
+
+#: Journal-only disposition marker (WS3): a same-direction
+#: h1_trigger fire was observed against an armed SHADOW setup.
+#: It is journaled on the instance (via the runner's setup-event
+#: record) but is NOT a store stage — the instance does not
+#: move; it stays armed until upkeep ends it.  Never routed.
+STAGE_TRIGGER_OBSERVED = "trigger_observed"
 
 
 @dataclass
@@ -105,6 +132,15 @@ class TrackedSetup:
     formation_ts: str | None = None
     touch_ts: str | None = None
     created_ts: str | None = None
+    #: WS3 (owner approval 2026-11-04): the parent thesis link,
+    #: resolved through the Judgment Core's child registration
+    #: (WS1 linkage) at registration time — None when no live
+    #: thesis had adopted this candidate as its child.
+    thesis_id: str | None = None
+    thesis_version: int | None = None
+    #: WS3: a §G shadow-route instance — preserved and traced,
+    #: never routed to execution evaluation in any mode.
+    shadow: bool = False
     trigger_kind: str = TRIGGER_H1_FIRE
     trigger_tf: str = "H1"
     validity_bars: int = 6
@@ -244,17 +280,37 @@ class SetupLifecycleStore:
                 "parent_setup_id": s.parent_setup_id,
                 "playbook": s.playbook, **event}
 
+    # -- thesis link ---------------------------------------------------
+    def stamp_thesis(self, setup_id: str, thesis_id: str,
+                     thesis_version: int | None) -> bool:
+        """Record the parent thesis link on a registered setup
+        (WS3: the link can resolve just after registration when
+        the judgment cycle inside the scan's own record adopts
+        the candidate).  Returns False for an unknown setup.
+        Not a lifecycle transition — no history entry; the
+        runner journals the link on the setup-event chain."""
+        s = self._setups.get(setup_id)
+        if s is None:
+            return False
+        s.thesis_id = thesis_id
+        s.thesis_version = thesis_version
+        self.save()
+        return True
+
     # -- lookups -------------------------------------------------------
     def get(self, setup_id: str) -> TrackedSetup | None:
         return self._setups.get(setup_id)
 
     def active(self, *, direction: int | None = None,
-               armed_only: bool = False) -> list[TrackedSetup]:
+               armed_only: bool = False,
+               shadow: bool | None = None) -> list[TrackedSetup]:
         out = [s for s in self._setups.values() if s.active]
         if armed_only:
             out = [s for s in out if s.armed]
         if direction is not None:
             out = [s for s in out if int(s.direction) == int(direction)]
+        if shadow is not None:
+            out = [s for s in out if bool(s.shadow) is bool(shadow)]
         out.sort(key=lambda s: (s.created_ts or "", s.setup_id))
         return out
 

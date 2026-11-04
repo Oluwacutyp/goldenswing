@@ -183,6 +183,13 @@ def test_sweep_no_setup_carries_structure_and_scenario(tmp_path):
 
 def test_sweep_candidate_observed_objects(tmp_path):
     runner, h1 = _sweep_runner(tmp_path)
+    # Amended for WS3 (2026-11-04): this test pins the sweep's
+    # LEGACY (handoff flag OFF) playbook_eval record — the
+    # observed / not-routed account.  With the handoff on (the
+    # default), the record carries the registered instance's
+    # disposition instead; pinned in
+    # tests/test_h1_trigger_handoff.py.
+    runner.cfg.h1_trigger_handoff_enabled = False
     frame = _flat_h1(40, 2000.0)
     spec = SimpleNamespace(
         name="fvg_midline", route="h1_roster",
