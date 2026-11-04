@@ -1,0 +1,3106 @@
+{
+ "program": "missed-move WS4 episode replay",
+ "episodes": [
+  {
+   "name": "centerpiece",
+   "title": "The missed move \u2014 Nov 3-4, 2026 (the +95pt rally the engine stayed bearish through)",
+   "window": {
+    "start": "2026-11-03T12:00:00+00:00",
+    "end": "2026-11-04T12:16:43+00:00"
+   },
+   "justification": [
+    "Ensemble forecast for the 2026-11-03 17:00Z bar: 24h up-rank 85.1485, journaled 2026-11-03T18:51:56Z in restart catch-up (forecast record, D1 cadence, alert_fired).",
+    "Its 12h reconciliation (journaled 2026-11-04T07:00:10Z): run_up +95.35pts, ret +2.395% \u2014 the rally was real and the forecast called it.",
+    "Live posture stayed bearish: judgment_thesis records show bearish thesis created 13:00Z, maintained 13:30Z, then re-created fresh at 15:00Z and 16:00Z by restarted runs \u2014 never weakened, never invalidated.",
+    "Hot Scalp armed 232 setups in-window and blocked 87 candidates on geometry.net_rr_below_min (121 across Nov 3-4).",
+    "Judgment shadow TOOK the 2026-11-04 06:00Z order_block short (expected_r +0.7287); reconciliations graded it -1.8647R (08:00Z) and -2.7504R (11:00Z)."
+   ],
+   "legs": {
+    "forecast": {
+     "forecasts": [
+      {
+       "cadence": "D1",
+       "forecast_bar_ts": "2026-11-03T08:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T09:00:00+00:00",
+       "forecast_generated_ts": "2026-11-02 00:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T09:58:47.688326+00:00",
+       "close": 3897.033,
+       "horizons": {
+        "12": {
+         "up": 73.26732673267327,
+         "dn": 17.82178217821782
+        },
+        "24": {
+         "up": 74.25742574257426,
+         "dn": 16.831683168316832
+        },
+        "72": {
+         "up": 74.25742574257426,
+         "dn": 13.861386138613863
+        },
+        "168": {
+         "up": 81.1881188118812,
+         "dn": 20.792079207920793
+        },
+        "360": {
+         "up": 89.10891089108911,
+         "dn": 15.841584158415841
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T09:58:47.688326+00:00"
+      },
+      {
+       "cadence": "H1",
+       "forecast_bar_ts": "2026-11-03T08:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T09:00:00+00:00",
+       "forecast_generated_ts": "2026-11-03 08:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T09:58:48.332654+00:00",
+       "close": 3897.033,
+       "horizons": {
+        "12": {
+         "up": 73.26732673267327,
+         "dn": 17.82178217821782
+        },
+        "24": {
+         "up": 74.25742574257426,
+         "dn": 16.831683168316832
+        },
+        "72": {
+         "up": 74.25742574257426,
+         "dn": 13.861386138613863
+        },
+        "168": {
+         "up": 81.1881188118812,
+         "dn": 20.792079207920793
+        },
+        "360": {
+         "up": 89.10891089108911,
+         "dn": 15.841584158415841
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T09:58:48.332654+00:00"
+      },
+      {
+       "cadence": "D1",
+       "forecast_bar_ts": "2026-11-03T09:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T10:00:00+00:00",
+       "forecast_generated_ts": "2026-11-02 00:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T10:18:47.338516+00:00",
+       "close": 3909.595,
+       "horizons": {
+        "12": {
+         "up": 68.31683168316832,
+         "dn": 37.62376237623762
+        },
+        "24": {
+         "up": 71.28712871287128,
+         "dn": 42.57425742574257
+        },
+        "72": {
+         "up": 66.33663366336634,
+         "dn": 35.64356435643564
+        },
+        "168": {
+         "up": 75.24752475247524,
+         "dn": 22.772277227722775
+        },
+        "360": {
+         "up": 84.15841584158416,
+         "dn": 17.82178217821782
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T10:18:47.338516+00:00"
+      },
+      {
+       "cadence": "H1",
+       "forecast_bar_ts": "2026-11-03T09:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T10:00:00+00:00",
+       "forecast_generated_ts": "2026-11-03 09:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T10:18:48.314445+00:00",
+       "close": 3909.595,
+       "horizons": {
+        "12": {
+         "up": 68.31683168316832,
+         "dn": 37.62376237623762
+        },
+        "24": {
+         "up": 71.28712871287128,
+         "dn": 42.57425742574257
+        },
+        "72": {
+         "up": 66.33663366336634,
+         "dn": 35.64356435643564
+        },
+        "168": {
+         "up": 75.24752475247524,
+         "dn": 22.772277227722775
+        },
+        "360": {
+         "up": 84.15841584158416,
+         "dn": 17.82178217821782
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T10:18:48.314445+00:00"
+      },
+      {
+       "cadence": "D1",
+       "forecast_bar_ts": "2026-11-03T10:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T11:00:00+00:00",
+       "forecast_generated_ts": "2026-11-02 00:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T11:15:21.645005+00:00",
+       "close": 3905.157,
+       "horizons": {
+        "12": {
+         "up": 70.29702970297029,
+         "dn": 19.801980198019802
+        },
+        "24": {
+         "up": 70.29702970297029,
+         "dn": 16.831683168316832
+        },
+        "72": {
+         "up": 70.29702970297029,
+         "dn": 16.831683168316832
+        },
+        "168": {
+         "up": 79.20792079207921,
+         "dn": 17.82178217821782
+        },
+        "360": {
+         "up": 89.10891089108911,
+         "dn": 12.871287128712872
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T11:15:21.645005+00:00"
+      },
+      {
+       "cadence": "H1",
+       "forecast_bar_ts": "2026-11-03T10:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T11:00:00+00:00",
+       "forecast_generated_ts": "2026-11-03 10:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T11:15:22.365568+00:00",
+       "close": 3905.157,
+       "horizons": {
+        "12": {
+         "up": 70.29702970297029,
+         "dn": 19.801980198019802
+        },
+        "24": {
+         "up": 70.29702970297029,
+         "dn": 16.831683168316832
+        },
+        "72": {
+         "up": 70.29702970297029,
+         "dn": 16.831683168316832
+        },
+        "168": {
+         "up": 79.20792079207921,
+         "dn": 17.82178217821782
+        },
+        "360": {
+         "up": 89.10891089108911,
+         "dn": 12.871287128712872
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T11:15:22.365568+00:00"
+      },
+      {
+       "cadence": "D1",
+       "forecast_bar_ts": "2026-11-03T13:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T14:00:00+00:00",
+       "forecast_generated_ts": "2026-11-02 00:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T14:13:36.378923+00:00",
+       "close": 3960.977,
+       "horizons": {
+        "12": {
+         "up": 22.772277227722775,
+         "dn": 61.386138613861384
+        },
+        "24": {
+         "up": 39.603960396039604,
+         "dn": 57.42574257425742
+        },
+        "72": {
+         "up": 41.584158415841586,
+         "dn": 59.4059405940594
+        },
+        "168": {
+         "up": 46.53465346534654,
+         "dn": 24.752475247524753
+        },
+        "360": {
+         "up": 55.44554455445545,
+         "dn": 20.792079207920793
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T14:13:36.378923+00:00"
+      },
+      {
+       "cadence": "H1",
+       "forecast_bar_ts": "2026-11-03T13:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T14:00:00+00:00",
+       "forecast_generated_ts": "2026-11-03 13:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T14:13:37.357049+00:00",
+       "close": 3960.977,
+       "horizons": {
+        "12": {
+         "up": 22.772277227722775,
+         "dn": 61.386138613861384
+        },
+        "24": {
+         "up": 39.603960396039604,
+         "dn": 57.42574257425742
+        },
+        "72": {
+         "up": 41.584158415841586,
+         "dn": 59.4059405940594
+        },
+        "168": {
+         "up": 46.53465346534654,
+         "dn": 24.752475247524753
+        },
+        "360": {
+         "up": 55.44554455445545,
+         "dn": 20.792079207920793
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T14:13:37.357049+00:00"
+      },
+      {
+       "cadence": "D1",
+       "forecast_bar_ts": "2026-11-03T14:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T15:00:00+00:00",
+       "forecast_generated_ts": "2026-11-02 00:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T15:43:52.077208+00:00",
+       "close": 3944.595,
+       "horizons": {
+        "12": {
+         "up": 28.71287128712871,
+         "dn": 51.48514851485149
+        },
+        "24": {
+         "up": 62.37623762376238,
+         "dn": 24.752475247524753
+        },
+        "72": {
+         "up": 64.35643564356435,
+         "dn": 33.663366336633665
+        },
+        "168": {
+         "up": 56.43564356435643,
+         "dn": 22.772277227722775
+        },
+        "360": {
+         "up": 73.26732673267327,
+         "dn": 19.801980198019802
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T15:43:52.077208+00:00"
+      },
+      {
+       "cadence": "H1",
+       "forecast_bar_ts": "2026-11-03T14:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T15:00:00+00:00",
+       "forecast_generated_ts": "2026-11-03 14:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T15:43:53.268294+00:00",
+       "close": 3944.595,
+       "horizons": {
+        "12": {
+         "up": 28.71287128712871,
+         "dn": 51.48514851485149
+        },
+        "24": {
+         "up": 62.37623762376238,
+         "dn": 24.752475247524753
+        },
+        "72": {
+         "up": 64.35643564356435,
+         "dn": 33.663366336633665
+        },
+        "168": {
+         "up": 56.43564356435643,
+         "dn": 22.772277227722775
+        },
+        "360": {
+         "up": 73.26732673267327,
+         "dn": 19.801980198019802
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T15:43:53.268294+00:00"
+      },
+      {
+       "cadence": "D1",
+       "forecast_bar_ts": "2026-11-03T15:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T16:00:00+00:00",
+       "forecast_generated_ts": "2026-11-02 00:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T16:20:06.927590+00:00",
+       "close": 3936.384,
+       "horizons": {
+        "12": {
+         "up": 72.27722772277228,
+         "dn": 14.85148514851485
+        },
+        "24": {
+         "up": 78.21782178217822,
+         "dn": 11.881188118811881
+        },
+        "72": {
+         "up": 76.23762376237624,
+         "dn": 13.861386138613863
+        },
+        "168": {
+         "up": 74.25742574257426,
+         "dn": 18.81188118811881
+        },
+        "360": {
+         "up": 83.16831683168317,
+         "dn": 20.792079207920793
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T16:20:06.927590+00:00"
+      },
+      {
+       "cadence": "H1",
+       "forecast_bar_ts": "2026-11-03T15:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T16:00:00+00:00",
+       "forecast_generated_ts": "2026-11-03 15:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T16:20:07.999348+00:00",
+       "close": 3936.384,
+       "horizons": {
+        "12": {
+         "up": 72.27722772277228,
+         "dn": 14.85148514851485
+        },
+        "24": {
+         "up": 78.21782178217822,
+         "dn": 11.881188118811881
+        },
+        "72": {
+         "up": 76.23762376237624,
+         "dn": 13.861386138613863
+        },
+        "168": {
+         "up": 74.25742574257426,
+         "dn": 18.81188118811881
+        },
+        "360": {
+         "up": 83.16831683168317,
+         "dn": 20.792079207920793
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T16:20:07.999348+00:00"
+      },
+      {
+       "cadence": "D1",
+       "forecast_bar_ts": "2026-11-03T17:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T18:00:00+00:00",
+       "forecast_generated_ts": "2026-11-02 00:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T18:51:56.817346+00:00",
+       "close": 3932.814,
+       "horizons": {
+        "12": {
+         "up": 79.20792079207921,
+         "dn": 8.91089108910891
+        },
+        "24": {
+         "up": 85.14851485148515,
+         "dn": 10.891089108910892
+        },
+        "72": {
+         "up": 83.16831683168317,
+         "dn": 8.91089108910891
+        },
+        "168": {
+         "up": 77.22772277227723,
+         "dn": 10.891089108910892
+        },
+        "360": {
+         "up": 82.17821782178217,
+         "dn": 21.782178217821784
+        }
+       },
+       "alert_fired": true,
+       "available_ts": "2026-11-03T18:51:56.817346+00:00"
+      },
+      {
+       "cadence": "H1",
+       "forecast_bar_ts": "2026-11-03T17:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-03T18:00:00+00:00",
+       "forecast_generated_ts": "2026-11-03 17:00:00+00:00",
+       "forecast_available_ts": "2026-11-03T18:51:58.284263+00:00",
+       "close": 3932.814,
+       "horizons": {
+        "12": {
+         "up": 79.20792079207921,
+         "dn": 8.91089108910891
+        },
+        "24": {
+         "up": 85.14851485148515,
+         "dn": 10.891089108910892
+        },
+        "72": {
+         "up": 83.16831683168317,
+         "dn": 8.91089108910891
+        },
+        "168": {
+         "up": 77.22772277227723,
+         "dn": 10.891089108910892
+        },
+        "360": {
+         "up": 82.17821782178217,
+         "dn": 21.782178217821784
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-03T18:51:58.284263+00:00"
+      },
+      {
+       "cadence": "D1",
+       "forecast_bar_ts": "2026-11-03T23:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-04T00:00:00+00:00",
+       "forecast_generated_ts": "2026-11-03 00:00:00+00:00",
+       "forecast_available_ts": "2026-11-04T00:00:42.130510+00:00",
+       "close": 3938.042,
+       "horizons": {
+        "12": {
+         "up": 66.33663366336634,
+         "dn": 28.71287128712871
+        },
+        "24": {
+         "up": 72.27722772277228,
+         "dn": 37.62376237623762
+        },
+        "72": {
+         "up": 69.3069306930693,
+         "dn": 43.56435643564357
+        },
+        "168": {
+         "up": 73.26732673267327,
+         "dn": 60.396039603960396
+        },
+        "360": {
+         "up": 71.28712871287128,
+         "dn": 23.762376237623762
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-04T00:00:42.130510+00:00"
+      },
+      {
+       "cadence": "H1",
+       "forecast_bar_ts": "2026-11-03T23:00:00+00:00",
+       "forecast_input_cutoff_ts": "2026-11-04T00:00:00+00:00",
+       "forecast_generated_ts": "2026-11-03 23:00:00+00:00",
+       "forecast_available_ts": "2026-11-04T00:00:43.171661+00:00",
+       "close": 3938.042,
+       "horizons": {
+        "12": {
+         "up": 66.33663366336634,
+         "dn": 28.71287128712871
+        },
+        "24": {
+         "up": 72.27722772277228,
+         "dn": 37.62376237623762
+        },
+        "72": {
+         "up": 69.3069306930693,
+         "dn": 43.56435643564357
+        },
+        "168": {
+         "up": 73.26732673267327,
+         "dn": 60.396039603960396
+        },
+        "360": {
+         "up": 71.28712871287128,
+         "dn": 23.762376237623762
+        }
+       },
+       "alert_fired": false,
+       "available_ts": "2026-11-04T00:00:43.171661+00:00"
+      }
+     ],
+     "centerpiece_forecast": {
+      "cadence": "D1",
+      "forecast_bar_ts": "2026-11-03T17:00:00+00:00",
+      "forecast_input_cutoff_ts": "2026-11-03T18:00:00+00:00",
+      "forecast_generated_ts": "2026-11-02 00:00:00+00:00",
+      "forecast_available_ts": "2026-11-03T18:51:56.817346+00:00",
+      "close": 3932.814,
+      "horizons": {
+       "12": {
+        "up": 79.20792079207921,
+        "dn": 8.91089108910891
+       },
+       "24": {
+        "up": 85.14851485148515,
+        "dn": 10.891089108910892
+       },
+       "72": {
+        "up": 83.16831683168317,
+        "dn": 8.91089108910891
+       },
+       "168": {
+        "up": 77.22772277227723,
+        "dn": 10.891089108910892
+       },
+       "360": {
+        "up": 82.17821782178217,
+        "dn": 21.782178217821784
+       }
+      },
+      "alert_fired": true,
+      "available_ts": "2026-11-03T18:51:56.817346+00:00"
+     },
+     "visible_at_bar_time": false,
+     "visible_at_1852": true,
+     "visible_at_scan_0600": true,
+     "as_of_bar": {
+      "claim": "24h up-rank 85.1485, 12h up-rank 79.2079 (side: up)",
+      "realized_12h_run_up": 95.35,
+      "realized_12h_ret_pct": 2.395,
+      "reconciled_ts": "2026-11-04T07:00:10.662863+00:00"
+     },
+     "operational": {
+      "available_from": "2026-11-03T18:51:56.817346+00:00",
+      "bar_close_at_availability": 3932.814,
+      "hours_available_before_0600_scan": 11.13,
+      "note": "E3 doctrine keeps forecasts evidence-only (journal-only until live calibration earns weight) \u2014 availability is graded as evidence the system HELD, not as a signal it was obliged to trade."
+     }
+    },
+    "thesis": {
+     "events": [
+      {
+       "event": "thesis_created",
+       "ts": 1793710800.0,
+       "thesis_id": "thesis-1",
+       "scenario": "bearish",
+       "direction": -1,
+       "winner_p": 0.6536,
+       "version": 1,
+       "reason": "regime direction is down; phase is distribution; qualified flow skews bearish (0 long vs 1 short qualified)",
+       "assessment": {
+        "scenarios": [
+         {
+          "name": "bearish",
+          "p": 0.6536,
+          "why": [
+           "regime direction is down",
+           "phase is distribution",
+           "qualified flow skews bearish (0 long vs 1 short qualified)"
+          ]
+         },
+         {
+          "name": "reversal",
+          "p": 0.1253,
+          "why": [
+           "",
+           "ADR is exhausted \u2014 the day's range is spent"
+          ]
+         },
+         {
+          "name": "continuation",
+          "p": 0.0977,
+          "why": [
+           "structure clean_trend carries the direction"
+          ]
+         },
+         {
+          "name": "bullish",
+          "p": 0.08,
+          "why": []
+         },
+         {
+          "name": "range",
+          "p": 0.0434,
+          "why": [
+           ""
+          ]
+         }
+        ],
+        "winner": "bearish",
+        "winner_p": 0.6536,
+        "margin": 0.5283,
+        "direction": -1,
+        "invalidation": [
+         {
+          "text": "regime direction turns up",
+          "trigger": "regime_direction_up"
+         },
+         {
+          "text": "structure breaks into reversal against shorts",
+          "trigger": "structure_reversal_against"
+         }
+        ],
+        "analytical_confidence": 0.817,
+        "evidence_quality": 0.8333,
+        "inputs": {
+         "regime": "down/clean_trend/normal/distribution/overlap",
+         "posture": "trend_day",
+         "day_type": "neutral",
+         "adr_pct": 119.3,
+         "adr_state": "extended",
+         "smt": null,
+         "flow": {
+          "evaluated_long": 0,
+          "evaluated_short": 2,
+          "qualified_long": 0,
+          "qualified_short": 1
+         }
+        }
+       },
+       "thesis": {
+        "id": "thesis-1",
+        "created_ts": 1793710800.0,
+        "updated_ts": 1793712627.0,
+        "scenario": "bearish",
+        "direction": -1,
+        "against_direction": 0,
+        "winner_p": 0.7568,
+        "invalidation": [
+         {
+          "text": "regime direction turns up",
+          "trigger": "regime_direction_up"
+         },
+         {
+          "text": "structure breaks into reversal against shorts",
+          "trigger": "structure_reversal_against"
+         }
+        ],
+        "plan": {
+         "direction": -1,
+         "entry_conditions": [
+          "shorts only while the regime direction stays down",
+          "enter on an entry-TF zone retest that rejects, or on displacement through the session low",
+          "no short into a fresh bullish displacement"
+         ],
+         "invalidation": [
+          "regime direction turns up",
+          "structure breaks into reversal against shorts"
+         ],
+         "entry": 3930.786,
+         "invalidation_price": 3944.4220892857143,
+         "target": 3910.3318660714285,
+         "execution_method": "per playbook intent",
+         "management_horizon": "standard_v1",
+         "playbook": "fvg_limit",
+         "basis": "aligned candidate fvg_limit"
+        },
+        "status": "invalidated",
+        "version": 1,
+        "state": "intact",
+        "supersedes": null,
+        "revisions": [],
+        "children": [
+         {
+          "playbook": "fvg_limit",
+          "direction": -1,
+          "entry": 3930.786,
+          "stop": 3944.4220892857143,
+          "targets": [
+           3910.3318660714285
+          ],
+          "registered_ts": 1793710800.0,
+          "thesis_id": "thesis-1",
+          "thesis_version": 1,
+          "orphaned_ts": 1793718000.0,
+          "orphan_status": "invalidated"
+         }
+        ],
+        "peak_p": 0.7568,
+        "standing_p": 0.7568,
+        "standing": {
+         "scenarios": {
+          "bearish": 0.7568,
+          "reversal": 0.088,
+          "continuation": 0.0686,
+          "bullish": 0.0562,
+          "range": 0.0304
+         },
+         "winner": "bearish",
+         "margin": 0.6688,
+         "regime": "down/clean_trend/normal/distribution/overlap"
+        },
+        "closed_ts": 1793718000.0,
+        "close_reason": "invalidation observed: price 3944.59 crossed the thesis invalidation price 3944.42 (plan: aligned candidate fvg_limit)"
+       },
+       "source": "replay-derived",
+       "record_ts": "2026-11-03 13:00:00+00:00"
+      },
+      {
+       "event": "thesis_child_registered",
+       "ts": 1793710800.0,
+       "thesis_id": "thesis-1",
+       "version": 1,
+       "scenario": "bearish",
+       "direction": -1,
+       "child": {
+        "playbook": "fvg_limit",
+        "direction": -1,
+        "entry": 3930.786,
+        "stop": 3944.4220892857143,
+        "targets": [
+         3910.3318660714285
+        ],
+        "registered_ts": 1793710800.0,
+        "thesis_id": "thesis-1",
+        "thesis_version": 1,
+        "orphaned_ts": 1793718000.0,
+        "orphan_status": "invalidated"
+       },
+       "source": "replay-derived",
+       "record_ts": "2026-11-03 13:00:00+00:00"
+      },
+      {
+       "event": "thesis_maintained",
+       "ts": 1793712627.0,
+       "thesis_id": "thesis-1",
+       "scenario": "bearish",
+       "direction": -1,
+       "winner_p": 0.7568,
+       "version": 1,
+       "state": "intact",
+       "assessment": {
+        "scenarios": [
+         {
+          "name": "bearish",
+          "p": 0.7568,
+          "why": [
+           "regime direction is down",
+           "phase is distribution",
+           "candidate flow skews bearish (0 long vs 6 short evaluated)",
+           "qualified flow skews bearish (0 long vs 1 short qualified)"
+          ]
+         },
+         {
+          "name": "reversal",
+          "p": 0.088,
+          "why": [
+           "",
+           "ADR is exhausted \u2014 the day's range is spent"
+          ]
+         },
+         {
+          "name": "continuation",
+          "p": 0.0686,
+          "why": [
+           "structure clean_trend carries the direction"
+          ]
+         },
+         {
+          "name": "bullish",
+          "p": 0.0562,
+          "why": []
+         },
+         {
+          "name": "range",
+          "p": 0.0304,
+          "why": [
+           ""
+          ]
+         }
+        ],
+        "winner": "bearish",
+        "winner_p": 0.7568,
+        "margin": 0.6688,
+        "direction": -1,
+        "invalidation": [
+         {
+          "text": "regime direction turns up",
+          "trigger": "regime_direction_up"
+         },
+         {
+          "text": "structure breaks into reversal against shorts",
+          "trigger": "structure_reversal_against"
+         }
+        ],
+        "analytical_confidence": 0.9513,
+        "evidence_quality": 1.0,
+        "inputs": {
+         "regime": "down/clean_trend/normal/distribution/overlap",
+         "posture": "trend_day",
+         "day_type": "neutral",
+         "adr_pct": 119.3,
+         "adr_state": "extended",
+         "smt": null,
+         "flow": {
+          "evaluated_long": 0,
+          "evaluated_short": 6,
+          "qualified_long": 0,
+          "qualified_short": 1
+         }
+        }
+       },
+       "source": "replay-derived",
+       "record_ts": "2026-11-03 13:30:27+00:00"
+      },
+      {
+       "event": "thesis_invalidated",
+       "ts": 1793718000.0,
+       "thesis_id": "thesis-1",
+       "scenario": "bearish",
+       "direction": -1,
+       "version": 1,
+       "reason": "invalidation observed: price 3944.59 crossed the thesis invalidation price 3944.42 (plan: aligned candidate fvg_limit)",
+       "thesis": {
+        "id": "thesis-1",
+        "created_ts": 1793710800.0,
+        "updated_ts": 1793712627.0,
+        "scenario": "bearish",
+        "direction": -1,
+        "against_direction": 0,
+        "winner_p": 0.7568,
+        "invalidation": [
+         {
+          "text": "regime direction turns up",
+          "trigger": "regime_direction_up"
+         },
+         {
+          "text": "structure breaks into reversal against shorts",
+          "trigger": "structure_reversal_against"
+         }
+        ],
+        "plan": {
+         "direction": -1,
+         "entry_conditions": [
+          "shorts only while the regime direction stays down",
+          "enter on an entry-TF zone retest that rejects, or on displacement through the session low",
+          "no short into a fresh bullish displacement"
+         ],
+         "invalidation": [
+          "regime direction turns up",
+          "structure breaks into reversal against shorts"
+         ],
+         "entry": 3930.786,
+         "invalidation_price": 3944.4220892857143,
+         "target": 3910.3318660714285,
+         "execution_method": "per playbook intent",
+         "management_horizon": "standard_v1",
+         "playbook": "fvg_limit",
+         "basis": "aligned candidate fvg_limit"
+        },
+        "status": "invalidated",
+        "version": 1,
+        "state": "intact",
+        "supersedes": null,
+        "revisions": [],
+        "children": [
+         {
+          "playbook": "fvg_limit",
+          "direction": -1,
+          "entry": 3930.786,
+          "stop": 3944.4220892857143,
+          "targets": [
+           3910.3318660714285
+          ],
+          "registered_ts": 1793710800.0,
+          "thesis_id": "thesis-1",
+          "thesis_version": 1,
+          "orphaned_ts": 1793718000.0,
+          "orphan_status": "invalidated"
+         }
+        ],
+        "peak_p": 0.7568,
+        "standing_p": 0.7568,
+        "standing": {
+         "scenarios": {
+          "bearish": 0.7568,
+          "reversal": 0.088,
+          "continuation": 0.0686,
+          "bullish": 0.0562,
+          "range": 0.0304
+         },
+         "winner": "bearish",
+         "margin": 0.6688,
+         "regime": "down/clean_trend/normal/distribution/overlap"
+        },
+        "closed_ts": 1793718000.0,
+        "close_reason": "invalidation observed: price 3944.59 crossed the thesis invalidation price 3944.42 (plan: aligned candidate fvg_limit)"
+       },
+       "evidence": {
+        "scenarios_before": {
+         "bearish": 0.7568,
+         "reversal": 0.088,
+         "continuation": 0.0686,
+         "bullish": 0.0562,
+         "range": 0.0304
+        },
+        "scenarios_after": {
+         "bearish": 0.5337,
+         "reversal": 0.1687,
+         "continuation": 0.1315,
+         "bullish": 0.1078,
+         "range": 0.0584
+        },
+        "winner": "bearish",
+        "winner_p": 0.5337,
+        "margin": 0.365,
+        "inputs": {
+         "regime": "down/clean_trend/normal/distribution/overlap",
+         "posture": "trend_day",
+         "day_type": "neutral",
+         "adr_pct": 131.0,
+         "adr_state": "extended",
+         "smt": "smt_bearish",
+         "flow": {
+          "evaluated_long": 1,
+          "evaluated_short": 0,
+          "qualified_long": 0,
+          "qualified_short": 0
+         }
+        },
+        "triggers_fired": [
+         "price 3944.59 crossed the thesis invalidation price 3944.42 (plan: aligned candidate fvg_limit)"
+        ],
+        "price": 3944.595,
+        "invalidation_price": 3944.4220892857143
+       },
+       "source": "replay-derived",
+       "record_ts": "2026-11-03 15:00:00+00:00"
+      },
+      {
+       "event": "thesis_orphaned",
+       "ts": 1793718000.0,
+       "thesis_id": "thesis-1",
+       "version": 1,
+       "scenario": "bearish",
+       "direction": -1,
+       "close_status": "invalidated",
+       "reason": "invalidation observed: price 3944.59 crossed the thesis invalidation price 3944.42 (plan: aligned candidate fvg_limit)",
+       "children": [
+        {
+         "playbook": "fvg_limit",
+         "direction": -1,
+         "entry": 3930.786,
+         "stop": 3944.4220892857143,
+         "targets": [
+          3910.3318660714285
+         ],
+         "registered_ts": 1793710800.0,
+         "thesis_id": "thesis-1",
+         "thesis_version": 1,
+         "orphaned_ts": 1793718000.0,
+         "orphan_status": "invalidated"
+        }
+       ],
+       "count": 1,
+       "source": "replay-derived",
+       "record_ts": "2026-11-03 15:00:00+00:00"
+      },
+      {
+       "event": "thesis_created",
+       "ts": 1793718000.0,
+       "thesis_id": "thesis-2",
+       "scenario": "bearish",
+       "direction": -1,
+       "winner_p": 0.5337,
+       "version": 1,
+       "reason": "regime direction is down; phase is distribution",
+       "assessment": {
+        "scenarios": [
+         {
+          "name": "bearish",
+          "p": 0.5337,
+          "why": [
+           "regime direction is down",
+           "phase is distribution"
+          ]
+         },
+         {
+          "name": "reversal",
+          "p": 0.1687,
+          "why": [
+           "",
+           "ADR is exhausted \u2014 the day's range is spent"
+          ]
+         },
+         {
+          "name": "continuation",
+          "p": 0.1315,
+          "why": [
+           "structure clean_trend carries the direction"
+          ]
+         },
+         {
+          "name": "bullish",
+          "p": 0.1078,
+          "why": []
+         },
+         {
+          "name": "range",
+          "p": 0.0584,
+          "why": [
+           ""
+          ]
+         }
+        ],
+        "winner": "bearish",
+        "winner_p": 0.5337,
+        "margin": 0.365,
+        "direction": -1,
+        "invalidation": [
+         {
+          "text": "regime direction turns up",
+          "trigger": "regime_direction_up"
+         },
+         {
+          "text": "structure breaks into reversal against shorts",
+          "trigger": "structure_reversal_against"
+         }
+        ],
+        "analytical_confidence": 0.719,
+        "evidence_quality": 0.8333,
+        "inputs": {
+         "regime": "down/clean_trend/normal/distribution/overlap",
+         "posture": "trend_day",
+         "day_type": "neutral",
+         "adr_pct": 131.0,
+         "adr_state": "extended",
+         "smt": "smt_bearish",
+         "flow": {
+          "evaluated_long": 1,
+          "evaluated_short": 0,
+          "qualified_long": 0,
+          "qualified_short": 0
+         }
+        }
+       },
+       "thesis": {
+        "id": "thesis-2",
+        "created_ts": 1793718000.0,
+        "updated_ts": 1793721600.0,
+        "scenario": "bearish",
+        "direction": -1,
+        "against_direction": 0,
+        "winner_p": 0.5337,
+        "invalidation": [
+         {
+          "text": "regime direction turns up",
+          "trigger": "regime_direction_up"
+         },
+         {
+          "text": "structure breaks into reversal against shorts",
+          "trigger": "structure_reversal_against"
+         }
+        ],
+        "plan": {
+         "direction": -1,
+         "entry_conditions": [
+          "shorts only while the regime direction stays down",
+          "enter on an entry-TF zone retest that rejects, or on displacement through the session low",
+          "no short into a fresh bullish displacement"
+         ],
+         "invalidation": [
+          "regime direction turns up",
+          "structure breaks into reversal against shorts"
+         ],
+         "entry": null,
+         "invalidation_price": null,
+         "target": null,
+         "execution_method": "per playbook intent",
+         "management_horizon": "standard_v1",
+         "playbook": "",
+         "basis": "scenario only \u2014 no aligned candidate this cycle"
+        },
+        "status": "active",
+        "version": 1,
+        "state": "intact",
+        "supersedes": null,
+        "revisions": [],
+        "children": [],
+        "peak_p": 0.5337,
+        "standing_p": 0.5337,
+        "standing": {
+         "scenarios": {
+          "bearish": 0.5337,
+          "reversal": 0.1687,
+          "continuation": 0.1315,
+          "bullish": 0.1078,
+          "range": 0.0584
+         },
+         "winner": "bearish",
+         "margin": 0.365,
+         "regime": "down/clean_trend/normal/distribution/overlap"
+        }
+       },
+       "source": "replay-derived",
+       "record_ts": "2026-11-03 15:00:00+00:00"
+      },
+      {
+       "event": "thesis_maintained",
+       "ts": 1793721600.0,
+       "thesis_id": "thesis-2",
+       "scenario": "bearish",
+       "direction": -1,
+       "winner_p": 0.5337,
+       "version": 1,
+       "state": "intact",
+       "assessment": {
+        "scenarios": [
+         {
+          "name": "bearish",
+          "p": 0.5337,
+          "why": [
+           "regime direction is down",
+           "phase is distribution"
+          ]
+         },
+         {
+          "name": "reversal",
+          "p": 0.1687,
+          "why": [
+           "",
+           "ADR is exhausted \u2014 the day's range is spent"
+          ]
+         },
+         {
+          "name": "continuation",
+          "p": 0.1315,
+          "why": [
+           "structure clean_trend carries the direction"
+          ]
+         },
+         {
+          "name": "bullish",
+          "p": 0.1078,
+          "why": []
+         },
+         {
+          "name": "range",
+          "p": 0.0584,
+          "why": [
+           ""
+          ]
+         }
+        ],
+        "winner": "bearish",
+        "winner_p": 0.5337,
+        "margin": 0.365,
+        "direction": -1,
+        "invalidation": [
+         {
+          "text": "regime direction turns up",
+          "trigger": "regime_direction_up"
+         },
+         {
+          "text": "structure breaks into reversal against shorts",
+          "trigger": "structure_reversal_against"
+         }
+        ],
+        "analytical_confidence": 0.669,
+        "evidence_quality": 0.6667,
+        "inputs": {
+         "regime": "down/clean_trend/normal/distribution/overlap",
+         "posture": "trend_day",
+         "day_type": "neutral",
+         "adr_pct": 131.0,
+         "adr_state": "extended",
+         "smt": null,
+         "flow": {
+          "evaluated_long": 1,
+          "evaluated_short": 0,
+          "qualified_long": 0,
+          "qualified_short": 0
+         }
+        }
+       },
+       "source": "replay-derived",
+       "record_ts": "2026-11-03 16:00:00+00:00"
+      }
+     ],
+     "gates": [
+      {
+       "ts": "2026-11-04T00:00:00+00:00",
+       "playbook": "inversion",
+       "direction": 1,
+       "entry": 3927.025,
+       "note": "the window's long scan candidate reaches the thesis gate",
+       "verdict": {
+        "verdict": "independent",
+        "thesis_id": null
+       }
+      },
+      {
+       "ts": "2026-11-04T06:00:00+00:00",
+       "playbook": "order_block",
+       "direction": -1,
+       "entry": 3972.506,
+       "note": "the shadow-taken short reaches the thesis gate",
+       "verdict": {
+        "verdict": "child",
+        "thesis_id": "thesis-2",
+        "version": 1,
+        "state": "intact",
+        "registered": false,
+        "child": null
+       }
+      }
+     ],
+     "status": {
+      "active": true,
+      "id": "thesis-2",
+      "scenario": "bearish",
+      "direction": -1,
+      "winner_p": 0.5337,
+      "created_ts": 1793718000.0,
+      "updated_ts": 1793721600.0,
+      "status": "active",
+      "version": 1,
+      "state": "intact",
+      "plan": {
+       "direction": -1,
+       "entry_conditions": [
+        "shorts only while the regime direction stays down",
+        "enter on an entry-TF zone retest that rejects, or on displacement through the session low",
+        "no short into a fresh bullish displacement"
+       ],
+       "invalidation": [
+        "regime direction turns up",
+        "structure breaks into reversal against shorts"
+       ],
+       "entry": null,
+       "invalidation_price": null,
+       "target": null,
+       "execution_method": "per playbook intent",
+       "management_horizon": "standard_v1",
+       "playbook": "",
+       "basis": "scenario only \u2014 no aligned candidate this cycle"
+      },
+      "children_open": 0,
+      "closed_total": 1
+     },
+     "live_events": [
+      {
+       "ts": "2026-11-03 13:00:00+00:00",
+       "run_id": "d8047b160a42",
+       "event": "thesis_created",
+       "winner_p": 0.6536
+      },
+      {
+       "ts": "2026-11-03 13:30:27+00:00",
+       "run_id": "d8047b160a42",
+       "event": "thesis_maintained",
+       "winner_p": 0.7568
+      },
+      {
+       "ts": "2026-11-03 15:00:00+00:00",
+       "run_id": "3acd73f942ba",
+       "event": "thesis_created",
+       "winner_p": 0.5337
+      },
+      {
+       "ts": "2026-11-03 16:00:00+00:00",
+       "run_id": "501483beb2e0",
+       "event": "thesis_created",
+       "winner_p": 0.5337
+      }
+     ]
+    },
+    "handoff": {
+     "finals": {
+      "inversion:2026-11-03 23:00:00+00:00:1:3927.03": {
+       "playbook": "inversion",
+       "direction": 1,
+       "entry": 3927.025,
+       "invalidation": 3922.81,
+       "targets": [
+        3939.3454910714286
+       ],
+       "score": 60.0,
+       "stage": "expired",
+       "shadow": false,
+       "thesis_id": null,
+       "history": [
+        "candidate_detected",
+        "setup_armed",
+        "expired"
+       ],
+       "terminal": true
+      },
+      "order_block:2026-11-04 05:00:00+00:00:-1:3972.51": {
+       "playbook": "order_block",
+       "direction": -1,
+       "entry": 3972.506,
+       "invalidation": 3999.328,
+       "targets": [
+        3924.985866071428
+       ],
+       "score": 60.0,
+       "stage": "invalidated",
+       "shadow": false,
+       "thesis_id": null,
+       "history": [
+        "candidate_detected",
+        "setup_armed",
+        "invalidated"
+       ],
+       "terminal": true
+      }
+     },
+     "orders_placed": 0
+    },
+    "hot_scalp": {
+     "exhibits": [
+      {
+       "id": "A",
+       "setup_id": "hs-63dc10ef330c904b42036f37ed9d",
+       "journal_facts": "armed 2026-11-04 01:55Z, FVG 3942.517-3947.592, stop 3941.375078; live journal blocked it at 02:02:02Z, geometry.net_rr_below_min, legacy target 3947.646, net_rr 0.076383",
+       "hierarchy": [
+        3955.51,
+        3964.5
+       ],
+       "event": "candidate_shadow",
+       "reason_code": null,
+       "plan_kind": "standard",
+       "planned_objective": 3955.51,
+       "legs": [
+        {
+         "price": 3955.51,
+         "verdict": "selected",
+         "net_rr": 1.4562063250486021
+        },
+        {
+         "price": 3964.5,
+         "verdict": "viable",
+         "net_rr": 3.03176233205145
+        }
+       ],
+       "legacy": {
+        "target": 3947.646,
+        "net_rr": 0.07638275703179195,
+        "verdict": "blocked"
+       }
+      },
+      {
+       "id": "B",
+       "setup_id": "hs-ade06913864859add85e251814e6",
+       "journal_facts": "armed 2026-11-04 07:00Z, FVG 4020.418-4021.269, stop 4019.056827; live journal blocked it at 07:04:00Z, net_rr 0.096269, legacy target 4020.913 inside the zone; its one true objective 4022.522 still prices below the 1.20 floor",
+       "hierarchy": [
+        4022.522
+       ],
+       "event": "candidate_blocked",
+       "reason_code": "geometry.net_rr_below_min",
+       "plan_kind": "blocked",
+       "planned_objective": null,
+       "legs": [
+        {
+         "price": 4022.522,
+         "verdict": "rejected",
+         "net_rr": 1.1263856423421663
+        }
+       ],
+       "legacy": {
+        "target": 4020.913,
+        "net_rr": 0.09626893150725543,
+        "verdict": "blocked"
+       },
+       "headline_net_rr": 0.09626893150725543
+      }
+     ],
+     "census": {
+      "setup_armed|None": 291,
+      "setup_expired|setup.expired": 186,
+      "setup_touched|setup.level_touched": 98,
+      "candidate_blocked|costs.spread_too_wide": 8,
+      "candidate_blocked|geometry.net_rr_below_min": 87,
+      "setup_extended|setup.approach_extension": 43,
+      "scan_degraded|data.stale": 15,
+      "setup_invalidated|setup.invalidated_close": 10
+     },
+     "geometry_blocked_by_direction": {
+      "1": 78,
+      "-1": 9
+     },
+     "geometry_blocked_total": 121
+    },
+    "signals": {
+     "chains": [
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 3907.439,
+       "score": 42.79602931216659,
+       "ts": "2026-11-03T12:20:01.189768+00:00",
+       "live_decision": "accepted",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-11-03T12:20:01.189768+00:00",
+         "journal"
+        ],
+        [
+         "trigger_fired",
+         "2026-11-03T12:20:01.189768+00:00",
+         "journal"
+        ],
+        [
+         "filled",
+         "2026-11-03T12:21:22.801407+00:00",
+         "journal"
+        ],
+        [
+         "closed",
+         "2026-11-03T12:22:16.188264+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "filled",
+       "outcome": {
+        "exit": 3911.904,
+        "r_net": -1.000111994624179,
+        "pnl_money": -4.465,
+        "close_reason": "broker_closed"
+       }
+      },
+      {
+       "playbook": "sweep_reversal",
+       "direction": -1,
+       "entry": 3932.475,
+       "score": 66.0,
+       "ts": "2026-11-03T13:00:23.483410+00:00",
+       "live_decision": "below_floor",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-11-03T13:00:23.483410+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-11-03T13:00:23.483410+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "floor.total",
+        "category": 7
+       }
+      },
+      {
+       "playbook": "fvg_limit",
+       "direction": -1,
+       "entry": 3930.786,
+       "score": 60.0,
+       "ts": "2026-11-03T13:00:23.749037+00:00",
+       "live_decision": "below_floor",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-11-03T13:00:23.749037+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-11-03T13:00:23.749037+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "floor.total",
+        "category": 7
+       }
+      },
+      {
+       "playbook": "inversion",
+       "direction": -1,
+       "entry": 3906.904,
+       "score": 60.0,
+       "ts": "2026-11-03T13:00:23.983414+00:00",
+       "live_decision": "below_floor",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-11-03T13:00:23.983414+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-11-03T13:00:23.983414+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "floor.total",
+        "category": 7
+       }
+      },
+      {
+       "playbook": "sweep_reversal",
+       "direction": -1,
+       "entry": 3932.475,
+       "score": 66.0,
+       "ts": "2026-11-03T13:30:37.004951+00:00",
+       "live_decision": "below_floor",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-11-03T13:30:37.004951+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-11-03T13:30:37.004951+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "floor.total",
+        "category": 7
+       }
+      },
+      {
+       "playbook": "fvg_limit",
+       "direction": -1,
+       "entry": 3930.786,
+       "score": 60.0,
+       "ts": "2026-11-03T13:30:37.448957+00:00",
+       "live_decision": "below_floor",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-11-03T13:30:37.448957+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-11-03T13:30:37.448957+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "floor.total",
+        "category": 7
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": 1,
+       "entry": 3926.671,
+       "score": 30.5,
+       "ts": "2026-11-03T19:15:02.032688+00:00",
+       "live_decision": "accepted",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-11-03T19:15:02.032688+00:00",
+         "journal"
+        ],
+        [
+         "trigger_fired",
+         "2026-11-03T19:15:02.032688+00:00",
+         "journal"
+        ],
+        [
+         "execution_evaluated",
+         "2026-11-03T19:15:02.032688+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "accepted_unfilled"
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": 1,
+       "entry": 3926.671,
+       "score": 30.5,
+       "ts": "2026-11-03T19:20:02.388850+00:00",
+       "live_decision": "accepted",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-11-03T19:20:02.388850+00:00",
+         "journal"
+        ],
+        [
+         "trigger_fired",
+         "2026-11-03T19:20:02.388850+00:00",
+         "journal"
+        ],
+        [
+         "execution_evaluated",
+         "2026-11-03T19:20:02.388850+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "accepted_unfilled"
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 3938.698,
+       "score": 37.621595202819115,
+       "ts": "2026-11-03T23:40:01.738970+00:00",
+       "live_decision": "accepted",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-11-03T23:40:01.738970+00:00",
+         "journal"
+        ],
+        [
+         "trigger_fired",
+         "2026-11-03T23:40:01.738970+00:00",
+         "journal"
+        ],
+        [
+         "filled",
+         "2026-11-03T23:56:32.064242+00:00",
+         "journal"
+        ],
+        [
+         "closed",
+         "2026-11-04T00:34:48.512822+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "filled",
+       "outcome": {
+        "exit": 3922.911,
+        "r_net": 1.26092450758057,
+        "pnl_money": 15.787,
+        "close_reason": "broker_closed"
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 4047.09,
+       "score": 28.657300944946208,
+       "ts": "2026-11-04T11:00:02.363197+00:00",
+       "live_decision": "accepted",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-11-04T11:00:02.363197+00:00",
+         "journal"
+        ],
+        [
+         "trigger_fired",
+         "2026-11-04T11:00:02.363197+00:00",
+         "journal"
+        ],
+        [
+         "execution_evaluated",
+         "2026-11-04T11:00:02.363197+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "accepted_unfilled"
+      }
+     ],
+     "filled": 2,
+     "rejected": 5,
+     "accepted_unfilled": 3,
+     "filled_r_sum": 0.2608
+    }
+   },
+   "stage_table": [
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T12:20",
+     "stage": "candidate_detected",
+     "ts": "2026-11-03T12:20:01.189768+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T12:20",
+     "stage": "trigger_fired",
+     "ts": "2026-11-03T12:20:01.189768+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T12:20",
+     "stage": "filled",
+     "ts": "2026-11-03T12:21:22.801407+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T12:20",
+     "stage": "closed",
+     "ts": "2026-11-03T12:22:16.188264+00:00",
+     "source": "journal",
+     "detail": "journal chain completed: filled 2026-11-03T12:21:22.801407+00:00, closed 2026-11-03T12:22:16.188264+00:00 at 3911.904 (broker_closed), r_net -1.000111994624179"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "thesis thesis-1",
+     "stage": "thesis_created",
+     "ts": "2026-11-03 13:00:00+00:00",
+     "source": "replay-derived",
+     "detail": "regime direction is down; phase is distribution; qualified flow skews bearish (0 long vs 1 short qualified)"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "thesis thesis-1",
+     "stage": "thesis_child_registered",
+     "ts": "2026-11-03 13:00:00+00:00",
+     "source": "replay-derived",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "sweep_reversal @2026-11-03T13:00",
+     "stage": "candidate_detected",
+     "ts": "2026-11-03T13:00:23.483410+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "sweep_reversal @2026-11-03T13:00",
+     "stage": "rejected",
+     "ts": "2026-11-03T13:00:23.483410+00:00",
+     "source": "journal",
+     "detail": "live decision 'below_floor' \u2014 refusal re-classified by current funnel taxonomy as floor.total (category 7)"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "fvg_limit @2026-11-03T13:00",
+     "stage": "candidate_detected",
+     "ts": "2026-11-03T13:00:23.749037+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "fvg_limit @2026-11-03T13:00",
+     "stage": "rejected",
+     "ts": "2026-11-03T13:00:23.749037+00:00",
+     "source": "journal",
+     "detail": "live decision 'below_floor' \u2014 refusal re-classified by current funnel taxonomy as floor.total (category 7)"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "inversion @2026-11-03T13:00",
+     "stage": "candidate_detected",
+     "ts": "2026-11-03T13:00:23.983414+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "inversion @2026-11-03T13:00",
+     "stage": "rejected",
+     "ts": "2026-11-03T13:00:23.983414+00:00",
+     "source": "journal",
+     "detail": "live decision 'below_floor' \u2014 refusal re-classified by current funnel taxonomy as floor.total (category 7)"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "thesis thesis-1",
+     "stage": "thesis_maintained",
+     "ts": "2026-11-03 13:30:27+00:00",
+     "source": "replay-derived",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "sweep_reversal @2026-11-03T13:30",
+     "stage": "candidate_detected",
+     "ts": "2026-11-03T13:30:37.004951+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "sweep_reversal @2026-11-03T13:30",
+     "stage": "rejected",
+     "ts": "2026-11-03T13:30:37.004951+00:00",
+     "source": "journal",
+     "detail": "live decision 'below_floor' \u2014 refusal re-classified by current funnel taxonomy as floor.total (category 7)"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "fvg_limit @2026-11-03T13:30",
+     "stage": "candidate_detected",
+     "ts": "2026-11-03T13:30:37.448957+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "fvg_limit @2026-11-03T13:30",
+     "stage": "rejected",
+     "ts": "2026-11-03T13:30:37.448957+00:00",
+     "source": "journal",
+     "detail": "live decision 'below_floor' \u2014 refusal re-classified by current funnel taxonomy as floor.total (category 7)"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast D1 bar 2026-11-03T13:00:00+00:00",
+     "stage": "forecast_journaled",
+     "ts": "2026-11-03T14:13:36.378923+00:00",
+     "source": "journal",
+     "detail": "bar 2026-11-03T13:00:00+00:00 \u00b7 inputs through 2026-11-03T14:00:00+00:00 \u00b7 generated (as journaled) 2026-11-02 00:00:00+00:00 \u00b7 available 2026-11-03T14:13:36.378923+00:00 \u00b7 24h up-rank 39.6040"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast H1 bar 2026-11-03T13:00:00+00:00",
+     "stage": "forecast_journaled",
+     "ts": "2026-11-03T14:13:37.357049+00:00",
+     "source": "journal",
+     "detail": "bar 2026-11-03T13:00:00+00:00 \u00b7 inputs through 2026-11-03T14:00:00+00:00 \u00b7 generated (as journaled) 2026-11-03 13:00:00+00:00 \u00b7 available 2026-11-03T14:13:37.357049+00:00 \u00b7 24h up-rank 39.6040"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "thesis thesis-1",
+     "stage": "thesis_invalidated",
+     "ts": "2026-11-03 15:00:00+00:00",
+     "source": "replay-derived",
+     "detail": "invalidation observed: price 3944.59 crossed the thesis invalidation price 3944.42 (plan: aligned candidate fvg_limit)"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "thesis thesis-1",
+     "stage": "thesis_orphaned",
+     "ts": "2026-11-03 15:00:00+00:00",
+     "source": "replay-derived",
+     "detail": "invalidation observed: price 3944.59 crossed the thesis invalidation price 3944.42 (plan: aligned candidate fvg_limit)"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "thesis thesis-2",
+     "stage": "thesis_created",
+     "ts": "2026-11-03 15:00:00+00:00",
+     "source": "replay-derived",
+     "detail": "regime direction is down; phase is distribution"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast D1 bar 2026-11-03T14:00:00+00:00",
+     "stage": "forecast_journaled",
+     "ts": "2026-11-03T15:43:52.077208+00:00",
+     "source": "journal",
+     "detail": "bar 2026-11-03T14:00:00+00:00 \u00b7 inputs through 2026-11-03T15:00:00+00:00 \u00b7 generated (as journaled) 2026-11-02 00:00:00+00:00 \u00b7 available 2026-11-03T15:43:52.077208+00:00 \u00b7 24h up-rank 62.3762"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast H1 bar 2026-11-03T14:00:00+00:00",
+     "stage": "forecast_journaled",
+     "ts": "2026-11-03T15:43:53.268294+00:00",
+     "source": "journal",
+     "detail": "bar 2026-11-03T14:00:00+00:00 \u00b7 inputs through 2026-11-03T15:00:00+00:00 \u00b7 generated (as journaled) 2026-11-03 14:00:00+00:00 \u00b7 available 2026-11-03T15:43:53.268294+00:00 \u00b7 24h up-rank 62.3762"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "thesis thesis-2",
+     "stage": "thesis_maintained",
+     "ts": "2026-11-03 16:00:00+00:00",
+     "source": "replay-derived",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast D1 bar 2026-11-03T15:00:00+00:00",
+     "stage": "forecast_journaled",
+     "ts": "2026-11-03T16:20:06.927590+00:00",
+     "source": "journal",
+     "detail": "bar 2026-11-03T15:00:00+00:00 \u00b7 inputs through 2026-11-03T16:00:00+00:00 \u00b7 generated (as journaled) 2026-11-02 00:00:00+00:00 \u00b7 available 2026-11-03T16:20:06.927590+00:00 \u00b7 24h up-rank 78.2178"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast H1 bar 2026-11-03T15:00:00+00:00",
+     "stage": "forecast_journaled",
+     "ts": "2026-11-03T16:20:07.999348+00:00",
+     "source": "journal",
+     "detail": "bar 2026-11-03T15:00:00+00:00 \u00b7 inputs through 2026-11-03T16:00:00+00:00 \u00b7 generated (as journaled) 2026-11-03 15:00:00+00:00 \u00b7 available 2026-11-03T16:20:07.999348+00:00 \u00b7 24h up-rank 78.2178"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast D1 bar 2026-11-03T17:00:00+00:00",
+     "stage": "forecast_journaled",
+     "ts": "2026-11-03T18:51:56.817346+00:00",
+     "source": "journal",
+     "detail": "bar 2026-11-03T17:00:00+00:00 \u00b7 inputs through 2026-11-03T18:00:00+00:00 \u00b7 generated (as journaled) 2026-11-02 00:00:00+00:00 \u00b7 available 2026-11-03T18:51:56.817346+00:00 \u00b7 24h up-rank 85.1485"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast D1 bar 2026-11-03T17:00:00+00:00",
+     "stage": "availability_window",
+     "ts": "2026-11-03T18:51:56.817346+00:00",
+     "source": "replay-derived",
+     "detail": "NOT consumable at bar time (journaled in restart catch-up); operationally available from 2026-11-03T18:51:56.817346+00:00 \u2014 11.13h before the 2026-11-04 06:00Z scan"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast H1 bar 2026-11-03T17:00:00+00:00",
+     "stage": "forecast_journaled",
+     "ts": "2026-11-03T18:51:58.284263+00:00",
+     "source": "journal",
+     "detail": "bar 2026-11-03T17:00:00+00:00 \u00b7 inputs through 2026-11-03T18:00:00+00:00 \u00b7 generated (as journaled) 2026-11-03 17:00:00+00:00 \u00b7 available 2026-11-03T18:51:58.284263+00:00 \u00b7 24h up-rank 85.1485"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T19:15",
+     "stage": "candidate_detected",
+     "ts": "2026-11-03T19:15:02.032688+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T19:15",
+     "stage": "trigger_fired",
+     "ts": "2026-11-03T19:15:02.032688+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T19:15",
+     "stage": "execution_evaluated",
+     "ts": "2026-11-03T19:15:02.032688+00:00",
+     "source": "journal",
+     "detail": "live decision 'accepted'; the journal carries no open (fill) record for this signal \u2014 evaluated, never filled, and no fill is claimed"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T19:20",
+     "stage": "candidate_detected",
+     "ts": "2026-11-03T19:20:02.388850+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T19:20",
+     "stage": "trigger_fired",
+     "ts": "2026-11-03T19:20:02.388850+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T19:20",
+     "stage": "execution_evaluated",
+     "ts": "2026-11-03T19:20:02.388850+00:00",
+     "source": "journal",
+     "detail": "live decision 'accepted'; the journal carries no open (fill) record for this signal \u2014 evaluated, never filled, and no fill is claimed"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T23:40",
+     "stage": "candidate_detected",
+     "ts": "2026-11-03T23:40:01.738970+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T23:40",
+     "stage": "trigger_fired",
+     "ts": "2026-11-03T23:40:01.738970+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T23:40",
+     "stage": "filled",
+     "ts": "2026-11-03T23:56:32.064242+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "gate inversion",
+     "stage": "gate_check",
+     "ts": "2026-11-04T00:00:00+00:00",
+     "source": "replay-derived",
+     "detail": "verdict=independent thesis_id=None \u2014 the window's long scan candidate reaches the thesis gate"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "inversion",
+     "stage": "candidate_detected",
+     "ts": "2026-11-04 00:00:00+00:00",
+     "source": "journal",
+     "detail": "live disposition was not_attempted / path.trigger_not_fired \u2014 the setup then vanished from the live chain"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "inversion:2026-11-03 23:00:00+00:00:1:3927.03",
+     "stage": "setup_armed",
+     "ts": "2026-11-04 00:00:00+00:00",
+     "source": "replay-derived",
+     "detail": "inversion dir 1 entry 3927.025 stop 3922.81 \u2014 store stage after step"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast D1 bar 2026-11-03T23:00:00+00:00",
+     "stage": "forecast_journaled",
+     "ts": "2026-11-04T00:00:42.130510+00:00",
+     "source": "journal",
+     "detail": "bar 2026-11-03T23:00:00+00:00 \u00b7 inputs through 2026-11-04T00:00:00+00:00 \u00b7 generated (as journaled) 2026-11-03 00:00:00+00:00 \u00b7 available 2026-11-04T00:00:42.130510+00:00 \u00b7 24h up-rank 72.2772"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "forecast H1 bar 2026-11-03T23:00:00+00:00",
+     "stage": "forecast_journaled",
+     "ts": "2026-11-04T00:00:43.171661+00:00",
+     "source": "journal",
+     "detail": "bar 2026-11-03T23:00:00+00:00 \u00b7 inputs through 2026-11-04T00:00:00+00:00 \u00b7 generated (as journaled) 2026-11-03 23:00:00+00:00 \u00b7 available 2026-11-04T00:00:43.171661+00:00 \u00b7 24h up-rank 72.2772"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-03T23:40",
+     "stage": "closed",
+     "ts": "2026-11-04T00:34:48.512822+00:00",
+     "source": "journal",
+     "detail": "journal chain completed: filled 2026-11-03T23:56:32.064242+00:00, closed 2026-11-04T00:34:48.512822+00:00 at 3922.911 (broker_closed), r_net 1.26092450758057"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "hs-63dc10ef330c904b42036f37ed9d",
+     "stage": "candidate_shadow",
+     "ts": "2026-11-04T01:58:40+00:00",
+     "source": "replay-derived",
+     "detail": "hierarchy [3955.51, 3964.5] \u00b7 plan standard \u00b7 legs [(3955.51, 'selected', 1.456), (3964.5, 'viable', 3.032)]"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "gate order_block",
+     "stage": "gate_check",
+     "ts": "2026-11-04T06:00:00+00:00",
+     "source": "replay-derived",
+     "detail": "verdict=child thesis_id=thesis-2 \u2014 the shadow-taken short reaches the thesis gate"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "order_block",
+     "stage": "candidate_detected",
+     "ts": "2026-11-04 06:00:00+00:00",
+     "source": "journal",
+     "detail": "live disposition was not_attempted / path.trigger_not_fired \u2014 the setup then vanished from the live chain"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "order_block:2026-11-04 05:00:00+00:00:-1:3972.51",
+     "stage": "setup_armed",
+     "ts": "2026-11-04 06:00:00+00:00",
+     "source": "replay-derived",
+     "detail": "order_block dir -1 entry 3972.506 stop 3999.328 \u2014 store stage after step"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "inversion:2026-11-03 23:00:00+00:00:1:3927.03",
+     "stage": "expired",
+     "ts": "2026-11-04T07:00:00+00:00",
+     "source": "replay-derived",
+     "detail": "inversion dir 1 entry 3927.025 stop 3922.81 \u2014 store stage after step"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "order_block:2026-11-04 05:00:00+00:00:-1:3972.51",
+     "stage": "invalidated",
+     "ts": "2026-11-04T07:00:00+00:00",
+     "source": "replay-derived",
+     "detail": "order_block dir -1 entry 3972.506 stop 3999.328 \u2014 store stage after step"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "hs-ade06913864859add85e251814e6",
+     "stage": "candidate_blocked",
+     "ts": "2026-11-04T07:04:20+00:00",
+     "source": "replay-derived",
+     "detail": "hierarchy [4022.522] \u00b7 plan blocked \u00b7 legs [(4022.522, 'rejected', 1.126)]"
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-04T11:00",
+     "stage": "candidate_detected",
+     "ts": "2026-11-04T11:00:02.363197+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-04T11:00",
+     "stage": "trigger_fired",
+     "ts": "2026-11-04T11:00:02.363197+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "centerpiece_missed_move",
+     "subject": "qm_m5 @2026-11-04T11:00",
+     "stage": "execution_evaluated",
+     "ts": "2026-11-04T11:00:02.363197+00:00",
+     "source": "journal",
+     "detail": "live decision 'accepted'; the journal carries no open (fill) record for this signal \u2014 evaluated, never filled, and no fill is claimed"
+    }
+   ],
+   "verdicts": {
+    "WS1 thesis revision": {
+     "verdict": "DEMONSTRATED",
+     "evidence": "replay keeper events: ['thesis_created', 'thesis_child_registered', 'thesis_maintained', 'thesis_invalidated', 'thesis_orphaned', 'thesis_created', 'thesis_maintained']; live journal events: ['thesis_created', 'thesis_maintained', 'thesis_created', 'thesis_created'] (three runs, no revision event of any kind in 16,509 records); invalidation at 2026-11-03 15:00:00+00:00: invalidation observed: price 3944.59 crossed the thesis invalidation price 3944.42 (plan: aligned candidate fvg_limit); orphan cut journaled: thesis_orphaned"
+    },
+    "WS2 Hot Scalp targets": {
+     "verdict": "DEMONSTRATED",
+     "evidence": "window geometry blocks by direction: {'1': 78, '-1': 9} (of 121 across Nov 3-4); Exhibit A (hs-63dc10ef): live-blocked at net_rr 0.0764 against a spent micro-swing \u2014 current engine emits candidate_shadow, plan standard, legs [{'price': 3955.51, 'verdict': 'selected', 'net_rr': 1.4562063250486021}, {'price': 3964.5, 'verdict': 'viable', 'net_rr': 3.03176233205145}]; Exhibit B (hs-ade06913): current engine still blocks it (candidate_blocked), its one true objective pricing 1.1263856423421663 < 1.20 \u2014 the floor was not lowered and no target was invented"
+    },
+    "WS3 H1 handoff": {
+     "verdict": "DEMONSTRATED",
+     "evidence": "both journal scan candidates (live disposition: observed / not_attempted, then silence) are preserved as tracked instances and end in named terminals: {'inversion:2026-11-03 23:00:00+00:00:1:3927.03': 'expired', 'order_block:2026-11-04 05:00:00+00:00:-1:3972.51': 'invalidated'}; orders placed by the scan path: 0 (registration is not authority \u2014 routing still requires a trigger fire)"
+    },
+    "Timestamp law / forecast availability": {
+     "verdict": "DEMONSTRATED",
+     "evidence": "the 17:00Z bar's forecast exists in four timestamps (bar 2026-11-03T17:00:00+00:00, cutoff 2026-11-03T18:00:00+00:00, generated as journaled 2026-11-02 00:00:00+00:00, available 2026-11-03T18:51:56.817346+00:00); not consumable at bar time (visible then: False), consumable from availability (visible at 18:52Z: True), held for 11.13h before the 06:00Z scan; as-of-bar it called the rally (12h run_up 95.35pts)"
+    },
+    "Signal chains (centerpiece)": {
+     "verdict": "ACCOUNTED",
+     "evidence": "10 journaled signals: 2 completed chains (sum r_net 0.2608), 3 accepted but never filled in the journal, 5 refused at the gate with reasons the current funnel taxonomy classifies \u2014 no chain ends unnamed"
+    }
+   },
+   "residuals": [
+    "Assessment-stream discontinuity: the live journal's judgment assessments stop at 16:00Z on Nov 3 (restarts re-created the thesis per run; Nov 4 runs journaled no thesis records at all). WS1's revision machinery can only revise on assessments it receives \u2014 in replay, thesis-1 is invalidated at 15:00Z and the same update creates its scenario-only successor (maintained at 16:00Z), which is still the active thesis at the 06:00Z scan; the gate therefore adopts the thesis-aligned order_block short as a child (verdict: child), and what ends that setup is WS3's close-rule invalidation before any trigger fire \u2014 not the gate. The fix this points at is keeper persistence / assessment continuity across restarts, which is outside WS1's shipped scope.",
+    "The handoff leg's instances carry thesis_id null: that leg runs the sweep path without judgment cycles, so no keeper adoption resolves there. Thesis-link stamping on scan instances is pinned by WS3's own suite (test_scan_instance_stamped_with_parent_thesis) and the keeper-side adoption is demonstrated in this replay's thesis leg (thesis_child_registered at 13:00Z, cut by thesis_orphaned at 15:00Z).",
+    "Weakening is not exercised by this episode's tape: at the 15:00Z cycle the price fact (3944.595 at/above the thesis's own invalidation price 3944.42) closes the thesis structurally in the same update that carries the erosion (winner_p peak 0.7568 -> 0.5337), and invalidation is checked before revision. The weakening path itself is pinned by WS1's own suite; no recorded assessment in this journal erodes a surviving thesis without also breaking it.",
+    "Routing still needs a trigger fire the journal does not evidence: the 00:00Z inversion long was preserved and its target (3939.345) was crossed by the 02:00Z tape mark (3947.047) while it sat armed, but the window's trigger records are __trigger__ evaluations (25, mostly not_eligible / path.invalidated) and none binds this instance \u2014 so under current code it ends expired, unfilled. Preservation and a named end are demonstrated; capture of that long is not claimed.",
+    "The forecast was operationally available for ~11.1h before the 06:00Z scan and the system's posture never moved: E3 keeps forecasts journal-only until live calibration earns weight (top-band lift >= 1.25, >= 20 resolutions), so this is doctrine operating as designed, recorded here as the standing tension the owner's calibration program has to resolve \u2014 not a WS1-WS3 defect.",
+    "Hot Scalp repricing is exhibit-deep, not census-deep: the journal's blocked-candidate records carry risk / reward / net_rr but not the M5 structure the current planner prices from, so the other geometry-blocked setups of the window cannot be re-priced without inventing bars. The two exhibits are the episode's journal-exact representatives (one each way); the census (87 blocks in-window, 78 of them longs) is reported as journal fact."
+   ]
+  },
+  {
+   "name": "trend_oct29",
+   "title": "Trend handled \u2014 Thu Oct 29, 2026 (one-way short day)",
+   "window": {
+    "start": "2026-10-29T00:00:00+00:00",
+    "end": "2026-10-29T23:59:59+00:00"
+   },
+   "justification": [
+    "Four qm_m5 short signals accepted (05:15, 09:10, 13:40, 22:55Z) and all four closed positive: +0.5336R, +1.0526R, +0.7982R, +1.4843R (sum +3.8687R).",
+    "Entries step down through the day (4044.594 -> 4035.206 -> 4034.112 -> 4025.566) and exits step down with them \u2014 a one-way trend the engine rode repeatedly.",
+    "Signal contexts read down/clean_trend (e.g. 05:15Z signal regime 'down/clean_trend/normal/distribution/asia', posture trend_day); the two counter-trend/long signals of the day were gated."
+   ],
+   "legs": {
+    "signals": {
+     "chains": [
+      {
+       "playbook": "qm_m5",
+       "direction": 1,
+       "entry": 4050.38,
+       "score": 41.838350903367754,
+       "ts": "2026-10-29T00:05:02.834787+00:00",
+       "live_decision": "gated",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-29T00:05:02.834787+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-29T00:05:02.834787+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "direction.flip",
+        "category": 5
+       }
+      },
+      {
+       "playbook": "range_sweep_reclaim",
+       "direction": -1,
+       "entry": 4051.649,
+       "score": 75.0,
+       "ts": "2026-10-29T01:30:14.191500+00:00",
+       "live_decision": "below_floor",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-29T01:30:14.191500+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-29T01:30:14.191500+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "floor.total",
+        "category": 7
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 4044.594,
+       "score": 40.97243340309876,
+       "ts": "2026-10-29T05:15:59.362399+00:00",
+       "live_decision": "accepted",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-29T05:15:59.362399+00:00",
+         "journal"
+        ],
+        [
+         "trigger_fired",
+         "2026-10-29T05:15:59.362399+00:00",
+         "journal"
+        ],
+        [
+         "filled",
+         "2026-10-29T05:17:18.728961+00:00",
+         "journal"
+        ],
+        [
+         "closed",
+         "2026-10-29T05:30:41.966160+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "filled",
+       "outcome": {
+        "exit": 4040.7309999999998,
+        "r_net": 0.5336135490205344,
+        "pnl_money": 3.8630000000002838,
+        "close_reason": "broker_closed"
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 4035.206,
+       "score": 27.724122769569036,
+       "ts": "2026-10-29T09:10:03.962631+00:00",
+       "live_decision": "accepted",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-29T09:10:03.962631+00:00",
+         "journal"
+        ],
+        [
+         "trigger_fired",
+         "2026-10-29T09:10:03.962631+00:00",
+         "journal"
+        ],
+        [
+         "filled",
+         "2026-10-29T09:11:04.795622+00:00",
+         "journal"
+        ],
+        [
+         "closed",
+         "2026-10-29T09:55:19.254031+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "filled",
+       "outcome": {
+        "exit": 4029.225,
+        "r_net": 1.0526421652745175,
+        "pnl_money": 5.981000000000222,
+        "close_reason": "stop"
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 4037.851,
+       "score": 43.871811574676514,
+       "ts": "2026-10-29T11:10:04.381574+00:00",
+       "live_decision": "gated",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-29T11:10:04.381574+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-29T11:10:04.381574+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "direction.flip",
+        "category": 5
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": 1,
+       "entry": 4025.013,
+       "score": 45.77676843695475,
+       "ts": "2026-10-29T11:55:14.821790+00:00",
+       "live_decision": "gated",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-29T11:55:14.821790+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-29T11:55:14.821790+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "direction.flip",
+        "category": 5
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 4034.112,
+       "score": 29.21690483946749,
+       "ts": "2026-10-29T13:40:02.952748+00:00",
+       "live_decision": "accepted",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-29T13:40:02.952748+00:00",
+         "journal"
+        ],
+        [
+         "trigger_fired",
+         "2026-10-29T13:40:02.952748+00:00",
+         "journal"
+        ],
+        [
+         "filled",
+         "2026-10-29T13:40:44.437524+00:00",
+         "journal"
+        ],
+        [
+         "closed",
+         "2026-10-29T13:42:58.297519+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "filled",
+       "outcome": {
+        "exit": 4028.26,
+        "r_net": 0.7981801088232727,
+        "pnl_money": 5.851999999999862,
+        "close_reason": "broker_closed"
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 4025.585,
+       "score": 47.72262807844502,
+       "ts": "2026-10-29T20:05:01.965282+00:00",
+       "live_decision": "gated",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-29T20:05:01.965282+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-29T20:05:01.965282+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "direction.flip",
+        "category": 5
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 4032.47,
+       "score": 46.456477742921834,
+       "ts": "2026-10-29T20:10:01.955913+00:00",
+       "live_decision": "gated",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-29T20:10:01.955913+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-29T20:10:01.955913+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "direction.flip",
+        "category": 5
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 4025.566,
+       "score": 21.52957886907693,
+       "ts": "2026-10-29T22:55:02.120429+00:00",
+       "live_decision": "accepted",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-29T22:55:02.120429+00:00",
+         "journal"
+        ],
+        [
+         "trigger_fired",
+         "2026-10-29T22:55:02.120429+00:00",
+         "journal"
+        ],
+        [
+         "filled",
+         "2026-10-29T22:55:50.078510+00:00",
+         "journal"
+        ],
+        [
+         "closed",
+         "2026-10-29T23:03:06.892366+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "filled",
+       "outcome": {
+        "exit": 4018.718,
+        "r_net": 1.4843164576559502,
+        "pnl_money": 6.847999999999956,
+        "close_reason": "broker_closed"
+       }
+      }
+     ],
+     "filled": 4,
+     "rejected": 6,
+     "accepted_unfilled": 0,
+     "filled_r_sum": 3.8688
+    },
+    "detection": {
+     "eval_total": 719,
+     "eval_census": {
+      "no_setup": 704,
+      "candidate_emitted": 15
+     },
+     "hot_scalp_census": {
+      "setup_armed|None": 89,
+      "setup_touched|setup.level_touched": 32,
+      "candidate_blocked|geometry.net_rr_below_min": 23,
+      "setup_expired|setup.expired": 51,
+      "setup_invalidated|setup.invalidated_close": 4,
+      "scan_degraded|data.stale": 16
+     },
+     "hot_scalp_armed_by_direction": {
+      "-1": 78,
+      "1": 11
+     }
+    }
+   },
+   "stage_table": [
+    {
+     "episode": "trend_oct29",
+     "subject": "roster scans",
+     "stage": "detection_census",
+     "ts": "2026-10-29T00:00:00+00:00",
+     "source": "journal",
+     "detail": "719 playbook evaluations in window; outcomes {'no_setup': 704, 'candidate_emitted': 15}"
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T00:05",
+     "stage": "candidate_detected",
+     "ts": "2026-10-29T00:05:02.834787+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T00:05",
+     "stage": "rejected",
+     "ts": "2026-10-29T00:05:02.834787+00:00",
+     "source": "journal",
+     "detail": "live decision 'gated' \u2014 refusal re-classified by current funnel taxonomy as direction.flip (category 5)"
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "range_sweep_reclaim @2026-10-29T01:30",
+     "stage": "candidate_detected",
+     "ts": "2026-10-29T01:30:14.191500+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "range_sweep_reclaim @2026-10-29T01:30",
+     "stage": "rejected",
+     "ts": "2026-10-29T01:30:14.191500+00:00",
+     "source": "journal",
+     "detail": "live decision 'below_floor' \u2014 refusal re-classified by current funnel taxonomy as floor.total (category 7)"
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T05:15",
+     "stage": "candidate_detected",
+     "ts": "2026-10-29T05:15:59.362399+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T05:15",
+     "stage": "trigger_fired",
+     "ts": "2026-10-29T05:15:59.362399+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T05:15",
+     "stage": "filled",
+     "ts": "2026-10-29T05:17:18.728961+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T05:15",
+     "stage": "closed",
+     "ts": "2026-10-29T05:30:41.966160+00:00",
+     "source": "journal",
+     "detail": "journal chain completed: filled 2026-10-29T05:17:18.728961+00:00, closed 2026-10-29T05:30:41.966160+00:00 at 4040.7309999999998 (broker_closed), r_net 0.5336135490205344"
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T09:10",
+     "stage": "candidate_detected",
+     "ts": "2026-10-29T09:10:03.962631+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T09:10",
+     "stage": "trigger_fired",
+     "ts": "2026-10-29T09:10:03.962631+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T09:10",
+     "stage": "filled",
+     "ts": "2026-10-29T09:11:04.795622+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T09:10",
+     "stage": "closed",
+     "ts": "2026-10-29T09:55:19.254031+00:00",
+     "source": "journal",
+     "detail": "journal chain completed: filled 2026-10-29T09:11:04.795622+00:00, closed 2026-10-29T09:55:19.254031+00:00 at 4029.225 (stop), r_net 1.0526421652745175"
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T11:10",
+     "stage": "candidate_detected",
+     "ts": "2026-10-29T11:10:04.381574+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T11:10",
+     "stage": "rejected",
+     "ts": "2026-10-29T11:10:04.381574+00:00",
+     "source": "journal",
+     "detail": "live decision 'gated' \u2014 refusal re-classified by current funnel taxonomy as direction.flip (category 5)"
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T11:55",
+     "stage": "candidate_detected",
+     "ts": "2026-10-29T11:55:14.821790+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T11:55",
+     "stage": "rejected",
+     "ts": "2026-10-29T11:55:14.821790+00:00",
+     "source": "journal",
+     "detail": "live decision 'gated' \u2014 refusal re-classified by current funnel taxonomy as direction.flip (category 5)"
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T13:40",
+     "stage": "candidate_detected",
+     "ts": "2026-10-29T13:40:02.952748+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T13:40",
+     "stage": "trigger_fired",
+     "ts": "2026-10-29T13:40:02.952748+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T13:40",
+     "stage": "filled",
+     "ts": "2026-10-29T13:40:44.437524+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T13:40",
+     "stage": "closed",
+     "ts": "2026-10-29T13:42:58.297519+00:00",
+     "source": "journal",
+     "detail": "journal chain completed: filled 2026-10-29T13:40:44.437524+00:00, closed 2026-10-29T13:42:58.297519+00:00 at 4028.26 (broker_closed), r_net 0.7981801088232727"
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T20:05",
+     "stage": "candidate_detected",
+     "ts": "2026-10-29T20:05:01.965282+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T20:05",
+     "stage": "rejected",
+     "ts": "2026-10-29T20:05:01.965282+00:00",
+     "source": "journal",
+     "detail": "live decision 'gated' \u2014 refusal re-classified by current funnel taxonomy as direction.flip (category 5)"
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T20:10",
+     "stage": "candidate_detected",
+     "ts": "2026-10-29T20:10:01.955913+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T20:10",
+     "stage": "rejected",
+     "ts": "2026-10-29T20:10:01.955913+00:00",
+     "source": "journal",
+     "detail": "live decision 'gated' \u2014 refusal re-classified by current funnel taxonomy as direction.flip (category 5)"
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T22:55",
+     "stage": "candidate_detected",
+     "ts": "2026-10-29T22:55:02.120429+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T22:55",
+     "stage": "trigger_fired",
+     "ts": "2026-10-29T22:55:02.120429+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T22:55",
+     "stage": "filled",
+     "ts": "2026-10-29T22:55:50.078510+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "trend_oct29",
+     "subject": "qm_m5 @2026-10-29T22:55",
+     "stage": "closed",
+     "ts": "2026-10-29T23:03:06.892366+00:00",
+     "source": "journal",
+     "detail": "journal chain completed: filled 2026-10-29T22:55:50.078510+00:00, closed 2026-10-29T23:03:06.892366+00:00 at 4018.718 (broker_closed), r_net 1.4843164576559502"
+    }
+   ],
+   "verdicts": {
+    "Signal chains (trend_oct29)": {
+     "verdict": "ACCOUNTED",
+     "evidence": "10 journaled signals: 4 completed chains (sum r_net 3.8688), 0 accepted but never filled in the journal, 6 refused at the gate with reasons the current funnel taxonomy classifies \u2014 no chain ends unnamed"
+    }
+   },
+   "residuals": [
+    "No thesis or forecast records exist for Oct 29 (the Judgment Core went live on EC2 on Nov 3): the thesis and forecast stages are absent from this window's table by evidence, not by omission. WS1/WS2/WS3 verdicts rest on the centerpiece; this episode grades regime behavior of the chain that did exist."
+   ]
+  },
+  {
+   "name": "range_oct28",
+   "title": "Range / chop \u2014 Wed Oct 28, 2026 (two-sided rotation, no follow-through)",
+   "window": {
+    "start": "2026-10-28T00:00:00+00:00",
+    "end": "2026-10-28T23:59:59+00:00"
+   },
+   "justification": [
+    "Signal entries oscillate inside a ~42pt band all day (4033.147 to 4074.928) in BOTH directions; five of six signals were gated, the one accepted long closed +0.5021R.",
+    "Hot Scalp armed 101 setups split 64 long / 37 short; 57 expired untouched, 35 were geometry-blocked, 8 invalidated \u2014 and the sleeve filled nothing.",
+    "The H1 roster scans emitted 24 candidates across the day (inversion 10, fvg_limit 4, retracement_trap 2, others) and the M5/trigger routes 6 more \u2014 every emitted candidate was refused downstream (a journal sample refusal: gate.data, touch 11 bars stale) and none became a fill; the day's only fill was the accepted qm_m5 long."
+   ],
+   "legs": {
+    "signals": {
+     "chains": [
+      {
+       "playbook": "qm_m5",
+       "direction": 1,
+       "entry": 4058.57,
+       "score": 45.787666473751884,
+       "ts": "2026-10-28T01:05:02.552695+00:00",
+       "live_decision": "gated",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-28T01:05:02.552695+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-28T01:05:02.552695+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "direction.flip",
+        "category": 5
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": -1,
+       "entry": 4056.022,
+       "score": 47.79798028194476,
+       "ts": "2026-10-28T12:20:01.850649+00:00",
+       "live_decision": "gated",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-28T12:20:01.850649+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-28T12:20:01.850649+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "direction.flip",
+        "category": 5
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": 1,
+       "entry": 4044.105,
+       "score": 34.95680511417528,
+       "ts": "2026-10-28T14:25:02.233097+00:00",
+       "live_decision": "gated",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-28T14:25:02.233097+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-28T14:25:02.233097+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "direction.flip",
+        "category": 5
+       }
+      },
+      {
+       "playbook": "qm_m5",
+       "direction": 1,
+       "entry": 4040.511,
+       "score": 26.970408962060883,
+       "ts": "2026-10-28T17:20:01.914577+00:00",
+       "live_decision": "accepted",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-28T17:20:01.914577+00:00",
+         "journal"
+        ],
+        [
+         "trigger_fired",
+         "2026-10-28T17:20:01.914577+00:00",
+         "journal"
+        ],
+        [
+         "filled",
+         "2026-10-28T17:20:02.321961+00:00",
+         "journal"
+        ],
+        [
+         "closed",
+         "2026-10-28T18:00:27.855087+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "filled",
+       "outcome": {
+        "exit": 4042.8900000000003,
+        "r_net": 0.5021131892154809,
+        "pnl_money": 2.5840000000002874,
+        "close_reason": "broker_closed"
+       }
+      },
+      {
+       "playbook": "range_mean_reversion",
+       "direction": -1,
+       "entry": 4033.147,
+       "score": 68.0,
+       "ts": "2026-10-28T20:00:34.990420+00:00",
+       "live_decision": "gated",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-28T20:00:34.990420+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-28T20:00:34.990420+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "direction.flip",
+        "category": 5
+       }
+      },
+      {
+       "playbook": "range_compression_breakout",
+       "direction": 1,
+       "entry": 4074.928,
+       "score": 64.0,
+       "ts": "2026-10-28T20:00:35.271790+00:00",
+       "live_decision": "gated",
+       "stages": [
+        [
+         "candidate_detected",
+         "2026-10-28T20:00:35.271790+00:00",
+         "journal"
+        ],
+        [
+         "rejected",
+         "2026-10-28T20:00:35.271790+00:00",
+         "journal"
+        ]
+       ],
+       "terminal": "rejected",
+       "taxonomy": {
+        "code": "gate.location",
+        "category": 3
+       }
+      }
+     ],
+     "filled": 1,
+     "rejected": 5,
+     "accepted_unfilled": 0,
+     "filled_r_sum": 0.5021
+    },
+    "detection": {
+     "eval_total": 720,
+     "eval_census": {
+      "no_setup": 690,
+      "candidate_emitted": 30
+     },
+     "hot_scalp_census": {
+      "scan_degraded|data.stale": 17,
+      "setup_armed|None": 101,
+      "setup_touched|setup.level_touched": 43,
+      "candidate_shadow|None": 1,
+      "candidate_blocked|geometry.net_rr_below_min": 35,
+      "setup_expired|setup.expired": 57,
+      "setup_invalidated|setup.invalidated_close": 8
+     },
+     "hot_scalp_armed_by_direction": {
+      "1": 64,
+      "-1": 37
+     }
+    }
+   },
+   "stage_table": [
+    {
+     "episode": "range_oct28",
+     "subject": "roster scans",
+     "stage": "detection_census",
+     "ts": "2026-10-28T00:00:00+00:00",
+     "source": "journal",
+     "detail": "720 playbook evaluations in window; outcomes {'no_setup': 690, 'candidate_emitted': 30}"
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "qm_m5 @2026-10-28T01:05",
+     "stage": "candidate_detected",
+     "ts": "2026-10-28T01:05:02.552695+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "qm_m5 @2026-10-28T01:05",
+     "stage": "rejected",
+     "ts": "2026-10-28T01:05:02.552695+00:00",
+     "source": "journal",
+     "detail": "live decision 'gated' \u2014 refusal re-classified by current funnel taxonomy as direction.flip (category 5)"
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "qm_m5 @2026-10-28T12:20",
+     "stage": "candidate_detected",
+     "ts": "2026-10-28T12:20:01.850649+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "qm_m5 @2026-10-28T12:20",
+     "stage": "rejected",
+     "ts": "2026-10-28T12:20:01.850649+00:00",
+     "source": "journal",
+     "detail": "live decision 'gated' \u2014 refusal re-classified by current funnel taxonomy as direction.flip (category 5)"
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "qm_m5 @2026-10-28T14:25",
+     "stage": "candidate_detected",
+     "ts": "2026-10-28T14:25:02.233097+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "qm_m5 @2026-10-28T14:25",
+     "stage": "rejected",
+     "ts": "2026-10-28T14:25:02.233097+00:00",
+     "source": "journal",
+     "detail": "live decision 'gated' \u2014 refusal re-classified by current funnel taxonomy as direction.flip (category 5)"
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "qm_m5 @2026-10-28T17:20",
+     "stage": "candidate_detected",
+     "ts": "2026-10-28T17:20:01.914577+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "qm_m5 @2026-10-28T17:20",
+     "stage": "trigger_fired",
+     "ts": "2026-10-28T17:20:01.914577+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "qm_m5 @2026-10-28T17:20",
+     "stage": "filled",
+     "ts": "2026-10-28T17:20:02.321961+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "qm_m5 @2026-10-28T17:20",
+     "stage": "closed",
+     "ts": "2026-10-28T18:00:27.855087+00:00",
+     "source": "journal",
+     "detail": "journal chain completed: filled 2026-10-28T17:20:02.321961+00:00, closed 2026-10-28T18:00:27.855087+00:00 at 4042.8900000000003 (broker_closed), r_net 0.5021131892154809"
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "range_mean_reversion @2026-10-28T20:00",
+     "stage": "candidate_detected",
+     "ts": "2026-10-28T20:00:34.990420+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "range_mean_reversion @2026-10-28T20:00",
+     "stage": "rejected",
+     "ts": "2026-10-28T20:00:34.990420+00:00",
+     "source": "journal",
+     "detail": "live decision 'gated' \u2014 refusal re-classified by current funnel taxonomy as direction.flip (category 5)"
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "range_compression_breakout @2026-10-28T20:00",
+     "stage": "candidate_detected",
+     "ts": "2026-10-28T20:00:35.271790+00:00",
+     "source": "journal",
+     "detail": ""
+    },
+    {
+     "episode": "range_oct28",
+     "subject": "range_compression_breakout @2026-10-28T20:00",
+     "stage": "rejected",
+     "ts": "2026-10-28T20:00:35.271790+00:00",
+     "source": "journal",
+     "detail": "live decision 'gated' \u2014 refusal re-classified by current funnel taxonomy as gate.location (category 3)"
+    }
+   ],
+   "verdicts": {
+    "Signal chains (range_oct28)": {
+     "verdict": "ACCOUNTED",
+     "evidence": "6 journaled signals: 1 completed chains (sum r_net 0.5021), 0 accepted but never filled in the journal, 5 refused at the gate with reasons the current funnel taxonomy classifies \u2014 no chain ends unnamed"
+    }
+   },
+   "residuals": [
+    "Range-day selectivity is graded on the journal's own decisions (5 of 6 signals gated, the sleeve's 101 armed setups filling nothing): the replay confirms every chain ends named under the current taxonomy, but does not re-derive the weighed judgments \u2014 the confluence engine's inputs (frames) are not in the journal, and re-scoring from journal facts alone would be a parallel decision path, which this program does not build."
+   ]
+  }
+ ]
+}

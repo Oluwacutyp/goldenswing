@@ -1,0 +1,218 @@
+{
+ "name": "trend_oct29",
+ "title": "Trend handled \u2014 Thu Oct 29, 2026 (one-way short day)",
+ "window": {
+  "start": "2026-10-29T00:00:00+00:00",
+  "end": "2026-10-29T23:59:59+00:00"
+ },
+ "justification": [
+  "Four qm_m5 short signals accepted (05:15, 09:10, 13:40, 22:55Z) and all four closed positive: +0.5336R, +1.0526R, +0.7982R, +1.4843R (sum +3.8687R).",
+  "Entries step down through the day (4044.594 -> 4035.206 -> 4034.112 -> 4025.566) and exits step down with them \u2014 a one-way trend the engine rode repeatedly.",
+  "Signal contexts read down/clean_trend (e.g. 05:15Z signal regime 'down/clean_trend/normal/distribution/asia', posture trend_day); the two counter-trend/long signals of the day were gated."
+ ],
+ "eval_census": {
+  "no_setup": 704,
+  "candidate_emitted": 15
+ },
+ "eval_total": 719,
+ "hot_scalp_census": {
+  "setup_armed|None": 89,
+  "setup_touched|setup.level_touched": 32,
+  "candidate_blocked|geometry.net_rr_below_min": 23,
+  "setup_expired|setup.expired": 51,
+  "setup_invalidated|setup.invalidated_close": 4,
+  "scan_degraded|data.stale": 16
+ },
+ "hot_scalp_armed_by_direction": {
+  "-1": 78,
+  "1": 11
+ },
+ "signals": [
+  {
+   "ts": "2026-10-29T00:05:02.834787+00:00",
+   "playbook": "qm_m5",
+   "direction": 1,
+   "entry": 4050.38,
+   "stop": 4043.2763571428573,
+   "targets": [
+    4060.068
+   ],
+   "score": 41.838350903367754,
+   "decision": "gated",
+   "reason": "weighed judgment: the asymmetry evidence is flipped \u2014 structure funds the opposite side only; this candidate's own evidence contradicts it",
+   "regime": "flat/compression/normal/distribution/offhours"
+  },
+  {
+   "ts": "2026-10-29T01:30:14.191500+00:00",
+   "playbook": "range_sweep_reclaim",
+   "direction": -1,
+   "entry": 4051.649,
+   "stop": 4086.987508159866,
+   "targets": [
+    4029.9545
+   ],
+   "score": 75.0,
+   "decision": "below_floor",
+   "reason": "asymmetry_floor: total 55 < 50 or component minimum unmet (location 9.8 >= 12 required on ZONE_PATH)",
+   "regime": "flat/compression/normal/distribution/asia"
+  },
+  {
+   "ts": "2026-10-29T05:15:59.362399+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4044.594,
+   "stop": 4051.0931607142857,
+   "targets": [
+    4036.626
+   ],
+   "score": 40.97243340309876,
+   "decision": "accepted",
+   "reason": "weighed judgment: score 41 on M5 evidence (supporting: with structural D1 bias -1; contradictory: journey geometry: counter_journey: the nearer draw is behind the trade and no nested faster-TF zone holds price \u2014 counter-journey needs a nested zone + >= 3R room to the magnet (G)) \u2014 hard facts pass; handed to the shared sizing/management path with evidence attached",
+   "regime": "down/clean_trend/normal/distribution/asia"
+  },
+  {
+   "ts": "2026-10-29T09:10:03.962631+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4035.206,
+   "stop": 4039.3694464285713,
+   "targets": [
+    4022.484
+   ],
+   "score": 27.724122769569036,
+   "decision": "accepted",
+   "reason": "weighed judgment: score 28 on M5 evidence (supporting: with structural D1 bias -1; contradictory: journey geometry: counter_journey: the nearer draw is behind the trade and no nested faster-TF zone holds price \u2014 counter-journey needs a nested zone + >= 3R room to the magnet (G)) \u2014 hard facts pass; handed to the shared sizing/management path with evidence attached",
+   "regime": "down/clean_trend/normal/distribution/london"
+  },
+  {
+   "ts": "2026-10-29T11:10:04.381574+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4037.851,
+   "stop": 4047.411732142857,
+   "targets": [
+    4022.142
+   ],
+   "score": 43.871811574676514,
+   "decision": "gated",
+   "reason": "weighed judgment: the asymmetry evidence is flipped \u2014 structure funds the opposite side only; this candidate's own evidence contradicts it",
+   "regime": "down/clean_trend/normal/distribution/london"
+  },
+  {
+   "ts": "2026-10-29T11:55:14.821790+00:00",
+   "playbook": "qm_m5",
+   "direction": 1,
+   "entry": 4025.013,
+   "stop": 4021.962410714286,
+   "targets": [
+    4034.112
+   ],
+   "score": 45.77676843695475,
+   "decision": "gated",
+   "reason": "weighed judgment: the asymmetry evidence is flipped \u2014 structure funds the opposite side only; this candidate's own evidence contradicts it",
+   "regime": "down/clean_trend/normal/distribution/london"
+  },
+  {
+   "ts": "2026-10-29T13:40:02.952748+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4034.112,
+   "stop": 4039.613839285714,
+   "targets": [
+    4023.002
+   ],
+   "score": 29.21690483946749,
+   "decision": "accepted",
+   "reason": "weighed judgment: score 29 on M5 evidence (supporting: sweep_head: the head leg swept the prior swing \u2014 rejection evidence at the extreme; displacement_break: the neckline break displaced \u2014 acceptance by closes through the level; with structural D1 bias -1; contradictory: journey geometry: counter_journey: room to the magnet 0.6R < 3R minimum \u2014 refused (G)) \u2014 hard facts pass; handed to the shared sizing/management path with evidence attached",
+   "regime": "down/clean_trend/normal/distribution/overlap"
+  },
+  {
+   "ts": "2026-10-29T20:05:01.965282+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4025.585,
+   "stop": 4027.511839285714,
+   "targets": [
+    4010.002
+   ],
+   "score": 47.72262807844502,
+   "decision": "gated",
+   "reason": "weighed judgment: the asymmetry evidence is flipped \u2014 structure funds the opposite side only; this candidate's own evidence contradicts it",
+   "regime": "flat/compression/normal/distribution/ny"
+  },
+  {
+   "ts": "2026-10-29T20:10:01.955913+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4032.47,
+   "stop": 4040.1905535714286,
+   "targets": [
+    4017.292
+   ],
+   "score": 46.456477742921834,
+   "decision": "gated",
+   "reason": "weighed judgment: the asymmetry evidence is flipped \u2014 structure funds the opposite side only; this candidate's own evidence contradicts it",
+   "regime": "flat/compression/normal/distribution/ny"
+  },
+  {
+   "ts": "2026-10-29T22:55:02.120429+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4025.566,
+   "stop": 4029.4842857142858,
+   "targets": [
+    4018.718
+   ],
+   "score": 21.52957886907693,
+   "decision": "accepted",
+   "reason": "weighed judgment: score 22 on M5 evidence (supporting: none special; contradictory: journey geometry: journey_room: magnet only 0.0R away \u2014 the target sits inside the noise (geometry, G)) \u2014 hard facts pass; handed to the shared sizing/management path with evidence attached",
+   "regime": "flat/compression/normal/distribution/ny"
+  }
+ ],
+ "trade_pairs": [
+  {
+   "open_ts": "2026-10-29T05:17:18.728961+00:00",
+   "close_ts": "2026-10-29T05:30:41.966160+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4044.594,
+   "exit": 4040.7309999999998,
+   "r_net": 0.5336135490205344,
+   "pnl_money": 3.8630000000002838,
+   "close_reason": "broker_closed"
+  },
+  {
+   "open_ts": "2026-10-29T09:11:04.795622+00:00",
+   "close_ts": "2026-10-29T09:55:19.254031+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4035.206,
+   "exit": 4029.225,
+   "r_net": 1.0526421652745175,
+   "pnl_money": 5.981000000000222,
+   "close_reason": "stop"
+  },
+  {
+   "open_ts": "2026-10-29T13:40:44.437524+00:00",
+   "close_ts": "2026-10-29T13:42:58.297519+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4034.112,
+   "exit": 4028.26,
+   "r_net": 0.7981801088232727,
+   "pnl_money": 5.851999999999862,
+   "close_reason": "broker_closed"
+  },
+  {
+   "open_ts": "2026-10-29T22:55:50.078510+00:00",
+   "close_ts": "2026-10-29T23:03:06.892366+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4025.566,
+   "exit": 4018.718,
+   "r_net": 1.4843164576559502,
+   "pnl_money": 6.847999999999956,
+   "close_reason": "broker_closed"
+  }
+ ]
+}

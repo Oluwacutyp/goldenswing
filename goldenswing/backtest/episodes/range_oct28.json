@@ -1,0 +1,130 @@
+{
+ "name": "range_oct28",
+ "title": "Range / chop \u2014 Wed Oct 28, 2026 (two-sided rotation, no follow-through)",
+ "window": {
+  "start": "2026-10-28T00:00:00+00:00",
+  "end": "2026-10-28T23:59:59+00:00"
+ },
+ "justification": [
+  "Signal entries oscillate inside a ~42pt band all day (4033.147 to 4074.928) in BOTH directions; five of six signals were gated, the one accepted long closed +0.5021R.",
+  "Hot Scalp armed 101 setups split 64 long / 37 short; 57 expired untouched, 35 were geometry-blocked, 8 invalidated \u2014 and the sleeve filled nothing.",
+  "The H1 roster scans emitted 24 candidates across the day (inversion 10, fvg_limit 4, retracement_trap 2, others) and the M5/trigger routes 6 more \u2014 every emitted candidate was refused downstream (a journal sample refusal: gate.data, touch 11 bars stale) and none became a fill; the day's only fill was the accepted qm_m5 long."
+ ],
+ "eval_census": {
+  "no_setup": 690,
+  "candidate_emitted": 30
+ },
+ "eval_total": 720,
+ "hot_scalp_census": {
+  "scan_degraded|data.stale": 17,
+  "setup_armed|None": 101,
+  "setup_touched|setup.level_touched": 43,
+  "candidate_shadow|None": 1,
+  "candidate_blocked|geometry.net_rr_below_min": 35,
+  "setup_expired|setup.expired": 57,
+  "setup_invalidated|setup.invalidated_close": 8
+ },
+ "hot_scalp_armed_by_direction": {
+  "1": 64,
+  "-1": 37
+ },
+ "signals": [
+  {
+   "ts": "2026-10-28T01:05:02.552695+00:00",
+   "playbook": "qm_m5",
+   "direction": 1,
+   "entry": 4058.57,
+   "stop": 4053.0904642857145,
+   "targets": [
+    4064.303
+   ],
+   "score": 45.787666473751884,
+   "decision": "gated",
+   "reason": "weighed judgment: the asymmetry evidence is flipped \u2014 structure funds the opposite side only; this candidate's own evidence contradicts it",
+   "regime": "flat/range/normal/distribution/asia"
+  },
+  {
+   "ts": "2026-10-28T12:20:01.850649+00:00",
+   "playbook": "qm_m5",
+   "direction": -1,
+   "entry": 4056.022,
+   "stop": 4058.8723214285715,
+   "targets": [
+    4049.7
+   ],
+   "score": 47.79798028194476,
+   "decision": "gated",
+   "reason": "weighed judgment: the asymmetry evidence is flipped \u2014 structure funds the opposite side only; this candidate's own evidence contradicts it",
+   "regime": "flat/range/normal/distribution/london"
+  },
+  {
+   "ts": "2026-10-28T14:25:02.233097+00:00",
+   "playbook": "qm_m5",
+   "direction": 1,
+   "entry": 4044.105,
+   "stop": 4041.845125,
+   "targets": [
+    4049.322
+   ],
+   "score": 34.95680511417528,
+   "decision": "gated",
+   "reason": "weighed judgment: the asymmetry evidence is flipped \u2014 structure funds the opposite side only; this candidate's own evidence contradicts it",
+   "regime": "flat/range/normal/distribution/overlap"
+  },
+  {
+   "ts": "2026-10-28T17:20:01.914577+00:00",
+   "playbook": "qm_m5",
+   "direction": 1,
+   "entry": 4040.511,
+   "stop": 4035.936875,
+   "targets": [
+    4046.188
+   ],
+   "score": 26.970408962060883,
+   "decision": "accepted",
+   "reason": "weighed judgment: score 27 on M5 evidence (supporting: sweep_head: the head leg swept the prior swing \u2014 rejection evidence at the extreme; displacement_break: the neckline break displaced \u2014 acceptance by closes through the level; contradictory: against structural D1 bias -1 (weighed as evidence, not a veto); journey geometry: counter_journey: the nearer draw is behind the trade and no nested faster-TF zone holds price \u2014 counter-journey needs a nested zone + >= 3R room to the magnet (G)) \u2014 hard facts pass; handed to the shared sizing/management path with evidence attached",
+   "regime": "up/clean_trend/normal/distribution/ny"
+  },
+  {
+   "ts": "2026-10-28T20:00:34.990420+00:00",
+   "playbook": "range_mean_reversion",
+   "direction": -1,
+   "entry": 4033.147,
+   "stop": 4070.2586795679467,
+   "targets": [
+    4029.9545
+   ],
+   "score": 68.0,
+   "decision": "gated",
+   "reason": "asymmetry_flip: close through the last defended pivot \u2014 structure funds the opposite side only",
+   "regime": "up/clean_trend/spike/distribution/ny"
+  },
+  {
+   "ts": "2026-10-28T20:00:35.271790+00:00",
+   "playbook": "range_compression_breakout",
+   "direction": 1,
+   "entry": 4074.928,
+   "stop": 4067.0304335201445,
+   "targets": [
+    4152.776
+   ],
+   "score": 64.0,
+   "decision": "gated",
+   "reason": "zone_used_up: armed zone lifecycle is used_up (touches consume; A2 abandon)",
+   "regime": "up/clean_trend/spike/distribution/ny"
+  }
+ ],
+ "trade_pairs": [
+  {
+   "open_ts": "2026-10-28T17:20:02.321961+00:00",
+   "close_ts": "2026-10-28T18:00:27.855087+00:00",
+   "playbook": "qm_m5",
+   "direction": 1,
+   "entry": 4040.306,
+   "exit": 4042.8900000000003,
+   "r_net": 0.5021131892154809,
+   "pnl_money": 2.5840000000002874,
+   "close_reason": "broker_closed"
+  }
+ ]
+}
