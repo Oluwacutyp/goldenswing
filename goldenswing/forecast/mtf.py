@@ -378,6 +378,36 @@ def train_from_frames(frames: dict, out_path: str | Path) -> dict:
     }
 
 
+class ScalarConversionError(ValueError):
+    """A forecast value that had to be ONE number arrived as a
+    multi-element array.  Raised (never silently resolved by
+    picking an element) so the failure names the field at fault."""
+
+
+def _scalar(value, *, field: str) -> float:
+    """Extract ONE Python float from a forecast value, honestly.
+
+    Accepts Python numbers, NumPy scalars, and 0-d / 1-element
+    arrays — a single-row ``predict_proba`` column is the live
+    shape.  A multi-element value is an upstream programming
+    error: raise :class:`ScalarConversionError` naming the field
+    and the shape instead of silently picking one element.
+
+    This boundary exists because NumPy >= 2 made ``float()`` on
+    any ndim >= 1 array a hard TypeError ("only 0-dimensional
+    arrays can be converted to Python scalars") where NumPy 1.x
+    only deprecated it — the per-model probability carry in
+    :func:`score_last_row` shipped on 1.x semantics and killed
+    every live forecast cycle the morning the runner restarted
+    on a NumPy 2 stack (journal, 2026-11-04)."""
+    arr = np.asarray(value, dtype=float)
+    if arr.size != 1:
+        raise ScalarConversionError(
+            f"{field}: expected a single value, got {arr.size} "
+            f"values (shape {arr.shape})")
+    return float(arr.reshape(-1)[0])
+
+
 def score_last_row(frames: dict, bundle: dict) -> tuple[dict | None, str]:
     """Score the last H1 row's MTF features against a validated
     bundle. Returns (ForecastRanks-like dict, note) — ranks are
@@ -404,13 +434,21 @@ def score_last_row(frames: dict, bundle: dict) -> tuple[dict | None, str]:
         ranks[h] = {}
         model_probs[h] = {}
         for dname in ("up", "dn"):
-            ps = [np.asarray(m.predict_proba(Xrow.to_numpy(dtype=float)),
-                             dtype=float)[:, 1]
+            # Each predict_proba answers for the ONE scored row, so
+            # its [:, 1] column is a 1-element array; extract the
+            # scalar through _scalar (float() on the array itself
+            # is a hard TypeError on NumPy >= 2 — see _scalar).
+            ps = [_scalar(
+                      np.asarray(
+                          m.predict_proba(Xrow.to_numpy(dtype=float)),
+                          dtype=float)[:, 1],
+                      field=f"per-model probability "
+                            f"(horizon {h}, {dname})")
                   for m in entry["models"][dname].values()]
             p = float(np.mean(ps)) if ps else float("nan")
             # F1: keep the per-model spread the mean hides — the
             # outlook's disagreement measure reads it.
-            model_probs[h][dname] = [float(x) for x in ps]
+            model_probs[h][dname] = ps
             q = bundle["ref_quantiles"][h][dname] \
                 if h in bundle["ref_quantiles"] \
                 else bundle["ref_quantiles"][str(h)][dname]

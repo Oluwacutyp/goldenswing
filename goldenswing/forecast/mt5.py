@@ -265,7 +265,16 @@ class MT5Forecaster:
         the independent alert evaluation fired — prediction
         generation and alerting are separate facts and are recorded
         as such (Nov 3 audit acceptance)."""
-        text, note = self.maybe_alert(frames)
+        try:
+            text, note = self.maybe_alert(frames)
+        except Exception as exc:  # noqa: BLE001 — recorded, then raised
+            # A scoring raise must still land on the status surface:
+            # /status reads _last_error, and a raise bypassing it is
+            # how the 2026-11-04 scalar failure stayed invisible
+            # there while the journal filled with alert-loop notes.
+            self._last_error = (
+                f"scoring raised {type(exc).__name__}: {exc}")
+            raise
         if self._last_error is not None \
                 or self._last_evaluation is None:
             return text, note, None

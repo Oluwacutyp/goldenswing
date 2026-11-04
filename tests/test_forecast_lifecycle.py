@@ -176,9 +176,15 @@ def test_forecast_cannot_touch_orders():
     # function in the same sense; F2 output is shadow/research
     # only and no order, sizing or risk path reads it.  Any
     # OTHER new reader still fails this pin.
+    # Scalar fix (2026-11-04): _forecast_alert_d1 is the
+    # D1-cadence half of _maybe_forecast_alert, extracted
+    # verbatim so its early exits no longer gate the intraday
+    # H1 cadence — the same forecast service function, split in
+    # two; it scores, journals and alerts, never orders.  Any
+    # OTHER new reader still fails this pin.
     allowed = {"__init__", "run", "forecast_line", "forecast_train_now",
-               "_maybe_forecast_alert", "_forecast_feed_for",
-               "_forecast_trained_service"}
+               "_maybe_forecast_alert", "_forecast_alert_d1",
+               "_forecast_feed_for", "_forecast_trained_service"}
     runner = Path("goldenswing/execution/mt5_runner.py").read_text()
     lines = runner.splitlines()
     for i, line in enumerate(lines):

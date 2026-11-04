@@ -996,6 +996,11 @@ class MT5Runner:
         self._forecast_last_scored_bar = None
         self._forecast_last_scored_h1_bar = None
         self._forecast_no_d1_noted = False
+        # Consecutive alert-loop failures (either cadence): named
+        # in every failure note so a dead forecast pipeline reads
+        # as a streak, not as isolated weather.  Reset whenever a
+        # scoring returns without raising.
+        self._forecast_consecutive_failures = 0
         # F1: the last outlook block built (for /status); the
         # journal holds the durable copy on each forecast record.
         self._forecast_last_outlook = None
@@ -4659,6 +4664,60 @@ class MT5Runner:
         tick loop — a forecast problem must never stop evaluation,
         management, or orders.
         """
+        self._forecast_alert_d1()
+        # Intraday scoring (continuous-cadence doctrine: D1 closes
+        # gate TRAINING, never inference) — independent of the D1
+        # block above: every fresh H1 bar is scored and journaled,
+        # so the ensemble produces a continuous, timestamped
+        # forecast record (the Nov 3 audit's runtime-proof
+        # requirement).  Alerts stay crossing-only inside the
+        # forecaster, so hourly scoring cannot spam.
+        try:
+            frames = self._stack.frames
+            h1_frame = frames.get("H1")
+            if h1_frame is not None and len(h1_frame) >= 50:
+                h1_bar = h1_frame.index[-1]
+                if h1_bar != self._forecast_last_scored_h1_bar:
+                    self._forecast_last_scored_h1_bar = h1_bar
+                    text2, note2, record2 = \
+                        self._forecaster.score_and_record(frames)
+                    self._forecast_consecutive_failures = 0
+                    if record2 is not None:
+                        _last2 = getattr(
+                            self._forecaster, "_last_evaluation",
+                            None)
+                        text2 = self._forecast_journal(
+                            record2, frames,
+                            _last2[1] if _last2 else None,
+                            "H1", h1_bar, text2)
+                    if text2 is not None:
+                        self.journal.log_note(
+                            f"forecast alert @ {h1_bar}: {note2}")
+                        self._send_alert(text2)
+        except Exception as exc:  # noqa: BLE001 — tick-loop guard
+            self._forecast_consecutive_failures += 1
+            self.journal.log_note(
+                f"forecast alert failed [H1 @ "
+                f"{self._forecast_last_scored_h1_bar}] (loop continues; "
+                f"consecutive failures: "
+                f"{self._forecast_consecutive_failures}): {exc}")
+
+    def _forecast_alert_d1(self) -> None:
+        """The D1-cadence half of :meth:`_maybe_forecast_alert`:
+        finished-train journaling, then one scoring per newly
+        closed D1 bar (self-training rides the same close).
+
+        Its own method so the early exits (no D1 frame, day
+        already scored, H1 history too short) skip ONLY the D1
+        scoring.  Inlined in the caller, those bare ``return``s
+        also gated the intraday H1 cadence — which is documented
+        as independent — so H1 forecasts journaled only on the
+        one tick per D1 day (or per restart) when the D1 block
+        ran through: the shape of the live journal exactly
+        (forecast records in restart/midnight pairs only), and
+        the reason the 2026-11-04 scalar failure produced one
+        pair of notes per process and then silence instead of
+        an hourly, countable failure streak."""
         try:
             # Finished-train outcome: journaled on the tick thread
             # (the worker thread only records it, never journals).
@@ -4695,6 +4754,7 @@ class MT5Runner:
                 self.journal.log_note(f"forecast: {note}")
             text, note, record = self._forecaster.score_and_record(
                 frames)
+            self._forecast_consecutive_failures = 0
             if record is not None:
                 _last = getattr(
                     self._forecaster, "_last_evaluation", None)
@@ -4706,39 +4766,12 @@ class MT5Runner:
                     f"forecast alert @ {day}: {note}")
                 self._send_alert(text)
         except Exception as exc:  # noqa: BLE001 — tick-loop guard
+            self._forecast_consecutive_failures += 1
             self.journal.log_note(
-                f"forecast alert failed (loop continues): {exc}")
-        # Intraday scoring (continuous-cadence doctrine: D1 closes
-        # gate TRAINING, never inference) — independent of the D1
-        # block above: every fresh H1 bar is scored and journaled,
-        # so the ensemble produces a continuous, timestamped
-        # forecast record (the Nov 3 audit's runtime-proof
-        # requirement).  Alerts stay crossing-only inside the
-        # forecaster, so hourly scoring cannot spam.
-        try:
-            frames = self._stack.frames
-            h1_frame = frames.get("H1")
-            if h1_frame is not None and len(h1_frame) >= 50:
-                h1_bar = h1_frame.index[-1]
-                if h1_bar != self._forecast_last_scored_h1_bar:
-                    self._forecast_last_scored_h1_bar = h1_bar
-                    text2, note2, record2 = \
-                        self._forecaster.score_and_record(frames)
-                    if record2 is not None:
-                        _last2 = getattr(
-                            self._forecaster, "_last_evaluation",
-                            None)
-                        text2 = self._forecast_journal(
-                            record2, frames,
-                            _last2[1] if _last2 else None,
-                            "H1", h1_bar, text2)
-                    if text2 is not None:
-                        self.journal.log_note(
-                            f"forecast alert @ {h1_bar}: {note2}")
-                        self._send_alert(text2)
-        except Exception as exc:  # noqa: BLE001 — tick-loop guard
-            self.journal.log_note(
-                f"forecast alert failed (loop continues): {exc}")
+                f"forecast alert failed [D1 @ "
+                f"{self._forecast_last_scored_bar}] (loop continues; "
+                f"consecutive failures: "
+                f"{self._forecast_consecutive_failures}): {exc}")
 
     def _refresh_bars(self, tick: dict, stats: dict) -> None:
         """Tick time crossing a bar boundary -> refresh that TF's bars.
