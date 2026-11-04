@@ -335,9 +335,11 @@ class MT5RunnerConfig:
     # steers, sizes, gates or vetoes.
     judgment_audit_enabled: bool = True
     # JUDGMENT CORE S2 (owner spec 2026-11-02): the five-scenario
-    # market read + thesis maintenance above S1 — also shadow-only,
-    # journaled as judgment_thesis records; the thesis never steers
-    # an order either.
+    # market read + thesis maintenance above S1, journaled as
+    # judgment_thesis records.  DEPLOYMENT (owner ruling
+    # 2026-11-04): the thesis LIFECYCLE is demo-active for its
+    # own child setups (see judgment_thesis_active_enabled); the
+    # read itself still steers nothing independently.
     judgment_thesis_enabled: bool = True
     # FORECAST E2: live calibration — journaled forecasts are
     # resolved against the bars that actually followed (the label
@@ -378,6 +380,16 @@ class MT5RunnerConfig:
     forecast_trained_enabled: bool = True
     judgment_thesis_ttl_hours: float = 24.0
     judgment_thesis_min_margin: float = 0.08
+    # THESIS REVISION (owner approval 2026-11-04): scenario-p
+    # erosion from peak at/above this marks the live thesis
+    # weakened (journaled revision; the thesis stands).
+    judgment_thesis_weaken_drop: float = 0.10
+    # THESIS ACTIVATION (owner ruling 2026-11-04): when True, the
+    # _place_live_order boundary cuts child setups whose parent
+    # thesis has closed (invalidated / superseded / expired).
+    # Children of a live thesis and independent flow are
+    # untouched; S1 judgment stays shadow-only either way.
+    judgment_thesis_active_enabled: bool = True
     deterministic_dir: Path | None = None  # default: <journal parent>/deterministic
     risk_state_path: Path = DATA_DIR / "mt5_risk_state.json"
     kill_switch_path: Path = DATA_DIR / "mt5_KILL"
@@ -1823,7 +1835,9 @@ class MT5Runner:
                 ttl_hours=float(getattr(
                     self.cfg, "judgment_thesis_ttl_hours", 24.0)),
                 min_margin=float(getattr(
-                    self.cfg, "judgment_thesis_min_margin", 0.08))))
+                    self.cfg, "judgment_thesis_min_margin", 0.08)),
+                weaken_drop=float(getattr(
+                    self.cfg, "judgment_thesis_weaken_drop", 0.10))))
             self._thesis_keeper = keeper
             self._thesis_flow: list = []
         flow_rows = self._thesis_flow
@@ -1847,9 +1861,21 @@ class MT5Runner:
 
         assessment = assess_market(
             context=self._decision_context(), flow=flow)
+        # Thesis revision (2026-11-04): the keeper also reads
+        # the last tick's price — the thesis's own stated
+        # invalidation price is evaluated as data every cycle,
+        # not left as prose on the plan (the Nov 3 failure: the
+        # bearish thesis named 3944.42 and price ran to 4046
+        # without a single thesis record).
+        _tick = getattr(self, "_last_tick", None) or {}
+        _mid = _tick.get("mid") or _tick.get("bid")
+        try:
+            _price = float(_mid) if _mid else None
+        except (TypeError, ValueError):
+            _price = None
         events = keeper.update(
             assessment, ts=_time.time(), candidate=candidate,
-            playbook=playbook)
+            playbook=playbook, price=_price)
         for event in events:
             payload = dict(event)
             payload["cycle_ts"] = payload.pop("ts", None)
@@ -12666,6 +12692,56 @@ class MT5Runner:
                 f"execution-ineligible ({_code}) — refused at "
                 "the order boundary (Phase 2 backstop)")
             return
+        # Judgment thesis lifecycle backstop (owner ruling
+        # 2026-11-04): a child setup whose PARENT THESIS has
+        # closed (invalidated / superseded / expired) since the
+        # setup was registered under it is refused HERE, at the
+        # same shared order boundary — the thesis lifecycle is
+        # demo-active for its own children only.  Children of a
+        # LIVE thesis and independent (never-parented) flow pass
+        # untouched; the gate reads keeper state only — it never
+        # sizes, steers or vetoes the desk's own candidates.  If
+        # the gate itself cannot answer, the order is refused
+        # explicitly: thesis state is never guessed.
+        if not is_layer and getattr(
+                self.cfg, "judgment_thesis_active_enabled", True):
+            _keeper = getattr(self, "_thesis_keeper", None)
+            if _keeper is not None:
+                try:
+                    _gate = _keeper.gate_check(
+                        playbook=pb.name,
+                        direction=int(sig.direction),
+                        entry=float(sig.entry_ref),
+                        atr=float(getattr(sig, "atr", 0.0) or 0.0),
+                        ts=time.time())
+                except Exception as _exc:  # noqa: BLE001
+                    self._record_blocked(
+                        f"thesis_gate_unavailable: "
+                        f"{type(_exc).__name__}: {_exc}", pb.name)
+                    self.journal.log_note(
+                        f"mt5: order refused {pb.name}: thesis "
+                        f"gate unavailable "
+                        f"({type(_exc).__name__}: {_exc}) — "
+                        "refusing rather than guessing thesis "
+                        "state (thesis lifecycle backstop)")
+                    return
+                if _gate.get("verdict") == "orphaned":
+                    _status = str(_gate.get("close_status")
+                                  or "closed")
+                    stats[f"thesis_cut::{_status}"] = stats.get(
+                        f"thesis_cut::{_status}", 0) + 1
+                    self._record_blocked(
+                        f"thesis_cut: parent thesis "
+                        f"{_gate.get('thesis_id')} was {_status} "
+                        f"({_gate.get('close_reason')}) — child "
+                        "setup orphaned", pb.name)
+                    self.journal.log_note(
+                        f"mt5: order refused {pb.name}: parent "
+                        f"thesis {_gate.get('thesis_id')} was "
+                        f"{_status} — child setup cut at the "
+                        "order boundary (thesis lifecycle "
+                        "backstop)")
+                    return
         # Market-closed guard (order placement): never place while
         # the broker is not accepting new orders — covers
         # confirm-fired orders and layers, not just the signal path.

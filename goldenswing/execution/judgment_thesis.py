@@ -21,12 +21,45 @@ desk's own candidate flow — and maintains ONE live thesis:
   Every transition is a journal event; history is preserved,
   never silently overwritten.
 
-Still SHADOW (the standing ruling): nothing here steers, sizes,
-gates or vetoes an order.  Analytical confidence and evidence
-quality are carried as SEPARATE fields, never blended.  Like S1,
-this is the deterministic baseline — stated priors and response
-constants, no fitted probabilities — that a later learned rung
-must beat on chronological walk-forward.
+REVISION (owner approval 2026-11-04, the missed-move program):
+maintenance above was not enough — the Nov 3 bearish thesis
+stated its own invalidation price (3944.42) and then journaled
+nothing while price ran through it to 4046, because the keeper
+never saw price and erosion short of a named trigger was
+invisible.  The lifecycle now REVISES:
+
+- every surviving cycle re-prices the thesis's own scenario
+  against the fresh assessment; a material erosion of its
+  probability from its peak (structure intact, no trigger
+  fired) journals ``thesis_weakened`` — a new thesis VERSION
+  (version + supersedes pointer + the exact evidence: scenario
+  probabilities before/after and the facts that moved) — and
+  the thesis stands, weakened, still parenting its setups;
+- the thesis's stated invalidation terms are evaluated AS DATA
+  every cycle: the named triggers (regime flip, structure
+  break) AND the plan's ``invalidation_price`` — a price cross
+  invalidates exactly like a named trigger;
+- a decisive rival REPLACES the thesis: the old one closes
+  ``superseded`` and the new thesis record points back at it
+  (``supersedes``), so version history is a chain, not a pile;
+- candidates aligned with the live thesis are adopted as its
+  CHILD setups (registered on the thesis, refreshed on
+  re-emission); when a thesis closes, its unfilled children are
+  journaled ``thesis_orphaned`` — never silently dropped.
+
+DEPLOYMENT (owner ruling 2026-11-04): S1 stays shadow-only.
+This S2 lifecycle is DEMO-ACTIVE for its own children: the
+runner's shared order boundary (``_place_live_order``) consults
+``gate_check`` and cuts a child whose parent thesis has closed
+(inside the orphan window) — children of a live thesis and
+independent, never-parented flow pass untouched.  The keeper
+still never sizes, never steers independent playbooks, and the
+friction gate / risk safeguards stay outside it, untouched.
+Analytical confidence and evidence quality are carried as
+SEPARATE fields, never blended.  Like S1, this is the
+deterministic baseline — stated priors and response constants,
+no fitted probabilities — that a later learned rung must beat
+on chronological walk-forward.
 """
 from __future__ import annotations
 
@@ -48,6 +81,26 @@ DEFAULT_SWITCH_MARGIN = 0.05
 DEFAULT_RANGE_CHALLENGE_LIMIT = 3
 HEARTBEAT_SECONDS = 1800.0
 
+#: Revision defaults (stated constants, like the priors): a
+#: thesis whose own scenario probability falls this far from
+#: its peak is WEAKENED (journaled, new version, thesis stands);
+#: recovery to within the band of the peak clears the weakened
+#: state.  Neither touches structure — a structural break is an
+#: invalidation, never a weakening.
+DEFAULT_WEAKEN_DROP = 0.10
+DEFAULT_RECOVER_BAND = 0.03
+
+#: How long after a thesis closes its orphaned children are
+#: still recognised at the order boundary (the armed window: a
+#: setup registered under the thesis can only be mid-flight
+#: briefly — pendings arm inside an H1 window).  After it, a
+#: re-emitted setup is the desk's own fresh candidate again.
+ORPHAN_WINDOW_SECONDS = 3600.0
+
+#: Child matching at the boundary uses the same at-level
+#: tolerance as the Step-15 thesis-twin duplicate guard.
+CHILD_MATCH_ATR_FRACTION = 0.25
+
 
 @dataclass(frozen=True)
 class ThesisConfig:
@@ -56,6 +109,8 @@ class ThesisConfig:
     switch_margin: float = DEFAULT_SWITCH_MARGIN
     range_challenge_limit: int = DEFAULT_RANGE_CHALLENGE_LIMIT
     heartbeat_seconds: float = HEARTBEAT_SECONDS
+    weaken_drop: float = DEFAULT_WEAKEN_DROP
+    recover_band: float = DEFAULT_RECOVER_BAND
 
 
 def _parse_regime_label(label) -> dict:
@@ -381,6 +436,23 @@ def build_plan(*, assessment: dict, candidate: dict | None,
     return plan
 
 
+def _scenario_probs(assessment: dict) -> dict:
+    """Scenario name -> probability from one assessment."""
+    return {s.get("name"): float(s.get("p") or 0.0)
+            for s in assessment.get("scenarios") or []}
+
+
+def _standing_snapshot(assessment: dict) -> dict:
+    """The keeper's per-cycle standing read of the market: what
+    the fresh assessment says, kept on the thesis so the NEXT
+    cycle's revision evidence can quote before/after exactly."""
+    inputs = assessment.get("inputs") or {}
+    return {"scenarios": _scenario_probs(assessment),
+            "winner": assessment.get("winner"),
+            "margin": assessment.get("margin"),
+            "regime": inputs.get("regime")}
+
+
 @dataclass
 class ThesisKeeper:
     """Maintains the one live thesis across evaluation cycles.
@@ -397,6 +469,9 @@ class ThesisKeeper:
     _seq: int = 0
     _last_emit: float = 0.0
     _range_challenges: int = 0
+    _last_orphans: list[dict] = field(default_factory=list)
+    _orphan_close: dict = field(default_factory=dict)
+    _pending_supersedes: str | None = None
 
     def _new_thesis(self, assessment: dict, ts: float,
                     candidate: dict | None,
@@ -418,10 +493,24 @@ class ThesisKeeper:
                                candidate=candidate,
                                playbook=playbook),
             "status": "active",
+            # Revision lineage (2026-11-04): a thesis is a chain
+            # of versions; ``revisions`` is its own history, and
+            # ``supersedes`` points at the thesis this one
+            # replaced (None for a fresh line).
+            "version": 1,
+            "state": "intact",
+            "supersedes": None,
+            "revisions": [],
+            "children": [],
+            "peak_p": float(assessment.get("winner_p") or 0.0),
+            "standing_p": float(assessment.get("winner_p")
+                                or 0.0),
+            "standing": _standing_snapshot(assessment),
         }
         return thesis
 
-    def _close(self, status: str, ts: float, reason: str) -> dict:
+    def _close(self, status: str, ts: float, reason: str,
+               evidence: dict | None = None) -> dict:
         thesis = self.active or {}
         thesis["status"] = status
         thesis["closed_ts"] = ts
@@ -429,15 +518,313 @@ class ThesisKeeper:
         self.history.append(thesis)
         self.active = None
         self._range_challenges = 0
-        return {"event": f"thesis_{status}", "ts": ts,
-                "thesis_id": thesis.get("id"),
-                "scenario": thesis.get("scenario"),
-                "direction": thesis.get("direction"),
-                "reason": reason, "thesis": thesis}
+        # The closed thesis's children become the recognisable
+        # orphans at the order boundary (latest close only — a
+        # newer close replaces the set).
+        self._last_orphans = [dict(c)
+                              for c in thesis.get("children")
+                              or []]
+        self._orphan_close = {
+            "thesis_id": thesis.get("id"), "status": status,
+            "reason": reason, "ts": ts}
+        event = {"event": f"thesis_{status}", "ts": ts,
+                 "thesis_id": thesis.get("id"),
+                 "scenario": thesis.get("scenario"),
+                 "direction": thesis.get("direction"),
+                 "version": thesis.get("version"),
+                 "reason": reason, "thesis": thesis}
+        if evidence is not None:
+            event["evidence"] = evidence
+        return event
+
+    def _orphan_event(self, events: list[dict], close_event: dict,
+                      ts: float) -> None:
+        """Journal the closed thesis's unfilled children as
+        orphaned — they lose their parent here, on the record,
+        never by silence.  (Shadow children are never filled by
+        construction; the order boundary is where a mid-flight
+        one is cut — see gate_check.)"""
+        thesis = close_event.get("thesis") or {}
+        children = thesis.get("children") or []
+        if not children:
+            return
+        for child in children:
+            child["orphaned_ts"] = ts
+            child["orphan_status"] = thesis.get("status")
+        events.append({
+            "event": "thesis_orphaned", "ts": ts,
+            "thesis_id": thesis.get("id"),
+            "version": thesis.get("version"),
+            "scenario": thesis.get("scenario"),
+            "direction": thesis.get("direction"),
+            "close_status": thesis.get("status"),
+            "reason": thesis.get("close_reason"),
+            "children": children, "count": len(children)})
+
+    def _close_evidence(self, assessment: dict,
+                        fired: list[str] | None = None,
+                        price: float | None = None) -> dict:
+        """The exact evidence a terminal revision carries:
+        scenario probabilities before (the thesis's standing
+        read) and after (the fresh assessment), plus the
+        triggering facts when the close is an invalidation."""
+        thesis = self.active or {}
+        evidence = {
+            "scenarios_before": (thesis.get("standing") or {})
+            .get("scenarios"),
+            "scenarios_after": _scenario_probs(assessment),
+            "winner": assessment.get("winner"),
+            "winner_p": assessment.get("winner_p"),
+            "margin": assessment.get("margin"),
+            "inputs": assessment.get("inputs"),
+        }
+        if fired:
+            evidence["triggers_fired"] = list(fired)
+        if price is not None:
+            evidence["price"] = price
+            evidence["invalidation_price"] = (
+                (thesis.get("plan") or {})
+                .get("invalidation_price"))
+        return evidence
+
+    def _price_fact(self, price: float | None) -> str | None:
+        """The thesis's own stated invalidation price, evaluated
+        as data: for a short thesis, price at/above the level
+        breaks the premise; for a long, at/below.  No plan price
+        (scenario-only thesis) -> no price term, exactly as
+        before."""
+        if price is None or self.active is None:
+            return None
+        plan = self.active.get("plan") or {}
+        level = plan.get("invalidation_price")
+        direction = int(self.active.get("direction") or 0)
+        if level is None or direction == 0:
+            return None
+        try:
+            px = float(price)
+            lv = float(level)
+        except (TypeError, ValueError):
+            return None
+        if (direction < 0 and px >= lv) \
+                or (direction > 0 and px <= lv):
+            return (f"price {px:.2f} crossed the thesis "
+                    f"invalidation price {lv:.2f} "
+                    f"(plan: {plan.get('basis') or 'scenario'})")
+        return None
+
+    def _register_child(self, candidate: dict | None,
+                        playbook: str, ts: float) -> tuple:
+        """Adopt an aligned candidate as a child of the live
+        thesis.  Returns (child, is_new); a re-emission of the
+        same setup refreshes its registration silently.  A
+        counter-thesis or directionless candidate is never a
+        child (weighed by the desk, not parented)."""
+        if self.active is None or not candidate:
+            return None, False
+        direction = int(candidate.get("direction") or 0)
+        if direction == 0 \
+                or direction != int(self.active["direction"]):
+            return None, False
+        name = playbook or str(candidate.get("playbook") or "")
+        entry = candidate.get("entry")
+        stop = candidate.get("stop")
+        for child in self.active["children"]:
+            if child["playbook"] == name \
+                    and child["direction"] == direction \
+                    and child.get("entry") == entry \
+                    and child.get("stop") == stop:
+                child["registered_ts"] = ts
+                return child, False
+        child = {"playbook": name, "direction": direction,
+                 "entry": entry, "stop": stop,
+                 "targets": list(candidate.get("targets") or []),
+                 "registered_ts": ts,
+                 "thesis_id": self.active["id"],
+                 "thesis_version": self.active["version"]}
+        self.active["children"].append(child)
+        return child, True
+
+    def _adopt(self, events: list[dict],
+               candidate: dict | None, playbook: str,
+               ts: float) -> None:
+        """Register the cycle's candidate under the live thesis
+        (if any); a NEW child is journaled so the decision trace
+        thesis -> child exists on the record."""
+        child, is_new = self._register_child(candidate, playbook,
+                                             ts)
+        if child is not None and is_new and self.active is not None:
+            events.append({
+                "event": "thesis_child_registered", "ts": ts,
+                "thesis_id": self.active["id"],
+                "version": self.active["version"],
+                "scenario": self.active["scenario"],
+                "direction": self.active["direction"],
+                "child": child})
+
+    def _revise_standing(self, assessment: dict, ts: float,
+                         events: list[dict]) -> None:
+        """Revision bookkeeping for a SURVIVING thesis: track
+        its scenario's standing/peak probability; on material
+        erosion with structure intact, journal the weakening as
+        a new version with the exact evidence.  A recovery to
+        within the band of the peak clears the weakened state
+        (recorded on the thesis's own revision history)."""
+        cfg = self.config
+        thesis = self.active
+        if thesis is None:
+            return
+        probs = _scenario_probs(assessment)
+        scenario = thesis["scenario"]
+        p_now = float(probs.get(scenario) or 0.0)
+        peak = float(thesis.get("peak_p") or 0.0)
+        if thesis.get("state") == "intact" \
+                and peak - p_now >= cfg.weaken_drop:
+            facts = [
+                f"{scenario} probability eroded: peak "
+                f"{peak:.4f} -> {p_now:.4f} (drop "
+                f"{peak - p_now:.4f} >= weaken drop "
+                f"{cfg.weaken_drop})"]
+            winner = assessment.get("winner")
+            if winner != scenario:
+                why = next((s.get("why") for s in
+                            assessment.get("scenarios") or []
+                            if s.get("name") == winner), None)
+                facts.append(
+                    f"{winner} now leads at "
+                    f"p={assessment.get('winner_p')}"
+                    + (f" — {why[0]}" if why else ""))
+            old_regime = (thesis.get("standing") or {}) \
+                .get("regime")
+            new_regime = (assessment.get("inputs") or {}) \
+                .get("regime")
+            if old_regime != new_regime:
+                facts.append(f"regime read changed: "
+                             f"{old_regime} -> {new_regime}")
+            thesis["version"] = int(thesis.get("version")
+                                     or 1) + 1
+            thesis["state"] = "weakened"
+            evidence = {
+                "p_before": thesis.get("standing_p"),
+                "p_after": p_now, "peak_p": peak,
+                "scenarios_before": (thesis.get("standing")
+                                     or {}).get("scenarios"),
+                "scenarios_after": probs,
+                "winner": winner,
+                "winner_p": assessment.get("winner_p"),
+                "margin": assessment.get("margin"),
+                "inputs": assessment.get("inputs"),
+                "facts": facts,
+                "analytical_confidence":
+                    assessment.get("analytical_confidence"),
+                "evidence_quality":
+                    assessment.get("evidence_quality"),
+            }
+            thesis["revisions"].append({
+                "version": thesis["version"], "ts": ts,
+                "kind": "weakened", "evidence": evidence})
+            events.append({
+                "event": "thesis_weakened", "ts": ts,
+                "thesis_id": thesis["id"],
+                "version": thesis["version"],
+                "supersedes_version": thesis["version"] - 1,
+                "scenario": scenario,
+                "direction": thesis["direction"],
+                "reason": "; ".join(facts),
+                "evidence": evidence})
+        elif thesis.get("state") == "weakened" \
+                and p_now >= peak - cfg.recover_band:
+            thesis["state"] = "intact"
+            thesis["revisions"].append({
+                "version": thesis["version"], "ts": ts,
+                "kind": "recovered", "p_after": p_now,
+                "peak_p": peak})
+        thesis["standing"] = _standing_snapshot(assessment)
+        thesis["standing_p"] = p_now
+        thesis["peak_p"] = max(peak, p_now)
+
+    @staticmethod
+    def _match_child(children: list[dict], playbook: str,
+                     direction: int, entry, atr) -> dict | None:
+        if entry is None:
+            return None
+        try:
+            level = float(entry)
+        except (TypeError, ValueError):
+            return None
+        tol = CHILD_MATCH_ATR_FRACTION * float(atr or 0.0)
+        for child in children:
+            if int(child.get("direction") or 0) != direction:
+                continue
+            if playbook and child.get("playbook") \
+                    and child["playbook"] != playbook:
+                continue
+            child_entry = child.get("entry")
+            if child_entry is None:
+                continue
+            if abs(float(child_entry) - level) <= tol:
+                return child
+        return None
+
+    def gate_check(self, *, playbook: str = "",
+                   direction: int = 0, entry=None, atr=None,
+                   ts: float | None = None) -> dict:
+        """The order boundary's question (demo-active ruling,
+        2026-11-04): is this setup a child of the thesis
+        lifecycle, and may it flow?
+
+        - ``child``: a registered child of the LIVE thesis, or
+          aligned by direction while the thesis stands — flows
+          through the shared order path as today.
+        - ``orphaned``: registered under a thesis that has since
+          closed and still inside the orphan window — the cut.
+          An orphan match outranks mere alignment with a newer
+          thesis: the setup was born under the dead thesis, and
+          a new thesis must ADOPT it through a fresh
+          registration cycle (rule order below) before it can
+          flow as that thesis's child.
+        - ``independent``: never parented by a thesis — the
+          lifecycle abstains; the desk's own path decides.
+        """
+        direction = int(direction or 0)
+        if self.active is not None and direction:
+            child = self._match_child(
+                self.active.get("children") or [], playbook,
+                direction, entry, atr)
+            if child is not None:
+                return {"verdict": "child",
+                        "thesis_id": self.active["id"],
+                        "version": self.active.get("version"),
+                        "state": self.active.get("state"),
+                        "registered": True,
+                        "child": child}
+        close = self._orphan_close
+        if direction and close and self._last_orphans:
+            if ts is None or ts - float(close.get("ts") or 0.0) \
+                    <= ORPHAN_WINDOW_SECONDS:
+                child = self._match_child(
+                    self._last_orphans, playbook, direction,
+                    entry, atr)
+                if child is not None:
+                    return {"verdict": "orphaned",
+                            "thesis_id": close.get("thesis_id"),
+                            "close_status": close.get("status"),
+                            "close_reason": close.get("reason"),
+                            "child": child}
+        if self.active is not None and direction \
+                and direction == int(self.active.get("direction")
+                                     or 0):
+            return {"verdict": "child",
+                    "thesis_id": self.active["id"],
+                    "version": self.active.get("version"),
+                    "state": self.active.get("state"),
+                    "registered": False,
+                    "child": None}
+        return {"verdict": "independent", "thesis_id": None}
 
     def update(self, assessment: dict, *, ts: float,
                candidate: dict | None = None,
-               playbook: str = "") -> list[dict]:
+               playbook: str = "",
+               price: float | None = None) -> list[dict]:
         cfg = self.config
         events: list[dict] = []
         winner = assessment.get("winner")
@@ -446,18 +833,33 @@ class ThesisKeeper:
         if self.active is not None:
             age_h = (ts - float(self.active["created_ts"])) / 3600.0
             if age_h > cfg.ttl_hours:
-                events.append(self._close(
+                ev = self._close(
                     "expired", ts,
                     f"horizon reached ({age_h:.1f}h > "
-                    f"{cfg.ttl_hours:.0f}h)"))
+                    f"{cfg.ttl_hours:.0f}h)",
+                    evidence=self._close_evidence(assessment))
+                events.append(ev)
+                self._orphan_event(events, ev, ts)
             else:
                 fired = _triggers_fired(self.active, assessment)
+                price_fact = self._price_fact(price)
+                if price_fact:
+                    fired = fired + [price_fact]
                 if fired:
-                    events.append(self._close(
+                    ev = self._close(
                         "invalidated", ts,
                         "invalidation observed: "
-                        + "; ".join(fired)))
+                        + "; ".join(fired),
+                        evidence=self._close_evidence(
+                            assessment, fired=fired, price=price))
+                    events.append(ev)
+                    self._orphan_event(events, ev, ts)
         if self.active is not None:
+            # Revision: a surviving thesis is re-priced against
+            # the fresh assessment EVERY cycle — erosion short
+            # of a structural break is a weakening, journaled,
+            # never silence (the Nov 3 failure mode).
+            self._revise_standing(assessment, ts, events)
             if winner == self.active["scenario"]:
                 self._range_challenges = 0
                 self.active["updated_ts"] = ts
@@ -470,55 +872,77 @@ class ThesisKeeper:
                         "scenario": winner,
                         "direction": self.active["direction"],
                         "winner_p": assessment.get("winner_p"),
+                        "version": self.active["version"],
+                        "state": self.active["state"],
                         "assessment": assessment})
+                self._adopt(events, candidate, playbook, ts)
                 return events
             if winner == "range":
                 self._range_challenges += 1
                 if self._range_challenges >= \
                         cfg.range_challenge_limit:
-                    events.append(self._close(
+                    ev = self._close(
                         "expired", ts,
                         "faded: repeated range reads — the "
                         "directional thesis no longer describes "
-                        "the market"))
+                        "the market",
+                        evidence=self._close_evidence(assessment))
+                    events.append(ev)
+                    self._orphan_event(events, ev, ts)
                     # fall through: a fresh thesis may form below
                 else:
                     self.active["updated_ts"] = ts
+                    self._adopt(events, candidate, playbook, ts)
                     return events
             elif winner in DIRECTIONAL and margin >= cfg.min_margin:
                 active_p = float(self.active.get("winner_p") or 0.0)
                 if float(assessment.get("winner_p") or 0.0) \
                         >= active_p + cfg.switch_margin:
                     old = self.active
-                    events.append(self._close(
+                    ev = self._close(
                         "superseded", ts,
                         f"{winner} won decisively "
                         f"(p={assessment.get('winner_p')} vs "
                         f"thesis {old.get('scenario')} "
-                        f"p={active_p})"))
+                        f"p={active_p})",
+                        evidence=self._close_evidence(assessment))
+                    events.append(ev)
+                    self._orphan_event(events, ev, ts)
+                    self._pending_supersedes = old.get("id")
                 else:
                     self.active["updated_ts"] = ts
+                    self._adopt(events, candidate, playbook, ts)
                     return events
             else:
                 self.active["updated_ts"] = ts
+                self._adopt(events, candidate, playbook, ts)
                 return events
 
         if self.active is None and winner in DIRECTIONAL \
                 and margin >= cfg.min_margin:
             thesis = self._new_thesis(assessment, ts, candidate,
                                       playbook)
+            if self._pending_supersedes:
+                thesis["supersedes"] = self._pending_supersedes
+                self._pending_supersedes = None
             self.active = thesis
             self._last_emit = ts
             self._range_challenges = 0
-            events.append({
+            created = {
                 "event": "thesis_created", "ts": ts,
                 "thesis_id": thesis["id"], "scenario": winner,
                 "direction": thesis["direction"],
                 "winner_p": assessment.get("winner_p"),
+                "version": thesis["version"],
                 "reason": "; ".join(
                     (assessment.get("scenarios") or [{}])[0]
                     .get("why") or []) or winner,
-                "assessment": assessment, "thesis": thesis})
+                "assessment": assessment, "thesis": thesis}
+            if thesis["supersedes"]:
+                created["supersedes"] = thesis["supersedes"]
+            events.append(created)
+            # The seeding candidate is the thesis's first child.
+            self._adopt(events, candidate, playbook, ts)
         return events
 
     def status(self) -> dict:
@@ -527,6 +951,9 @@ class ThesisKeeper:
         return {"active": True, **{
             k: self.active.get(k) for k in (
                 "id", "scenario", "direction", "winner_p",
-                "created_ts", "updated_ts", "status")},
+                "created_ts", "updated_ts", "status",
+                "version", "state")},
             "plan": self.active.get("plan"),
+            "children_open": len(self.active.get("children")
+                                 or []),
             "closed_total": len(self.history)}
