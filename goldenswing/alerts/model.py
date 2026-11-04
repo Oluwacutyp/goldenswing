@@ -18,6 +18,21 @@ class SendResult:
     detail: str = ""
 
 
+def send_failure_detail(result) -> str | None:
+    """The failure detail when a send REPORTED non-delivery, else
+    None.  Senders answer with a SendResult; ``delivered=False``
+    means the message never left (e.g. a document refused for
+    exceeding Telegram's 50MB cap) — a caller that ignores the
+    return value turns that refusal into silence for the owner.
+    Senders returning None reported nothing; treat as delivered.
+    """
+    if result is None:
+        return None
+    if getattr(result, "delivered", True):
+        return None
+    return getattr(result, "detail", "") or "send failed"
+
+
 @dataclass
 class Alert:
     alert_id: str

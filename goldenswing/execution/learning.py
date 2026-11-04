@@ -33,6 +33,11 @@ class TradeJournal:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        #: Unreadable lines skipped by the most recent read (torn
+        #: final line after a crash mid-append, corrupt bytes) —
+        #: set by every records()/records_with_health() call so
+        #: surfaces can report damage instead of hiding it.
+        self.last_read_bad_lines = 0
 
     # ------------------------------------------------------------ writing
     def append(self, record: dict) -> dict:
@@ -115,15 +120,45 @@ class TradeJournal:
         return self.append({"type": "note", "text": text, **context})
 
     # ------------------------------------------------------------ reading
-    def records(self) -> list[dict]:
+    def records_with_health(self) -> tuple[list[dict], int]:
+        """Every readable record + the count of unreadable lines.
+
+        The journal is written by a long-lived engine and read on a
+        Windows host: the old read loaded the whole file with the
+        locale default encoding and parsed strictly, so ONE torn
+        line (crash mid-append), one non-cp1252 character, or one
+        corrupt byte failed the ENTIRE read — and every consumer
+        (commands, reporting, performance) inherited the failure.
+        This read streams line by line as UTF-8 bytes and treats
+        damage per-line: an unparseable line is skipped AND counted,
+        never fatal.  The count also lands on
+        :attr:`last_read_bad_lines`.
+        """
         if not self.path.exists():
-            return []
-        out = []
-        for line in self.path.read_text().splitlines():
-            line = line.strip()
-            if line:
-                out.append(json.loads(line))
-        return out
+            self.last_read_bad_lines = 0
+            return [], 0
+        out: list[dict] = []
+        bad = 0
+        with self.path.open("rb") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    bad += 1
+                    continue
+                if not isinstance(rec, dict):
+                    bad += 1
+                    continue
+                out.append(rec)
+        self.last_read_bad_lines = bad
+        return out, bad
+
+    def records(self) -> list[dict]:
+        records, _bad = self.records_with_health()
+        return records
 
     def performance(self) -> "PerformanceBook":
         return PerformanceBook(self.records())

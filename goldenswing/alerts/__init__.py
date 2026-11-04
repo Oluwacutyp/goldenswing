@@ -9,7 +9,8 @@ from .callbacks import (AlertAction, CallbackHandler, CallbackRegistry,
                         CallbackResult, make_callback_data,
                         parse_callback_data)
 from .email import EmailSender
-from .model import Alert, SendResult, build_alert, build_alert_text
+from .model import (Alert, SendResult, build_alert, build_alert_text,
+                    send_failure_detail)
 from .positions import PositionNotifier
 from .service import AlertService
 from .summary import build_daily_summary
@@ -20,6 +21,6 @@ __all__ = [
     "CallbackRegistry", "CallbackResult", "EmailSender", "ErrorDeduper",
     "PositionNotifier", "SendResult",
     "TelegramSender", "build_alert", "build_alert_text",
-    "build_daily_summary",
+    "build_daily_summary", "send_failure_detail",
     "make_callback_data", "parse_callback_data",
 ]

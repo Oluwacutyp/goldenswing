@@ -37,8 +37,10 @@ from ..alerts.commands import (CommandContext, CommandResult,
                                fmt_code, fmt_feed_line,
                                fmt_next_keyboard, fmt_none, fmt_pnl,
                                fmt_progress, fmt_r, fmt_section,
-                               last_journal_manifest,
-                               next_button_rows, write_journal_slice)
+                               journal_count_line, journal_db_result,
+                               journal_last_line, last_journal_manifest,
+                               next_button_rows, read_journal_records,
+                               write_journal_slice)
 from .mt5_config import (EXECUTE_PLAYBOOK_NAMES, SHADOW_PLAYBOOK_NAMES,
                         describe_change, parse_set)
 
@@ -663,8 +665,9 @@ def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
         return CommandResult(text="no journal attached.")
     try:
         records = ctx.journal.records()
-    except Exception:
-        records = []
+    except Exception as exc:
+        return CommandResult(
+            text=f"journal read failed: {type(exc).__name__}: {exc}")
     latest = latest_evaluations(records)
     if not latest:
         return CommandResult(
@@ -834,17 +837,15 @@ def _mt5_trades(ctx: CommandContext, args: list[str]) -> CommandResult:
 
 @mt5_command("/db", "send the MT5 journal as a file")
 def _mt5_db(ctx: CommandContext, args: list[str]) -> CommandResult:
-    path = Path(ctx.journal_path) if ctx.journal_path else None
-    if path is None or not path.exists():
-        return CommandResult(text="MT5 journal file not found.")
-    size_mb = path.stat().st_size / 1e6
-    note = (f" — {size_mb:.1f}MB; Telegram bot documents cap at 50MB"
-            if size_mb > 40 else "")
-    # Documents carry navigation too (audit check 3): a bare file
-    # leaves the user with no inline path onward.
-    return CommandResult(
-        document=path,
-        caption=f"📓 MT5 journal ({path.name}){note}",
+    # Shared size-aware delivery with the paper loop's /db: over
+    # Telegram's 50MB cap the answer is an explanation + a gzip (or
+    # a labelled newest-records slice), never the raw path the
+    # sender would refuse into silence.  Documents carry navigation
+    # too (audit check 3): a bare file leaves the user with no
+    # inline path onward.
+    return journal_db_result(
+        ctx, not_found_text="MT5 journal file not found.",
+        caption_prefix="📓 MT5 journal",
         reply_markup=fmt_next_keyboard("/status", "/journal", "/report"))
 
 
@@ -1250,19 +1251,16 @@ def _mt5_journal_export(ctx: CommandContext, args: list[str]) -> CommandResult:
 def _mt5_journal(ctx: CommandContext, args: list[str]) -> CommandResult:
     if ctx.journal is None:
         return CommandResult(text="no journal attached.")
-    try:
-        records = ctx.journal.records()
-    except Exception:
-        records = []
+    records, bad, error = read_journal_records(ctx)
     lines = [fmt_section("📓", "MT5 Journal"),
-             f"journal: {fmt_code(ctx.journal_path or '(unknown path)')}",
-             f"records: {len(records)}"]
-    if records:
-        last = records[-1]
-        lines.append(
-            f"last: seq={fmt_code(last.get('seq', '?'))} "
-            f"type={fmt_code(last.get('type', '?'))} "
-            f"ts={fmt_code(last.get('ts', '?'))}")
+             f"journal: {fmt_code(ctx.journal_path or '(unknown path)')}"]
+    if error is not None:
+        # A failed read is a failure, not "records: 0".
+        lines.append(f"journal read failed: {error}")
+    else:
+        lines.append(journal_count_line(records, bad))
+        if records:
+            lines.append(journal_last_line(records[-1]))
     return CommandResult(text="\n".join(lines),
                          reply_markup=fmt_next_keyboard("/snapshot", "/health", "/status"))
 
@@ -1290,11 +1288,15 @@ def _mt5_health(ctx: CommandContext, args: list[str]) -> CommandResult:
                            tick_state=_truth.get("tick_state"),
                            tick_age_s=_truth.get("tick_age_s"))]
     if ctx.journal is not None:
-        try:
-            lines += ["", fmt_section("📓", "Journal"),
-                      f"journal records: {len(ctx.journal.records())}"]
-        except Exception:
-            pass
+        records, bad, error = read_journal_records(ctx)
+        lines += ["", fmt_section("📓", "Journal")]
+        if error is not None:
+            lines.append(f"journal read failed: {error}")
+        else:
+            count = f"journal records: {len(records)}"
+            if bad:
+                count += f" ({bad} unreadable skipped)"
+            lines.append(count)
     lines += ["", fmt_section("📈", "Open Positions"),
               f"open MT5 positions: {len(ctx.live_positions)}",
               "", fmt_section("⏳", "Pending Orders"),

@@ -33,7 +33,8 @@ import numpy as np
 import pandas as pd
 
 from ..alerts import (AlertService, CallbackRegistry, EmailSender,
-                      TelegramSender, make_callback_data)
+                      TelegramSender, make_callback_data,
+                      send_failure_detail)
 from ..alerts.callbacks import AlertAction
 from ..alerts.positions import PositionNotifier
 from ..alerts.summary import build_daily_summary
@@ -1457,8 +1458,13 @@ class LiveRunner:
             return
         try:
             if getattr(result, "document", None) is not None:
-                sender.send_document(result.document,
-                                     caption=result.caption)
+                res = sender.send_document(result.document,
+                                           caption=result.caption)
+                detail = send_failure_detail(res)
+                if detail:
+                    sender.send_text(
+                        f"⚠️ document not delivered: {detail}",
+                        silent=True)
             elif getattr(result, "text", None) is not None:
                 sender.send_text(result.text, silent=True)
         except Exception:
@@ -1473,14 +1479,29 @@ class LiveRunner:
         sender = self._telegram_sender()
         if sender is None:
             return                       # nowhere to answer; stay quiet
+        # A send that REPORTS non-delivery (SendResult.delivered
+        # False — e.g. a document over Telegram's 50MB cap) or
+        # raises earns a fallback text: the owner always hears
+        # something, never silence (the old /db failure shape).
+        failure = None
         try:
+            if result.text is not None and result.document is not None:
+                res = sender.send_text(result.text, silent=True)
+                failure = send_failure_detail(res)
             if result.document is not None:
-                sender.send_document(result.document,
-                                     caption=result.caption)
+                res = sender.send_document(result.document,
+                                           caption=result.caption)
+                failure = failure or send_failure_detail(res)
             elif result.text is not None:
-                sender.send_text(result.text, silent=True)
-        except Exception:
-            pass                         # answering never breaks the loop
+                res = sender.send_text(result.text, silent=True)
+                failure = send_failure_detail(res)
+        except Exception as exc:
+            failure = f"command reply failed: {exc}"
+        if failure:
+            try:
+                sender.send_text(f"⚠️ {failure}", silent=True)
+            except Exception:
+                pass                     # answering never breaks the loop
 
     def _poll_telegram(self) -> None:
         """Feed button taps AND owner commands from getUpdates into

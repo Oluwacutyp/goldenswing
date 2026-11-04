@@ -418,17 +418,160 @@ def _trades(ctx: CommandContext, args: list[str]) -> CommandResult:
     return CommandResult(text="\n".join(lines))
 
 
-@command("/db", "send the paper journal database as a file")
-def _db(ctx: CommandContext, args: list[str]) -> CommandResult:
+# ------------------------------------------------------------ journal reads
+# One honest read shape for every journal card (/journal, /health,
+# both registries): a failed read renders as a failure line, and
+# lines the tolerant reader had to skip are counted on the card —
+# never a silent "records: 0" for a journal that merely hiccuped.
+
+def read_journal_records(ctx: CommandContext):
+    """(records, bad_lines, error) for ctx.journal.
+
+    On success error is None; on failure records is None and error
+    names what went wrong.  Journals with records_with_health()
+    (TradeJournal) report their skipped-line count; plainer
+    journals read through records() with a zero count.
+    """
+    journal = ctx.journal
+    if journal is None:
+        return None, 0, "no journal attached"
+    try:
+        with_health = getattr(journal, "records_with_health", None)
+        if callable(with_health):
+            records, bad = with_health()
+            return records, int(bad), None
+        return journal.records(), 0, None
+    except Exception as exc:
+        return None, 0, f"{type(exc).__name__}: {exc}"
+
+
+def journal_count_line(records: list, bad_lines: int) -> str:
+    """'records: N' — with the skipped-line damage named when real."""
+    line = f"records: {len(records)}"
+    if bad_lines:
+        line += (f" ({bad_lines} unreadable line"
+                 f"{'s' if bad_lines != 1 else ''} skipped)")
+    return line
+
+
+def journal_last_line(last: dict) -> str:
+    """The 'last:' line from fields journal records actually carry.
+
+    MT5 records have no ``seq`` (that belongs to the deterministic
+    engine's journal), so seq renders only when present; type/ts
+    always, alert_id/playbook when the record carries them.
+    """
+    bits = []
+    if last.get("seq") is not None:
+        bits.append(f"seq={fmt_code(last['seq'])}")
+    bits.append(f"type={fmt_code(last.get('type', '?'))}")
+    bits.append(f"ts={fmt_code(last.get('ts', '?'))}")
+    for key in ("alert_id", "playbook"):
+        if last.get(key):
+            bits.append(f"{key}={fmt_code(last[key])}")
+    return "last: " + " ".join(bits)
+
+
+# ------------------------------------------------------------ /db delivery
+#: Telegram's bot sendDocument hard cap (alerts/telegram.py refuses
+#: anything over 50MB, decimal, up front).  A journal over the cap
+#: used to earn the owner SILENCE: /db returned the raw path, the
+#: sender refused it, and the reply path discarded the refusal.
+DB_DOCUMENT_LIMIT_BYTES = 50_000_000
+#: Generated /db fallbacks (gzip / slice) stay under this target so
+#: the sender never refuses them either.
+DB_ARTIFACT_TARGET_BYTES = 45_000_000
+
+
+def _gzip_journal(src: Path, out_path: Path) -> Path:
+    """Stream-gzip a journal file (never whole-file in memory)."""
+    import gzip
+    import shutil
+    with src.open("rb") as f_in, gzip.open(out_path, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out, length=1 << 20)
+    return out_path
+
+
+def journal_db_result(ctx: CommandContext, *, not_found_text: str,
+                      caption_prefix: str,
+                      reply_markup: dict | None = None) -> CommandResult:
+    """The /db answer for one journal file — honest and size-aware.
+
+    Fits under the cap → the raw file, as always.  Over Telegram's
+    50MB bot document limit → an explanatory text PLUS a lossless
+    gzip of the whole journal; if even the gzip is over the cap,
+    the newest records that fit ride as a slice labelled with the
+    range it covers.  A fallback that fails to build is a text
+    answer naming the failure — /db never answers with silence.
+    """
     path = Path(ctx.journal_path) if ctx.journal_path else None
     if path is None or not path.exists():
-        return CommandResult(text="journal file not found.")
-    size_mb = path.stat().st_size / 1e6
-    note = (f" — {size_mb:.1f}MB; Telegram bot documents cap at 50MB"
-            if size_mb > 40 else "")
+        return CommandResult(text=not_found_text)
+    size = path.stat().st_size
+    size_mb = size / 1e6
+    caption = f"{caption_prefix} ({path.name})"
+    if size <= DB_DOCUMENT_LIMIT_BYTES:
+        note = (f" — {size_mb:.1f}MB; Telegram bot documents cap at 50MB"
+                if size_mb > 40 else "")
+        return CommandResult(document=path, caption=f"{caption}{note}",
+                             reply_markup=reply_markup)
+    out_dir = Path(ctx.reports_dir) if ctx.reports_dir else path.parent
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        gz_path = _gzip_journal(path, out_dir / f"{path.name}.gz")
+    except Exception as exc:
+        return CommandResult(
+            text=(f"📓 {path.name} is {size_mb:.1f}MB — over Telegram's "
+                  f"50MB bot document limit, so the raw journal can't "
+                  f"be sent, and building a compressed copy failed: "
+                  f"{type(exc).__name__}: {exc}"),
+            reply_markup=reply_markup)
+    gz_size = gz_path.stat().st_size
+    gz_mb = gz_size / 1e6
+    if gz_size <= DB_DOCUMENT_LIMIT_BYTES:
+        return CommandResult(
+            text=(f"📓 {path.name} is {size_mb:.1f}MB — over Telegram's "
+                  f"50MB bot document limit, so the raw journal can't "
+                  f"be sent. Sending a lossless gzip copy instead "
+                  f"({gz_mb:.1f}MB — gunzip restores every record)."),
+            document=gz_path,
+            caption=f"{caption} (gzip — full journal, compressed)",
+            reply_markup=reply_markup)
+    # Even the gzip is over the cap: the newest records that fit.
+    slice_error = None
+    try:
+        slice_path = out_dir / f"{path.stem}_recent.jsonl"
+        prov = write_journal_slice(path, slice_path,
+                                    DB_ARTIFACT_TARGET_BYTES)
+    except Exception as exc:  # write_journal_slice swallows OSError
+        prov = None
+        slice_error = f"{type(exc).__name__}: {exc}"
+    if prov is None:
+        return CommandResult(
+            text=(f"📓 {path.name} is {size_mb:.1f}MB — over Telegram's "
+                  f"50MB bot document limit; gzipped it is still "
+                  f"{gz_mb:.1f}MB, and slicing the newest records "
+                  f"failed"
+                  + (f": {slice_error}" if slice_error else ".")),
+            reply_markup=reply_markup)
     return CommandResult(
-        document=path,
-        caption=f"📓 paper journal ({path.name}){note}")
+        text=(f"📓 {path.name} is {size_mb:.1f}MB — over Telegram's "
+              f"50MB bot document limit, and even gzipped it is "
+              f"{gz_mb:.1f}MB. Sending the newest {prov['records']} "
+              f"records instead ({prov['first_ts']} → "
+              f"{prov['last_ts']}). Use /harvest for a ZIP of the "
+              f"full journal."),
+        document=slice_path,
+        caption=(f"{caption} (newest {prov['records']} records — "
+                 f"the full journal is {size_mb:.1f}MB)"),
+        reply_markup=reply_markup)
+
+
+@command("/db", "send the paper journal database as a file")
+def _db(ctx: CommandContext, args: list[str]) -> CommandResult:
+    return journal_db_result(
+        ctx, not_found_text="journal file not found.",
+        caption_prefix="📓 paper journal")
 
 
 @command("/report", "send the latest backtest/paper results as a file")
@@ -1297,19 +1440,16 @@ def _journal_export(ctx: CommandContext, args: list[str]) -> CommandResult:
 def _journal(ctx: CommandContext, args: list[str]) -> CommandResult:
     if ctx.journal is None:
         return CommandResult(text="no journal attached.")
-    try:
-        records = ctx.journal.records()
-    except Exception:
-        records = []
+    records, bad, error = read_journal_records(ctx)
     lines = [fmt_section("📓", "Journal"),
-             f"journal: {fmt_code(ctx.journal_path or '(unknown path)')}",
-             f"records: {len(records)}"]
-    if records:
-        last = records[-1]
-        lines.append(
-            f"last: seq={fmt_code(last.get('seq', '?'))} "
-            f"type={fmt_code(last.get('type', '?'))} "
-            f"ts={fmt_code(last.get('ts', '?'))}")
+             f"journal: {fmt_code(ctx.journal_path or '(unknown path)')}"]
+    if error is not None:
+        # A failed read is a failure, not "records: 0".
+        lines.append(f"journal read failed: {error}")
+    else:
+        lines.append(journal_count_line(records, bad))
+        if records:
+            lines.append(journal_last_line(records[-1]))
     lines.append(fmt_next_cta("/snapshot", "/health", "/status"))
     return CommandResult(text="\n".join(lines))
 
@@ -1364,8 +1504,16 @@ def _reconcile(ctx: CommandContext, args: list[str]) -> CommandResult:
     from goldenswing.execution.reporting import open_positions
     try:
         opens = open_positions(ctx.journal)
-    except Exception:
-        opens = []
+    except Exception as exc:
+        # Unknown is not zero: a failed read must not pose as
+        # "no unclosed positions".
+        return CommandResult(
+            text="\n".join([
+                fmt_section("🔄", "Reconciliation"),
+                "no live reconciler attached to this loop.",
+                f"journal open positions: unknown — journal read "
+                f"failed: {type(exc).__name__}: {exc}"]),
+            reply_markup=fmt_next_keyboard("/health", "/journal", "/status"))
     return CommandResult(
         text="\n".join([
             fmt_section("🔄", "Reconciliation"),
@@ -1393,11 +1541,15 @@ def _health(ctx: CommandContext, args: list[str]) -> CommandResult:
         except Exception:
             pass
     if ctx.journal is not None:
-        try:
-            lines += ["", fmt_section("📓", "Journal"),
-                      f"journal records: {len(ctx.journal.records())}"]
-        except Exception:
-            pass
+        records, bad, error = read_journal_records(ctx)
+        lines += ["", fmt_section("📓", "Journal")]
+        if error is not None:
+            lines.append(f"journal read failed: {error}")
+        else:
+            count = f"journal records: {len(records)}"
+            if bad:
+                count += f" ({bad} unreadable skipped)"
+            lines.append(count)
     if ctx.paper is not None:
         try:
             lines += ["", fmt_section("📈", "Open Paper Positions"),

@@ -68,6 +68,7 @@ from pathlib import Path
 import pandas as pd
 
 from ..alerts.commands import CommandContext, is_owner_callback
+from ..alerts.model import send_failure_detail
 from ..backtest.data import REPO_ROOT
 from ..charts.engine import render_mt5_signal, zones_to_study_dicts
 from ..charts.signal_view import build_signal_view_html
@@ -5973,14 +5974,19 @@ class MT5Runner:
     def _position_state_trustworthy(self) -> tuple[bool, str]:
         """Is the POSITION state (not the regime state) readable?
 
-        Journal: every line must parse as JSON (``records()``
-        raises on a corrupt line).  MT5: ``executor.positions()``
-        must return.  Called only on the corrupt-regime path.
+        Journal: every line must parse (``records_with_health()``
+        counts the lines a tolerant read has to skip — any damage
+        means the position state built on it is not trusted).
+        MT5: ``executor.positions()`` must return.  Called only on
+        the corrupt-regime path.
         """
         try:
-            self.journal.records()
+            _records, bad_lines = self.journal.records_with_health()
         except Exception as exc:
             return False, f"journal corrupt: {exc}"
+        if bad_lines:
+            return False, (f"journal corrupt: {bad_lines} unreadable "
+                           f"line(s)")
         if self.executor is None:
             return False, "no executor — positions unreadable"
         try:
@@ -16193,39 +16199,80 @@ class MT5Runner:
         )
 
     def _reply_command(self, result) -> None:
-        """Send one command result back (document or text)."""
+        """Send one command result back (document or text).
+
+        Never silent on failure: a send that REPORTS non-delivery
+        (SendResult.delivered False — e.g. a document refused for
+        exceeding Telegram's 50MB cap, which is how /db used to
+        vanish) or raises earns the owner a fallback text naming
+        what could not be delivered, plus a journal note.  A result
+        carrying BOTH text and a document sends the text first (an
+        explanation riding with a fallback file, the oversize-/db
+        shape), then the document.
+        """
         if result is None:
             return
         for sender in self.senders:
+            failure = None
             try:
+                if result.text is not None \
+                        and result.document is not None:
+                    failure = self._reply_result_text(sender, result)
                 if result.document is not None:
-                    if hasattr(sender, "send_document"):
-                        try:
-                            sender.send_document(
-                                result.document,
-                                caption=result.caption,
-                                reply_markup=result.reply_markup)
-                        except TypeError:
-                            # Legacy sender without reply_markup support.
-                            sender.send_document(result.document,
-                                                 caption=result.caption)
-                    else:
-                        sender.send(f"{result.caption or ''} "
-                                    f"({result.document})")
+                    detail = self._reply_result_document(sender, result)
+                    failure = failure or detail
                 elif result.text is not None:
-                    if hasattr(sender, "send_text"):
-                        try:
-                            sender.send_text(
-                                result.text, silent=True,
-                                reply_markup=result.reply_markup)
-                        except TypeError:
-                            # Legacy sender without reply_markup support.
-                            sender.send_text(result.text, silent=True)
-                    else:
-                        sender.send(result.text)
+                    failure = self._reply_result_text(sender, result)
             except Exception as exc:
-                self.journal.log_note(
-                    f"mt5: command reply failed: {exc}")
+                failure = f"command reply failed: {exc}"
+            if failure:
+                self.journal.log_note(f"mt5: {failure}")
+                self._send_failure_notice(sender, failure)
+
+    def _reply_result_text(self, sender, result) -> str | None:
+        """Send result.text via one sender; failure detail or None."""
+        if hasattr(sender, "send_text"):
+            try:
+                res = sender.send_text(
+                    result.text, silent=True,
+                    reply_markup=result.reply_markup)
+            except TypeError:
+                # Legacy sender without reply_markup support.
+                res = sender.send_text(result.text, silent=True)
+        else:
+            res = sender.send(result.text)
+        detail = send_failure_detail(res)
+        return f"message not delivered: {detail}" if detail else None
+
+    def _reply_result_document(self, sender, result) -> str | None:
+        """Send result.document via one sender; failure detail or
+        None."""
+        if not hasattr(sender, "send_document"):
+            sender.send(f"{result.caption or ''} "
+                        f"({result.document})")
+            return None
+        try:
+            res = sender.send_document(
+                result.document,
+                caption=result.caption,
+                reply_markup=result.reply_markup)
+        except TypeError:
+            # Legacy sender without reply_markup support.
+            res = sender.send_document(result.document,
+                                       caption=result.caption)
+        detail = send_failure_detail(res)
+        return f"document not delivered: {detail}" if detail else None
+
+    def _send_failure_notice(self, sender, failure: str) -> None:
+        """Best-effort plain-text notice that a reply failed — the
+        owner hears SOMETHING even when the payload couldn't go."""
+        try:
+            if hasattr(sender, "send_text"):
+                sender.send_text(f"⚠️ {failure}", silent=True)
+            else:
+                sender.send(f"⚠️ {failure}")
+        except Exception:
+            pass
 
     def _tg_api(self, method: str, payload: dict) -> dict:
         """One Bot API call; returns the parsed JSON or {}.
