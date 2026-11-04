@@ -71,6 +71,18 @@ class HotScalpConfig:
     # opportunity is still forming — prepared, not chasing.
     approach_band_atr_m5: float = 1.0
     approach_extension_max: int = 3
+    # Continuation-target planning (owner approval 2026-11-04,
+    # workstream 2 — his PRIORITY item): a setup carries the FULL
+    # structural objective hierarchy from creation, and at the touch
+    # every objective is priced separately from the attainable
+    # entry, so an exhausted TP1 can no longer hide a viable
+    # continuation objective behind it (the Nov 4 disease: risk
+    # 5.586 vs remaining reward 0.685 priced against a micro-swing
+    # inside the zone while the real shelf sat ~19 points out).
+    # When False, planning is the legacy single-target behaviour,
+    # byte-identical.  The geometry floor (min_net_reward_risk) and
+    # the shared friction gate are NOT moved by this flag.
+    multi_target_planning_enabled: bool = True
 
     def __post_init__(self):
         if self.max_setup_age_minutes <= 0:
@@ -347,7 +359,18 @@ def build_hot_scalp_setups(symbol: str, frames: dict[str, pd.DataFrame],
     unique: dict[str, dict] = {}
     for setup in sorted(setups, key=lambda x: (x["formation_ts"], x["setup_id"])):
         unique.setdefault(setup["setup_id"], setup)
-    return list(unique.values())[-cfg.max_active_setups:]
+    final = list(unique.values())[-cfg.max_active_setups:]
+    if cfg.multi_target_planning_enabled:
+        # Continuation-target planning (owner approval 2026-11-04):
+        # the FULL structural objective hierarchy is fixed HERE, at
+        # creation, from the structure that created the setup.  The
+        # touch-time planner prices these objectives and no others —
+        # it can never reach for a level the setup was not born with.
+        for setup in final:
+            setup["target_hierarchy"] = _target_hierarchy(
+                m5, int(setup["direction"]), float(setup["zone_low"]),
+                float(setup["zone_high"]))
+    return final
 
 
 def _targets_from_structure(m5: pd.DataFrame, direction: int,
@@ -382,6 +405,156 @@ def _target_from_structure(m5: pd.DataFrame, direction: int,
     """Nearest confirmed opposing swing beyond the actual tick entry."""
     targets = _targets_from_structure(m5, direction, entry)
     return targets[0] if targets else None
+
+
+def _target_hierarchy(m5: pd.DataFrame, direction: int,
+                      zone_low: float, zone_high: float) -> list[dict]:
+    """The setup's FULL structural objective hierarchy at creation.
+
+    Every confirmed opposing swing STRICTLY beyond the trade-side
+    zone edge (above ``zone_high`` for a long, below ``zone_low``
+    for a short), nearest first.  The zone edge is the anchor — an
+    objective inside the entry zone is the entry's own noise, never
+    an objective (the Nov 4 Exhibit B failure priced a "target"
+    inside the zone it was entering).  Each objective traces to a
+    swing in the creation frame; NOTHING is derived from distances,
+    ATR multiples or R thresholds, so no target can be invented to
+    satisfy a floor.  The runner terminus beyond the last objective
+    stays open by design (``runner: "open"`` on the candidate).
+
+    Fallback mirrors the legacy target search (recent-window
+    extreme) when no confirmed swing exists beyond the edge.
+    """
+    edge = float(zone_high) if direction > 0 else float(zone_low)
+    found: list[tuple[int, float]] = []
+    try:
+        highs, lows = find_swings(m5["high"].to_numpy(dtype=float),
+                                  m5["low"].to_numpy(dtype=float), 3)
+        pool = highs if direction > 0 else lows
+        found = [(int(pos), float(price)) for pos, price in pool
+                 if (float(price) > edge if direction > 0
+                     else float(price) < edge)]
+        found.sort(key=lambda item: item[1], reverse=direction < 0)
+    except (ValueError, TypeError, IndexError, KeyError):
+        found = []
+    objectives: list[dict] = []
+    for rank, (pos, price) in enumerate(found, start=1):
+        objectives.append({
+            "rank": rank,
+            "role": ("tp1" if rank == 1 else
+                     "tp2" if rank == 2 else "continuation"),
+            "price": float(price),
+            "source": ("m5_swing_high" if direction > 0
+                       else "m5_swing_low"),
+            "swing_ts": (_utc(m5.index[pos]).isoformat()
+                         if 0 <= pos < len(m5) else None),
+        })
+    if objectives:
+        return objectives
+    recent = m5.tail(60)
+    column = "high" if direction > 0 else "low"
+    beyond = recent.loc[(recent[column] > edge if direction > 0
+                         else recent[column] < edge), column]
+    if not len(beyond):
+        return []
+    price = float(beyond.min() if direction > 0 else beyond.max())
+    extreme_label = (beyond.idxmin() if direction > 0
+                     else beyond.idxmax())
+    return [{"rank": 1, "role": "tp1", "price": price,
+             "source": ("recent_extreme_high" if direction > 0
+                        else "recent_extreme_low"),
+             "swing_ts": _utc(extreme_label).isoformat()}]
+
+
+def _plan_targets(*, hierarchy_prices: list[float], direction: int,
+                  entry_mid: float, spread: float, stop: float,
+                  cfg: HotScalpConfig) -> dict:
+    """Price EVERY objective in the hierarchy at the zone touch.
+
+    The legacy planner priced only the nearest level from the mid
+    — a price nobody can trade at.  This planner prices from the
+    ATTAINABLE entry (the executable side of the quote: ask for a
+    long, bid for a short — the spread/slippage between the mid
+    reference and the fill is paid there, and the exit half-spread
+    comes off each leg's reward), against the setup's structural
+    invalidation.  Each leg is judged against the UNCHANGED
+    ``min_net_reward_risk`` floor:
+
+    - ``exhausted``: no gross reward remains at the attainable
+      entry (price already travelled to/past the objective);
+    - ``rejected``: reward remains but net geometry is below the
+      floor;
+    - ``selected``: the first leg that clears the floor — the
+      planned objective; later legs that clear it are ``viable``.
+
+    Net R/R is monotonic along the hierarchy (same risk, growing
+    reward), so the first clearing leg is the honest plan: TP1 when
+    TP1 still pays, the continuation objective when it does not.
+    No leg's price ever comes from anywhere but the hierarchy the
+    setup was created with.
+    """
+    entry = float(entry_mid) + (direction * float(spread) / 2.0)
+    risk = (entry - float(stop)) if direction > 0 else \
+        (float(stop) - entry)
+    legs: list[dict] = []
+    planned_rank: int | None = None
+    for rank, raw_price in enumerate(hierarchy_prices, start=1):
+        price = float(raw_price)
+        gross = (price - entry) if direction > 0 else (entry - price)
+        net_reward = gross - float(spread) / 2.0
+        net_rr = (net_reward / risk) if risk > 0 else 0.0
+        if gross <= 0:
+            verdict = "exhausted"
+            reason = ("no reward remains at the attainable entry — "
+                      "price already reached this objective")
+        elif net_reward <= 0 or net_rr < cfg.min_net_reward_risk:
+            verdict = "rejected"
+            reason = (f"net geometry {net_rr:.3f}R is below the "
+                      f"unchanged {cfg.min_net_reward_risk:.2f}R floor")
+        elif planned_rank is None:
+            verdict = "selected"
+            planned_rank = rank
+            reason = ("first objective whose remaining reward clears "
+                      "the geometry floor at the attainable entry")
+        else:
+            verdict = "viable"
+            reason = "also clears the floor; rides behind the plan"
+        legs.append({
+            "rank": rank,
+            "role": ("tp1" if rank == 1 else
+                     "tp2" if rank == 2 else "continuation"),
+            "price": price,
+            "remaining_reward": gross,
+            "net_reward": net_reward,
+            "net_rr": net_rr,
+            "verdict": verdict,
+            "reason": reason,
+        })
+    if not legs:
+        plan_kind = "no_target"
+    elif planned_rank is None:
+        plan_kind = "blocked"
+    elif planned_rank == 1:
+        plan_kind = "standard"
+    else:
+        plan_kind = "continuation"
+    planned = (legs[planned_rank - 1] if planned_rank is not None
+               else None)
+    return {
+        "entry_attainable": entry,
+        "entry_reference_mid": float(entry_mid),
+        "risk": risk,
+        "spread": float(spread),
+        "min_net_reward_risk": float(cfg.min_net_reward_risk),
+        "legs": legs,
+        "planned_objective": (planned["price"] if planned else None),
+        "planned_rank": planned_rank,
+        "plan_kind": plan_kind,
+        "planned_targets": ([leg["price"] for leg in
+                             legs[planned_rank - 1:]]
+                            if planned_rank is not None else []),
+        "runner": "open",
+    }
 
 
 class HotScalpResearchEngine:
@@ -611,30 +784,140 @@ class HotScalpResearchEngine:
                                        "spread": spread, "atr_m1": atr1})
                     continue
 
-                targets = _targets_from_structure(m5, direction, mid)
-                target = targets[0] if targets else None
-                if target is None:
-                    if self.store.terminate(sid, "blocked",
-                                            "no opposing structural target beyond entry",
-                                            now_ts):
-                        events.append({"event": "candidate_blocked",
-                                       "setup_id": sid,
-                                       "reason_code": "geometry.no_target"})
-                    continue
-                risk = (mid - stop) if direction > 0 else (stop - mid)
-                reward = (target - mid) if direction > 0 else (mid - target)
-                net_rr = ((reward - spread) / (risk + spread)
-                          if risk > 0 and reward > spread else 0.0)
-                if risk <= 0 or reward <= 0 or net_rr < self.cfg.min_net_reward_risk:
-                    if self.store.terminate(sid, "blocked",
-                                            "net reward/risk below Hot Scalp geometry requirement",
-                                            now_ts):
-                        events.append({"event": "candidate_blocked",
-                                       "setup_id": sid,
-                                       "reason_code": "geometry.net_rr_below_min",
-                                       "risk": risk, "reward": reward,
-                                       "net_rr": net_rr})
-                    continue
+                target_plan: dict | None = None
+                legacy_geometry: dict | None = None
+                planned_targets: list[float] = []
+                if self.cfg.multi_target_planning_enabled:
+                    # Continuation-target planning (owner approval
+                    # 2026-11-04, workstream 2): price EVERY
+                    # objective in the setup's creation hierarchy
+                    # from the attainable entry.  The legacy
+                    # single-target computation is still produced
+                    # alongside — as the journaled shadow comparison
+                    # (old plan vs new plan on the same touch) — but
+                    # it no longer decides anything.
+                    _legacy_targets = _targets_from_structure(
+                        m5, direction, mid)
+                    _legacy_target = (_legacy_targets[0]
+                                       if _legacy_targets else None)
+                    if _legacy_target is not None:
+                        _l_risk = ((mid - stop) if direction > 0
+                                   else (stop - mid))
+                        _l_reward = ((_legacy_target - mid)
+                                     if direction > 0
+                                     else (mid - _legacy_target))
+                        _l_net = ((_l_reward - spread)
+                                  / (_l_risk + spread)
+                                  if _l_risk > 0 and _l_reward > spread
+                                  else 0.0)
+                        legacy_geometry = {
+                            "planner": "legacy_single_target_mid",
+                            "target": float(_legacy_target),
+                            "risk": _l_risk, "reward": _l_reward,
+                            "net_rr": _l_net,
+                            "verdict": ("candidate"
+                                        if _l_risk > 0 and _l_reward > 0
+                                        and _l_net >=
+                                        self.cfg.min_net_reward_risk
+                                        else "blocked"),
+                        }
+                    else:
+                        legacy_geometry = {
+                            "planner": "legacy_single_target_mid",
+                            "target": None, "risk": None,
+                            "reward": None, "net_rr": None,
+                            "verdict": "blocked_no_target",
+                        }
+                    _stored = setup.get("target_hierarchy") or []
+                    if _stored:
+                        _prices = [float(o["price"]) for o in _stored]
+                        _h_source = "creation"
+                    else:
+                        # Armed before the hierarchy existed (or by
+                        # a flag-off build): recompute from THIS
+                        # frame, anchored at the zone edge — never
+                        # from the mid — and say so on the record.
+                        _objs = _target_hierarchy(m5, direction, lo, hi)
+                        _prices = [o["price"] for o in _objs]
+                        _h_source = "touch_recomputed"
+                    _plan = _plan_targets(
+                        hierarchy_prices=_prices, direction=direction,
+                        entry_mid=mid, spread=spread, stop=stop,
+                        cfg=self.cfg)
+                    _plan["hierarchy_source"] = _h_source
+                    target_plan = _plan
+                    if not _prices:
+                        if self.store.terminate(
+                                sid, "blocked",
+                                "no opposing structural target beyond entry",
+                                now_ts):
+                            events.append({
+                                "event": "candidate_blocked",
+                                "setup_id": sid,
+                                "reason_code": "geometry.no_target",
+                                "target_plan": _plan,
+                                "legacy_geometry": legacy_geometry})
+                        continue
+                    if _plan["planned_objective"] is None:
+                        _best = max(_plan["legs"],
+                                    key=lambda leg: leg["net_rr"])
+                        _ev = {"event": "candidate_blocked",
+                               "setup_id": sid,
+                               "reason_code": "geometry.net_rr_below_min",
+                               "target_plan": _plan,
+                               "legacy_geometry": legacy_geometry}
+                        # The headline risk/reward/net_rr keep the
+                        # legacy numbers when the legacy planner had
+                        # a target (continuity with the historical
+                        # records); otherwise the best leg the new
+                        # planner could find stands in.
+                        if legacy_geometry.get("risk") is not None:
+                            _ev["risk"] = legacy_geometry["risk"]
+                            _ev["reward"] = legacy_geometry["reward"]
+                            _ev["net_rr"] = legacy_geometry["net_rr"]
+                        else:
+                            _ev["risk"] = _plan["risk"]
+                            _ev["reward"] = _best["remaining_reward"]
+                            _ev["net_rr"] = _best["net_rr"]
+                        if self.store.terminate(
+                                sid, "blocked",
+                                "net reward/risk below Hot Scalp geometry requirement",
+                                now_ts):
+                            events.append(_ev)
+                        continue
+                    targets = _prices
+                    target = float(_plan["planned_objective"])
+                    _leg = _plan["legs"][_plan["planned_rank"] - 1]
+                    risk = float(_plan["risk"])
+                    reward = float(_leg["remaining_reward"])
+                    net_rr = float(_leg["net_rr"])
+                    planned_targets = [float(p) for p in
+                                       _plan["planned_targets"]]
+                else:
+                    targets = _targets_from_structure(m5, direction, mid)
+                    target = targets[0] if targets else None
+                    if target is None:
+                        if self.store.terminate(sid, "blocked",
+                                                "no opposing structural target beyond entry",
+                                                now_ts):
+                            events.append({"event": "candidate_blocked",
+                                           "setup_id": sid,
+                                           "reason_code": "geometry.no_target"})
+                        continue
+                    risk = (mid - stop) if direction > 0 else (stop - mid)
+                    reward = (target - mid) if direction > 0 else (mid - target)
+                    net_rr = ((reward - spread) / (risk + spread)
+                              if risk > 0 and reward > spread else 0.0)
+                    if risk <= 0 or reward <= 0 or net_rr < self.cfg.min_net_reward_risk:
+                        if self.store.terminate(sid, "blocked",
+                                                "net reward/risk below Hot Scalp geometry requirement",
+                                                now_ts):
+                            events.append({"event": "candidate_blocked",
+                                           "setup_id": sid,
+                                           "reason_code": "geometry.net_rr_below_min",
+                                           "risk": risk, "reward": reward,
+                                           "net_rr": net_rr})
+                        continue
 
                 evidence = self._evidence(setup, frames, now_ts, mid,
                                          spread, atr1, reaction_strength)
@@ -698,6 +981,22 @@ class HotScalpResearchEngine:
                     "execution_authority": "shadow_only",
                     "claim": claim,
                 }
+                if target_plan is not None:
+                    # The full per-target table rides the candidate:
+                    # which objectives existed, what each still paid
+                    # at the touch, and why the plan chose the one
+                    # it did.  The promotion path consumes
+                    # planned_targets — the viable ladder — instead
+                    # of the raw tp1/tp2 pair, so a continuation
+                    # plan's broker target is the objective the plan
+                    # actually selected, not the exhausted TP1.
+                    candidate["targets"]["planned_objective"] = float(
+                        target_plan["planned_objective"])
+                    candidate["targets"]["plan_kind"] = str(
+                        target_plan["plan_kind"])
+                    candidate["planned_targets"] = planned_targets
+                    candidate["target_plan"] = target_plan
+                    candidate["legacy_geometry"] = legacy_geometry
                 if self.store.write_event_once(
                         event_id=f"candidate:{sid}", setup_id=sid,
                         event_type="candidate_shadow", now=now_ts.isoformat(),

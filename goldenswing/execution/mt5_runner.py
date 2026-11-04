@@ -544,6 +544,18 @@ class MT5RunnerConfig:
     # the live loop, and it refuses even when called
     # directly (defense in depth).
     hot_scalp_live_enabled: bool = True
+    # Continuation-target planning (owner approval 2026-11-04,
+    # workstream 2 — his PRIORITY item): the Hot Scalp sleeve
+    # carries each setup's full structural target hierarchy from
+    # creation and prices every objective at the touch, so an
+    # exhausted TP1 no longer hides a viable continuation
+    # objective.  DEFAULT ON (same posture as live authority: the
+    # owner does not configure); config-file/env-overridable
+    # (GS_HOT_SCALP_MULTI_TARGET=0), never /set-editable.  OFF
+    # restores the legacy single-target planning byte-identically.
+    # The shared friction gate and the geometry floor are NOT
+    # moved by this switch.
+    hot_scalp_multi_target_enabled: bool = True
     # DXY correlation (owner's-bot floor): the XAUUSD vs DXYm
     # correlation is confluence context (Ghost Sentinel bands,
     # bounded ±0.5) — never a gate leg.  A dead DXY feed degrades
@@ -677,6 +689,10 @@ class MT5RunnerConfig:
         if env_live is not None:
             self.hot_scalp_live_enabled = env_live.strip().lower() in (
                 "1", "true", "yes", "on")
+        env_mt = os.environ.get("GS_HOT_SCALP_MULTI_TARGET")
+        if env_mt is not None:
+            self.hot_scalp_multi_target_enabled = \
+                env_mt.strip().lower() in ("1", "true", "yes", "on")
         if self.hot_scalp_db_path is None:
             self.hot_scalp_db_path = self.journal_path.parent / "hot_scalp_setups.db"
 
@@ -798,6 +814,32 @@ def management_block_for(pb_name: str, sig=None) -> dict:
         "management_target": (
             float(targets[0]) if targets else None),
     }
+
+
+def _hot_scalp_order_targets(candidate: dict) -> list[float]:
+    """The target ladder a Hot Scalp candidate hands the shared
+    order path at promotion.
+
+    A candidate carrying a continuation-target plan (owner
+    approval 2026-11-04, workstream 2) trades to its PLANNED
+    ladder — the viable objectives from the planned one onward —
+    so the broker target is the objective the plan selected at
+    the touch, never an exhausted TP1 the plan already priced as
+    spent.  Candidates without a plan keep the exact legacy
+    selection: the staged tp1/tp2 pair, else the single target
+    reference.
+    """
+    planned = candidate.get("planned_targets") or []
+    targets = [float(p) for p in planned if p]
+    if targets:
+        return targets
+    staged = candidate.get("targets") or {}
+    if isinstance(staged, dict):
+        targets = [float(staged[k]) for k in ("tp1", "tp2")
+                   if staged.get(k)]
+    if not targets:
+        targets = [float(candidate.get("target_reference") or 0.0)]
+    return targets
 
 
 @dataclass
@@ -990,7 +1032,10 @@ class MT5Runner:
             try:
                 _hs_store = SetupStore(self.cfg.hot_scalp_db_path)
                 self._hot_scalp = HotScalpResearchEngine(
-                    _hs_store, HotScalpConfig(enabled=True),
+                    _hs_store, HotScalpConfig(
+                        enabled=True,
+                        multi_target_planning_enabled=bool(
+                            self.cfg.hot_scalp_multi_target_enabled)),
                     instance_id=self._hot_scalp_instance_id)
             except Exception as _hs_exc:
                 self.journal.log_note(
@@ -8566,6 +8611,23 @@ class MT5Runner:
                 "score": event.get("score"),
                 "targets": event.get("targets"),
             })
+            if event.get("target_plan") is not None:
+                # Continuation-target planning (2026-11-04): the
+                # canonical chain carries the per-target table and
+                # the legacy shadow comparison, so the audit reads
+                # the plan — and what the old planner would have
+                # done with the same touch — from this one record.
+                fields.update({
+                    "target_plan": event.get("target_plan"),
+                    "planned_targets": event.get("planned_targets"),
+                    "legacy_geometry": event.get("legacy_geometry"),
+                })
+        elif name == "candidate_blocked" \
+                and event.get("target_plan") is not None:
+            fields.update({
+                "target_plan": event.get("target_plan"),
+                "legacy_geometry": event.get("legacy_geometry"),
+            })
         self._hs_chain(chain_id=chain_id, parent_id=parent_id,
                        stage=stage, status=stage, tick=tick,
                        fields=fields)
@@ -8731,13 +8793,7 @@ class MT5Runner:
                     "order_shape": kind})
             _resolve(False)
             return False
-        _staged = candidate.get("targets") or {}
-        _sig_targets = [float(_staged[k]) for k in ("tp1", "tp2")
-                        if isinstance(_staged, dict)
-                        and _staged.get(k)]
-        if not _sig_targets:
-            _sig_targets = [float(candidate.get("target_reference")
-                                  or 0.0)]
+        _sig_targets = _hot_scalp_order_targets(candidate)
         sig = SimpleNamespace(
             direction=direction, entry_ref=entry_ref,
             invalidation=float(candidate.get("structural_stop") or 0.0),
@@ -8770,8 +8826,11 @@ class MT5Runner:
                        "entry_reference": entry_ref,
                        "stop": float(candidate.get("structural_stop")
                                      or 0.0),
-                       "targets": candidate.get("targets")
-                       or [candidate.get("target_reference")],
+                       "targets": (_sig_targets
+                                   if candidate.get("planned_targets")
+                                   else candidate.get("targets")
+                                   or [candidate.get(
+                                       "target_reference")]),
                        "management": sig.management},
         }
         try:
