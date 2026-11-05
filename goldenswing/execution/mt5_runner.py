@@ -4126,6 +4126,10 @@ class MT5Runner:
                                     f"outside entry zone "
                                     f"{_cap['zone_low']:.2f}–"
                                     f"{_cap['zone_high']:.2f}")
+                            _pl = self.tick_manager.pl_state(ticket)
+                            if _pl.get("earned"):
+                                _sl_note += (
+                                    f" — earned: {_pl.get('by')}")
                         self.journal.log_note(_sl_note)
                         if action.reason == "breakeven":
                             self._send_alert(
@@ -4159,6 +4163,26 @@ class MT5Runner:
                                 f"MT5 PROFIT LOCK {pb} ticket {ticket}: "
                                 f"SL -> {action.level:.2f} — profit "
                                 f"locked in, trade cannot lose")
+                            # Earned lock (hot_scalp): the firing
+                            # joins the structured record WITH its
+                            # earning evidence (acceptance close /
+                            # backstop excursion) — the be_earned
+                            # audit-trail principle, extended.
+                            _pl = self.tick_manager.pl_state(ticket)
+                            if _pl.get("earned") and pos is not None:
+                                log_signal(
+                                    self.journal,
+                                    signal_id=str(pos.alert_id),
+                                    playbook=pb,
+                                    direction=int(pos.direction),
+                                    score=float(
+                                        (self._position_ctx.get(
+                                            int(ticket)) or {}).get(
+                                            "entry_total") or 0.0),
+                                    decision="management",
+                                    reason=(f"pl_earned: "
+                                            f"{_pl.get('by')}"),
+                                    context=self._decision_context())
                     else:
                         if str(res.message).startswith("no position"):
                             # Broker-closed between ticks: stand
@@ -7868,6 +7892,48 @@ class MT5Runner:
                 entry_mgmt_bar=int(ctx.get(
                     "entry_mgmt_bar", ctx["entry_bar"])),
                 current_mgmt_bar=now_mgmt)
+            # Earned profit-lock (hot_scalp): ACCEPTANCE earns
+            # the lock — an M5 close beyond the position's first
+            # target in its favour (acceptance-by-closes, the
+            # reaction doctrine — not a wick touch).  Fed here,
+            # on the position's own bar-close pass; the tick
+            # manager only records the earning (mark_pl_earned,
+            # the mark_be_earned seam), and the lock itself
+            # fires on the next tick.  Stamped once: repeat
+            # closes beyond TP1 never re-journal.
+            if str(ctx.get("playbook") or "") in \
+                    self.tick_manager.tick_cfg \
+                    .profit_lock_earned_playbooks and pos.targets:
+                _pl = self.tick_manager.pl_state(int(ticket))
+                if not _pl.get("earned") and not _pl.get("done"):
+                    _m5 = (self._stack.frames.get("M5")
+                           if self._stack is not None else None)
+                    if _m5 is not None and len(_m5):
+                        _m5_close = float(_m5["close"].iloc[-1])
+                        _tp1 = float(pos.targets[0])
+                        if (_m5_close - _tp1) * d > 0:
+                            _via = (
+                                f"acceptance: M5 close "
+                                f"{_m5_close:.2f} beyond TP1 "
+                                f"{_tp1:.2f} (bar {_m5.index[-1]})")
+                            if self.tick_manager.mark_pl_earned(
+                                    int(ticket), _via):
+                                self.journal.log_note(
+                                    f"mt5: profit lock EARNED for "
+                                    f"ticket {ticket} ({_via}) — "
+                                    "the lock may fire on the "
+                                    "next tick")
+                                log_signal(
+                                    self.journal,
+                                    signal_id=str(pos.alert_id),
+                                    playbook=str(ctx.get("playbook")
+                                                 or ""),
+                                    direction=d,
+                                    score=float(ctx.get(
+                                        "entry_total") or 0.0),
+                                    decision="management",
+                                    reason=f"pl_earned: {_via}",
+                                    context=self._decision_context())
             # (1) defended stop: close through the defended pivot.
             defended = ctx.get("defended_stop")
             if defended is not None and atr_h1 > 0:

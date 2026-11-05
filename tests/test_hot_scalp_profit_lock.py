@@ -26,7 +26,12 @@ Fixes pinned here:
    ``profit_lock_progress_excluded_playbooks`` (the 2026-10-27
    "premature profit locking" precedent): travelling halfway
    to target no longer arms the lock; the best-R >= 1.0 arm
-   still fires.
+   still fires.  (Follow-up, same day: ticket 540791314 showed
+   the best-R arm itself locking too early — hot_scalp's lock
+   is now EARNED, and the touch arm is gone for hot_scalp;
+   see tests/test_hot_scalp_earned_lock.py.  The pins below
+   that exercise cap/label mechanics stamp the earning
+   explicitly.)
 2. Structure floor: a zone-born position's profit-lock level
    is capped a buffer (0.05R) INSIDE the entry zone's far edge
    (long: zone_high - buffer; short: zone_low + buffer), so a
@@ -173,13 +178,19 @@ def test_journal_replay_control_playbook_locks_at_journal_level():
 
 # ------------------------------------------------------------- fix 1
 def test_hot_scalp_best_r_arm_still_fires():
-    """Exclusion is progress-arm only: a full 1R excursion
-    still locks (zone-less, so at the raw journal level)."""
+    """SUPERSEDED by the earned-lock follow-up (ticket
+    540791314, same morning): the +1R touch arm itself became
+    the de-facto exit on the second trade, so for hot_scalp
+    the touch no longer arms the lock at all — the lock must
+    be EARNED (acceptance close beyond TP1, or the 2R
+    backstop).  The full earned contract is pinned in
+    tests/test_hot_scalp_earned_lock.py; this pin now records
+    that the old arm is gone."""
     tm = TickManager()
     _open(tm, zone=None)
-    locks = _locks(tm.on_tick(540274935, BEST_R_TICK))
-    assert len(locks) == 1
-    assert locks[0].level == pytest.approx(RAW_LOCK)
+    assert _locks(tm.on_tick(540274935, BEST_R_TICK)) == []
+    assert tm.pl_state(540274935)["earned"] is False
+    assert tm.profit_lock_state(540274935)["done"] is False
 
 
 def test_runner_hot_scalp_progress_tick_moves_no_stop(tmp_path):
@@ -196,6 +207,10 @@ def test_runner_hot_scalp_progress_tick_moves_no_stop(tmp_path):
 def test_zone_cap_long_floors_lock_inside_zone_edge():
     tm = TickManager()
     _open(tm)  # hot_scalp + the journal zone
+    # Earned-lock follow-up: the cap is the subject here, so
+    # the lock is earned explicitly (acceptance stamp) — the
+    # +1R touch alone no longer arms hot_scalp.
+    assert tm.mark_pl_earned(540274935, "acceptance: fixture")
     locks = _locks(tm.on_tick(540274935, BEST_R_TICK))
     assert len(locks) == 1
     assert locks[0].level == pytest.approx(CAPPED_LOCK)
@@ -222,6 +237,7 @@ def test_zone_cap_short_mirrors_at_zone_low():
                                         stop_loss=4136.405),
             fill_price=ENTRY, entry_bar=10, broker_sl=4137.405,
             playbook="hot_scalp", entry_zone=ZONE)
+    assert tm.mark_pl_earned(11, "acceptance: fixture")
     locks = _locks(tm.on_tick(11, 4131.30))  # best_r 1.057
     assert len(locks) == 1
     assert locks[0].level == pytest.approx(4132.1584)
@@ -255,6 +271,7 @@ def test_zoneless_and_degenerate_zones_behave_as_before():
     for zone in (None, (0.0, 0.0), (4135.883,), "junk"):
         tm = TickManager()
         _open(tm, zone=zone)
+        assert tm.mark_pl_earned(540274935, "acceptance: fixture")
         locks = _locks(tm.on_tick(540274935, BEST_R_TICK))
         assert len(locks) == 1
         assert locks[0].level == pytest.approx(RAW_LOCK)

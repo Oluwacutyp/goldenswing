@@ -126,6 +126,27 @@ class TickConfig:
     #: state; see profit_lock_state).  Positions without zone
     #: data are untouched — today's exact behaviour.
     profit_lock_zone_buffer_r: float = 0.05
+    #: Earned profit-lock (P3 mirror, 2026-11-05): for these
+    #: playbooks the +1R touch alone does NOT arm profit_lock —
+    #: the lock must be EARNED, either by ACCEPTANCE (an M5 close
+    #: beyond the position's first target in its favour, stamped
+    #: by the runner's bar-close pass via mark_pl_earned — the
+    #: owner's reaction doctrine: acceptance-by-closes, not a
+    #: wick touch) or by the BACKSTOP excursion below.  Evidence:
+    #: two same-morning live trades — 540274935 (progress arm,
+    #: +0.46R; the exclusion above) and 540791314, where the
+    #: best-R arm locked at entry + 0.50R exactly (4124.49 ->
+    #: 4131.52 on a 14.06 risk) and a normal pullback four
+    #: minutes later converted a runner-shaped trade into a
+    #: +0.49R scratch.  The +0.5R level had become the de-facto
+    #: exit.  The lock LEVEL formula is unchanged — only WHEN
+    #: it may fire changes.  Every other playbook keeps the
+    #: touch arms exactly as before.
+    profit_lock_earned_playbooks: tuple[str, ...] = ("hot_scalp",)
+    #: Backstop for the earned profit-lock: an excursion this
+    #: deep earns the lock even without an acceptance close
+    #: (same value and posture as breakeven_backstop_r).
+    profit_lock_backstop_r: float = 2.0
     #: Step 13 (2026-10-29, owner's pick after the Oct 29 journal
     #: evidence): FIXED-BRACKET playbooks — no post-entry stop
     #: tightening of any kind.  Profit-lock, breakeven, the R-trail
@@ -236,6 +257,13 @@ class _TickState:
     #: structure event) or by a banked partial (TP1) in apply().
     be_earned: bool = False
     be_earned_by: str = ""
+    #: Earned profit-lock state (mirror of be_earned): set by
+    #: mark_pl_earned (an acceptance close beyond TP1, fed by
+    #: the runner's bar-close pass) or in on_tick when the
+    #: backstop excursion first arms the lock.  Only consulted
+    #: for TickConfig.profit_lock_earned_playbooks.
+    pl_earned: bool = False
+    pl_earned_by: str = ""
     #: SL actually on the broker (breakeven/trailing moves only tighten).
     broker_sl: float | None = None
     #: Broker says this position is gone (a modify reported "no
@@ -481,6 +509,31 @@ class TickManager:
         return {"earned": bool(st.be_earned),
                 "by": st.be_earned_by,
                 "done": bool(st.breakeven_done)}
+
+    # --------------------------------------- earned profit-lock
+    def mark_pl_earned(self, ticket: int, via: str) -> bool:
+        """Arm the earned profit-lock for a position: an
+        acceptance close beyond TP1 printed in its favour (the
+        runner's bar-close pass names the event).  The lock
+        itself fires on the next tick via the ordinary candidate
+        path — this only records the earning, so /status and
+        the journal can say WHY.  False when the ticket is
+        unknown or the lock already happened."""
+        st = self._states.get(ticket)
+        if st is None or st.pos.profit_lock_done:
+            return False
+        if not st.pl_earned:
+            st.pl_earned = True
+            st.pl_earned_by = str(via)
+        return True
+
+    def pl_state(self, ticket: int) -> dict:
+        st = self._states.get(ticket)
+        if st is None:
+            return {}
+        return {"earned": bool(st.pl_earned),
+                "by": st.pl_earned_by,
+                "done": bool(st.pos.profit_lock_done)}
 
     def last_sl_reason(self, ticket: int) -> str:
         """Reason of the last modify_sl applied for this ticket
@@ -911,10 +964,29 @@ class TickManager:
                 # was underwater.
                 progress = d * (price - pos.entry_price) / target_dist \
                     if target_dist > 0 else 0.0
-                if pos.best_r >= tcfg.profit_lock_trigger_r \
+                if st.playbook in tcfg.profit_lock_earned_playbooks:
+                    # EARNED lock (P3 mirror): the +1R touch alone
+                    # does NOT arm it — an acceptance close beyond
+                    # TP1 (mark_pl_earned, fed by the runner's
+                    # bar-close pass) or the backstop excursion
+                    # earns it.  The backstop earning is stamped
+                    # the tick it first holds, so the record names
+                    # it even when a tighter candidate (trail /
+                    # chandelier) wins that tick's modify.
+                    if not st.pl_earned \
+                            and pos.best_r \
+                            >= tcfg.profit_lock_backstop_r:
+                        st.pl_earned = True
+                        st.pl_earned_by = (
+                            f"backstop (best_r {pos.best_r:.2f}R)")
+                    lock_armed = st.pl_earned
+                else:
+                    lock_armed = \
+                        pos.best_r >= tcfg.profit_lock_trigger_r \
                         or (progress >= tcfg.profit_lock_progress
                             and st.playbook not in
-                            tcfg.profit_lock_progress_excluded_playbooks):
+                            tcfg.profit_lock_progress_excluded_playbooks)
+                if lock_armed:
                     lock_dist = max(
                         tcfg.profit_lock_fraction_of_risk
                         * pos.risk_price,
@@ -1024,6 +1096,13 @@ class TickManager:
                     st.be_earned_by = st.be_earned_by or "backstop"
             if action.reason == "profit_lock":
                 pos.profit_lock_done = True
+                if not st.pl_earned and st.playbook in \
+                        self.tick_cfg.profit_lock_earned_playbooks:
+                    # Fired on the backstop excursion (the in-tick
+                    # stamp normally precedes it): the record says
+                    # so — earned-by-backstop stays distinguishable
+                    # from earned-by-acceptance in the journal.
+                    st.pl_earned_by = st.pl_earned_by or "backstop"
             # Keep the stepper's trail level in sync so active_stop
             # never disagrees with the broker SL on the next tick.
             if pos.trail_level is None or \
