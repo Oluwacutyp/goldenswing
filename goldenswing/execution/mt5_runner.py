@@ -1033,6 +1033,10 @@ class MT5Runner:
         # (ticket, reason, level): a stood-down level notes once
         # per side-invalid window, never once per tick.
         self._sl_stood_down: set = set()
+        # Profit-lock zone-cap HELD notes already journalled,
+        # keyed (ticket, capped level): a held lock notes once
+        # per capped level, never once per tick (2026-11-05).
+        self._pl_zone_noted: set = set()
         # Setup lifecycle (owner rulings 2026-10-30 §1): scan-detected
         # roster setups persist across restarts so a later trigger
         # fire can route them to execution evaluation.  A store that
@@ -4109,9 +4113,20 @@ class MT5Runner:
                             self._pool_sync_stop(
                                 ticket, pos.alert_id,
                                 float(action.level))
-                        self.journal.log_note(
+                        _sl_note = (
                             f"mt5 tick: ticket {ticket} SL -> "
                             f"{action.level:.2f} ({action.reason})")
+                        if action.reason == "profit_lock":
+                            _cap = self.tick_manager.profit_lock_state(
+                                ticket).get("zone_cap")
+                            if _cap:
+                                _sl_note += (
+                                    f" — entry-zone cap: raw lock "
+                                    f"{_cap['raw_level']:.2f} capped "
+                                    f"outside entry zone "
+                                    f"{_cap['zone_low']:.2f}–"
+                                    f"{_cap['zone_high']:.2f}")
+                        self.journal.log_note(_sl_note)
                         if action.reason == "breakeven":
                             self._send_alert(
                                 f"MT5 BREAKEVEN {pb} ticket {ticket}: "
@@ -4290,6 +4305,26 @@ class MT5Runner:
                     else:
                         self._record_close(ticket, price, "scalp_cap",
                                            stats)
+            # Profit-lock zone cap (2026-11-05): a lock the cap
+            # suppressed this tick produced no action — journal
+            # the hold once per capped level, the same
+            # once-per-window discipline as SL stand-downs, so a
+            # held lock is auditable instead of silent.
+            _cap = self.tick_manager.profit_lock_state(
+                ticket).get("zone_cap")
+            if _cap and _cap.get("suppressed"):
+                _key = (ticket, round(float(_cap["level"]), 2))
+                if _key not in self._pl_zone_noted:
+                    self._pl_zone_noted.add(_key)
+                    self.journal.log_note(
+                        f"mt5 tick: ticket {ticket} profit_lock "
+                        f"HELD (entry-zone cap): raw lock "
+                        f"{_cap['raw_level']:.2f} capped to "
+                        f"{_cap['level']:.2f} outside entry zone "
+                        f"{_cap['zone_low']:.2f}–"
+                        f"{_cap['zone_high']:.2f} — capped level "
+                        f"does not tighten the current stop, "
+                        f"lock waits")
 
     def _broker_close_price(self, ticket: int,
                             fallback: float) -> tuple[float, str | None]:
@@ -4452,9 +4487,13 @@ class MT5Runner:
 
         - ``timeout`` stays ``timeout`` (the rule that fired), even
           when the exit is in profit.
-        - The safety-net ``stop`` is an SL hit; when the stop that
-          got hit is the TRAIL level or the BREAKEVEN level, it says
-          so (a breakeven stop is risk-off, not a loss).
+        - The safety-net ``stop`` is an SL hit; the label names
+          the mechanism that LAST moved the stop (the tick
+          manager's applied-modify record), or plain ``SL hit``
+          when the stop never moved — the placement stop.  It is
+          never inferred from price geometry: geometry called
+          ticket 540274935's profit_lock exit "(trail)" because
+          every modify syncs the trail level (2026-11-05).
         - ``broker_closed`` is the broker's TP or SL (or a manual
           close): classify by price against the signal's first
           target and the effective broker stop.  Between the two,
@@ -4481,13 +4520,15 @@ class MT5Runner:
         return reason
 
     def _stop_label(self, pos) -> str:
-        """Which stop got hit: breakeven (risk-off), trail, or the
-        structural stop."""
-        if abs((self.tick_manager.effective_stop(pos.ticket) or 0.0)
-               - pos.entry_price) < 1e-9 and pos.risk_price > 0:
-            return "SL hit (breakeven)"
-        if pos.stop_is_trail:
-            return "SL hit (trail)"
+        """Which stop got hit: the mechanism that last moved it
+        (profit_lock / trail / breakeven / chandelier, from the
+        tick manager's applied-modify record), else the placement
+        stop — plain "SL hit".  Fixed-bracket playbooks never
+        record a modify, so their closes always read as the
+        placement stop."""
+        reason = self.tick_manager.last_sl_reason(pos.ticket)
+        if reason:
+            return f"SL hit ({reason})"
         return "SL hit"
 
     def _narrative_fill_plan(self, sig, fill_price: float):
@@ -9144,6 +9185,17 @@ class MT5Runner:
         # horizon, standard policy — hot scalp is NOT
         # fixed-bracket; only qm_m5 is).
         sig.management = management_block_for("hot_scalp", sig)
+        # 2026-11-05 (ticket 540274935): the entry zone rides
+        # onto the signal — the shared fill path carries it into
+        # the tick manager, whose profit-lock zone cap floors
+        # the lock outside the zone this trade was built on.
+        # Absent/malformed zone data stays None (no cap — the
+        # position behaves exactly as before the cap existed).
+        try:
+            sig.entry_zone = (float(setup["zone_low"]),
+                              float(setup["zone_high"]))
+        except (KeyError, TypeError, ValueError):
+            sig.entry_zone = None
         pb = SimpleNamespace(name="hot_scalp")
         # Chain stage: judgment.  The Judgment Core's market read at
         # promotion time, recorded as EVIDENCE on the chain — the
@@ -13691,6 +13743,8 @@ class MT5Runner:
                                entry_bar=len(h1) - 1 if entry_bar is None
                                else entry_bar, broker_sl=stop0,
                                playbook=pb.name,
+                               entry_zone=getattr(sig, "entry_zone",
+                                                  None),
                                management_horizon=str(
                                    _mgmt.get("management_horizon")
                                    or ""),
@@ -14260,6 +14314,8 @@ class MT5Runner:
                 fill_price=float(pos.entry_price),
                 entry_bar=fill_bar, broker_sl=float(state.sl),
                 playbook=state.playbook,
+                entry_zone=getattr(getattr(state, "sig", None),
+                                   "entry_zone", None),
                 management_horizon=str(
                     _mgmt.get("management_horizon") or ""),
                 management_policy_id=str(
@@ -14293,6 +14349,9 @@ class MT5Runner:
                                entry_bar=fill_bar,
                                broker_sl=float(state.sl),
                                playbook=state.playbook,
+                               entry_zone=getattr(
+                                   getattr(state, "sig", None),
+                                   "entry_zone", None),
                                management_horizon=str(
                                    _mgmt.get("management_horizon")
                                    or ""),

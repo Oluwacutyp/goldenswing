@@ -100,12 +100,32 @@ class TickConfig:
     #: for these, travelling 50% of the way to TP1 does NOT arm
     #: profit_lock — only a full 1R best excursion does.  Ordered
     #: 2026-10-27: qm_m5's close targets made the progress arm
-    #: fire on small moves ("premature profit locking").  Re-enable
+    #: fire on small moves ("premature profit locking").  Extended
+    #: 2026-11-05: hot_scalp joins on the same evidence — ticket
+    #: 540274935's progress-armed lock (entry + 0.50R) sat 0.04
+    #: above its own entry zone's top edge and 0.26 below TP1;
+    #: the first routine retest of the zone ate it 11 seconds
+    #: later for +0.46R against a +1.43R objective.  Re-enable
     #: per playbook only on replay-grade evidence.  The best-R
     #: arm, breakeven, trail, Chandelier, and the initial
     #: protective stop are unaffected, and other playbooks keep
     #: the progress arm.
-    profit_lock_progress_excluded_playbooks: tuple[str, ...] = ("qm_m5",)
+    profit_lock_progress_excluded_playbooks: tuple[str, ...] = (
+        "qm_m5", "hot_scalp")
+    #: Structure floor for the profit-lock on ZONE-BORN positions
+    #: (owner's doctrine: structure determines the stop — applied
+    #: to management, 2026-11-05, ticket 540274935): when the
+    #: position's entry zone is known, a long's lock level may not
+    #: sit within ``profit_lock_zone_buffer_r`` x risk of the
+    #: zone's far edge — it is capped at zone_high - buffer
+    #: (shorts: zone_low + buffer), so a mere TOUCH of the edge
+    #: the trade was built on cannot eat the stop; price must
+    #: penetrate the buffer into the zone.  If the cap makes the
+    #: lock no tighter than the current stop, the lock does not
+    #: fire that tick (the decision is recorded on the tick
+    #: state; see profit_lock_state).  Positions without zone
+    #: data are untouched — today's exact behaviour.
+    profit_lock_zone_buffer_r: float = 0.05
     #: Step 13 (2026-10-29, owner's pick after the Oct 29 journal
     #: evidence): FIXED-BRACKET playbooks — no post-entry stop
     #: tightening of any kind.  Profit-lock, breakeven, the R-trail
@@ -257,6 +277,27 @@ class _TickState:
     #: "fvg": {"top": float, "bottom": float}|None}.  See
     #: :meth:`TickManager.check_narrative_invalidation`.
     narrative_context: dict = field(default_factory=dict)
+    #: The entry zone the position was born from, (low, high),
+    #: carried from the signal at fill time (``open(entry_zone=)``).
+    #: None = unknown (adopted positions, zone-less signals):
+    #: the profit-lock zone cap does not apply and management
+    #: behaves exactly as before the cap existed.
+    entry_zone: tuple | None = None
+    #: Reason of the last modify_sl actually applied to the
+    #: broker ("breakeven" | "trail" | "profit_lock" |
+    #: "chandelier" | ...).  "" = the stop never moved: the
+    #: placement stop is still the stop.  The close classifier
+    #: names the exit from THIS record, never from price
+    #: geometry — geometry mislabelled ticket 540274935's
+    #: profit_lock exit as "(trail)" (2026-11-05).
+    last_sl_reason: str = ""
+    #: The last profit-lock zone-cap decision, when the cap was
+    #: evaluated: {"raw_level", "level", "zone_low", "zone_high",
+    #: "buffer", "suppressed"}.  Refreshed on every tick that
+    #: evaluates a profit-lock candidate; None when no candidate
+    #: was evaluated or the cap did not bind.  The runner reads
+    #: it via profit_lock_state() to journal capped / held locks.
+    profit_lock_zone_cap: dict | None = None
 
     @property
     def effective_stop(self) -> float:
@@ -327,7 +368,8 @@ class TickManager:
              narrative_plan: dict | None = None,
              narrative_atr: float = 0.0,
              narrative_choch_extreme: float | None = None,
-             narrative_fvg: dict | None = None) -> TrackedPosition:
+             narrative_fvg: dict | None = None,
+             entry_zone=None) -> TrackedPosition:
         """Start tracking a live position (after the order filled).
 
         ``request.stop_loss`` is the raw structural invalidation;
@@ -341,6 +383,11 @@ class TickManager:
         :meth:`attach_narrative_plan`); when given, the plan owns
         breakeven / partials / trailing / time-stop for this
         position instead of the TickConfig defaults.
+        ``entry_zone`` is the signal's entry zone (low, high)
+        the position was born from; it rides onto the tick state
+        and floors the profit-lock outside the zone (see
+        ``TickConfig.profit_lock_zone_buffer_r``).  A (0.0, 0.0)
+        / empty / degenerate zone means "unknown" — no cap.
         """
         pos = self._stepper.open(ticket=ticket, request=request,
                                  fill_price=fill_price,
@@ -353,10 +400,18 @@ class TickManager:
         # resolution (asserted in the step-18 acceptance tests).
         pos.management_horizon = str(management_horizon or "")
         pos.management_policy_id = str(management_policy_id or "")
+        zone = None
+        if entry_zone:
+            try:
+                _zlo, _zhi = float(entry_zone[0]), float(entry_zone[1])
+            except (TypeError, ValueError, IndexError):
+                _zlo = _zhi = 0.0
+            if _zhi > _zlo > 0.0:
+                zone = (_zlo, _zhi)
         self._states[ticket] = _TickState(
             pos=pos, broker_sl=(float(broker_sl) if broker_sl is not None
                                 else pos.stop0),
-            playbook=str(playbook),
+            playbook=str(playbook), entry_zone=zone,
             layers=[Layer(entry=float(fill_price),
                           volume=float(request.volume),
                           sl=float(broker_sl) if broker_sl is not None
@@ -426,6 +481,27 @@ class TickManager:
         return {"earned": bool(st.be_earned),
                 "by": st.be_earned_by,
                 "done": bool(st.breakeven_done)}
+
+    def last_sl_reason(self, ticket: int) -> str:
+        """Reason of the last modify_sl applied for this ticket
+        ("profit_lock" / "trail" / "breakeven" / "chandelier");
+        "" when the stop never moved (the placement stop is
+        still the stop) or the ticket is unknown."""
+        st = self._states.get(ticket)
+        return st.last_sl_reason if st is not None else ""
+
+    def profit_lock_state(self, ticket: int) -> dict:
+        """Profit-lock bookkeeping for the journal path:
+        {"done", "zone_cap"} — zone_cap is the last zone-cap
+        decision (raw vs capped level, the zone, whether the
+        cap suppressed the lock this evaluation) or None."""
+        st = self._states.get(ticket)
+        if st is None:
+            return {}
+        return {"done": bool(st.pos.profit_lock_done),
+                "zone_cap": (dict(st.profit_lock_zone_cap)
+                             if st.profit_lock_zone_cap is not None
+                             else None)}
 
     def book_external_partial(self, ticket: int,
                               volume: float) -> bool:
@@ -844,8 +920,37 @@ class TickManager:
                         * pos.risk_price,
                         tcfg.profit_lock_atr_mult * pos.atr
                         if pos.atr > 0 else 0.0)
-                    candidates.append((
-                        pos.entry_price + d * lock_dist, "profit_lock"))
+                    lock_level = pos.entry_price + d * lock_dist
+                    # Structure floor (2026-11-05): a zone-born
+                    # position's lock may not sit within the buffer
+                    # of its entry zone's far edge — ticket
+                    # 540274935's lock sat 0.04 ABOVE the zone top
+                    # and a touch of the edge ate it.  Cap the
+                    # level a buffer INSIDE the far edge; if the
+                    # capped level no longer tightens the current
+                    # stop, the tighter-filter below drops it and
+                    # the lock stays pending (never marked done).
+                    # The decision is recorded on the state either
+                    # way — the runner journals capped/held locks
+                    # from profit_lock_state().
+                    st.profit_lock_zone_cap = None
+                    if st.entry_zone is not None:
+                        zlo, zhi = st.entry_zone
+                        buffer = tcfg.profit_lock_zone_buffer_r \
+                            * pos.risk_price
+                        cap = zhi - buffer if d == 1 else zlo + buffer
+                        if (d == 1 and lock_level > cap) or \
+                                (d == -1 and lock_level < cap):
+                            st.profit_lock_zone_cap = {
+                                "raw_level": lock_level,
+                                "level": cap,
+                                "zone_low": zlo, "zone_high": zhi,
+                                "buffer": buffer,
+                                "suppressed": not (
+                                    (d == 1 and cap > stop)
+                                    or (d == -1 and cap < stop))}
+                            lock_level = cap
+                    candidates.append((lock_level, "profit_lock"))
             # P3: earned mode — the +1R touch alone does NOT move
             # the stop (F13); an earning event or the backstop
             # excursion does.  Touch mode keeps the legacy rule
@@ -901,6 +1006,11 @@ class TickManager:
                 # one is ever missed.)
                 return
             st.broker_sl = float(action.level)
+            # The close classifier names the exit from the LAST
+            # mechanism that actually moved the stop — recorded
+            # here, at the one seam every modify path books
+            # through, never inferred from price geometry later.
+            st.last_sl_reason = str(action.reason)
             # A success closes the failure window for this level:
             # the next candidate (if any) starts with a fresh budget.
             st.sl_failures.pop((str(action.reason), float(action.level)),
