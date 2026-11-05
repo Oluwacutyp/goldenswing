@@ -326,6 +326,15 @@ class _TickState:
     #: was evaluated or the cap did not bind.  The runner reads
     #: it via profit_lock_state() to journal capped / held locks.
     profit_lock_zone_cap: dict | None = None
+    #: Lifecycle event log (chart truth): every EXECUTED event on
+    #: this position, in order — {"kind": "open"|"sl"|"partial",
+    #: "ts": epoch, ...}.  Appended only at the booking seams
+    #: (open / apply / bank_leg), so it records what the broker
+    #: confirmed, never what a tick merely proposed.  The close
+    #: chart (charts.signal_model.LifecycleStudy) reads it via
+    #: lifecycle_events(); the journal notes remain the audit
+    #: trail, this is the same facts in structured form.
+    events: list = field(default_factory=list)
 
     @property
     def effective_stop(self) -> float:
@@ -436,7 +445,7 @@ class TickManager:
                 _zlo = _zhi = 0.0
             if _zhi > _zlo > 0.0:
                 zone = (_zlo, _zhi)
-        self._states[ticket] = _TickState(
+        _st = _TickState(
             pos=pos, broker_sl=(float(broker_sl) if broker_sl is not None
                                 else pos.stop0),
             playbook=str(playbook), entry_zone=zone,
@@ -446,6 +455,12 @@ class TickManager:
                           else float(pos.stop0),
                           alert_id=request.alert_id,
                           playbook=getattr(request, "playbook", ""))])
+        _st.events.append({
+            "kind": "open", "ts": float(pos.opened_at),
+            "price": float(fill_price),
+            "broker_sl": (float(broker_sl) if broker_sl is not None
+                          else float(pos.stop0))})
+        self._states[ticket] = _st
         if narrative_plan is not None:
             self.attach_narrative_plan(
                 ticket, narrative_plan, atr=narrative_atr,
@@ -591,6 +606,9 @@ class TickManager:
             "entry": float(entry), "stop": float(stop),
             "pnl": float(pnl_money)})
         st.pos.banked_pnl += float(pnl_money)
+        st.events.append({
+            "kind": "partial", "ts": time.time(),
+            "price": float(price), "volume": float(volume)})
         return True
 
     def check_narrative_invalidation(self, ticket: int, price: float,
@@ -722,6 +740,17 @@ class TickManager:
     def position(self, ticket: int) -> TrackedPosition | None:
         st = self._states.get(ticket)
         return st.pos if st is not None else None
+
+    def lifecycle_events(self, ticket: int) -> list[dict]:
+        """The position's executed lifecycle, in order (open /
+        stop modifications / partial legs), as recorded at the
+        booking seams. Empty for an unknown ticket — the chart
+        layer treats that as "no lifecycle recorded", never as
+        license to reconstruct one from prices."""
+        st = self._states.get(ticket)
+        if st is None:
+            return []
+        return [dict(ev) for ev in st.events]
 
     def effective_stop(self, ticket: int) -> float | None:
         """SL actually governing the position (broker SL if moved,
@@ -1078,6 +1107,10 @@ class TickManager:
                 # one is ever missed.)
                 return
             st.broker_sl = float(action.level)
+            st.events.append({
+                "kind": "sl", "ts": time.time(),
+                "level": float(action.level),
+                "reason": str(action.reason)})
             # The close classifier names the exit from the LAST
             # mechanism that actually moved the stop — recorded
             # here, at the one seam every modify path books

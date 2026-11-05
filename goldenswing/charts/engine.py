@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import matplotlib
 
@@ -58,12 +59,28 @@ from matplotlib.patches import Rectangle  # noqa: E402
 
 from ..reader import session_timeframes as sessions  # Step 3: DST-aware authority (was fixed-UTC sessions)
 from .signal_model import (  # Step 7: one shared signal-view model
+    MAX_ROLE_OVERLAYS,
+    ROLE_CONTEXT,
+    ROLE_ENTRY,
+    ROLE_ORDER,
+    ROLE_TRADE,
+    admit_level_bounds,
+    chart_targets,
+    context_study_from_state,
     decollide_label_ys,
+    label_spec,
     panel_role,
     score_text,
+    trade_label_specs,
 )
 
 STYLES = ("classic", "heikin_ashi", "line", "blueprint", "signal")
+
+#: Zone-drawing relevance caps for the study renderer: how many
+#: active FVG / OB rectangles one panel may draw, nearest to the
+#: decision price first (see the zones block in ``render``).
+_ZONE_CAP_FVG = 6
+_ZONE_CAP_OB = 4
 
 _FIGSIZE = (16, 10)          # at 100 dpi -> 1600x1000 px
 _DPI = 100
@@ -246,7 +263,15 @@ def render(df: pd.DataFrame, state, signal=None, *, style: str = "classic",
                         linestyle=ls, alpha=0.65, zorder=2)
 
     # ---------- zones: FVG + order blocks --------------------------------
-    for g in state.active_fvgs:
+    # Relevance cap (2026-11-05): EVERY active zone used to draw
+    # its own full-width rectangle, so a live accumulated state
+    # tiled the panel into stacked bands and buried the candles.
+    # A study shows the zones NEAR the decision price: at most
+    # _ZONE_CAP_FVG / _ZONE_CAP_OB, nearest first. The state
+    # itself is untouched — this is a drawing rule, not a read.
+    for g in sorted(state.active_fvgs,
+                    key=lambda z: abs(z.midpoint - state.close))[
+                        :_ZONE_CAP_FVG]:
         col = theme["up"] if g.direction == 1 else theme["down"]
         ax.add_patch(Rectangle(
             (max(g.created_at, start) - 0.5, g.bottom),
@@ -255,7 +280,10 @@ def render(df: pd.DataFrame, state, signal=None, *, style: str = "classic",
             zorder=1))
         ax.text(x_hi - 0.3, g.midpoint, "FVG ", ha="right", va="center",
                 fontsize=7.5, color=col)
-    for ob in state.active_obs:
+    for ob in sorted(state.active_obs,
+                     key=lambda z: abs(0.5 * (z.top + z.bottom)
+                                       - state.close))[
+                        :_ZONE_CAP_OB]:
         col = theme["up"] if ob.direction == 1 else theme["down"]
         ax.add_patch(Rectangle(
             (max(ob.created_at, start) - 0.5, ob.bottom),
@@ -388,13 +416,14 @@ def render(df: pd.DataFrame, state, signal=None, *, style: str = "classic",
 
     # ---------- y limits (include visible levels, clamped) ---------------
     lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
-    span = max(hi_v - lo_v, 1e-9)
-    cand = [lo_v, hi_v]
+    cand = []
     if signal is not None:
         cand += [signal.invalidation, signal.entry_ref] + list(signal.targets)
-    for v in cand:
-        if lo_v - 1.6 * span <= v <= hi_v + 1.6 * span:
-            lo_v, hi_v = min(lo_v, v), max(hi_v, v)
+    # Admission tested against the ORIGINAL candle bounds — the
+    # old loop re-tested against the growing bounds, so a
+    # staircase of levels ratcheted the axis (see signal_model.
+    # admit_level_bounds; the 540791314 ladder charts).
+    lo_v, hi_v = admit_level_bounds(lo_v, hi_v, cand, mult=1.6)
     pad = 0.07 * (hi_v - lo_v)
     ax.set_ylim(lo_v - pad, hi_v + pad)
 
@@ -589,10 +618,10 @@ def _render_signal(df: pd.DataFrame, state, signal=None, *, window: int = 64,
                 color="#f7b924", markeredgecolor=theme["text"],
                 markeredgewidth=1.2, zorder=7)
         lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
-        for v in [signal.invalidation, signal.entry_ref,
-                  *signal.targets]:
-            if lo_v - 1.2 * (hi_v - lo_v) <= v <= hi_v + 1.2 * (hi_v - lo_v):
-                lo_v, hi_v = min(lo_v, v), max(hi_v, v)
+        lo_v, hi_v = admit_level_bounds(
+            lo_v, hi_v,
+            [signal.invalidation, signal.entry_ref, *signal.targets],
+            mult=1.2)
     else:
         lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
     pad = 0.06 * max(hi_v - lo_v, 1e-9)
@@ -714,8 +743,19 @@ def _mt5_trade_levels(ax, x_hi, *, entry: float, stop: float,
     if broker_stop is not None:
         _line(broker_stop, "#ff7043", 1.6, "-",
               f" BROKER SL {_fmt(broker_stop)}", bold=True)
-    for j, t in enumerate(targets):
-        _line(t, "#2e7d32", 1.1, (0, (6, 3)), f" T{j + 1} {_fmt(t)}")
+    # Ladder-aware (2026-11-05): a hot_scalp signal carries every
+    # planned hierarchy leg; drawing them all tiled the live
+    # panels into green bands (ticket 540791314's fill charts).
+    # The chart draws the operative targets + the ladder top,
+    # labeled with their TRUE ranks (signal_model.chart_targets);
+    # the caller states the full leg count in the header box.
+    _shown, _total = chart_targets(targets, entry=entry,
+                                   direction=direction)
+    for rank, t in _shown:
+        _line(t, "#2e7d32", 1.1, (0, (6, 3)),
+              f" T{rank} {_fmt(t)}"
+              + (" (ladder top)" if rank == _total and _total > 3
+                 else ""))
     if risk > 0:
         _line(entry + direction * 2.0 * risk, "#2e7d32", 0.8,
               (0, (2, 2)), " 2R ", size=8)
@@ -764,8 +804,7 @@ def _mt5_panel_ylim(view, *, entry: float, stop: float,
     l = view["low"].to_numpy(dtype=float)
     h = view["high"].to_numpy(dtype=float)
     lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
-    span = max(hi_v - lo_v, 1e-9)
-    cand = [lo_v, hi_v, stop, entry] + list(targets) \
+    cand = [stop, entry] + list(targets) \
         + [float(v) for v in (extra or []) if v is not None]
     if broker_stop is not None:
         cand.append(broker_stop)
@@ -773,9 +812,10 @@ def _mt5_panel_ylim(view, *, entry: float, stop: float,
         cand.append(fill_price)
     if zone is not None and zone.get("top") and zone.get("bottom"):
         cand += [float(zone["top"]), float(zone["bottom"])]
-    for v in cand:
-        if lo_v - 1.6 * span <= v <= hi_v + 1.6 * span:
-            lo_v, hi_v = min(lo_v, v), max(hi_v, v)
+    # Admission against the ORIGINAL bounds (admit_level_bounds):
+    # the old growing-bounds loop let a target ladder ratchet the
+    # axis hundreds of points above the candles.
+    lo_v, hi_v = admit_level_bounds(lo_v, hi_v, cand, mult=1.6)
     pad = 0.07 * max(hi_v - lo_v, 1e-9)
     return lo_v - pad, hi_v + pad
 
@@ -804,9 +844,19 @@ def zones_to_study_dicts(zones, entry: float, signal_zone, cap: int = 8) -> list
             continue
         if sig_lo and sig_hi and sig_lo <= lvl <= sig_hi:
             continue
+        _swing_ts = getattr(z, "swing_ts", None)
         out.append({"level": lvl,
                     "tier": str(getattr(z, "tier", "") or ""),
-                    "side": str(getattr(z, "side", "") or "")})
+                    "side": str(getattr(z, "side", "") or ""),
+                    # Source timeframe + formation time ride along
+                    # (2026-11-05): the context role labels every
+                    # HTF level with where it came from, and age
+                    # is computed against the frame, never guessed.
+                    "tf": str(getattr(z, "tf", "") or ""),
+                    "swing_ts": (_swing_ts.isoformat()
+                                 if hasattr(_swing_ts, "isoformat")
+                                 else (str(_swing_ts)
+                                       if _swing_ts else ""))})
     out.sort(key=lambda d: abs(d["level"] - entry))
     return out[:cap]
 
@@ -865,7 +915,10 @@ def _mt5_nearby_lines(ax, x_hi, nearby_zones, theme) -> list[dict]:
         ax.axhline(lvl, color=col, linewidth=1.0 if major else 0.6,
                    linestyle="-" if major else (0, (6, 3)),
                    alpha=0.8, zorder=2)
-        specs.append({"value": lvl, "text": f" {tier} {lvl:.1f} ",
+        _tf = str(z.get("tf", "") or "")
+        specs.append({"value": lvl,
+                      "text": f" {_tf + ' ' if _tf else ''}{tier} "
+                              f"{lvl:.1f} ",
                       "color": col, "bold": False, "size": 7.5})
     return specs
 
@@ -1174,6 +1227,12 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
             if fill_price is not None:
                 stop_line += f" · Fill {_fmt(fill_price)}"
             vlines.append(stop_line)
+            _shown_t, _total_t = chart_targets(
+                targets, entry=entry, direction=direction)
+            if _total_t > len(_shown_t):
+                vlines.append(
+                    f"Targets charted: first {len(_shown_t) - 1} "
+                    f"+ ladder top, of {_total_t} planned legs")
             ax.text(0.008, 0.992, "\n".join(vlines),
                     transform=ax.transAxes, va="top", ha="left",
                     fontsize=8.6, family="monospace",
@@ -1202,3 +1261,707 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
         plt.close(fig)
         panel_pngs.append(buf.getvalue())
     return panel_pngs
+
+
+# ------------------------------------------------------------------ roles
+# Role-based alert charts (owner spec, 2026-11-05): the three PNGs
+# an alert sends each have ONE job, and all three read the
+# canonical studies in charts.signal_model — the same model the
+# HTML signal view reads, so the mediums cannot disagree.
+#
+#   A · Trade — fill overview: the position's truth on its
+#       management timeframe. Planned vs actual are different
+#       visual objects, always: planned targets are dashed and
+#       labeled "(planned)"; the fill, the broker stop's step
+#       path through every confirmed modification, partial legs
+#       and the exit are the actuals. The structural invalidation
+#       and the broker SL are separate lines with separate names.
+#   B · H1 — context: why the market presented the opportunity.
+#       Swings, the last structure event, the RELEVANT active
+#       zones (nearest, capped, with age), the nearest pool each
+#       side, HTF cache levels labeled with their source TF.
+#   C · Entry timeframe — entry precision: the formation, up
+#       close. Zone boundaries, the trigger candle, the fill,
+#       the stop/target geometry, and ONLY the indicator
+#       families the strategy's recorded evidence used.
+#
+# Visual language (the alert default): light background, green /
+# red candles, subtle grey grid, price axis on the RIGHT, time
+# axis at the bottom, a separate volume pane, at most
+# MAX_ROLE_OVERLAYS study families per panel, and every
+# right-edge label through the ONE de-collision pass
+# (_mt5_edge_labels) — whole-surface, no exceptions. The legacy
+# render_mt5_signal stays as the named study profiles
+# (classic / blueprint) for callers that ask for the full study.
+_ROLE_FIGSIZE = (16, 7.0)    # 1600x700 per role panel
+_ROLE_MARGIN = 12
+
+
+def _hhmm(ts_epoch: float) -> str:
+    return datetime.fromtimestamp(
+        float(ts_epoch), tz=timezone.utc).strftime("%H:%M")
+
+
+def _ts_to_pos(index, ts_epoch) -> int | None:
+    """Panel-frame position of the bar containing a timestamp.
+
+    None when the timestamp predates the frame — a marker is
+    omitted, never placed by guessing."""
+    if ts_epoch is None:
+        return None
+    try:
+        ns = index.asi8
+        pos = int(np.searchsorted(
+            ns, int(float(ts_epoch) * 1e9), side="right")) - 1
+    except Exception:
+        return None
+    return pos if 0 <= pos < len(index) else None
+
+
+def _role_scaffold(title: str, header: str):
+    """Figure + price/volume axes in the alert visual language."""
+    theme = _THEMES["classic"]
+    fig = plt.figure(figsize=_ROLE_FIGSIZE, dpi=_DPI)
+    fig.patch.set_facecolor(theme["bg"])
+    gs = fig.add_gridspec(2, 1, height_ratios=[4.4, 1.0], hspace=0.05,
+                          left=0.045, right=0.965, top=0.80,
+                          bottom=0.09)
+    ax = fig.add_subplot(gs[0])
+    axv = fig.add_subplot(gs[1], sharex=ax)
+    for a in (ax, axv):
+        a.set_facecolor(theme["bg"])
+        a.tick_params(colors=theme["text"], labelsize=9)
+        for spine in a.spines.values():
+            spine.set_color(theme["grid"])
+        a.grid(True, color=theme["grid"], linewidth=0.5, alpha=0.7)
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
+    axv.yaxis.tick_right()
+    axv.yaxis.set_label_position("right")
+    plt.setp(ax.get_xticklabels(), visible=False)
+    fig.text(0.045, 0.955, header, fontsize=13.5, fontweight="bold",
+             color=theme["text"], ha="left", va="top")
+    fig.text(0.045, 0.905, title, fontsize=11.5,
+             color=theme["text"], ha="left", va="top")
+    return fig, ax, axv, theme
+
+
+def _role_volume(axv, view, xs, theme) -> bool:
+    """Volume pane from the frame's own volume column.
+
+    False (and an empty pane) when the frame carries no usable
+    volume — volume is never synthesized."""
+    if "volume" not in view.columns:
+        return False
+    vol = view["volume"].to_numpy(dtype=float)
+    if not np.isfinite(vol).any() or float(np.nanmax(vol)) <= 0:
+        return False
+    o = view["open"].to_numpy(dtype=float)
+    c = view["close"].to_numpy(dtype=float)
+    vcol = [theme["up"] if cc >= oo else theme["down"]
+            for oo, cc in zip(o, c)]
+    axv.bar(xs, vol, width=0.64, color=vcol, alpha=0.75)
+    axv.set_ylabel("Vol", fontsize=8.5, color=theme["text"])
+    axv.set_ylim(0, float(np.nanmax(vol)) * 1.15)
+    return True
+
+
+def _role_time_axis(axv, view) -> None:
+    n = len(view)
+    ticks = np.linspace(0, n - 1, 5).astype(int)
+    ts = view.index
+    axv.set_xticks(ticks)
+    axv.set_xticklabels(
+        [ts[i].strftime("%m-%d %H:%M") if hasattr(ts[i], "strftime")
+         else str(ts[i]) for i in ticks], fontsize=9)
+
+
+def _role_finish(fig, ax, x_hi, specs) -> bytes:
+    fig.canvas.draw()
+    _mt5_edge_labels(ax, x_hi, specs)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=_DPI,
+                facecolor=fig.get_facecolor(),
+                metadata={"Software": "GoldenSwing charts"})
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _role_unavailable(title: str, header: str, tf: str) -> bytes:
+    """A role whose frame is missing: labeled, never invented."""
+    fig, ax, axv, theme = _role_scaffold(title, header)
+    axv.set_visible(False)
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 1)
+    ax.text(5, 0.5, f"{tf} frame unavailable — panel not charted "
+            "(no bars invented)", ha="center", va="center",
+            fontsize=11, color=theme["text"], alpha=0.8)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=_DPI,
+                facecolor=theme["bg"],
+                metadata={"Software": "GoldenSwing charts"})
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def build_context_study(h1, *, entry: float, verdict,
+                        nearby_zones) -> object | None:
+    """ContextStudy for role B, from the H1 frame's own state.
+
+    Featurizes the frame the alert already holds (the same
+    pipeline the runner's other studies use) and converts the
+    last state through signal_model — relevance caps and all.
+    None when the featurizer cannot read the frame: the role
+    then renders candles + trade references only, and says the
+    structure read is unavailable in its header."""
+    try:
+        from ..features.engine import read_and_featurize
+        states = read_and_featurize(h1, None)
+        if not states:
+            return None
+        st = states[-1]
+    except Exception:
+        return None
+    v = verdict or {}
+    htf = [(float(z["level"]), str(z.get("tf", "") or ""),
+            str(z.get("tier", "") or ""))
+           for z in (nearby_zones or [])][:4]
+    return context_study_from_state(
+        st, entry=float(entry), trigger=str(v.get("trigger") or ""),
+        bias_d1=int(v.get("bias_d1", 0) or 0),
+        bias_h4=int(v.get("bias_h4", 0) or 0), htf_levels=htf)
+
+
+def build_entry_study(*, sig, verdict, qm_pattern=None,
+                      playbook: str = ""):
+    """EntryStudy for role C, from the signal's recorded evidence.
+
+    Overlays are declared from evidence, never from habit: the
+    QM geometry when the caller passes this signal's confirmed
+    pattern; the EMA pair when the recorded factors name it.
+    Formation / touch timestamps pass through only when the
+    verdict actually carries them."""
+    from .signal_model import EntryStudy
+    v = verdict or {}
+    zone = v.get("zone") or {}
+    zlo, zhi = (float(x) for x in (getattr(sig, "entry_zone", None)
+                                   or (0.0, 0.0)))
+    overlays: list[str] = []
+    if qm_pattern:
+        overlays.append("qm")
+    factors = [str(f) for f in (getattr(sig, "factors", None) or [])]
+    evidence = " ".join(factors + [str(v.get("trigger") or "")])
+    if "EMA" in evidence and "ema_pair" not in overlays:
+        overlays.append("ema_pair")
+    reasons: list[str] = []
+    if v.get("trigger"):
+        reasons.append(f"trigger: {v['trigger']}")
+    reasons.extend(factors[:3])
+
+    def _num(x):
+        try:
+            return float(x) if x is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return EntryStudy(
+        entry_zone=(zlo, zhi) if zhi > zlo > 0 else None,
+        zone_kind=str(zone.get("kind", "") or ""),
+        formation_ts=_num(v.get("formation_ts",
+                                zone.get("formation_ts"))),
+        first_touch_ts=_num(v.get("first_touch_ts",
+                                  zone.get("first_touch_ts"))),
+        trigger_label=str(v.get("trigger") or ""),
+        overlays=tuple(overlays),
+        qm_pattern=qm_pattern,
+        reason_lines=tuple(reasons))
+
+
+def _hdr(instrument: str, playbook: str, score_line: str) -> str:
+    return " · ".join(x for x in (instrument, playbook, score_line) if x)
+
+
+def _render_role_trade(frame, lc, *, instrument: str, tf_label: str,
+                       playbook: str, score_line: str) -> bytes:
+    """Role A — the position's truth on its management timeframe."""
+    header = _hdr(instrument, playbook, score_line)
+    title = f"A · Trade — fill overview · {tf_label}"
+    fig, ax, axv, theme = _role_scaffold(title, header)
+    anchor = _ts_to_pos(frame.index, lc.fill_ts)
+    if anchor is None:
+        anchor = len(frame) - 1
+    start = max(0, anchor - 46)
+    view = frame.iloc[start:]
+    offset = start
+    xs = np.arange(len(view), dtype=float)
+    x_lo, x_hi = -0.6, len(view) - 1 + _ROLE_MARGIN + 0.4
+    ax.set_xlim(x_lo, x_hi)
+    axv.set_xlim(x_lo, x_hi)
+    _mt5_candles(ax, view, xs, theme)
+    _role_volume(axv, view, xs, theme)
+    _role_time_axis(axv, view)
+
+    if lc.entry_zone:
+        zlo, zhi = lc.entry_zone
+        ax.axhspan(zlo, zhi, color="#f7b924", alpha=0.20, zorder=1)
+        ax.text(x_lo + 0.4, zhi, f" ENTRY ZONE {_fmt(zlo)}–{_fmt(zhi)}",
+                va="bottom", fontsize=8.5, color="#8a6d00",
+                fontweight="bold", zorder=5,
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="#ffffff",
+                          edgecolor="none", alpha=0.75))
+
+    specs = trade_label_specs(lc, fmt=_fmt)
+    fill_x = (anchor - offset) if lc.fill_price is not None else None
+    first_ev_x = None
+    if lc.stop_events:
+        fx = _ts_to_pos(frame.index, lc.stop_events[0].ts)
+        first_ev_x = (fx - offset) if fx is not None else None
+    for s in specs:
+        text = s["text"]
+        v = s["value"]
+        if text.startswith(" PARTIAL"):
+            continue  # marker only — a partial is an event, not a level
+        if text.startswith(" FILL"):
+            ax.axhline(v, color="#7e57c2", linewidth=1.5,
+                       linestyle=(0, (8, 3)), zorder=3)
+        elif text.startswith(" BROKER SL") and "(initial)" in text \
+                and first_ev_x is not None:
+            # The initial stop governed only until the first
+            # confirmed modification — draw it for that span
+            # only, then the step path takes over.
+            ax.plot([x_lo, first_ev_x], [v, v], color="#e65100",
+                    linewidth=1.5, linestyle=(0, (6, 3)), zorder=3)
+        elif text.startswith(" BROKER SL"):
+            # (initial) dashed, (now) solid — the two broker stops
+            # must be distinguishable at a glance, not just by label.
+            ax.axhline(v, color=s["color"], linewidth=1.8,
+                       linestyle=(0, (6, 3)) if "(initial)" in text
+                       else "-", zorder=4)
+        elif text.startswith(" T"):
+            ax.axhline(v, color="#2e7d32", linewidth=1.1,
+                       linestyle=(0, (6, 3)), zorder=2)
+        elif text.startswith(" EXIT"):
+            ax.axhline(v, color="#37474f", linewidth=1.4, zorder=3)
+        else:
+            ax.axhline(v, color=s["color"], linewidth=1.8, zorder=4)
+
+    # The broker stop's step path through every confirmed move.
+    if lc.initial_broker_stop is not None and lc.stop_events:
+        px = [float(fill_x) if fill_x is not None else 0.0]
+        py = [float(lc.initial_broker_stop)]
+        for ev in lc.stop_events:
+            ex = _ts_to_pos(frame.index, ev.ts)
+            if ex is None:
+                continue
+            px.append(float(ex - offset))
+            py.append(float(ev.level))
+        if len(px) > 1:
+            px.append(float(len(view) - 1))
+            py.append(py[-1])
+            ax.step(px, py, where="post", color="#ff7043",
+                    linewidth=2.0, zorder=5)
+            ax.plot(px[1:-1], py[1:-1], marker="o", markersize=5,
+                    color="#ff7043", markeredgecolor=theme["text"],
+                    zorder=6)
+
+    if lc.fill_price is not None and fill_x is not None:
+        ax.plot([fill_x], [lc.fill_price], marker="D", markersize=8,
+                color="#7e57c2", markeredgecolor=theme["text"],
+                zorder=7)
+    for p in lc.partials:
+        px_ = _ts_to_pos(frame.index, p.ts) if p.ts else None
+        if px_ is None:
+            continue
+        ax.plot([px_ - offset], [p.price],
+                marker="v" if lc.direction >= 0 else "^",
+                markersize=9, color="#7e57c2",
+                markeredgecolor=theme["text"], zorder=7)
+    if lc.exit_price is not None:
+        ex = _ts_to_pos(frame.index, lc.exit_ts)
+        if ex is not None:
+            ax.plot([ex - offset], [lc.exit_price], marker="X",
+                    markersize=11, color="#37474f",
+                    markeredgecolor="#ffffff", zorder=7)
+
+    # Ledger box: state, ticket, and every lifecycle event with
+    # its time — the chart's audit trail, in the chart.
+    arrow = "▲ LONG" if lc.direction >= 0 else "▼ SHORT"
+    lines = [f"{arrow} {instrument} · {playbook} · {score_line}"]
+    if lc.state == "planned":
+        lines.append("plan — no fill yet · broker SL pending "
+                     "at placement")
+    else:
+        state_line = f"ticket {lc.ticket} · {lc.state.upper()}"
+        if lc.volume is not None:
+            state_line += f" · {lc.volume:g} lots"
+        lines.append(state_line)
+    if lc.fill_price is not None and lc.fill_ts:
+        lines.append(f"{_hhmm(lc.fill_ts)} fill @ "
+                     f"{_fmt(lc.fill_price)}")
+    for ev in lc.stop_events:
+        lines.append(f"{_hhmm(ev.ts)} SL → {_fmt(ev.level)}"
+                     + (f" ({ev.reason})" if ev.reason else ""))
+    for p in lc.partials:
+        lines.append(f"{_hhmm(p.ts) if p.ts else '--:--'} partial "
+                     f"{p.volume:g} @ {_fmt(p.price)}")
+    if lc.exit_price is not None:
+        lines.append(f"{_hhmm(lc.exit_ts) if lc.exit_ts else '--:--'} "
+                     f"exit {_fmt(lc.exit_price)}"
+                     + (f" — {lc.exit_reason}" if lc.exit_reason
+                        else ""))
+    _shown, _total = chart_targets(lc.targets, entry=lc.entry_ref,
+                                   direction=lc.direction)
+    if _total > len(_shown):
+        lines.append(f"targets: {_total} planned legs — first "
+                     f"{len(_shown) - 1} + ladder top charted")
+    ax.text(0.008, 0.985, "\n".join(lines), transform=ax.transAxes,
+            va="top", ha="left", fontsize=8.6, family="monospace",
+            color=theme["text"], zorder=8,
+            bbox=dict(boxstyle="round,pad=0.45", facecolor=theme["bg"],
+                      edgecolor=theme["text"], alpha=0.9))
+
+    l = view["low"].to_numpy(dtype=float)
+    h = view["high"].to_numpy(dtype=float)
+    lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
+    cand = [lc.entry_ref, lc.structural_stop]
+    cand += [t for _r, t in _shown]
+    for v in (lc.fill_price, lc.initial_broker_stop,
+              lc.current_broker_stop, lc.exit_price):
+        if v is not None:
+            cand.append(v)
+    cand += [p.price for p in lc.partials]
+    if lc.entry_zone:
+        cand += list(lc.entry_zone)
+    lo_v, hi_v = admit_level_bounds(lo_v, hi_v, cand, mult=1.6)
+    pad = 0.07 * max(hi_v - lo_v, 1e-9)
+    ax.set_ylim(lo_v - pad, hi_v + pad)
+    return _role_finish(fig, ax, x_hi, specs)
+
+
+def _render_role_context(h1, ctx, lc, *, instrument: str,
+                         playbook: str, score_line: str,
+                         window: int = 120) -> bytes:
+    """Role B — H1 context: the structure behind the trade."""
+    header = _hdr(instrument, playbook, score_line)
+    title = "B · H1 — context"
+    if ctx is not None:
+        title += (f" · D1 {ctx.bias_d1:+d} / H4 {ctx.bias_h4:+d}"
+                  + (f" / {ctx.trigger}" if ctx.trigger else ""))
+    else:
+        title += " · structure read unavailable"
+    fig, ax, axv, theme = _role_scaffold(title, header)
+    view = h1.iloc[-window:]
+    offset = len(h1) - len(view)
+    xs = np.arange(len(view), dtype=float)
+    x_lo, x_hi = -0.6, len(view) - 1 + _ROLE_MARGIN + 0.4
+    ax.set_xlim(x_lo, x_hi)
+    axv.set_xlim(x_lo, x_hi)
+    _mt5_candles(ax, view, xs, theme)
+    _role_volume(axv, view, xs, theme)
+    _role_time_axis(axv, view)
+    specs: list[dict] = []
+
+    if ctx is not None:
+        for z in ctx.zones:
+            col = theme["up"] if z.direction >= 0 else theme["down"]
+            x0 = max(z.created_bar - offset, 0) - 0.5
+            ax.add_patch(Rectangle(
+                (x0, z.bottom), x_hi - x0, z.top - z.bottom,
+                facecolor=col,
+                alpha=0.10 if z.kind == "FVG" else 0.06,
+                edgecolor=col, linewidth=0.7, zorder=1))
+            specs.append(label_spec(
+                0.5 * (z.top + z.bottom),
+                f" {z.kind} · H1 · {z.age_bars}b ", col, size=8.0))
+        for price, side, strength in ctx.pools:
+            col = "#e08a00" if side == "above" else "#00838f"
+            ax.axhline(price, color=col, linewidth=1.0,
+                       linestyle=(0, (6, 3)), alpha=0.85, zorder=2)
+            specs.append(label_spec(
+                price,
+                f" {'BSL' if side == 'above' else 'SSL'} "
+                f"{_fmt(price)} x{strength}", col, size=8.5))
+        for price, tf, tier in ctx.htf_levels:
+            ax.axhline(price, color="#7e57c2",
+                       linewidth=1.0 if tier == "MAJOR" else 0.7,
+                       linestyle="-" if tier == "MAJOR" else (0, (6, 3)),
+                       alpha=0.8, zorder=2)
+            specs.append(label_spec(
+                price, f" {tf} {tier} {_fmt(price)} ", "#7e57c2",
+                size=8.0))
+        for bar, price, lab in ctx.swings:
+            x = bar - offset
+            if not (0 <= x < len(view)):
+                continue
+            above = lab in ("H", "HH", "LH")
+            ax.plot([x], [price], marker="v" if above else "^",
+                    markersize=5, color=theme["text"], alpha=0.75,
+                    zorder=5)
+            ax.annotate(lab, (x, price),
+                        xytext=(0, 7 if above else -13),
+                        textcoords="offset points", ha="center",
+                        fontsize=7.5, color=theme["text"], alpha=0.85,
+                        zorder=5)
+        ev = ctx.structure_event
+        if ev is not None:
+            x = ev["bar"] - offset
+            if 0 <= x < len(view):
+                ax.axvline(x, color="#37474f", linewidth=0.9,
+                           linestyle=(0, (4, 3)), alpha=0.65, zorder=2)
+                ax.plot([x, x_hi], [ev["level"], ev["level"]],
+                        color="#37474f", linewidth=0.8,
+                        linestyle=(0, (4, 3)), alpha=0.7, zorder=2)
+                ax.text(x, 0.985,
+                        f" {ev['kind']} "
+                        f"{'↑' if ev['direction'] >= 0 else '↓'} ",
+                        transform=ax.get_xaxis_transform(),
+                        ha="center", va="top", fontsize=8,
+                        color="#ffffff", fontweight="bold",
+                        bbox=dict(boxstyle="round,pad=0.2",
+                                  facecolor="#37474f",
+                                  edgecolor="none", alpha=0.9),
+                        zorder=6)
+                specs.append(label_spec(
+                    ev["level"], f" {ev['kind']} {_fmt(ev['level'])} ",
+                    "#37474f", size=8.0))
+        if ctx.trigger:
+            last = len(view) - 1
+            ax.axvspan(last - 0.5, last + 0.5, color="#7e57c2",
+                       alpha=0.10, zorder=1)
+            ax.text(last, 0.985, f" TRIGGER {ctx.trigger} ",
+                    transform=ax.get_xaxis_transform(), ha="center",
+                    va="top", fontsize=8.5, color="#ffffff",
+                    fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25",
+                              facecolor="#7e57c2", edgecolor="none",
+                              alpha=0.95), zorder=6)
+
+    # Trade references — thin, muted, named as references.
+    specs.append(label_spec(lc.entry_ref,
+                            f" ENTRY {_fmt(lc.entry_ref)} (ref)",
+                            "#b8860b", size=8.5))
+    ax.axhline(lc.entry_ref, color="#f7b924", linewidth=1.0,
+               alpha=0.8, zorder=3)
+    specs.append(label_spec(
+        lc.structural_stop,
+        f" STOP {_fmt(lc.structural_stop)} (ref)", "#d32f2f",
+        size=8.5))
+    ax.axhline(lc.structural_stop, color="#d32f2f", linewidth=1.0,
+               alpha=0.8, zorder=3)
+    shown, _total = chart_targets(lc.targets, entry=lc.entry_ref,
+                                  direction=lc.direction)
+    for rank, t in shown:
+        ax.axhline(t, color="#2e7d32", linewidth=0.9,
+                   linestyle=(0, (6, 3)), alpha=0.8, zorder=2)
+        specs.append(label_spec(t, f" T{rank} {_fmt(t)} (ref)",
+                                "#2e7d32", size=8.5))
+
+    l = view["low"].to_numpy(dtype=float)
+    h = view["high"].to_numpy(dtype=float)
+    lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
+    cand = [lc.entry_ref, lc.structural_stop] + [t for _r, t in shown]
+    if ctx is not None:
+        cand += [p for p, _s, _n in ctx.pools]
+        cand += [p for p, _tf, _tier in ctx.htf_levels]
+        for z in ctx.zones:
+            cand += [z.top, z.bottom]
+    lo_v, hi_v = admit_level_bounds(lo_v, hi_v, cand, mult=1.6)
+    pad = 0.07 * max(hi_v - lo_v, 1e-9)
+    ax.set_ylim(lo_v - pad, hi_v + pad)
+    return _role_finish(fig, ax, x_hi, specs)
+
+
+def _ema(values: np.ndarray, span: int) -> np.ndarray:
+    """EMA identical to the evidence pipeline's (pandas ewm)."""
+    return pd.Series(values).ewm(span=span, adjust=False) \
+        .mean().to_numpy(dtype=float)
+
+
+def _render_role_entry(frame, es, lc, *, instrument: str,
+                       tf_label: str, playbook: str,
+                       score_line: str, window: int = 44) -> bytes:
+    """Role C — the entry, up close, with only the used studies."""
+    header = _hdr(instrument, playbook, score_line)
+    title = f"C · {tf_label} — entry precision"
+    fig, ax, axv, theme = _role_scaffold(title, header)
+    anchor = _ts_to_pos(frame.index, lc.fill_ts)
+    if anchor is None:
+        anchor = len(frame) - 1
+    start = max(0, anchor - (window - 8))
+    view = frame.iloc[start:]
+    offset = start
+    xs = np.arange(len(view), dtype=float)
+    x_lo, x_hi = -0.6, len(view) - 1 + _ROLE_MARGIN + 0.4
+    ax.set_xlim(x_lo, x_hi)
+    axv.set_xlim(x_lo, x_hi)
+    _mt5_candles(ax, view, xs, theme)
+    _role_volume(axv, view, xs, theme)
+    _role_time_axis(axv, view)
+    specs: list[dict] = []
+
+    if es.entry_zone:
+        zlo, zhi = es.entry_zone
+        ax.add_patch(Rectangle(
+            (x_lo, zlo), x_hi - x_lo, zhi - zlo, facecolor="#f7b924",
+            alpha=0.22, edgecolor="#f7b924", linewidth=0.8, zorder=1))
+        for zb in (zlo, zhi):
+            ax.axhline(zb, color="#b8860b", linewidth=0.9,
+                       linestyle=(0, (4, 3)), zorder=2)
+        ax.text(x_lo + 0.4, zhi,
+                f" {es.zone_kind + ' ' if es.zone_kind else ''}ZONE "
+                f"{_fmt(zlo)}–{_fmt(zhi)}",
+                va="bottom", fontsize=8.5, color="#8a6d00",
+                fontweight="bold", zorder=5,
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="#ffffff",
+                          edgecolor="none", alpha=0.75))
+    for ts_val, tag, col in (
+            (es.formation_ts, "FORMED", "#b8860b"),
+            (es.first_touch_ts, "FIRST TOUCH", "#00838f")):
+        if ts_val is None:
+            continue
+        pos = _ts_to_pos(frame.index, ts_val)
+        if pos is None:
+            continue
+        x = pos - offset
+        if not (0 <= x < len(view)):
+            continue
+        ax.axvline(x, color=col, linewidth=0.9,
+                   linestyle=(0, (2, 2)), alpha=0.8, zorder=2)
+        ax.text(x, 0.985, f" {tag} {_hhmm(ts_val)} ",
+                transform=ax.get_xaxis_transform(), ha="center",
+                va="top", fontsize=7.5, color="#ffffff",
+                fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor=col,
+                          edgecolor="none", alpha=0.9), zorder=6)
+    trig_x = anchor - offset
+    ax.axvspan(trig_x - 0.5, trig_x + 0.5, color="#7e57c2",
+               alpha=0.12, zorder=1)
+    if es.trigger_label:
+        ax.text(trig_x, 0.985, f" TRIGGER {es.trigger_label} ",
+                transform=ax.get_xaxis_transform(), ha="center",
+                va="top", fontsize=8.5, color="#ffffff",
+                fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.25",
+                          facecolor="#7e57c2", edgecolor="none",
+                          alpha=0.95), zorder=6)
+
+    legend: list[str] = []
+    if "ema_pair" in es.overlays:
+        closes = frame["close"].to_numpy(dtype=float)
+        e9 = _ema(closes, 9)
+        e21 = _ema(closes, 21)
+        sl = slice(offset, offset + len(view))
+        ax.plot(xs, e9[sl], color="#2962ff", linewidth=1.1,
+                alpha=0.9, zorder=3)
+        ax.plot(xs, e21[sl], color="#ff6d00", linewidth=1.1,
+                alpha=0.9, zorder=3)
+        legend.append(f"EMA9 {_fmt(e9[anchor])} · "
+                      f"EMA21 {_fmt(e21[anchor])}")
+    if "qm" in es.overlays and es.qm_pattern:
+        specs += _mt5_qm_pattern(ax, x_hi, es.qm_pattern,
+                                 view.index, theme)
+
+    ax.axhline(lc.entry_ref, color="#c99700", linewidth=1.8, zorder=4)
+    specs.append(label_spec(lc.entry_ref,
+                            f" ENTRY {_fmt(lc.entry_ref)}",
+                            "#8a6d00", bold=True))
+    ax.axhline(lc.structural_stop, color="#d32f2f", linewidth=1.8,
+               zorder=4)
+    specs.append(label_spec(
+        lc.structural_stop,
+        f" STOP {_fmt(lc.structural_stop)} (structural)", "#d32f2f",
+        bold=True))
+    shown, _total = chart_targets(lc.targets, entry=lc.entry_ref,
+                                  direction=lc.direction)
+    for rank, t in shown:
+        ax.axhline(t, color="#2e7d32", linewidth=1.1,
+                   linestyle=(0, (6, 3)), zorder=3)
+        specs.append(label_spec(t, f" T{rank} {_fmt(t)} (planned)",
+                                "#2e7d32"))
+    if lc.fill_price is not None:
+        ax.axhline(lc.fill_price, color="#7e57c2", linewidth=1.5,
+                   linestyle=(0, (8, 3)), zorder=4)
+        specs.append(label_spec(lc.fill_price,
+                                f" FILL {_fmt(lc.fill_price)}",
+                                "#7e57c2", bold=True))
+        ax.plot([trig_x], [lc.fill_price], marker="D", markersize=8,
+                color="#7e57c2", markeredgecolor=theme["text"],
+                zorder=7)
+
+    box_lines = legend + list(es.reason_lines)
+    if box_lines:
+        ax.text(0.008, 0.02, "\n".join(box_lines),
+                transform=ax.transAxes, va="bottom", ha="left",
+                fontsize=8.4, family="monospace", color=theme["text"],
+                zorder=8,
+                bbox=dict(boxstyle="round,pad=0.4",
+                          facecolor=theme["bg"],
+                          edgecolor=theme["text"], alpha=0.88))
+
+    l = view["low"].to_numpy(dtype=float)
+    h = view["high"].to_numpy(dtype=float)
+    lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
+    cand = [lc.entry_ref, lc.structural_stop] + [t for _r, t in shown]
+    if lc.fill_price is not None:
+        cand.append(lc.fill_price)
+    if es.entry_zone:
+        cand += list(es.entry_zone)
+    lo_v, hi_v = admit_level_bounds(lo_v, hi_v, cand, mult=1.6)
+    pad = 0.07 * max(hi_v - lo_v, 1e-9)
+    ax.set_ylim(lo_v - pad, hi_v + pad)
+    return _role_finish(fig, ax, x_hi, specs)
+
+
+def render_mt5_roles(*, frames: dict, lifecycle, context=None,
+                     entry_study=None, instrument: str = "XAUUSD",
+                     playbook: str = "", score_line: str = "",
+                     entry_clock: str = "M15",
+                     roles=ROLE_ORDER) -> list[bytes]:
+    """The role trio: one PNG per role, in ROLE_ORDER.
+
+    ``frames`` maps timeframe -> OHLCV frame (the stack the alert
+    already holds); ``lifecycle`` is the canonical LifecycleStudy;
+    ``context`` / ``entry_study`` are the role B / C studies (None
+    renders the role without its study layer — candles and trade
+    truth only, never an invented study). A missing frame renders
+    its role as an explicit unavailable panel.
+    """
+    from .signal_model import EntryStudy
+    header = _hdr(instrument, playbook, score_line)
+    out: list[bytes] = []
+    for role in roles:
+        if role == ROLE_TRADE:
+            frame = frames.get(entry_clock)
+            if frame is None or len(frame) == 0:
+                out.append(_role_unavailable(
+                    f"A · Trade — fill overview · {entry_clock}",
+                    header, entry_clock))
+            else:
+                out.append(_render_role_trade(
+                    frame, lifecycle, instrument=instrument,
+                    tf_label=entry_clock, playbook=playbook,
+                    score_line=score_line))
+        elif role == ROLE_CONTEXT:
+            h1 = frames.get("H1")
+            if h1 is None or len(h1) == 0:
+                out.append(_role_unavailable(
+                    "B · H1 — context", header, "H1"))
+            else:
+                out.append(_render_role_context(
+                    h1, context, lifecycle, instrument=instrument,
+                    playbook=playbook, score_line=score_line))
+        elif role == ROLE_ENTRY:
+            frame = frames.get(entry_clock)
+            if frame is None or len(frame) == 0:
+                out.append(_role_unavailable(
+                    f"C · {entry_clock} — entry precision",
+                    header, entry_clock))
+            else:
+                out.append(_render_role_entry(
+                    frame, entry_study or EntryStudy(),
+                    lifecycle, instrument=instrument,
+                    tf_label=entry_clock, playbook=playbook,
+                    score_line=score_line))
+    return out

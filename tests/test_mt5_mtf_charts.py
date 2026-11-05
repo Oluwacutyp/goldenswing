@@ -160,12 +160,16 @@ def test_runner_passes_h4_and_entry_frames(tmp_path, monkeypatch):
 
     def recorder(*args, **kwargs):
         seen.update(kwargs)
-        seen["h1"] = args[0] if args else None
-        from goldenswing.charts.engine import render_mt5_signal as real
+        from goldenswing.charts.engine import render_mt5_roles as real
         return real(*args, **kwargs)
 
+    # 2026-11-05: the alert default renders through the role trio;
+    # the invariant this test guards is unchanged — the runner
+    # hands the chart layer the WHOLE stack, not just H1. The
+    # legacy render_mt5_signal seam is exercised by the blueprint
+    # style test below.
     monkeypatch.setattr(
-        "goldenswing.execution.mt5_runner.render_mt5_signal", recorder)
+        "goldenswing.execution.mt5_runner.render_mt5_roles", recorder)
     pngs, paths = runner._build_chart(
         _sig(), _verdict(), alert_id="MT5-test-100",
         playbook="fvg_midline")
@@ -174,10 +178,10 @@ def test_runner_passes_h4_and_entry_frames(tmp_path, monkeypatch):
     assert paths is not None and len(paths) == 3
     assert all(p.exists() for p in paths)
     # The runner passed the whole stack, not just H1.
-    assert seen["h4"] is not None and len(seen["h4"]) > 0
-    assert seen["entry_frame"] is not None and len(seen["entry_frame"]) > 0
+    frames = seen["frames"]
+    assert frames["H4"] is not None and len(frames["H4"]) > 0
+    assert frames["M15"] is not None and len(frames["M15"]) > 0
     assert seen["entry_clock"] == "M15"
-    assert seen["style"] == "classic"
 
 
 def test_runner_chart_without_h4_still_builds(tmp_path):

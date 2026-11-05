@@ -70,7 +70,11 @@ import pandas as pd
 from ..alerts.commands import CommandContext, is_owner_callback
 from ..alerts.model import send_failure_detail
 from ..backtest.data import REPO_ROOT
-from ..charts.engine import render_mt5_signal, zones_to_study_dicts
+from ..charts.engine import (build_context_study, build_entry_study,
+                             render_mt5_roles, render_mt5_signal,
+                             zones_to_study_dicts)
+from ..charts.signal_model import (ROLE_TRADE, lifecycle_from_events,
+                                   score_text)
 from ..charts.signal_view import build_signal_view_html
 from ..charts.terminal_server import TerminalServer
 from ..confluence import ConfluenceEngine
@@ -4777,11 +4781,38 @@ class MT5Runner:
         # close is reported, wins AND losses, with the R and the
         # reason (a loss is never silently journalled).
         pb = self._playbook_from_alert_id(pos.alert_id)
+        # Close chart (2026-11-05): role A — the completed
+        # lifecycle (fill, every confirmed stop move, partials,
+        # the exit) — rides the close alert. Best-effort like
+        # every chart build: any failure leaves the text alert
+        # exactly as it was.
+        _close_pngs = None
+        try:
+            _clock = next((s.native_tf for s in PLAYBOOK_REGISTRY
+                           if s.name == pb), None)
+            _frame = (self._stack.frames.get(_clock)
+                      if getattr(self, "_stack", None) is not None
+                      and _clock else None)
+            if _frame is not None and len(_frame) > 0:
+                _lc = self._lifecycle_for_chart(
+                    ticket=ticket, pos=pos, exit_price=price,
+                    exit_reason=display, exit_ts=time.time())
+                _pngs = render_mt5_roles(
+                    frames={_clock: _frame}, lifecycle=_lc,
+                    instrument=self.cfg.symbol, playbook=pb,
+                    score_line="", entry_clock=_clock,
+                    roles=(ROLE_TRADE,))
+                if _pngs:
+                    _close_pngs = _pngs
+        except Exception as exc:
+            self.journal.log_note(
+                f"mt5: close chart failed for ticket {ticket}: {exc}")
         self._send_alert(
             f"MT5 CLOSE {pb} {'+' if d > 0 else '-'}1 "
             f"{float(getattr(pos, 'orig_volume', 0.0) or pos.volume)} lots entry {pos.entry_price:.2f} -> exit "
             f"{price:.2f} — {display} {total_r:+.2f}R "
-            f"(ticket {ticket})")
+            f"(ticket {ticket})",
+            chart_pngs=_close_pngs)
         # Feed the closed trade's outcome to RiskGuards: the
         # daily/weekly/drawdown/consecutive-loss halts only work if
         # outcomes are booked.  Never breaks the close path.
@@ -13883,13 +13914,13 @@ class MT5Runner:
             fill_price=fill, suffix="-fill",
             decision_score=(float(score.total)
                             if score is not None else float(sig.score)),
-            broker_stop=float(stop0))
+            broker_stop=float(stop0), ticket=int(res.ticket))
         _, view_path = self._build_signal_view(
             sig, verdict, alert_id=request.alert_id, playbook=pb.name,
             fill_price=fill, suffix="-fill",
             decision_score=(float(score.total)
                             if score is not None else float(sig.score)),
-            broker_stop=float(stop0))
+            broker_stop=float(stop0), ticket=int(res.ticket))
         self._send_alert(
             f"MT5 FILL {pb.name} {'+' if sig.direction > 0 else '-'}1 "
             f"{lots} lots @ {fill:.2f} SL {stop0:.2f} "
@@ -14091,13 +14122,15 @@ class MT5Runner:
             suffix="-pending",
             decision_score=(float(score.total)
                             if score is not None else None),
-            broker_stop=float(request.stop_loss))
+            broker_stop=float(request.stop_loss),
+            ticket=int(res.ticket))
         _, view_path = self._build_signal_view(
             sig, verdict, alert_id=request.alert_id, playbook=pb.name,
             suffix="-pending",
             decision_score=(float(score.total)
                             if score is not None else None),
-            broker_stop=float(request.stop_loss))
+            broker_stop=float(request.stop_loss),
+            ticket=int(res.ticket))
         self._send_alert(
             f"MT5 PENDING {kind.upper()} {pb.name} "
             f"{'+' if sig.direction > 0 else '-'}1 "
@@ -14520,14 +14553,16 @@ class MT5Runner:
                 suffix="-fill",
                 decision_score=(float(state.placed_score)
                                 if state.placed_score else None),
-                broker_stop=float(state.sl))
+                broker_stop=float(state.sl),
+                ticket=int(pos.ticket))
             _, view_path = self._build_signal_view(
                 sig, state.verdict, alert_id=state.alert_id,
                 playbook=state.playbook,
                 fill_price=float(pos.entry_price), suffix="-fill",
                 decision_score=(float(state.placed_score)
                                 if state.placed_score else None),
-                broker_stop=float(state.sl))
+                broker_stop=float(state.sl),
+                ticket=int(pos.ticket))
         self._send_alert(
             f"MT5 FILL {state.playbook or 'pending'} "
             f"{'+' if state.direction > 0 else '-'}1 "
@@ -16640,12 +16675,72 @@ class MT5Runner:
                 "direction": int(qm.get("direction") or 0),
                 "touch_ts": qm.get("touch_ts")}
 
+    def _lifecycle_for_chart(self, sig=None, *, ticket=None,
+                             fill_price: float | None = None,
+                             broker_stop: float | None = None,
+                             pos=None, exit_price: float | None = None,
+                             exit_reason: str = "",
+                             exit_ts: float | None = None):
+        """The canonical LifecycleStudy for the role charts and
+        the HTML view (charts.signal_model): the plan from the
+        signal (or, on the close path, the tracked position's own
+        book), the caller's fill / broker facts, and the
+        TickManager's executed-event log. Planned and actual are
+        assembled side by side, never merged; anything not
+        recorded stays empty.
+        """
+        events: list = []
+        if ticket is not None:
+            try:
+                events = self.tick_manager.lifecycle_events(
+                    int(ticket))
+            except Exception:
+                events = []
+        partials = [ev for ev in events
+                    if ev.get("kind") == "partial"]
+        if pos is not None:
+            return lifecycle_from_events(
+                direction=int(pos.direction),
+                entry_ref=float(pos.entry_price),
+                structural_stop=float(pos.invalidation),
+                targets=tuple(float(t) for t in (pos.targets or ())),
+                state="closed" if exit_price is not None else "open",
+                ticket=int(ticket) if ticket is not None else None,
+                volume=float(getattr(pos, "orig_volume", 0.0)
+                             or pos.volume),
+                fill_price=float(pos.entry_price),
+                fill_ts=(float(pos.opened_at)
+                         if getattr(pos, "opened_at", None)
+                         else None),
+                initial_broker_stop=float(pos.stop0),
+                events=events, partials=partials,
+                exit_price=exit_price, exit_ts=exit_ts,
+                exit_reason=exit_reason)
+        zone = getattr(sig, "entry_zone", None)
+        return lifecycle_from_events(
+            direction=int(sig.direction),
+            entry_ref=float(sig.entry_ref),
+            structural_stop=float(sig.invalidation),
+            targets=tuple(float(t) for t in (sig.targets or ())),
+            entry_zone=(tuple(float(x) for x in zone)
+                        if zone else None),
+            state=("closed" if exit_price is not None
+                   else "open" if fill_price is not None
+                   else "planned"),
+            ticket=int(ticket) if ticket is not None else None,
+            fill_price=fill_price,
+            initial_broker_stop=broker_stop,
+            events=events, partials=partials,
+            exit_price=exit_price, exit_ts=exit_ts,
+            exit_reason=exit_reason)
+
     def _build_chart(self, sig, verdict: dict | None, *,
                      alert_id: str, playbook: str = "",
                      fill_price: float | None = None,
                      suffix: str = "",
                      decision_score: float | None = None,
-                     broker_stop: float | None = None) -> tuple[list[bytes] | None, list | None]:
+                     broker_stop: float | None = None,
+                     ticket: int | None = None) -> tuple[list[bytes] | None, list | None]:
         """Chart PNGs for a signal/fill (THREE, one per panel —
         owner order 2026-10-31): the WHOLE hierarchy stack
         (H4 structure / H1 trigger / entry-TF entry) + levels + verdict
@@ -16697,29 +16792,53 @@ class MT5Runner:
                               if st["fib_range"] is not None else None),
                 },
             }
-            panel_pngs = render_mt5_signal(
-                h1, zone=zone, entry=entry,
-                stop=float(sig.invalidation),
-                targets=[float(x) for x in (sig.targets or [])],
-                direction=int(sig.direction), verdict=verdict,
-                playbook=playbook,
-                decision_score=decision_score,
-                broker_stop=broker_stop,
-                instrument=self.cfg.symbol, fill_price=fill_price,
-                h4=frames.get("H4"),
-                entry_frame=frames.get(entry_clock),
-                entry_clock=entry_clock,
-                style=self.cfg.chart_style,
-                nearby_zones=st["nearby"], fib_levels=st["fib_levels"],
-                fib_range=st["fib_range"], ote_band=st["ote_band"],
-                qm_pattern=self._qm_pattern_for_chart(
-                    sig, verdict, playbook))
-            # Owner order 2026-10-31: the chart is THREE PNGs
-            # (H4 / H1 / entry panels) — one file each, in panel
-            # order, next to the journal.
+            if self.cfg.chart_style == "blueprint":
+                # Named study profile: the legacy full-study trio.
+                panel_pngs = render_mt5_signal(
+                    h1, zone=zone, entry=entry,
+                    stop=float(sig.invalidation),
+                    targets=[float(x) for x in (sig.targets or [])],
+                    direction=int(sig.direction), verdict=verdict,
+                    playbook=playbook,
+                    decision_score=decision_score,
+                    broker_stop=broker_stop,
+                    instrument=self.cfg.symbol, fill_price=fill_price,
+                    h4=frames.get("H4"),
+                    entry_frame=frames.get(entry_clock),
+                    entry_clock=entry_clock,
+                    style=self.cfg.chart_style,
+                    nearby_zones=st["nearby"],
+                    fib_levels=st["fib_levels"],
+                    fib_range=st["fib_range"], ote_band=st["ote_band"],
+                    qm_pattern=self._qm_pattern_for_chart(
+                        sig, verdict, playbook))
+                _tags = ("h4", "h1", "entry")
+            else:
+                # Alert default (2026-11-05): the role trio —
+                # A trade/fill overview, B H1 context, C entry
+                # precision — from the canonical studies.
+                _lc = self._lifecycle_for_chart(
+                    sig, ticket=ticket, fill_price=fill_price,
+                    broker_stop=broker_stop)
+                _ctx = build_context_study(
+                    h1, entry=entry, verdict=verdict,
+                    nearby_zones=st["nearby"])
+                _es = build_entry_study(
+                    sig=sig, verdict=verdict,
+                    qm_pattern=self._qm_pattern_for_chart(
+                        sig, verdict, playbook),
+                    playbook=playbook)
+                panel_pngs = render_mt5_roles(
+                    frames=frames, lifecycle=_lc, context=_ctx,
+                    entry_study=_es, instrument=self.cfg.symbol,
+                    playbook=playbook,
+                    score_line=score_text(decision_score),
+                    entry_clock=entry_clock)
+                _tags = ("trade", "context", "entry")
+            # Owner order 2026-10-31: the chart is THREE PNGs —
+            # one file each, in panel order, next to the journal.
             paths = []
-            for _tag, _panel_png in zip(("h4", "h1", "entry"),
-                                        panel_pngs):
+            for _tag, _panel_png in zip(_tags, panel_pngs):
                 _p = self._charts_dir / \
                     f"{alert_id}{suffix}-{_tag}.png"
                 _p.write_bytes(_panel_png)
@@ -16735,7 +16854,8 @@ class MT5Runner:
                            fill_price: float | None = None,
                            suffix: str = "",
                            decision_score: float | None = None,
-                           broker_stop: float | None = None) -> tuple[str | None, Path | None]:
+                           broker_stop: float | None = None,
+                           ticket: int | None = None) -> tuple[str | None, Path | None]:
         """Self-contained HTML terminal view for a signal: one page,
         baked at signal time, with per-timeframe bars + analysis,
         trade levels, and the same studies as the PNG chart. Saved
@@ -16770,6 +16890,9 @@ class MT5Runner:
                 qm_pattern=self._qm_pattern_for_chart(
                     sig, verdict, playbook),
                 instrument=self.cfg.symbol, fill_price=fill_price,
+                lifecycle=self._lifecycle_for_chart(
+                    sig, ticket=ticket, fill_price=fill_price,
+                    broker_stop=broker_stop),
                 signal_time=datetime.now(timezone.utc).isoformat())
             path = self._charts_dir / f"{alert_id}{suffix}.html"
             path.write_text(html_str, encoding="utf-8")
@@ -16960,7 +17083,7 @@ class MT5Runner:
                     # 3-PNG charts (owner order 2026-10-31): the
                     # H4 panel carries the alert text; the H1 and
                     # entry panels follow with their own captions.
-                    _caps = [text, "H1 — trigger / context",
+                    _caps = [text, "H1 — context",
                              "Entry timeframe — entry"]
                     for _i, _panel_png in enumerate(chart_pngs):
                         res = sender.send_photo(

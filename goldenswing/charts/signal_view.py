@@ -22,6 +22,7 @@ import math
 
 from ..reader import session_timeframes as sessions  # Step 3: DST-aware authority (was fixed-UTC sessions)
 from .signal_model import (  # Step 7: one shared signal-view model
+    chart_targets,
     effective_r,
     panel_role,
     score_text,
@@ -76,10 +77,42 @@ def _session_spans(frame) -> list:
     return spans
 
 
+def _hhmm(ts_epoch) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(
+        float(ts_epoch), tz=timezone.utc).strftime("%H:%M")
+
+
+def _lifecycle_lines(lifecycle) -> list[str]:
+    """Lifecycle facts for the entry-timeframe analysis: the same
+    LifecycleStudy the PNG role A renders — fill, every confirmed
+    stop move, partial legs, the exit. Nothing reconstructed."""
+    if lifecycle is None:
+        return []
+    lines: list[str] = []
+    if lifecycle.fill_price is not None:
+        lines.append(f"Filled {_fmt(lifecycle.fill_price)}"
+                     + (f" at {_hhmm(lifecycle.fill_ts)} UTC"
+                        if lifecycle.fill_ts else "")
+                     + (f" · ticket {lifecycle.ticket}"
+                        if lifecycle.ticket is not None else ""))
+    for ev in lifecycle.stop_events:
+        lines.append(f"{_hhmm(ev.ts)} SL → {_fmt(ev.level)}"
+                     + (f" ({ev.reason})" if ev.reason else ""))
+    for p in lifecycle.partials:
+        lines.append(f"Partial {p.volume:g} @ {_fmt(p.price)}"
+                     + (f" at {_hhmm(p.ts)} UTC" if p.ts else ""))
+    if lifecycle.exit_price is not None:
+        lines.append(f"Exit {_fmt(lifecycle.exit_price)}"
+                     + (f" — {lifecycle.exit_reason}"
+                        if lifecycle.exit_reason else ""))
+    return lines
+
+
 def _analysis_for_tf(tf: str, *, verdict, entry_clock, zone,
                      fib_info, fib_range, entry, stop, targets,
                      direction, broker_stop=None,
-                     eff_r=None) -> list[str]:
+                     eff_r=None, lifecycle=None) -> list[str]:
     """Analysis lines for one timeframe. Missing reads are stated,
     never filled in."""
     v = verdict or {}
@@ -138,6 +171,7 @@ def _analysis_for_tf(tf: str, *, verdict, entry_clock, zone,
         lines.append(stop_line)
         if targets:
             lines.append(f"Targets {', '.join(_fmt(t) for t in targets)}.")
+        lines.extend(_lifecycle_lines(lifecycle))
     else:
         lines.append("Bars + studies only — the verdict names no read "
                      "for this timeframe.")
@@ -155,7 +189,8 @@ def build_signal_view_html(*, frames, entry: float, stop: float,
                            instrument: str = "XAUUSD",
                            fill_price: float | None = None,
                            signal_time: str | None = None,
-                           qm_pattern: dict | None = None) -> str:
+                           qm_pattern: dict | None = None,
+                           lifecycle=None) -> str:
     """Render the self-contained signal view page (HTML string).
 
     Step 7: the page shows the DECISION score (``decision_score``;
@@ -177,6 +212,12 @@ def build_signal_view_html(*, frames, entry: float, stop: float,
                    else score)
     eff_r = effective_r(entry=entry, broker_stop=broker_stop,
                         targets=targets)
+    # Ladder-aware (2026-11-05): the page draws the same chart
+    # targets as the PNGs (signal_model.chart_targets) — a
+    # 20+-leg hot_scalp ladder must not tile the canvas either.
+    _shown_t, _total_t = chart_targets(targets or [], entry=entry,
+                                       direction=direction)
+    drawn_targets = [t for _rank, t in _shown_t]
     zone_d = None
     if zone and zone.get("top") and zone.get("bottom"):
         zone_d = {"top": float(zone["top"]), "bottom": float(zone["bottom"]),
@@ -190,6 +231,10 @@ def build_signal_view_html(*, frames, entry: float, stop: float,
     vol = v.get("volume") or {}
     if isinstance(vol, dict) and vol.get("volume_ratio") is not None:
         header_lines.append(f"Volume ratio: {vol.get('volume_ratio')}")
+    if _total_t > len(drawn_targets):
+        header_lines.append(
+            f"Targets: {_total_t} planned legs — chart draws the "
+            f"first {len(drawn_targets) - 1} + ladder top")
     payload = {
         "meta": {
             "instrument": instrument, "playbook": playbook,
@@ -201,12 +246,27 @@ def build_signal_view_html(*, frames, entry: float, stop: float,
             "broker_stop": (float(broker_stop)
                             if broker_stop is not None else None),
             "effective_r": eff_r,
-            "targets": [float(t) for t in (targets or [])],
+            "targets": [float(t) for t in drawn_targets],
+            "targets_total": _total_t,
             "fill": float(fill_price) if fill_price is not None else None,
             "alert_id": alert_id, "signal_time": signal_time or "",
             "verdict_lines": header_lines,
             "entry_clock": entry_clock,
         },
+        "lifecycle": (
+            {"state": lifecycle.state, "ticket": lifecycle.ticket,
+             "fill": lifecycle.fill_price, "fill_ts": lifecycle.fill_ts,
+             "initial_broker_stop": lifecycle.initial_broker_stop,
+             "current_broker_stop": lifecycle.current_broker_stop,
+             "stop_events": [
+                 {"ts": e.ts, "level": e.level, "reason": e.reason}
+                 for e in lifecycle.stop_events],
+             "partials": [
+                 {"ts": p.ts, "price": p.price, "volume": p.volume}
+                 for p in lifecycle.partials],
+             "exit": lifecycle.exit_price,
+             "exit_reason": lifecycle.exit_reason}
+            if lifecycle is not None else None),
         "zone": zone_d,
         "qm": ({"head": float(qm_pattern["head"]),
                 "neckline": float(qm_pattern["neckline"]),
@@ -235,7 +295,8 @@ def build_signal_view_html(*, frames, entry: float, stop: float,
                     tf, verdict=v, entry_clock=entry_clock, zone=zone,
                     fib_info=fib_info, fib_range=fib_range, entry=entry,
                     stop=stop, targets=targets, direction=direction,
-                    broker_stop=broker_stop, eff_r=eff_r),
+                    broker_stop=broker_stop, eff_r=eff_r,
+                    lifecycle=lifecycle),
             }
             for tf in tfs
         },

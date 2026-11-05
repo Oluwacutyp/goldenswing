@@ -470,8 +470,11 @@ def test_runner_build_chart_saves_png(tmp_path):
     assert all(p[:8] == b"\x89PNG\r\n\x1a\n" for p in pngs)
     assert paths is not None and len(paths) == 3
     assert all(p.exists() for p in paths)
+    # 2026-11-05 role redesign: the alert trio is saved under its
+    # role tags (trade / context / entry); the legacy H4/H1/entry
+    # tags remain only on the blueprint study profile.
     assert [p.name for p in paths] == [
-        "MT5-test-100-h4.png", "MT5-test-100-h1.png",
+        "MT5-test-100-trade.png", "MT5-test-100-context.png",
         "MT5-test-100-entry.png"]
 
 
