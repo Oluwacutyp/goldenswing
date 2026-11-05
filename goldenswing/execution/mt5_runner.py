@@ -320,16 +320,46 @@ class MT5RunnerConfig:
     # flag exists so a test (or a forensic A/B) can prove that.
     funnel_enabled: bool = True
     # JUDGMENT CORE (owner rulings 2026-10-23; build ordered
-    # 2026-11-02): shadow evaluation of every candidate-bearing
-    # funnel record — market-state estimation -> competing
-    # scenarios -> evidence evaluation -> take/abstain, journaled
-    # as judgment_shadow records.  OBSERVATION-ONLY in v1: the
-    # verdict never steers, sizes, gates or vetoes an order (hard
-    # risk invariants stay outside the model, in risk/friction);
-    # first promotion (M5 route only) needs a separate approval.
+    # 2026-11-02): evaluation of every candidate-bearing funnel
+    # record — market-state estimation -> competing scenarios ->
+    # evidence evaluation -> take/abstain, journaled as
+    # judgment_shadow records (the record type keeps its name:
+    # the S3/S4 consumers read it).  PROMOTION (owner decision
+    # 2026-11-05 — the separate approval the program always
+    # required): the core is the DEMO decision authority, per
+    # judgment_mode below.  Hard risk invariants stay outside
+    # the model, in risk/friction, in every mode.
     judgment_shadow_enabled: bool = True
     judgment_min_expected_r: float = 0.05
     judgment_min_confidence: float = 0.15
+    # JUDGMENT MODE — the kill switch (owner decision
+    # 2026-11-05).  "active" (default): on every route the core
+    # evaluates — the H1 roster trigger path (incl. lifecycle-
+    # routed setups and the owner-confirm staging branch), the
+    # qm_m5 native route, the qm_d1 native route — the core's
+    # verdict governs at the route's order decision point
+    # (_judgment_authority): no demo order without a "take"; an
+    # abstention refuses the attempt under judgment.abstain.
+    # The safeguard stack inside the shared order path
+    # (friction gate, protective stop, RiskGuards / pool budget
+    # + min-lot floor, 15% drawdown halt, position caps) runs
+    # AFTER the verdict, unchanged and above it — a take is
+    # necessary, never sufficient.  "shadow": the pre-promotion
+    # behavior exactly (gate stack decides, core observes) —
+    # rollback without a code change.  In active mode the seam
+    # evaluation runs regardless of judgment_shadow_enabled
+    # (that flag gates only the passive tap): an order without
+    # a core record must be impossible, not merely unjournaled.
+    # NOT under the core's authority (named, not silent — the
+    # core has never shadow-evaluated either, so there is no
+    # verdict history to promote): the hot_scalp promotion path
+    # (candidates live in the candidate-chain store, never the
+    # funnel) and the A6 resting limit (playbook "arrival_zone"
+    # — the decision flow itself places it; no playbook
+    # candidate record exists).  Both keep their own gate
+    # stacks; promoting either is a separate build that first
+    # gives it funnel candidate records + a shadow history.
+    judgment_mode: str = "active"
     # JUDGMENT CORE S3 (owner spec 2026-11-02): outcome
     # reconciliation + self-audit — shadow judgments and theses are
     # measured against forward price action, calibration is
@@ -1601,6 +1631,10 @@ class MT5Runner:
             "manipulation_filter": cfg.manipulation_filter,
             "news_pause_enabled": cfg.news_pause_enabled,
             "entry_gates_enabled": cfg.entry_gates_enabled,
+            # Promotion (2026-11-05): the judgment mode decides
+            # orders — it is decision config by definition, so a
+            # mode flip changes the fingerprint (provenance).
+            "judgment_mode": self._judgment_mode(),
         }
         raw = json.dumps(payload, sort_keys=True, default=str)
         self._config_fingerprint_cache = hashlib.sha256(
@@ -1638,7 +1672,9 @@ class MT5Runner:
                    kind: str = "playbook_eval",
                    trigger_stage: str | None = None,
                    source: str | None = None,
-                   assessment: dict | None = None) -> dict | None:
+                   assessment: dict | None = None,
+                   precomputed_judgment: dict | None = None
+                   ) -> dict | None:
         """Append ONE funnel evaluation record + update the
         in-memory /status counters.  Never raises; returns the
         record (or None when the funnel is disabled).
@@ -1820,15 +1856,21 @@ class MT5Runner:
                 if isinstance(_av, dict) \
                         and _av.get("verdict") == "qualified":
                     slot["qualified"] += 1
-        # Judgment core shadow (owner rulings 2026-10-23; build
-        # ordered 2026-11-02): every candidate-bearing LIVE record
-        # also gets a judgment_shadow record — the judgment core's
-        # take/abstain on the SAME inputs the gate stack decided
-        # on, so the two models can be compared against outcomes.
-        # It reads only this record; it can never steer, size,
-        # gate or veto an order.  Warmup/replay records are
-        # skipped (their bar is historical — a shadow verdict
-        # stamped on them would misdescribe the dataset).
+        # Judgment core (owner rulings 2026-10-23; promotion
+        # owner decision 2026-11-05): every candidate-bearing
+        # LIVE record also gets a judgment_shadow record — the
+        # judgment core's take/abstain on the SAME inputs the
+        # gate stack decided on, so the verdict can be scored
+        # against outcomes.  In shadow mode this tap is the only
+        # evaluation (passive, exactly as pre-promotion).  In
+        # active mode a route that reached its order decision
+        # point passes precomputed_judgment — the verdict the
+        # order actually rode on, computed synchronously at the
+        # seam (_judgment_authority) — and this block journals
+        # THAT verdict beside the terminal record instead of
+        # evaluating a second time.  Warmup/replay records are
+        # skipped (their bar is historical — a verdict stamped
+        # on them would misdescribe the dataset).
         if candidate is not None and kind != "trigger_event" \
                 and source != "warmup_scan":
             # S3: this bar counts as EVALUATED for the
@@ -1837,46 +1879,43 @@ class MT5Runner:
         if candidate is not None and decision is not None \
                 and kind != "trigger_event" \
                 and source != "warmup_scan" \
-                and getattr(self.cfg, "judgment_shadow_enabled",
-                            True):
+                and (precomputed_judgment is not None
+                     or getattr(self.cfg, "judgment_shadow_enabled",
+                                True)):
             try:
-                from .judgment import (JudgmentConfig,
-                                       evaluate_judgment)
-                _feed_block, _judgment_evidence = \
-                    self._forecast_feed_for(
-                        candidate=candidate, evidence=evidence,
+                if precomputed_judgment is not None:
+                    _feed_block = precomputed_judgment.get(
+                        "forecast_evidence")
+                    _judgment = precomputed_judgment.get(
+                        "judgment")
+                else:
+                    _bundle = self._judgment_evaluate(
+                        candidate=candidate, decision=decision,
+                        evidence=evidence,
                         intended_tf=intended_tf,
                         eval_now=_eval_now)
-                _judgment = evaluate_judgment(
-                    candidate=candidate, decision=decision,
-                    evidence=_judgment_evidence,
-                    context=self._decision_context(),
-                    config=JudgmentConfig(
-                        min_expected_r=float(getattr(
-                            self.cfg, "judgment_min_expected_r",
-                            0.05)),
-                        min_confidence=float(getattr(
-                            self.cfg, "judgment_min_confidence",
-                            0.15))))
-                self.journal.append({
-                    "type": "judgment_shadow",
-                    "ts": str(_eval_now),
-                    "run_id": self._run_id,
-                    "playbook": playbook,
-                    "intended_tf": intended_tf,
-                    "gate_result": decision.get("result"),
-                    "gate_order_result":
-                        decision.get("order_result"),
-                    "gate_reason_code":
-                        decision.get("reason_code")
-                        or reason_code or None,
-                    # E3: what the forecast feed said at this
-                    # evaluation, verbatim — weighed or not.
-                    "forecast_evidence": _feed_block,
-                    "judgment": _judgment})
-                self._audit_register_shadow(
-                    _judgment, candidate, _eval_now,
-                    playbook=playbook)
+                    _feed_block = _bundle["forecast_evidence"]
+                    _judgment = _bundle["judgment"]
+                if _judgment is not None:
+                    self.journal.append({
+                        "type": "judgment_shadow",
+                        "ts": str(_eval_now),
+                        "run_id": self._run_id,
+                        "playbook": playbook,
+                        "intended_tf": intended_tf,
+                        "gate_result": decision.get("result"),
+                        "gate_order_result":
+                            decision.get("order_result"),
+                        "gate_reason_code":
+                            decision.get("reason_code")
+                            or reason_code or None,
+                        # E3: what the forecast feed said at this
+                        # evaluation, verbatim — weighed or not.
+                        "forecast_evidence": _feed_block,
+                        "judgment": _judgment})
+                    self._audit_register_shadow(
+                        _judgment, candidate, _eval_now,
+                        playbook=playbook)
             except Exception as exc:
                 self.journal.log_note(
                     f"mt5: judgment shadow failed for "
@@ -1884,7 +1923,8 @@ class MT5Runner:
         # Judgment core S2 (owner spec 2026-11-02): the five-scenario
         # market read + the maintained thesis, fed by the same cycle
         # (decision context + the desk's rolling candidate flow).
-        # Shadow-only like S1: journal events, never order authority.
+        # Journal events: the thesis read itself holds no order
+        # authority (the S1 core's authority lives at the seams).
         if candidate is not None and decision is not None \
                 and kind != "trigger_event" \
                 and source != "warmup_scan" \
@@ -1899,6 +1939,104 @@ class MT5Runner:
                     f"mt5: judgment thesis failed for "
                     f"{playbook}: {type(exc).__name__}: {exc}")
         return record
+
+    # ── Judgment Core: mode, evaluation, authority seam ─────
+    # PROMOTION (owner decision 2026-11-05).  The core itself
+    # (execution/judgment.py) stays a pure function; everything
+    # about AUTHORITY lives here: the mode, the one evaluation
+    # entry point both the passive tap and the decision seams
+    # share (so the verdict that governs an order is computed
+    # from exactly the inputs the journaled record carries),
+    # and the seam contract the order routes call.
+
+    def _judgment_mode(self) -> str:
+        """The core's effective authority mode: exactly
+        "shadow" (after case/space normalization) rolls back to
+        the pre-promotion posture; anything else runs ACTIVE —
+        a typo can never silently restore the unjudged path.
+        The manifest journals raw + effective, so a bad value
+        is a visible fact, not a silent mode."""
+        raw = str(getattr(self.cfg, "judgment_mode", "active")
+                  or "active").strip().lower()
+        return "shadow" if raw == "shadow" else "active"
+
+    def _judgment_evaluate(self, *, candidate, decision,
+                           evidence, intended_tf, eval_now):
+        """ONE core evaluation of one candidate, in the exact
+        shape the journal carries: returns the bundle
+        {"judgment": <block, effective mode stamped over the
+        core's own label>, "forecast_evidence": <E3 feed block
+        or None>} — the forecast feed merge included, so the
+        weighed evidence is the record's evidence.  Raises on
+        failure: the _emit_eval tap logs its note as before;
+        the authority seam catches and fails closed."""
+        from .judgment import (JudgmentConfig, evaluate_judgment)
+        feed_block, judgment_evidence = self._forecast_feed_for(
+            candidate=candidate, evidence=evidence,
+            intended_tf=intended_tf, eval_now=eval_now)
+        judgment = evaluate_judgment(
+            candidate=candidate, decision=decision,
+            evidence=judgment_evidence,
+            context=self._decision_context(),
+            config=JudgmentConfig(
+                min_expected_r=float(getattr(
+                    self.cfg, "judgment_min_expected_r", 0.05)),
+                min_confidence=float(getattr(
+                    self.cfg, "judgment_min_confidence", 0.15))))
+        judgment["mode"] = self._judgment_mode()
+        return {"judgment": judgment,
+                "forecast_evidence": feed_block}
+
+    def _judgment_authority(self, *, candidate, decision,
+                            evidence, intended_tf, eval_now):
+        """The promotion seam, called by every order route the
+        core evaluates (H1 roster trigger path, qm_m5, qm_d1)
+        at its order decision point — after the route's own
+        facts and gates, BEFORE any order dispatch.  The shared
+        safeguard stack inside the order path (friction gate,
+        protective-stop presence, RiskGuards / pool budget +
+        min-lot floor, 15% drawdown halt, position caps) still
+        runs after, unchanged and above: a "take" is necessary,
+        never sufficient, and a safeguard refusal journals under
+        the safeguard's own reason, never this one's.
+
+        Returns (bundle, refusal_reason):
+        - shadow mode: (None, None) — the caller proceeds
+          exactly as pre-promotion; the _emit_eval tap evaluates
+          passively.  The decision path is untouched.
+        - active + take: (bundle, None) — proceed; the caller
+          passes the bundle to its terminal _emit_eval as
+          precomputed_judgment, so the journaled core record IS
+          the decision the order rode on (decision, expected_r,
+          mode — the S3/S4 scoring inputs survive the promotion).
+        - active + abstain: (bundle, reason) — the caller
+          refuses THIS order attempt under judgment.abstain,
+          mirroring its existing gate-refusal handling (the
+          candidate/setup lifecycle is otherwise untouched).
+        - active + evaluation failure: ({"judgment": None},
+          reason) — fail closed: no core record, no order; the
+          caller's refusal record states the failure."""
+        if self._judgment_mode() != "active":
+            return None, None
+        try:
+            bundle = self._judgment_evaluate(
+                candidate=candidate, decision=decision,
+                evidence=evidence, intended_tf=intended_tf,
+                eval_now=eval_now)
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            return {"judgment": None, "forecast_evidence": None}, (
+                "judgment core evaluation failed at the order "
+                f"decision point ({type(exc).__name__}: {exc}) — "
+                "fail closed: no core record, no order")
+        judgment = bundle["judgment"]
+        if judgment.get("decision") == "take":
+            return bundle, None
+        return bundle, (
+            "judgment core abstained (active authority): "
+            f"{judgment.get('reason') or 'no reason recorded'} "
+            f"[decision=abstain, expected_r="
+            f"{judgment.get('expected_r')}, confidence="
+            f"{judgment.get('confidence')}, mode=active]")
 
     def _ensure_thesis_keeper(self):
         """The one keeper for this run, built at the first touch
@@ -3496,12 +3634,28 @@ class MT5Runner:
                     "risk_pct": self.cfg.risk_pct,
                     "min_score": self.cfg.min_score,
                     "floor_authority": dict(_FLOOR_AUTHORITY),
-                    # Judgment core (2026-11-02): shadow mode is
-                    # the only mode v1 ships; promotion is a
-                    # separate owner approval, never a config flip
-                    # smuggled in here.
+                    # Judgment core: PROMOTED to the demo
+                    # decision authority by the owner's decision
+                    # of 2026-11-05 (the separate approval the
+                    # shadow program always required).  The
+                    # manifest journals the EFFECTIVE mode (the
+                    # kill switch's real state), the configured
+                    # value verbatim, and the authority boundary:
+                    # the routes the core governs vs the two
+                    # order routes it has never evaluated (named
+                    # on the config field — hot_scalp promotion
+                    # and the A6 resting limit keep their own
+                    # gate stacks, not a silent dual path).
                     "judgment_core": {
-                        "mode": "shadow",
+                        "mode": self._judgment_mode(),
+                        "mode_configured": str(getattr(
+                            self.cfg, "judgment_mode", "active")),
+                        "authority_routes": [
+                            "h1_trigger", "qm_m5_native",
+                            "qm_d1_native"],
+                        "not_authoritative": [
+                            "hot_scalp_promotion",
+                            "resting_limit"],
                         "enabled": bool(getattr(
                             self.cfg, "judgment_shadow_enabled",
                             True)),
@@ -8688,7 +8842,18 @@ class MT5Runner:
         the score floor, the RiskPool budget logic (placement-time
         sizing), RiskGuards and the margin check.  Journaled with
         trigger_source=resting_limit, playbook 'arrival_zone' (the
-        decision flow is the actor; no playbook fired)."""
+        decision flow is the actor; no playbook fired).
+
+        PROMOTION BOUNDARY (owner decision 2026-11-05, named —
+        not silent): the Judgment Core's demo authority does NOT
+        extend to this placement.  No funnel candidate record
+        exists for arrival_zone (the actor is the decision flow,
+        not a playbook), so the core has never shadow-evaluated
+        it and there is no verdict history to promote; the floor
+        + RiskGuards + margin stack above remains its whole
+        governance.  Promoting the core here is a separate build
+        that first gives this route funnel candidate records +
+        a shadow history."""
         if not self.cfg.resting_limit_enabled:
             return
         if self.cfg.paused or self._regime_pause is not None:
@@ -9294,11 +9459,22 @@ class MT5Runner:
         except (KeyError, TypeError, ValueError):
             sig.entry_zone = None
         pb = SimpleNamespace(name="hot_scalp")
-        # Chain stage: judgment.  The Judgment Core's market read at
+        # Chain stage: judgment.  The thesis layer's market read at
         # promotion time, recorded as EVIDENCE on the chain — the
-        # promotion does not take orders from it (shadow posture
-        # stands); the chain simply stops being blind to what the
-        # wider system believed when this candidate was decided.
+        # chain simply stops being blind to what the wider system
+        # believed when this candidate was decided.
+        # PROMOTION BOUNDARY (owner decision 2026-11-05, named —
+        # not silent): the Judgment Core's demo authority does NOT
+        # extend to this promotion path.  The core has never
+        # shadow-evaluated a hot_scalp candidate (these candidates
+        # live in the candidate-chain store and never enter the
+        # funnel record shape the core consumes), so there is no
+        # verdict history to promote; this path keeps its own
+        # gate stack (live authority, claim, flat-only, order
+        # shape, then the shared order path's safeguards).
+        # Promoting the core here is a separate build that first
+        # gives the sleeve funnel candidate records + a shadow
+        # history to be judged against.
         _judgment_fields: dict = {
             "intent": {"shape": kind, "direction": direction,
                        "entry_reference": entry_ref,
@@ -11171,76 +11347,18 @@ class MT5Runner:
             self._last_scores[pb.name] = breakdown
             self._last_score = breakdown
 
-            def _emit_sig(*, result, reason_code="", reason="",
-                          floor_result=None, execution_eligible=None,
-                          order_result=None, selected_action=None,
-                          rejected_alternatives=None):
-                """FUNNEL §1.1: this signal's terminal decision
-                record (mirrors the log_signal beside it).
-
-                Burn-down #1: the record carries the full
-                assessment objects the native routes produce —
-                the evidence the decider actually weighed for
-                THIS candidate (signal factors, the asymmetry
-                score's stance, HTF hierarchy agreement, zone
-                context, journey geometry, funding events), with
-                correlation groups, plus the two competing
-                scenarios.  Built from closure state at emit
-                time; observation-only — no value here is read
-                by any decision."""
-                if injected_sig is not None:
-                    injected_terminals.append(
-                        {"result": result,
-                         "reason_code": reason_code or "",
-                         "order_result": order_result,
-                         "alert_id": alert_id})
-                dec = {"result": result,
-                       "reason_code": reason_code or None,
-                       "reason": reason}
-                if floor_result is not None:
-                    dec["floor_result"] = floor_result
-                if execution_eligible is not None:
-                    dec["execution_eligible"] = execution_eligible
-                if order_result is not None:
-                    dec["order_result"] = order_result
-                # Two verdict layers, distinct (owner ruling):
-                # analytical qualification vs risk-layer
-                # eligibility, derived from this record's own
-                # terminal fields.
-                _vb_eligible = (
-                    order_result in ("filled", "placed_pending",
-                                     "layer_filled", "layer_pending",
-                                     "layer_no_order")
-                    if order_result is not None
-                    else (bool(execution_eligible)
-                          if execution_eligible is not None
-                          else result == "accepted"))
-                dec.update(_verdict_blocks(
-                    analytical=("qualified" if result == "accepted"
-                                else "not_qualified"),
-                    analytical_code=(None if result == "accepted"
-                                     else (reason_code or None)),
-                    eligible=_vb_eligible,
-                    execution_code=(
-                        (reason_code or None)
-                        if order_result in (
-                            "refused_in_order_path", "rejected")
-                        else None),
-                    outcome=order_result or "not_attempted"))
-                dec.setdefault(
-                    "floor_authority",
-                    _FLOOR_AUTHORITY["h1_roster"])
-                if was_flipped:
-                    # Step 16: every flipped candidate's decision
-                    # record carries the flip block — stance
-                    # "premise_invalidation" only when THIS emit is
-                    # the declared-premise refusal (the sole
-                    # direction.flip producer left), "evidence"
-                    # otherwise, with the pre-Step-16 counterfactual
-                    # as the live shadow comparison.
-                    dec["direction_flip"] = direction_flip_block(
-                        score, pb.name,
-                        refused=(reason_code == "direction.flip"))
+            def _build_ev():
+                """The candidate's evidence object (burn-down
+                #1): observed geometry + bias/session, the
+                inferred structure read, itemized supporting vs
+                contradictory evidence with correlation groups.
+                Built ONCE per signal from closure state; shared
+                by _emit_sig (the funnel record) and — since the
+                promotion (owner decision 2026-11-05) — the
+                Judgment Core authority seam, which must judge
+                the candidate on EXACTLY the evidence its record
+                carries.  Pure construction: reads closure state,
+                decides nothing."""
                 # --- assessment objects (burn-down #1) --------
                 _dir = int(sig.direction)
                 _entry = float(sig.entry_ref)
@@ -11324,6 +11442,100 @@ class MT5Runner:
                         None),
                     "journey_state": journey.get("state"),
                     "room_r": journey.get("room_r")}
+                _ev = {"route": "h1_trigger",
+                       "hierarchy": hier_rec,
+                       "observed": _observed,
+                       "inferred": _inferred,
+                       "supporting": _sup,
+                       "contradictory": _con,
+                       "evidence_groups": _groups,
+                       "independent_evidence_groups":
+                           sorted(_groups)}
+                if injected_sig is not None:
+                    # The decision record joins the setup's
+                    # lifecycle chain by ID (owner rulings
+                    # 2026-10-30 §1).
+                    _ev["setup_id"] = injected_setup_id
+                    _ev["parent_setup_id"] = \
+                        injected_parent_setup_id
+                    _ev["lifecycle_routed"] = True
+                return _ev, _dir, _entry
+
+            def _emit_sig(*, result, reason_code="", reason="",
+                          floor_result=None, execution_eligible=None,
+                          order_result=None, selected_action=None,
+                          rejected_alternatives=None,
+                          reason_category=None,
+                          precomputed_judgment=None):
+                """FUNNEL §1.1: this signal's terminal decision
+                record (mirrors the log_signal beside it).
+
+                Burn-down #1: the record carries the full
+                assessment objects the native routes produce —
+                the evidence the decider actually weighed for
+                THIS candidate (signal factors, the asymmetry
+                score's stance, HTF hierarchy agreement, zone
+                context, journey geometry, funding events), with
+                correlation groups, plus the two competing
+                scenarios.  Built from closure state at emit
+                time; observation-only — no value here is read
+                by any decision."""
+                if injected_sig is not None:
+                    injected_terminals.append(
+                        {"result": result,
+                         "reason_code": reason_code or "",
+                         "order_result": order_result,
+                         "alert_id": alert_id})
+                dec = {"result": result,
+                       "reason_code": reason_code or None,
+                       "reason": reason}
+                if floor_result is not None:
+                    dec["floor_result"] = floor_result
+                if execution_eligible is not None:
+                    dec["execution_eligible"] = execution_eligible
+                if order_result is not None:
+                    dec["order_result"] = order_result
+                # Two verdict layers, distinct (owner ruling):
+                # analytical qualification vs risk-layer
+                # eligibility, derived from this record's own
+                # terminal fields.
+                _vb_eligible = (
+                    order_result in ("filled", "placed_pending",
+                                     "layer_filled", "layer_pending",
+                                     "layer_no_order")
+                    if order_result is not None
+                    else (bool(execution_eligible)
+                          if execution_eligible is not None
+                          else result == "accepted"))
+                dec.update(_verdict_blocks(
+                    analytical=("qualified" if result == "accepted"
+                                else "not_qualified"),
+                    analytical_code=(None if result == "accepted"
+                                     else (reason_code or None)),
+                    eligible=_vb_eligible,
+                    execution_code=(
+                        (reason_code or None)
+                        if order_result in (
+                            "refused_in_order_path", "rejected")
+                        else None),
+                    outcome=order_result or "not_attempted"))
+                dec.setdefault(
+                    "floor_authority",
+                    _FLOOR_AUTHORITY["h1_roster"])
+                if was_flipped:
+                    # Step 16: every flipped candidate's decision
+                    # record carries the flip block — stance
+                    # "premise_invalidation" only when THIS emit is
+                    # the declared-premise refusal (the sole
+                    # direction.flip producer left), "evidence"
+                    # otherwise, with the pre-Step-16 counterfactual
+                    # as the live shadow comparison.
+                    dec["direction_flip"] = direction_flip_block(
+                        score, pb.name,
+                        refused=(reason_code == "direction.flip"))
+                if reason_category is not None:
+                    dec["reason_category"] = reason_category
+                _ev, _dir, _entry = _build_ev()
                 dec["competing_scenarios"] = [
                     {"scenario": f"take the {_dir:+d} "
                                  f"{pb.name} setup at "
@@ -11348,23 +11560,6 @@ class MT5Runner:
                 if rejected_alternatives:
                     dec["rejected_alternatives"] = list(
                         rejected_alternatives)
-                _ev = {"route": "h1_trigger",
-                       "hierarchy": hier_rec,
-                       "observed": _observed,
-                       "inferred": _inferred,
-                       "supporting": _sup,
-                       "contradictory": _con,
-                       "evidence_groups": _groups,
-                       "independent_evidence_groups":
-                           sorted(_groups)}
-                if injected_sig is not None:
-                    # The decision record joins the setup's
-                    # lifecycle chain by ID (owner rulings
-                    # 2026-10-30 §1).
-                    _ev["setup_id"] = injected_setup_id
-                    _ev["parent_setup_id"] = \
-                        injected_parent_setup_id
-                    _ev["lifecycle_routed"] = True
                 return self._emit_eval(
                     playbook=pb.name,
                     evaluation_clock="h1_trigger",
@@ -11394,7 +11589,8 @@ class MT5Runner:
                     # lifecycle-routed record can join its
                     # setup's chain by ID.)
                     evidence=_ev,
-                    source="trigger_path")
+                    source="trigger_path",
+                    precomputed_judgment=precomputed_judgment)
 
             hier_rec = {
                 "bias_d1": (verdict or {}).get("bias_d1"),
@@ -11911,6 +12107,82 @@ class MT5Runner:
                               reason=why, execution_eligible=True,
                               order_result="not_attempted")
                     continue
+            # ---- Judgment Core authority (promotion, owner
+            # decision 2026-11-05) ------------------------------
+            # The candidate has passed this route's own gates and
+            # is dispatch-bound (shared order path, funding layer,
+            # or owner-confirm staging — the seam sits before the
+            # branch, so all three are governed).  In active mode
+            # the core decides NOW, on the same candidate +
+            # evidence the terminal record will carry: an
+            # abstention refuses this attempt under
+            # judgment.abstain, mirroring the manipulation refusal
+            # above (an ordinary refusal — the setup's lifecycle
+            # is untouched beyond this attempt); a take proceeds
+            # to the dispatch, whose safeguard stack keeps its
+            # own authority.  Pending orders placed from here are
+            # bound by this placement-time decision (the trigger
+            # fill is the order path executing a judged order).
+            # In shadow mode nothing here runs.
+            _core_bundle, _core_refusal = \
+                self._judgment_authority(
+                    candidate=self._candidate_dict(
+                        sig, breakdown,
+                        injected_provenance
+                        if injected_sig is not None else None),
+                    decision={
+                        "floor_result": {
+                            "floor": float(fl["floor"]),
+                            "total": float(score.total),
+                            "path": path},
+                        **({"direction_flip":
+                            direction_flip_block(
+                                score, pb.name, refused=False)}
+                           if was_flipped else {})},
+                    evidence=_build_ev()[0],
+                    intended_tf=_native_tf(pb.name) or "H1",
+                    eval_now=self._evaluation_now())
+            if _core_refusal is not None:
+                stats["judgment_refused"] = stats.get(
+                    "judgment_refused", 0) + 1
+                self._record_blocked(_core_refusal, pb.name)
+                self.journal.log_note(
+                    f"mt5: {pb.name} signal judgment-refused: "
+                    f"{_core_refusal}")
+                log_signal(
+                    self.journal, signal_id=alert_id,
+                    playbook=pb.name, direction=int(sig.direction),
+                    score=float(sig.score),
+                    decision="judgment_refused",
+                    reason=_core_refusal,
+                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    entry=float(sig.entry_ref),
+                    stop=float(sig.invalidation),
+                    targets=[float(x) for x in
+                             (sig.targets or [])],
+                    factors=list(getattr(sig, "factors", [])
+                                 or []),
+                    hierarchy=hier_rec,
+                    score_breakdown=breakdown,
+                    context=self._decision_context())
+                _emit_sig(
+                    result="refused",
+                    reason_code="judgment.abstain",
+                    reason=_core_refusal,
+                    reason_category=(
+                        ((_core_bundle or {}).get("judgment")
+                         or {}).get("reason_category")
+                        if _core_bundle else None),
+                    execution_eligible=True,
+                    order_result="not_attempted",
+                    selected_action="refuse this order attempt — "
+                                    "the Judgment Core abstained "
+                                    "under active authority; the "
+                                    "candidate's lifecycle is "
+                                    "untouched beyond this "
+                                    "attempt",
+                    precomputed_judgment=_core_bundle)
+                continue
             # FUNNEL §1.1: snapshot the order-path counters so the
             # terminal record can state the order outcome from
             # observed effects (observation-only — reads, never
@@ -11983,6 +12255,7 @@ class MT5Runner:
             _terminal_record = _emit_sig(
                 result="accepted", execution_eligible=True,
                 order_result=_ores,
+                precomputed_judgment=_core_bundle,
                 reason_code=(
                     _FRICTION_CODE
                     if _ores == "refused_in_order_path"
@@ -15250,7 +15523,9 @@ class MT5Runner:
 
         def _refuse(code: str, reason: str,
                     hard_checks: list,
-                    analytical_qualified: bool = False) -> None:
+                    analytical_qualified: bool = False,
+                    reason_category: int | None = None,
+                    precomputed_judgment=None) -> None:
             # Competing scenarios on a refusal: this side was
             # NOT taken; on a flip the other side is what the
             # weighed evidence selected.
@@ -15283,6 +15558,9 @@ class MT5Runner:
                 reason=reason, candidate=candidate,
                 decision={"result": "refused", "reason_code": code,
                           "reason": reason,
+                          **({"reason_category": reason_category}
+                             if reason_category is not None
+                             else {}),
                           "execution_eligible": False,
                           "order_result": "not_attempted",
                           "hard_risk_checks": hard_checks,
@@ -15315,7 +15593,8 @@ class MT5Runner:
                                   refused=(code == "direction.flip"),
                                   evidence=flip_ev)}
                              if was_flipped else {})},
-                evidence=evidence, source=_src)
+                evidence=evidence, source=_src,
+                precomputed_judgment=precomputed_judgment)
 
         hard_checks: list[dict] = []
         # FACT 1 — stop geometry: a stop not beyond the entry in
@@ -15464,6 +15743,39 @@ class MT5Runner:
                     f"decision-stage solvency: {_solv_reason}",
                     hard_checks, analytical_qualified=True)
             return "gate.solvency"
+        # Judgment Core authority (promotion, owner decision
+        # 2026-11-05): the route's facts have passed and
+        # decision solvency holds — the candidate is
+        # dispatch-bound.  In active mode the core's verdict
+        # governs on the same candidate + evidence this record
+        # carries: an abstention refuses this touch under
+        # judgment.abstain (a consuming outcome, like every
+        # non-friction refusal — RULING 6 keeps only risk.friction
+        # alive for re-evaluation); a take proceeds to the shared
+        # order path, whose safeguards keep their own authority.
+        # In shadow mode nothing here runs.
+        _core_bundle, _core_refusal = self._judgment_authority(
+            candidate=candidate,
+            decision=(
+                {"direction_flip": direction_flip_block(
+                    score, "qm_m5", refused=False,
+                    evidence=flip_ev)}
+                if was_flipped else {}),
+            evidence=evidence, intended_tf="M5",
+            eval_now=self._evaluation_now())
+        if _core_refusal is not None:
+            hard_checks.append({
+                "check": "judgment_core (active authority)",
+                "result": "VETO",
+                "detail": _core_refusal})
+            _refuse("judgment.abstain", _core_refusal,
+                    hard_checks, analytical_qualified=True,
+                    reason_category=(
+                        ((_core_bundle or {}).get("judgment")
+                         or {}).get("reason_category")
+                        if _core_bundle else None),
+                    precomputed_judgment=_core_bundle)
+            return "judgment.abstain"
         # ACCEPT — the weighed judgment, stated with its evidence,
         # then the shared order machinery carries the risk.
         judgment = (
@@ -15567,7 +15879,8 @@ class MT5Runner:
                         score, "qm_m5", refused=False,
                         evidence=flip_ev)}
                    if was_flipped else {})},
-            evidence=evidence, source=_src)
+            evidence=evidence, source=_src,
+            precomputed_judgment=_core_bundle)
         self._announce_assessment(_rec)
         return _ocode
 
@@ -15841,10 +16154,106 @@ class MT5Runner:
         factors = list(getattr(sig, "factors", []) or [])
         bar_ts = d1_df.index[sig.index] \
             if sig.index < len(d1_df) else None
+        # Evidence vector (the burn-down #1 standard the sibling
+        # routes meet): what this route actually weighs — the QM
+        # pattern's reaction tags, the signal's own factors, the
+        # D1 score's stance, the desk's independent HTF read, and
+        # journey geometry (filled in where it is computed,
+        # below).  PROMOTION NOTE (2026-11-05): this route's
+        # records carried only {route, provenance}; under shadow
+        # that merely journaled thin-evidence abstentions, but
+        # under the core's active authority it would refuse EVERY
+        # qm_d1 candidate as "evidence too thin to judge",
+        # whatever its merit — an evidence-starvation kill
+        # switch nobody ordered.  The vector is built from the
+        # route's own weighed facts only: this route's verdict
+        # carries bias_d1 = the candidate's OWN direction (order
+        # -path machinery), so the observed HTF fields carry the
+        # desk's live-setup read instead — absent stays absent,
+        # never manufactured from the candidate itself.
+        lc = dict(getattr(sig, "live_context", None) or {})
+        _setup = self._live_setup or {}
+        _tags = list(lc.get("tags") or [])
+        _ev_sup: list[str] = []
+        _ev_con: list[str] = []
+        _ev_groups: dict[str, list[str]] = {}
+
+        def _ev_note(bucket, group, text):
+            bucket.append(text)
+            _ev_groups.setdefault(group, []).append(text)
+
+        if "sweep_head" in _tags:
+            _ev_note(_ev_sup, "qm_pattern_event",
+                     "sweep_head: the head leg swept the prior "
+                     "swing — rejection evidence at the extreme")
+        if "displacement_break" in _tags:
+            _ev_note(_ev_sup, "qm_pattern_event",
+                     "displacement_break: the neckline break "
+                     "displaced — acceptance by closes through "
+                     "the level")
+        for _f in factors:
+            if _f not in _tags:
+                _ev_note(_ev_sup, "qm_d1_signal",
+                         f"signal factor: {_f}")
+        was_flipped = bool(getattr(score, "flipped", False))
+        if was_flipped:
+            _ev_note(_ev_con, "asymmetry_score",
+                     "asymmetry score flipped: the weighed "
+                     "structure funds the opposite side")
+        else:
+            _ev_note(_ev_sup, "asymmetry_score",
+                     f"asymmetry score {score.total:.0f} for "
+                     f"the {direction:+d} side")
+        for _key, _lbl in (("bias_d1", "D1"), ("bias_h4", "H4")):
+            _b = _setup.get(_key)
+            if _b in (1, -1):
+                if int(_b) == direction:
+                    _ev_note(_ev_sup, "htf_structure",
+                             f"with structural {_lbl} bias "
+                             f"{int(_b):+d}")
+                else:
+                    _ev_note(_ev_con, "htf_structure",
+                             f"against structural {_lbl} bias "
+                             f"{int(_b):+d} (weighed as "
+                             "evidence, not a veto)")
+        evidence = {
+            "route": "qm_d1_native",
+            "observed": {
+                "tags": _tags,
+                "qm_level": lc.get("qm_level"),
+                "head": lc.get("head"),
+                "neckline": lc.get("neckline"),
+                "entry": entry, "stop": stop,
+                "stop_dist": abs(entry - stop),
+                "bias_d1": _setup.get("bias_d1"),
+                "bias_h4": _setup.get("bias_h4"),
+                "session_bucket": (
+                    session_of(bar_ts)[0]
+                    if bar_ts is not None else None),
+            },
+            "inferred": {
+                "score_total": float(score.total),
+                "score_components": breakdown,
+                "score_flipped": was_flipped,
+                "regime": verdict["regime"],
+                "posture": (self._posture.name
+                            if self._posture is not None
+                            else None),
+                "journey_state": None,
+                "room_r": None,
+            },
+            "supporting": _ev_sup,
+            "contradictory": _ev_con,
+            "evidence_groups": _ev_groups,
+            "independent_evidence_groups": sorted(_ev_groups),
+            "provenance": provenance,
+        }
 
         def _journal(decision: str, reason: str,
                      funnel_code: str | None = None,
-                     analytical_qualified: bool = False) -> None:
+                     analytical_qualified: bool = False,
+                     reason_category: int | None = None,
+                     precomputed_judgment=None) -> None:
             # Phase 2 (P0-2): signal-record score = the Asymmetry
             # total (the computed decision score); the sleeve
             # base rides under its own name in the candidate
@@ -15871,6 +16280,9 @@ class MT5Runner:
                     decision={"result": "refused",
                               "reason_code": funnel_code,
                               "reason": reason,
+                              **({"reason_category": reason_category}
+                                 if reason_category is not None
+                                 else {}),
                               "execution_eligible": False,
                               "order_result": "not_attempted",
                               "reasoning_mode": "standalone",
@@ -15889,9 +16301,9 @@ class MT5Runner:
                                       funnel_code
                                       if analytical_qualified
                                       else None))},
-                    evidence={"route": "qm_d1_native",
-                              "provenance": provenance},
-                    source=_src)
+                    evidence=evidence,
+                    source=_src,
+                    precomputed_judgment=precomputed_judgment)
 
         # Hard lines (spread / hunting ground / session / the
         # playbook's own live check on the D1 frame).
@@ -15933,7 +16345,12 @@ class MT5Runner:
         journey = self._journey_context(
             direction=direction, price=entry,
             stop_dist=abs(entry - stop), zone_d=None, atr=atr_d1)
+        evidence["inferred"]["journey_state"] = journey.get(
+            "state")
+        evidence["inferred"]["room_r"] = journey.get("room_r")
         if journey.get("refusal"):
+            _ev_note(_ev_con, "journey_geometry",
+                     f"journey geometry: {journey['refusal']}")
             stats["gated"] = stats.get("gated", 0) + 1
             self._record_blocked(journey["refusal"], "qm_d1")
             _journal("gated", journey["refusal"], "gate.location")
@@ -15965,6 +16382,39 @@ class MT5Runner:
             _journal("gated",
                      f"decision-stage solvency: {_solv_reason}",
                      "gate.solvency", analytical_qualified=True)
+            return
+        # Judgment Core authority (promotion, owner decision
+        # 2026-11-05): hard lines, posture, journey, floor and
+        # decision solvency have passed — the candidate is
+        # dispatch-bound.  In active mode the core's verdict
+        # governs on the same candidate + evidence this route's
+        # records carry: an abstention refuses the touch under
+        # judgment.abstain (this route's ordinary gated-refusal
+        # handling; the instance is terminally disposed by the
+        # caller's mark-seen, exactly like its other refusals);
+        # a take proceeds to the shared order path, whose
+        # safeguards keep their own authority.  Shadow mode:
+        # nothing here runs.
+        _core_bundle, _core_refusal = self._judgment_authority(
+            candidate=self._candidate_dict(sig, breakdown,
+                                           provenance),
+            decision={"floor_result": {
+                "floor": float(fl["floor"]),
+                "total": float(score.total),
+                "path": "MACRO_SWING_OPEN"}},
+            evidence=evidence,
+            intended_tf="D1",
+            eval_now=self._evaluation_now())
+        if _core_refusal is not None:
+            stats["gated"] = stats.get("gated", 0) + 1
+            self._record_blocked(_core_refusal, "qm_d1")
+            _journal("gated", _core_refusal, "judgment.abstain",
+                     analytical_qualified=True,
+                     reason_category=(
+                         ((_core_bundle or {}).get("judgment")
+                          or {}).get("reason_category")
+                         if _core_bundle else None),
+                     precomputed_judgment=_core_bundle)
             return
         _journal("accepted",
                  f"asymmetry {score.total:.0f} clears "
@@ -16048,9 +16498,9 @@ class MT5Runner:
                           outcome=_ores),
                       "execution_eligible": True,
                       "order_result": _ores},
-            evidence={"route": "qm_d1_native",
-                      "provenance": provenance},
-            source=_src)
+            evidence=evidence,
+            source=_src,
+            precomputed_judgment=_core_bundle)
         self._announce_assessment(_rec)
 
     # --------------------------- scheduled evaluations (P0-3)

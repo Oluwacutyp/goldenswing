@@ -2,14 +2,19 @@
 2026-11-02): market-state estimation -> competing scenarios ->
 evidence evaluation -> decision / abstention.
 
-SHADOW-FIRST (the ruling): this module is a pure function over
-the funnel evaluation record the runner already journals.  It
-decides NOTHING in v1 — the runner appends its verdict as a
+SHADOW-FIRST (the ruling), PROMOTED 2026-11-05: this module
+stays a pure function over the funnel evaluation record the
+runner already journals — it decides nothing BY ITSELF.  The
+promotion the shadow program always required was granted by
+the owner's decision of 2026-11-05, and it lives in the
+RUNNER (mt5_runner._judgment_authority): in active mode the
+runner evaluates this function synchronously at each covered
+route's order decision point and the verdict governs the demo
+order; in shadow mode the runner appends the verdict as a
 ``judgment_shadow`` record beside the gate stack's own record,
-so the two decision models can be compared on identical inputs
-against real outcomes before any promotion.  First promotion
-(M5 route only) needs a separate owner approval and is NOT
-implemented here.
+exactly as before.  The ``mode`` stamped below is this
+module's own label; the runner overstamps the effective
+authority mode ("active" / "shadow") on the journaled block.
 
 Hard risk invariants stay OUTSIDE this model (the ruling): the
 friction gate, RiskGuards/RiskPool and the drawdown halt keep
@@ -189,7 +194,9 @@ def evaluate_judgment(*, candidate: dict, decision: dict | None,
     """One shadow judgment for one evaluated candidate.
 
     Pure: same record in, same verdict out.  The returned block
-    is journaled verbatim on the ``judgment_shadow`` record."""
+    is journaled on the ``judgment_shadow`` record, with the
+    runner overstamping ``mode`` with the effective authority
+    mode (see the module docstring)."""
     cfg = config or JudgmentConfig()
     candidate = candidate or {}
     decision = decision or {}

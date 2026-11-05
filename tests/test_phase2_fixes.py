@@ -251,8 +251,13 @@ def test_terminal_refusal_promoted_and_reconciles(tmp_path):
 def test_contradictory_evidence_weighed_and_truthful(tmp_path):
     """Counter-D1-bias candidate: the contradiction is IN the
     record (weighed, never a veto) and the terminal outcome is
-    the truth (ordered)."""
-    runner = _wire(_qm_runner(tmp_path), _m5_fixture())
+    the truth (ordered).  SHADOW mode: the subject is the
+    ROUTE's weighing/record; under the core's active authority
+    (promotion, 2026-11-05) this same evidence is the core's
+    decision and it abstains — pinned in
+    tests/test_judgment_promotion.py."""
+    runner = _wire(_qm_runner(tmp_path, judgment_mode="shadow"),
+                   _m5_fixture())
     runner._live_setup = {"bias_d1": 1, "bias_h4": 1,
                           "regime": "trend", "size_mult": 1.0,
                           "h4_context": ""}
@@ -547,6 +552,11 @@ def _equity_runner(tmp_path, monkeypatch, equity, stop=100.34):
         journal_path=tmp_path / "j.jsonl",
         risk_state_path=tmp_path / "r.json",
         kill_switch_path=tmp_path / "KILL",
+        # SHADOW mode: this helper's tests measure the sizing
+        # machinery INSIDE the shared order path; the Judgment
+        # Core's authority over the path is pinned separately
+        # (tests/test_judgment_promotion.py).
+        judgment_mode="shadow",
         news_pause_enabled=False)
     runner = MT5Runner(cfg, feed=feed, executor=_FakeExecutor())
     runner._send_alert = lambda *a, **k: None
@@ -708,8 +718,13 @@ def test_competing_scenarios_coexist_on_the_record(
     weighed evidence, NOT a refusal: the candidate is decided by
     the hard facts, and the record carries the direction_flip
     block with the pre-Step-16 counterfactual.  Nothing is
-    silently suppressed on either side."""
-    runner = _wire(_qm_runner(tmp_path), _m5_fixture())
+    silently suppressed on either side.  SHADOW mode: the
+    subject is the ROUTE's Step-16 record treatment; under the
+    core's active authority (promotion, 2026-11-05) the flipped
+    evidence is the core's to decide on — pinned in
+    tests/test_judgment_promotion.py (a)."""
+    runner = _wire(_qm_runner(tmp_path, judgment_mode="shadow"),
+                   _m5_fixture())
     runner._run_qm_m5(_m5_fixture(), {})
     dec = _candidate_records(runner)[0]["decision"]
     scen = dec["competing_scenarios"]
@@ -728,7 +743,8 @@ def test_competing_scenarios_coexist_on_the_record(
     import tempfile
     from pathlib import Path as _P
     tmp2 = _P(tempfile.mkdtemp())
-    runner2 = _wire(_qm_runner(tmp2), _m5_fixture())
+    runner2 = _wire(_qm_runner(tmp2, judgment_mode="shadow"),
+                    _m5_fixture())
     runner2._score_for = lambda **kw: _RepricedFlipScore(
         41.0, 0.0, 15.0)
     runner2._run_qm_m5(_m5_fixture(), {})
@@ -749,7 +765,8 @@ def test_competing_scenarios_coexist_on_the_record(
     class _BareFlipScore(_FakeScore):
         flipped = True
     tmp3 = _P(tempfile.mkdtemp())
-    runner3 = _wire(_qm_runner(tmp3), _m5_fixture())
+    runner3 = _wire(_qm_runner(tmp3, judgment_mode="shadow"),
+                    _m5_fixture())
     runner3._score_for = lambda **kw: _BareFlipScore(
         70.0, 25.0, 15.0)
     runner3._run_qm_m5(_m5_fixture(), {})

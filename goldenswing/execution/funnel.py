@@ -79,6 +79,13 @@ CATEGORY_EXECUTION = 9            # execution / broker failure
 CATEGORY_ACCEPTED = 10            # accepted / submitted / filled
 
 _CODE_TO_CATEGORY = {
+    # Judgment Core abstention under active authority (promotion,
+    # owner decision 2026-11-05): the generic bucket is QUALITY —
+    # the core's own reason_category for THIS abstention (quality /
+    # direction / regime / invalid geometry) rides the decision
+    # record itself and wins over this fallback wherever the route
+    # stamps it (the emitter only fills an absent category).
+    "judgment.abstain": CATEGORY_QUALITY,
     "gate.location": CATEGORY_INVALID_GEOMETRY,
     "gate.instrument": CATEGORY_INVALID_GEOMETRY,
     "gate.data": CATEGORY_NOT_EVALUATED,

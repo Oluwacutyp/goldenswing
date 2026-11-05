@@ -230,7 +230,10 @@ def _emit_candidate(runner):
 
 
 def test_shadow_record_journaled_beside_evaluation(tmp_path):
-    runner = _runner(tmp_path)
+    # The passive tap under SHADOW mode (the pre-promotion
+    # posture; since the 2026-11-05 promotion the config default
+    # is "active", so the mode is stated explicitly here).
+    runner = _runner(tmp_path, judgment_mode="shadow")
     _emit_candidate(runner)
     records = _journal_records(tmp_path)
     kinds = [r["type"] for r in records]

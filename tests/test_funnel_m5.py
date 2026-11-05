@@ -382,7 +382,13 @@ def test_friction_gate_refuses_and_setup_stays_alive(tmp_path):
 # ------------------------------------------------------ (h) ruling 1
 
 def test_m5_counter_bias_evaluated_not_suppressed(tmp_path):
-    runner = _qm_runner(tmp_path)
+    # SHADOW mode: this test's subject is the ROUTE's weighing
+    # (RULING 1 — counter-bias is evidence, never a route veto).
+    # Under the core's active authority (promotion, 2026-11-05)
+    # the same weighed evidence is the core's to decide on, and
+    # it abstains — that outcome is pinned in
+    # tests/test_judgment_promotion.py.
+    runner = _qm_runner(tmp_path, judgment_mode="shadow")
     # The fixture is a SHORT; structural D1/H4 bias is LONG.
     runner._live_setup = {"bias_d1": 1, "bias_h4": 1,
                           "regime": "trend", "size_mult": 1.0,
