@@ -52,7 +52,8 @@ from .funnel import (
     ORDERED_RESULTS,
     TERMINAL_ORDER_REFUSALS,
 )
-from .judgment_audit import calibration_add, calibration_view
+from .judgment_audit import (
+    calibration_add, calibration_view, degenerate_stop)
 
 try:  # the code->category table is the funnel's own truth
     from .funnel import _CODE_TO_CATEGORY
@@ -142,7 +143,18 @@ def build_pairs(records: list[dict],
     One pair per judged candidate.  ``realized_r`` is None while
     the horizon outcome is still pending (the candidate was
     judged too recently) — pending pairs count toward coverage
-    honesty, never toward outcome means."""
+    honesty, never toward outcome means.
+
+    Degenerate-R guard (completion-04): a reconciled pair whose
+    implied stop distance (|move| / |realized_r|, both journaled
+    on the reconciliation) breaches the shared price floor
+    (judgment_audit.degenerate_stop) is EXCLUDED from every
+    R statistic — its realized_r is nulled and the pair carries
+    ``r_excluded`` + the implied distance, so segment stats
+    compute hit rates and means on the clean set and report the
+    excluded count beside them.  The +226R record in the
+    2026-11-05 evidence pack (a ~$0.135 stop) is the shape this
+    exists for."""
     outcomes: dict[tuple[str, str], dict] = {}
     for row in records:
         if row.get("type") != "judgment_reconciliation":
@@ -160,6 +172,24 @@ def build_pairs(records: list[dict],
         key = (str(row.get("ts") or ""),
                str(row.get("playbook") or ""))
         outcome = outcomes.get(key)
+        realized_r = outcome.get("realized_r") if outcome \
+            else None
+        r_excluded = None
+        implied_stop = None
+        if outcome is not None and realized_r not in (None, 0):
+            try:
+                implied_stop = abs(float(outcome.get("move"))) \
+                    / abs(float(realized_r))
+                entry_f = float(outcome.get("entry"))
+            except (TypeError, ValueError, ZeroDivisionError):
+                implied_stop = None
+                entry_f = None
+            if implied_stop is not None and entry_f is not None \
+                    and degenerate_stop(
+                        entry_f,
+                        entry_f - implied_stop) is not None:
+                r_excluded = "degenerate_stop"
+                realized_r = None
         pairs.append({
             "ts": str(row.get("ts") or ""),
             "playbook": str(row.get("playbook") or ""),
@@ -170,9 +200,12 @@ def build_pairs(records: list[dict],
             "reason_category": judgment.get("reason_category"),
             "gate": gate_class(row),
             "gate_reason_code": row.get("gate_reason_code"),
-            "realized_r": (outcome.get("realized_r")
-                           if outcome else None),
+            "realized_r": realized_r,
             "hit": (outcome.get("hit") if outcome else None),
+            "r_excluded": r_excluded,
+            "implied_stop_distance": (
+                round(implied_stop, 4)
+                if implied_stop is not None else None),
         })
     pairs.sort(key=lambda p: p["ts"])
     return pairs
@@ -186,6 +219,7 @@ def _mean(values: list[float]) -> float | None:
 
 def _segment_stats(pairs: list[dict]) -> dict[str, Any]:
     done = [p for p in pairs if p["realized_r"] is not None]
+    excluded = [p for p in pairs if p.get("r_excluded")]
     takes = [p for p in done if p["judgment_decision"] == "take"]
     abstains = [p for p in done
                 if p["judgment_decision"] == "abstain"]
@@ -214,7 +248,8 @@ def _segment_stats(pairs: list[dict]) -> dict[str, Any]:
     return {
         "pairs": len(pairs),
         "with_outcome": len(done),
-        "pending": len(pairs) - len(done),
+        "pending": len(pairs) - len(done) - len(excluded),
+        "excluded_degenerate_r": len(excluded),
         "judgment": {
             "take_n": len(takes),
             "take_mean_r": _mean([float(p["realized_r"])
@@ -333,6 +368,9 @@ def validate(records: list[dict], *, horizon_h: int = 4,
         "journal_records": len(records),
         "malformed_lines": malformed,
         "pairs_total": len(pairs),
+        "excluded_degenerate_r": (
+            evaluation["excluded_degenerate_r"]
+            + holdout["excluded_degenerate_r"]),
         "evaluation": evaluation,
         "holdout": holdout,
         "bars": bars,

@@ -232,6 +232,15 @@ def _apply_trained(out: dict, entry: dict | None) -> None:
         "trained_at": meta.get("trained_at"),
         "trained_through": meta.get("trained_through"),
         "graduated": bool(entry.get("graduated")),
+        # Completion-04: the graduation EVIDENCE rides the record
+        # — the live book's numbers behind the verdict (n / ECE /
+        # gates, from ProbabilityBook.graduated) and the latest
+        # F3 battery slice for the horizon when it bears on the
+        # standing (a firm outside_band block names itself here).
+        # A record that says "graduated" (or not) without its
+        # evidence is a claim; with it, it is a measurement.
+        "graduation": entry.get("graduation"),
+        "battery": entry.get("battery"),
     }
     fields = entry.get("fields")
     if entry.get("graduated") and isinstance(fields, dict):

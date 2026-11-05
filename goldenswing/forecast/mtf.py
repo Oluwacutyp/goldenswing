@@ -462,24 +462,34 @@ def score_last_row(frames: dict, bundle: dict) -> tuple[dict | None, str]:
     ), "forecast scored"
 
 
-def needs_training(bundle_path: str | Path, h1) -> tuple[bool, str]:
-    """Does the engine need to (re)train? No bundle, an unloadable
-    bundle, or a bundle failing full validation all mean yes.
-    Otherwise yes only when MIN_NEW_BARS_RETRAIN H1 bars arrived
-    since trained_through. Never raises on a bad bundle — a bad
-    bundle is a reason to train, not a crash."""
+def bundle_accrual(bundle_path: str | Path, h1) -> dict:
+    """The ensemble bundle's retrain accrual as DATA
+    (completion-04): new H1 bars accrued against
+    ``MIN_NEW_BARS_RETRAIN`` since the bundle's training cutoff.
+    ``needs_training`` is this computation's verdict; the status
+    surface and the runtime manifest read the same numbers."""
     import joblib
 
+    acc: dict = {
+        "new_bars": None, "threshold": MIN_NEW_BARS_RETRAIN,
+        "trained_through": None, "due": True, "cause": None,
+        "reason": ""}
     path = Path(bundle_path)
     if not path.exists():
-        return True, f"no forecaster bundle at {path}"
+        acc.update(cause="no_bundle",
+                   reason=f"no forecaster bundle at {path}")
+        return acc
     try:
         bundle = joblib.load(path)
     except Exception as exc:  # noqa: BLE001 — bad bundle -> retrain
-        return True, f"bundle unloadable ({exc}) — retraining"
+        acc.update(cause="unloadable",
+                   reason=f"bundle unloadable ({exc}) — retraining")
+        return acc
     valid, reason = _validate_bundle(bundle)
     if not valid:
-        return True, f"bundle invalid ({reason}) — retraining"
+        acc.update(cause="invalid",
+                   reason=f"bundle invalid ({reason}) — retraining")
+        return acc
     through = pd.Timestamp(bundle["trained_through"])
     idx = h1.sort_index().index
     # A naive stamp (old bundle, hand-edited stamp) must not crash
@@ -490,6 +500,24 @@ def needs_training(bundle_path: str | Path, h1) -> tuple[bool, str]:
     elif idx.tz is None and through.tzinfo is not None:
         through = through.tz_localize(None)
     new_bars = int((idx > through).sum())
+    acc.update(new_bars=new_bars,
+               trained_through=str(bundle["trained_through"]))
     if new_bars >= MIN_NEW_BARS_RETRAIN:
-        return True, f"{new_bars} new H1 bars since {through}"
-    return False, f"bundle current ({new_bars} new H1 bars < {MIN_NEW_BARS_RETRAIN})"
+        acc.update(due=True, cause="new_bars",
+                   reason=f"{new_bars} new H1 bars since {through}")
+    else:
+        acc.update(
+            due=False, cause=None,
+            reason=(f"bundle current ({new_bars} new H1 bars "
+                    f"< {MIN_NEW_BARS_RETRAIN})"))
+    return acc
+
+
+def needs_training(bundle_path: str | Path, h1) -> tuple[bool, str]:
+    """Does the engine need to (re)train? No bundle, an unloadable
+    bundle, or a bundle failing full validation all mean yes.
+    Otherwise yes only when MIN_NEW_BARS_RETRAIN H1 bars arrived
+    since trained_through. Never raises on a bad bundle — a bad
+    bundle is a reason to train, not a crash."""
+    acc = bundle_accrual(bundle_path, h1)
+    return bool(acc["due"]), str(acc["reason"])

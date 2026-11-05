@@ -464,6 +464,17 @@ class MT5RunnerConfig:
     # a failure leaves the previous artifact live.  Journal/
     # render only, like F1: no order path reads any of it.
     forecast_trained_enabled: bool = True
+    # FORECAST F3 LOOP (completion-04): the acceptance battery
+    # (forecast/validation.py) RUNS in the live loop — triggered
+    # by a completed retrain (either lifecycle), journaled as a
+    # forecast_validation record, persisted in the calibration
+    # state, and rendered on /status beside the probability
+    # book.  Measurement only: the battery promotes nothing —
+    # graduation stays the live probability book's gate — but a
+    # firm (holdout-grade) outside_band verdict for the trained
+    # method holds that horizon in shadow until a later battery
+    # clears it, with the block named on the outlook record.
+    forecast_battery_enabled: bool = True
     judgment_thesis_ttl_hours: float = 24.0
     judgment_thesis_min_margin: float = 0.08
     # THESIS REVISION (owner approval 2026-11-04): scenario-p
@@ -1188,6 +1199,13 @@ class MT5Runner:
         self._forecast_trained = None
         self._f2_training = False
         self._f2_train_result = None
+        # F3 loop (completion-04): a completed retrain (either
+        # lifecycle) sets this trigger; the calibration cycle
+        # picks it up and runs the acceptance battery over the
+        # journal.  The last battery summary also persists in
+        # the calibration state (key "battery").
+        self._battery_pending: str | None = None
+        self._forecast_battery: dict | None = None
         # Deterministic engine runtime (bridge).  Best-effort: if it
         # fails to initialise, the legacy journal path continues and
         # the failure is noted — the live loop never dies on it.
@@ -2391,6 +2409,7 @@ class MT5Runner:
                           "abstain_n": 0, "abstain_would_hit": 0,
                           "missed_opportunities": 0,
                           "thesis_n": 0, "thesis_hits": 0,
+                          "r_degenerate_excluded": 0,
                           "dropped": 0},
               "reconciled_total": 0, "since_summary": 0,
               "last_summary_bar": None}
@@ -2668,6 +2687,24 @@ class MT5Runner:
         self._forecast_trained = svc
         return svc
 
+    def _forecast_graduation(self, book, battery, horizon):
+        """F2 graduation, EFFECTIVE (completion-04): the live
+        probability book's verdict (trained.py owns the gate),
+        held in shadow while the latest F3 battery summary
+        carries a FIRM (holdout-grade) outside_band verdict for
+        the trained method on this horizon.  The battery never
+        promotes — it can only hold, the safeguard shape this
+        system uses everywhere — and the block rides the outlook
+        record either way, so a held horizon names what holds
+        it.  Returns (graduated, book_info, battery_block)."""
+        ok, info = book.graduated(horizon)
+        from ..forecast.validation import battery_block_for
+        block = battery_block_for(battery, horizon)
+        if ok and block is not None:
+            info = {**info, "battery_block": block}
+            return False, info, block
+        return bool(ok), info, block
+
     def _forecast_trained_param(self, frames, close, atr_value,
                                 st):  # type: ignore[no-untyped-def]
         """F2: the ``trained`` argument for build_outlook — per
@@ -2689,12 +2726,14 @@ class MT5Runner:
             if not preds:
                 return None
             art, _note = svc.artifact()
+            battery = st.get("battery") or None
             horizons = {}
             for h, pred in preds.items():
-                ok, info = book.graduated(h)
+                graduated, info, block = self._forecast_graduation(
+                    book, battery, h)
                 horizons[str(h)] = {
-                    **pred, "graduated": bool(ok),
-                    "graduation": info}
+                    **pred, "graduated": graduated,
+                    "graduation": info, "battery": block}
             return {
                 "version": (art or {}).get("version"),
                 "trained_at": (art or {}).get("trained_at"),
@@ -2808,6 +2847,14 @@ class MT5Runner:
             # run even with nothing pending — the triggers are
             # bars and age, not only resolutions.
             self._forecast_f2_cycle(stack.frames, h1, st)
+            # F3 loop (completion-04): a retrain that completed
+            # since the last cycle triggers the acceptance
+            # battery over the journal — verdicts journaled,
+            # persisted, and surfaced (see _run_forecast_battery).
+            if getattr(self, "_battery_pending", None):
+                _trigger, self._battery_pending = \
+                    self._battery_pending, None
+                self._run_forecast_battery(_trigger)
             if not st["pending"]:
                 self._forecast_cal_save()
                 return
@@ -2952,6 +2999,10 @@ class MT5Runner:
                 self.journal.append({
                     "type": "forecast_trained_training",
                     "ok": bool(ok), "note": str(note)})
+                # F3 loop (completion-04): a completed retrain —
+                # success or failure — re-measures the journal:
+                # the battery runs on this calibration cycle.
+                self._battery_pending = "f2_retrain"
             if getattr(self, "_f2_training", False):
                 return
             import datetime as _dt
@@ -2998,6 +3049,41 @@ class MT5Runner:
                 daemon=True).start()
         except Exception:  # noqa: BLE001 — bookkeeping only
             pass
+
+    def _run_forecast_battery(self, trigger: str) -> None:
+        """F3 acceptance battery over the journal (completion-04
+        — the loop closure): runs forecast/validation.validate
+        over every journaled record, journals the compact
+        per-horizon summary as a ``forecast_validation`` record,
+        and persists it in the calibration state (key "battery")
+        where /status, the manifest and the graduation path read
+        it.  Triggered by a completed retrain on the calibration
+        cycle; synchronous there — the read + scoring are
+        bounded by the forecast records, and the cadence is a
+        retrain, not a tick.  Never raises into the loop."""
+        try:
+            if not getattr(
+                    self.cfg, "forecast_battery_enabled", True):
+                return
+            from ..forecast.validation import (
+                battery_summary, validate)
+            records, bad = self.journal.records_with_health()
+            result = validate(records, malformed=bad)
+            import datetime as _dt
+
+            generated = _dt.datetime.now(
+                _dt.timezone.utc).isoformat()
+            summary = battery_summary(
+                result, generated_at=generated, trigger=trigger)
+            self.journal.append({
+                "type": "forecast_validation", **summary})
+            st = self._forecast_cal_state()
+            st["battery"] = summary
+            self._forecast_cal_save()
+            self._forecast_battery = summary
+        except Exception as exc:  # noqa: BLE001 — measurement only
+            self.journal.log_note(
+                f"mt5: forecast battery failed: {exc}")
 
     def _judgment_audit_cycle(self) -> None:
         """On each fresh H1 bar: reconcile what's due, flag the
@@ -3061,13 +3147,33 @@ class MT5Runner:
                         exit_price, atr)
                     stop = item.get("stop")
                     realized_r = None
+                    r_excluded = None
+                    stop_distance = None
                     if stop is not None and float(stop) != float(
                             item["entry"]):
-                        realized_r = round(
-                            outcome["move"]
-                            / abs(float(item["entry"]) - float(stop)),
-                            4)
-                    self.journal.append({
+                        stop_distance = abs(
+                            float(item["entry"]) - float(stop))
+                        # Degenerate-stop guard (completion-04):
+                        # a stop a hair from the entry manufactures
+                        # an astronomical R from an ordinary move
+                        # (the +226R record in the 2026-11-05
+                        # evidence pack).  Such a record reconciles
+                        # as direction evidence only — it never
+                        # enters calibration — and the exclusion is
+                        # journaled on the record itself + counted.
+                        from .judgment_audit import degenerate_stop
+                        floor_hit = degenerate_stop(
+                            float(item["entry"]), float(stop), atr)
+                        if floor_hit is not None:
+                            r_excluded = "degenerate_stop"
+                            st["tallies"]["r_degenerate_excluded"] \
+                                = int(st["tallies"].get(
+                                    "r_degenerate_excluded")
+                                    or 0) + 1
+                        else:
+                            realized_r = round(
+                                outcome["move"] / stop_distance, 4)
+                    rec = {
                         "type": "judgment_reconciliation",
                         "judged_ts": item["ts"],
                         "playbook": item.get("playbook"),
@@ -3077,7 +3183,13 @@ class MT5Runner:
                         "entry": item["entry"],
                         "exit_price": exit_price,
                         "realized_r": realized_r,
-                        **outcome})
+                        **outcome}
+                    if r_excluded is not None:
+                        rec["r_excluded"] = r_excluded
+                        rec["stop_distance"] = round(
+                            float(stop_distance), 4)
+                        rec["r_exclusion_floor"] = floor_hit
+                    self.journal.append(rec)
                     tallies = st["tallies"]
                     if item.get("decision") == "take":
                         tallies["take_n"] += 1
@@ -3770,6 +3882,94 @@ class MT5Runner:
             out["management"] = dict(_mgmt)
         return out
 
+    def _forecast_manifest_block(self) -> dict:
+        """Completion-04: the predictive system's standing state
+        for the run manifest — retrain accrual for both
+        lifecycles (counted as data, DUE named), per-horizon
+        method standing through the same effective-graduation
+        path the outlook uses, the F3 battery's last summary,
+        and the E3 trust verdicts.  Self-guarded section by
+        section: whatever cannot be computed reads as absent,
+        never fabricated and never fatal to the manifest."""
+        block: dict = {"ensemble": {}, "trained": {},
+                       "horizons": {}, "battery": None,
+                       "trust": {}}
+        try:
+            frames = self._stack.frames if getattr(
+                self, "_stack", None) is not None else {}
+            h1 = frames.get("H1")
+            st = self._forecast_cal_state()
+            battery = st.get("battery") or None
+            block["battery"] = battery
+            if h1 is not None and len(h1):
+                import datetime as _dt
+
+                from ..forecast.mtf import bundle_accrual
+                acc = bundle_accrual(self._forecaster.bundle_path,
+                                     h1)
+                block["ensemble"] = {
+                    "version": (self._forecaster.status_dict()
+                                or {}).get("version"),
+                    "trained_through": acc["trained_through"],
+                    "new_bars": acc["new_bars"],
+                    "threshold": acc["threshold"],
+                    "retrain_due": acc["due"]}
+                if getattr(self.cfg, "forecast_trained_enabled",
+                           True):
+                    from ..forecast.trained import (
+                        ProbabilityBook, retrain_accrual)
+                    svc = self._forecast_trained_service()
+                    art, _note = svc.artifact()
+                    acc_t = retrain_accrual(
+                        art, h1.index,
+                        _dt.datetime.now(_dt.timezone.utc))
+                    block["trained"] = {
+                        "version": (art or {}).get("version"),
+                        "trained_through": acc_t[
+                            "trained_through"],
+                        "new_bars": acc_t["new_bars"],
+                        "threshold": acc_t["threshold"],
+                        "age_days": acc_t["age_days"],
+                        "max_age_days": acc_t["max_age_days"],
+                        "retrain_due": acc_t["due"],
+                        "retrain_cause": acc_t["cause"]}
+                    book = ProbabilityBook(st.get("prob_book")
+                                           or {})
+                    for h in (12, 24, 72, 168, 360):
+                        ok, info, hold = self._forecast_graduation(
+                            book, battery, h)
+                        if art is None:
+                            standing = "no artifact"
+                        elif ok:
+                            standing = "graduated"
+                        elif hold is not None:
+                            standing = "shadow_battery_hold"
+                        else:
+                            standing = "shadow"
+                        block["horizons"][str(h)] = {
+                            "standing": standing,
+                            "book_n": info.get("n"),
+                            "book_ece": info.get("ece")}
+            try:
+                from ..forecast.calibration import CalibrationBook
+                from .forecast_evidence import trust_state
+                rank_view = CalibrationBook(
+                    st.get("book") or {}).view()
+                for key, sides in (
+                        rank_view.get("horizons") or {}).items():
+                    for word in ("up", "dn"):
+                        side = sides.get(word) or {}
+                        if not side.get("n"):
+                            continue
+                        block["trust"][f"{key}h|{word}"] = \
+                            trust_state(rank_view, int(key),
+                                        word)["state"]
+            except Exception:  # noqa: BLE001 — one section only
+                pass
+        except Exception:  # noqa: BLE001 — manifest must not die
+            pass
+        return block
+
     def _journal_manifest(self) -> None:
         """FUNNEL §4.6 / directive §2: the runtime manifest,
         journaled once per run — commit, tree state, config
@@ -3873,8 +4073,16 @@ class MT5Runner:
                                 self._audit_state()[
                                     "reconciled_total"],
                             "pending": len(
-                                self._audit_state()["pending"])}},
-                }})
+                                self._audit_state()["pending"])}}},
+                # FORECAST LOOP (completion-04): the predictive
+                # system's standing state in the same manifest —
+                # retrain accrual for both lifecycles, per-horizon
+                # method standing (graduated / shadow / battery
+                # hold), the battery's last verdict, the E3 trust
+                # state.  Self-guarded helper: a gap reads as an
+                # empty block, never a crash.
+                "forecast": self._forecast_manifest_block(),
+                })
         except Exception:
             pass
 
@@ -5383,6 +5591,90 @@ class MT5Runner:
                 f"mt5: rollover recap failed: {exc}")
 
     # --------------------------------------------------------------- bars
+    def _forecast_loop_lines(self) -> list[str]:
+        """Completion-04: the predictive loop's standing state
+        for /status — rendered on BOTH forecast paths (ready and
+        not-ready): the loop's evidence lives in the calibration
+        state, not in the ensemble bundle, so a missing bundle
+        never hides why the trained method is shadow, what the
+        battery last said, or why the forecast is not weighing
+        in Judgment.  Every section self-guards; absence reads
+        as absence."""
+        lines: list[str] = []
+        # (a) Retrain accrual for BOTH lifecycles — bars counted
+        # as data against their thresholds, DUE named when the
+        # threshold is met (the trigger the cycles act on).
+        try:
+            frames = self._stack.frames if getattr(
+                self, "_stack", None) is not None else {}
+            h1_frame = frames.get("H1")
+            if h1_frame is not None and len(h1_frame):
+                import datetime as _dt
+
+                from ..forecast.mtf import bundle_accrual
+                acc = bundle_accrual(self._forecaster.bundle_path,
+                                     h1_frame)
+                bars = acc["new_bars"] if acc["new_bars"] \
+                    is not None else "—"
+                lines.append(
+                    "  retrain accrual: ensemble "
+                    f"{bars}/{acc['threshold']} new H1 bars"
+                    + (" — DUE (retrain triggers on the D1 cycle)"
+                       if acc["due"] else ""))
+                if getattr(self.cfg, "forecast_trained_enabled",
+                           True):
+                    from ..forecast.trained import retrain_accrual
+                    _art, _note = (
+                        self._forecast_trained_service().artifact())
+                    acc_t = retrain_accrual(
+                        _art, h1_frame.index,
+                        _dt.datetime.now(_dt.timezone.utc))
+                    bars_t = acc_t["new_bars"] if acc_t[
+                        "new_bars"] is not None else "—"
+                    lines.append(
+                        "    trained (F2): "
+                        f"{bars_t}/{acc_t['threshold']} "
+                        f"new H1 bars · age {acc_t['age_days']}d/"
+                        f"{acc_t['max_age_days']}d"
+                        + (" — DUE" if acc_t["due"] else "")
+                        + (f" ({acc_t['cause']})"
+                           if acc_t["due"] else ""))
+        except Exception:  # noqa: BLE001 — status must not die
+            pass
+        # (b) The F3 battery's standing verdict per horizon —
+        # which method wins, and each method's measured state.
+        try:
+            battery = (self._forecast_cal_state().get("battery")
+                       or getattr(self, "_forecast_battery", None))
+            if battery:
+                from ..forecast.outlook import tag_for
+                lines.append(
+                    "  battery (F3 acceptance — per horizon):")
+                for key in sorted(battery.get("horizons") or {},
+                                  key=int):
+                    ent = battery["horizons"][key]
+                    f1 = ent.get("f1") or {}
+                    f2 = ent.get("f2") or {}
+                    lines.append(
+                        f"    {tag_for(int(key))}: winner "
+                        f"{ent.get('winner')} · F1 "
+                        f"{f1.get('state')} (n={f1.get('n')}) · "
+                        f"F2 {f2.get('state')} (n={f2.get('n')})")
+        except Exception:  # noqa: BLE001 — status must not die
+            pass
+        # (c) E3 trust state — why the forecast is (or is not)
+        # weighing in Judgment, from the rank book itself.
+        try:
+            from ..forecast.calibration import CalibrationBook
+            from .forecast_evidence import render_trust_lines
+            rank_view = CalibrationBook(
+                self._forecast_cal_state().get("book")
+                or {}).view()
+            lines.extend(render_trust_lines(rank_view))
+        except Exception:  # noqa: BLE001 — status must not die
+            pass
+        return lines
+
     def forecast_line(self) -> str:
         """One /status Forecast block from real runtime values (never
         hard-coded): readiness, version, training time, coverage,
@@ -5405,6 +5697,9 @@ class MT5Runner:
             if st["last_error"]:
                 lines.append(f"  last error: {st['last_error']}")
             lines.append("  alerts: idle — no valid bundle")
+            # The predictive loop's state does not live in the
+            # bundle — it renders on this path too.
+            lines.extend(self._forecast_loop_lines())
             return "\n".join(lines)
         lines = ["🔮 forecast: READY — alerts live on 1d/3d crossings"]
         lines.append(
@@ -5471,11 +5766,17 @@ class MT5Runner:
                 art_horizons = {
                     int(k) for k in (art or {}).get("horizons")
                     or {}}
+                cal_state = self._forecast_cal_state()
+                battery = cal_state.get("battery") or None
                 states = {}
                 for h in (12, 24, 72, 168, 360):
-                    ok, _info = book.graduated(h)
+                    ok, _info, block = self._forecast_graduation(
+                        book, battery, h)
                     if ok and art is not None:
                         states[h] = "graduated"
+                    elif block is not None and art is not None:
+                        states[h] = ("shadow — held by battery "
+                                     "(outside_band, firm)")
                     elif h in art_horizons:
                         states[h] = "shadow"
                     else:
@@ -5484,6 +5785,7 @@ class MT5Runner:
                     book.view(), states))
         except Exception:  # noqa: BLE001 — status must not die
             pass
+        lines.extend(self._forecast_loop_lines())
         if st["training_running"]:
             lines.append("  training: running in the background")
         if st["last_error"]:
@@ -5587,6 +5889,11 @@ class MT5Runner:
                 self.journal.log_note(
                     f"forecast training {'complete' if ok else 'FAILED'}: "
                     f"{note}")
+                # F3 loop (completion-04): the ensemble retrain
+                # completing triggers the same battery the F2
+                # lifecycle does — the calibration cycle picks
+                # the trigger up.
+                self._battery_pending = "ensemble_retrain"
             d1 = self._stack.frames.get("D1")
             if d1 is None or len(d1) == 0:
                 if not self._forecast_no_d1_noted:

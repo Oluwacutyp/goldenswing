@@ -73,33 +73,98 @@ def _f(value: Any) -> float | None:
         return None
 
 
-def trust_for(book_view: dict | None, horizon: int,
-              direction_word: str) -> str:
-    """'trusted' | 'anti_calibrated' | 'unproven' from the E2
-    calibration book's view for one horizon + direction."""
+def trust_state(book_view: dict | None, horizon: int,
+                direction_word: str) -> dict:
+    """The E3 trust evaluation as DATA (completion-04) for one
+    horizon + direction: the verdict ``trust_for`` returns, the
+    pooled top-band evidence behind it (n per trust band, the
+    pooled rate, the base rate, the lift), and the gates.  One
+    computation, two readers — the judgment feed's per-candidate
+    verdict and the status surface's standing answer to "why
+    isn't the forecast weighing in"."""
+    state: dict[str, Any] = {
+        "state": "unproven", "horizon": int(horizon),
+        "direction": direction_word, "base_rate": None,
+        "n_pool": 0, "pool_rate": None, "lift": None,
+        "bands": [], "min_n": TRUST_MIN_N,
+        "trust_lift": TRUST_LIFT, "anti_lift": ANTI_LIFT}
     if not book_view:
-        return "unproven"
+        return state
     entry = ((book_view.get("horizons") or {})
              .get(str(horizon)) or {})
     side = entry.get(direction_word) or {}
     base_rate = side.get("base_rate")
-    if base_rate is None or not base_rate:
-        return "unproven"
+    state["base_rate"] = base_rate
     n_pool = 0
     hits_pool = 0.0
     for band in side.get("bands") or []:
         if band.get("band") in TRUST_BANDS:
-            n_pool += int(band.get("n") or 0)
-            hits_pool += float(band.get("rate") or 0.0) \
-                * int(band.get("n") or 0)
-    if n_pool < TRUST_MIN_N:
-        return "unproven"
+            n = int(band.get("n") or 0)
+            n_pool += n
+            hits_pool += float(band.get("rate") or 0.0) * n
+            state["bands"].append({
+                "band": band.get("band"), "n": n,
+                "rate": band.get("rate"),
+                "lift": band.get("lift")})
+    state["n_pool"] = n_pool
+    if base_rate is None or not base_rate or not n_pool:
+        return state
+    state["pool_rate"] = round(hits_pool / n_pool, 4)
     lift = (hits_pool / n_pool) / base_rate
+    state["lift"] = round(lift, 4)
+    if n_pool < TRUST_MIN_N:
+        return state
+    # The verdict compares the RAW lift (the rounded value is
+    # display only) — trust_for's historical boundary behavior
+    # is unchanged by this refactor.
     if lift >= TRUST_LIFT:
-        return "trusted"
-    if lift < ANTI_LIFT:
-        return "anti_calibrated"
-    return "unproven"
+        state["state"] = "trusted"
+    elif lift < ANTI_LIFT:
+        state["state"] = "anti_calibrated"
+    return state
+
+
+def trust_for(book_view: dict | None, horizon: int,
+              direction_word: str) -> str:
+    """'trusted' | 'anti_calibrated' | 'unproven' from the E2
+    calibration book's view for one horizon + direction."""
+    return str(trust_state(book_view, horizon,
+                           direction_word)["state"])
+
+
+def render_trust_lines(book_view: dict | None) -> list[str]:
+    """The /status E3 trust section (completion-04): per horizon
+    and direction with any book data, the verdict with its
+    evidence — pooled top-band resolutions against the gate,
+    the lift against the trust/anti lines, and the per-band n.
+    A horizon whose bands are still 0–2 deep reads exactly that
+    here, instead of the answer living inside individual shadow
+    records.  Empty when the book has nothing at all."""
+    if not book_view:
+        return []
+    horizons = book_view.get("horizons") or {}
+    lines: list[str] = []
+    for key in sorted(horizons, key=lambda k: int(k)):
+        for word in ("up", "dn"):
+            st = trust_state(book_view, int(key), word)
+            side = (horizons.get(key) or {}).get(word) or {}
+            if not st["bands"] and not side.get("n"):
+                continue
+            band_bits = " · ".join(
+                f"{b['band']} n={b['n']}" for b in st["bands"])
+            lift_bit = (f"lift {st['lift']:.2f} "
+                        f"(trust ≥{TRUST_LIFT}, anti <{ANTI_LIFT})"
+                        if st["lift"] is not None
+                        else "lift — (no base rate)")
+            lines.append(
+                f"    {key}h {word}: {st['state']} — top-band "
+                f"{st['n_pool']}/{TRUST_MIN_N} resolutions · "
+                f"{lift_bit}"
+                + (f" · {band_bits}" if band_bits else ""))
+    if not lines:
+        return []
+    return ["  forecast trust (E3 — weighed only when trusted):",
+            *lines]
 
 
 def forecast_block(*, ranks: Any, direction: int,

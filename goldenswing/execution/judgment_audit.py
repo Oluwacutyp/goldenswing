@@ -29,6 +29,49 @@ MISSED_MOVE_ATR = 1.2
 CONFIDENCE_BANDS: tuple[tuple[float, float], ...] = (
     (0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01))
 
+#: Degenerate-stop floors (completion-04).  R divides the forward
+#: move by the judged trade's own stop distance, so a record whose
+#: stop sits a hair from its entry manufactures an astronomical R
+#: from an ordinary move — the promotion evidence pack found a
+#: live one: a ~$0.135 stop on a ~$4,100 entry reconciling at
+#: +226R and dragging every mean it touched.  The floors are
+#: CORRUPTION catchers, not tightness police: a stop distance
+#: under EITHER is not geometry any structural method produces —
+#: 0.01% of the entry price is ~$0.41 on gold, inside the spread
+#: itself (the poison record sat ~3× under it), and 2% of ATR is
+#: far below any structure-plus-buffer distance this desk
+#: journals.  A breaching record still reconciles as DIRECTION
+#: evidence (its hit is a fact about the call), but it never
+#: enters an R-denominated statistic: the shared predicate lives
+#: here so the S3 cycle, the S4 battery and any future consumer
+#: exclude the same records the same way, each
+#: journaling/reporting the exclusion and its count.
+MIN_STOP_DIST_PRICE_FRAC = 0.0001
+MIN_STOP_DIST_ATR_FRAC = 0.02
+
+
+def degenerate_stop(entry: float, stop: float,
+                    atr: float | None = None) -> str | None:
+    """The floor a stop distance breaches — ``"price_frac"`` or
+    ``"atr_frac"`` — or None when the geometry can carry an R.
+    ``atr`` is optional: journal-side consumers that no longer
+    have the bar's ATR apply the price floor alone."""
+    try:
+        entry_f = float(entry)
+        dist = abs(entry_f - float(stop))
+    except (TypeError, ValueError):
+        return None
+    if entry_f > 0 and dist < MIN_STOP_DIST_PRICE_FRAC * entry_f:
+        return "price_frac"
+    if atr:
+        try:
+            atr_f = float(atr)
+        except (TypeError, ValueError):
+            atr_f = 0.0
+        if atr_f > 0 and dist < MIN_STOP_DIST_ATR_FRAC * atr_f:
+            return "atr_frac"
+    return None
+
 
 def forward_outcome(direction: int, entry_price: float,
                     exit_price: float, atr: float) -> dict:

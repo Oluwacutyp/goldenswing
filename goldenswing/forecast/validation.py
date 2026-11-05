@@ -885,8 +885,13 @@ def validate(records: list[dict], *,
         },
         "note": (
             "Measurement only — this battery promotes nothing "
-            "and no order, sizing, risk or graduation path "
-            "reads it. Probabilities are scored only where "
+            "and no order, sizing or risk path reads it. Since "
+            "completion-04 the graduation path reads its summary "
+            "for exactly one purpose: a FIRM outside_band "
+            "verdict for the trained method holds that horizon's "
+            "graduation in shadow until a later battery clears "
+            "it (the battery can withhold, never grant). "
+            "Probabilities are scored only where "
             "they were stated as calibrated at the time; the "
             "trained shadow series is measured separately and "
             "never enters a verdict. The holdout (final "
@@ -896,6 +901,113 @@ def validate(records: list[dict], *,
             "split edges were fixed on the evaluation segment "
             "only."),
     }
+
+
+# ── the compact summary: what the live loop journals ────────────
+
+#: Winner vocabulary for the per-horizon summary — the same
+#: trichotomy the status surface and the manifest speak.
+WINNER_BASELINE = "baseline"
+WINNER_TRAINED = "trained"
+WINNER_NONE = "insufficient_data"
+
+_METHOD_WINNER = {METHOD_F1: WINNER_BASELINE,
+                  METHOD_F2: WINNER_TRAINED}
+
+
+def battery_summary(result: dict[str, Any], *,
+                    generated_at: Any = None,
+                    trigger: str | None = None) -> dict[str, Any]:
+    """The compact per-horizon verdict summary of one battery
+    run (completion-04) — the shape the runner journals as a
+    ``forecast_validation`` record, persists in the calibration
+    state, and renders on the status surface.
+
+    Winner rule, stated once and applied mechanically: a method
+    is a candidate winner for a horizon only when its cell
+    verdict is ``within_band``; exactly one candidate → that
+    method wins; both → the head-to-head leader wins (both
+    verdict-grade cells always contest — see ``_head_to_head``);
+    neither → ``insufficient_data``, with each method's own
+    state riding along so "unmeasured" and "measured and
+    failed" are never confused.  The summary is measurement:
+    it promotes nothing by itself (the graduation gate stays
+    the live probability book — see forecast/trained.py); a
+    FIRM ``outside_band`` verdict for the trained method is
+    the one battery outcome with a consumer — it holds that
+    horizon in shadow until a later battery clears it."""
+    cells = result.get("cells") or {}
+    h2h = result.get("head_to_head") or {}
+    horizons: dict[str, Any] = {}
+    for horizon in sorted({c["horizon"] for c in cells.values()}):
+        entry: dict[str, Any] = {}
+        within: list[str] = []
+        for method, label in ((METHOD_F1, "f1"), (METHOD_F2, "f2")):
+            cell = cells.get(f"{horizon}|{method}")
+            if cell is None:
+                entry[label] = None
+                continue
+            verdict = cell.get("verdict") or {}
+            entry[label] = {
+                "state": verdict.get("state"),
+                "firm": bool(verdict.get("firm")),
+                "segment": verdict.get("segment"),
+                "n": verdict.get("n"),
+                "fails": list(verdict.get("fails") or []),
+            }
+            if verdict.get("state") == "within_band":
+                within.append(method)
+        head = h2h.get(str(horizon)) or {}
+        if len(within) == 1:
+            winner = _METHOD_WINNER[within[0]]
+        elif len(within) == 2:
+            winner = _METHOD_WINNER.get(
+                str(head.get("leader") or ""), WINNER_BASELINE)
+        else:
+            winner = WINNER_NONE
+        entry.update({
+            "winner": winner,
+            "leader": head.get("leader"),
+            "contested": bool(head.get("contested")),
+        })
+        horizons[str(horizon)] = entry
+    coverage = result.get("coverage") or {}
+    return {
+        "generated_at": (str(generated_at)
+                         if generated_at is not None else None),
+        "trigger": trigger,
+        "overall": result.get("overall"),
+        "journal_records": result.get("journal_records"),
+        "malformed_lines": result.get("malformed_lines"),
+        "scored_rows": coverage.get("scored_rows"),
+        "forecast_bars": coverage.get("forecast_bars"),
+        "holdout_boundary": result.get("holdout_boundary"),
+        "horizons": horizons,
+    }
+
+
+def battery_block_for(summary: dict | None,
+                      horizon: int) -> dict[str, Any] | None:
+    """Whether the latest battery summary holds one horizon's
+    trained method in shadow: the f2 cell slice when its verdict
+    is a FIRM ``outside_band`` (holdout-grade), else None.  A
+    provisional (pooled, thin-n) failure never blocks — thin
+    evidence is reported as insufficient data everywhere else
+    in this system, and the battery is not exempt."""
+    if not isinstance(summary, dict):
+        return None
+    entry = (summary.get("horizons") or {}).get(str(int(horizon)))
+    if not isinstance(entry, dict):
+        return None
+    f2 = entry.get("f2")
+    if not isinstance(f2, dict):
+        return None
+    if f2.get("state") == "outside_band" and f2.get("firm"):
+        return {"state": f2.get("state"), "firm": True,
+                "segment": f2.get("segment"), "n": f2.get("n"),
+                "fails": list(f2.get("fails") or []),
+                "generated_at": summary.get("generated_at")}
+    return None
 
 
 # ── rendering (plain language first, S4 style) ──────────────────

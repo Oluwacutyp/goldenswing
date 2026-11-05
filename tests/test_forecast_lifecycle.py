@@ -182,9 +182,17 @@ def test_forecast_cannot_touch_orders():
     # H1 cadence — the same forecast service function, split in
     # two; it scores, journals and alerts, never orders.  Any
     # OTHER new reader still fails this pin.
+    # Completion-04 (2026-11-05): _forecast_loop_lines and
+    # _forecast_manifest_block read ONLY the forecaster's
+    # bundle_path / status_dict to REPORT retrain accrual on
+    # the /status and manifest surfaces — presentation
+    # functions in the same sense as forecast_line itself;
+    # nothing they compute reaches an order, sizing or risk
+    # path.  Any OTHER new reader still fails this pin.
     allowed = {"__init__", "run", "forecast_line", "forecast_train_now",
                "_maybe_forecast_alert", "_forecast_alert_d1",
-               "_forecast_feed_for", "_forecast_trained_service"}
+               "_forecast_feed_for", "_forecast_trained_service",
+               "_forecast_loop_lines", "_forecast_manifest_block"}
     runner = Path("goldenswing/execution/mt5_runner.py").read_text()
     lines = runner.splitlines()
     for i, line in enumerate(lines):

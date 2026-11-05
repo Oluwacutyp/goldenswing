@@ -428,15 +428,29 @@ def _validate_artifact(artifact) -> tuple[bool, str]:
     return True, "artifact valid"
 
 
-def needs_retrain(artifact: dict | None, h1_index,
-                  now: datetime.datetime) -> tuple[bool, str]:
-    """The F2 retrain trigger: no (valid) artifact, enough new
-    H1 bars since the training cutoff, or an old artifact."""
+def retrain_accrual(artifact: dict | None, h1_index,
+                    now: datetime.datetime) -> dict:
+    """The F2 retrain accrual as DATA (completion-04): how many
+    new H1 bars have accrued against ``RETRAIN_NEW_BARS`` since
+    the artifact's training cutoff, and how old the artifact is
+    against ``RETRAIN_MAX_AGE_DAYS``.  ``needs_retrain`` is this
+    computation's verdict; the status surface and the runtime
+    manifest read the same numbers, so "how close is the next
+    retrain" is never a reason string someone has to parse."""
+    acc: dict[str, Any] = {
+        "new_bars": None, "threshold": RETRAIN_NEW_BARS,
+        "age_days": None, "max_age_days": RETRAIN_MAX_AGE_DAYS,
+        "trained_through": None, "due": True, "cause": None,
+        "reason": ""}
     if not artifact:
-        return True, "no trained artifact"
+        acc.update(cause="no_artifact",
+                   reason="no trained artifact")
+        return acc
     valid, reason = _validate_artifact(artifact)
     if not valid:
-        return True, f"artifact invalid ({reason}) — retraining"
+        acc.update(cause="invalid",
+                   reason=f"artifact invalid ({reason}) — retraining")
+        return acc
     through = pd.Timestamp(artifact["trained_through"])
     idx = pd.DatetimeIndex(h1_index)
     if idx.tz is not None and through.tzinfo is None:
@@ -444,16 +458,30 @@ def needs_retrain(artifact: dict | None, h1_index,
     elif idx.tz is None and through.tzinfo is not None:
         through = through.tz_localize(None)
     new_bars = int((idx > through).sum())
-    if new_bars >= RETRAIN_NEW_BARS:
-        return True, (f"{new_bars} new H1 bars since "
-                      f"{through}")
     trained_at = pd.Timestamp(artifact["trained_at"])
     age_days = (pd.Timestamp(now) - trained_at).total_seconds() \
         / 86400.0
-    if age_days >= RETRAIN_MAX_AGE_DAYS:
-        return True, f"artifact is {age_days:.0f} days old"
-    return False, (f"artifact current ({new_bars} new H1 bars, "
-                   f"{age_days:.1f} days old)")
+    acc.update(new_bars=new_bars, age_days=round(age_days, 1),
+               trained_through=str(artifact["trained_through"]))
+    if new_bars >= RETRAIN_NEW_BARS:
+        acc.update(due=True, cause="new_bars",
+                   reason=f"{new_bars} new H1 bars since {through}")
+    elif age_days >= RETRAIN_MAX_AGE_DAYS:
+        acc.update(due=True, cause="age",
+                   reason=f"artifact is {age_days:.0f} days old")
+    else:
+        acc.update(due=False, cause=None,
+                   reason=(f"artifact current ({new_bars} new H1 "
+                           f"bars, {age_days:.1f} days old)"))
+    return acc
+
+
+def needs_retrain(artifact: dict | None, h1_index,
+                  now: datetime.datetime) -> tuple[bool, str]:
+    """The F2 retrain trigger: no (valid) artifact, enough new
+    H1 bars since the training cutoff, or an old artifact."""
+    acc = retrain_accrual(artifact, h1_index, now)
+    return bool(acc["due"]), str(acc["reason"])
 
 
 # ── the LIVE probability book ───────────────────────────────────
