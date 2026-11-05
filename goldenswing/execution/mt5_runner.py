@@ -2969,6 +2969,126 @@ class MT5Runner:
             reason_code=reason_code, reason=reason,
             trigger_stage=stage)
 
+    @staticmethod
+    def _binding_expired(setup, bar_ts) -> bool:
+        """Expiry as the routing selection sees it: the
+        persisted expiry at or before the fire's bar.  An
+        unparseable expiry never counts as expired (the routing
+        block's own try/except semantics)."""
+        expiry = getattr(setup, "expiry_ts", None)
+        if expiry is None:
+            return False
+        try:
+            return bool(pd.Timestamp(expiry) <= bar_ts)
+        except Exception:
+            return False
+
+    def _emit_trigger_binding(self, *, direction: int, verdict,
+                              h1, t: int, armed_all: list,
+                              candidates: dict, rules: dict
+                              ) -> None:
+        """One trigger-BINDING journal record per fire that
+        reaches the lifecycle routing selection
+        (kind=trigger_binding).
+
+        Why this exists (WS4 residual #2, traced 2026-11-04):
+        in the Nov 3-4 episode the window's three fires each
+        journaled only the prose disposition "no armed setups
+        routed; armed setups remaining in direction: 0" —
+        closing the episode took a forensic pass over three
+        record kinds to prove the same-direction group had been
+        empty at every fire (the armed instances were all
+        opposite-direction; the one same-direction instance had
+        expired hours earlier).  This record makes every future
+        fire self-describing: the bound instances with the rule
+        that picked each (bracket / nearest / oldest / single),
+        or the not-bound reason from the closed taxonomy —
+        ``no_armed_instances`` / ``direction_mismatch`` /
+        ``all_expired`` / ``shadow_only`` — plus every armed
+        instance's disposition at fire time (bound:<rule> /
+        not_selected / other_direction / shadow / expired), so
+        the selection is reconstructable from this record
+        alone.  Emitted only where the selection actually runs
+        (a live fire's signal path with a setup store);
+        observation-only, it changes no decision."""
+        bar_ts = h1.index[t]
+        try:
+            fire_entry = float((verdict or {}).get("entry"))
+            if not math.isfinite(fire_entry):
+                fire_entry = None
+        except (TypeError, ValueError):
+            fire_entry = None
+        bound = [{"setup_id": s.setup_id, "playbook": pb,
+                  "rule": rules.get(pb, "")}
+                 for pb, s in candidates.items()]
+        bound_ids = {b["setup_id"] for b in bound}
+        instances: list[dict] = []
+        for s in armed_all:
+            if s.setup_id in bound_ids:
+                disp = f"bound:{rules.get(s.playbook, '')}"
+            elif int(s.direction) != int(direction):
+                disp = "other_direction"
+            elif getattr(s, "shadow", False):
+                disp = "shadow"
+            elif self._binding_expired(s, bar_ts):
+                disp = "expired"
+            else:
+                disp = "not_selected"
+            instances.append({
+                "setup_id": s.setup_id, "playbook": s.playbook,
+                "direction": int(s.direction),
+                "expiry_ts": getattr(s, "expiry_ts", None),
+                "disposition": disp})
+        if candidates:
+            decision, reason = "bound", ""
+            detail = "; ".join(
+                f"{b['setup_id']} ({b['rule']})" for b in bound)
+            text = (f"fire {int(direction):+d}: bound "
+                    f"{len(bound)} instance(s) — {detail}")
+        else:
+            decision = "not_bound"
+            same = [s for s in armed_all
+                    if int(s.direction) == int(direction)]
+            live_same = [s for s in same
+                         if not self._binding_expired(s, bar_ts)]
+            if not armed_all:
+                reason = "no_armed_instances"
+                text = (f"fire {int(direction):+d}: no instance "
+                        "bound — no armed instances in the store")
+            elif not same:
+                reason = "direction_mismatch"
+                text = (f"fire {int(direction):+d}: no instance "
+                        f"bound — {len(armed_all)} armed "
+                        "instance(s), none in the fire's "
+                        "direction")
+            elif live_same:
+                reason = "shadow_only"
+                text = (f"fire {int(direction):+d}: no instance "
+                        "bound — same-direction instances are "
+                        "shadow-only (preserved, never routed)")
+            else:
+                reason = "all_expired"
+                text = (f"fire {int(direction):+d}: no instance "
+                        "bound — every same-direction instance "
+                        "is past expiry")
+        self._emit_eval(
+            playbook="__trigger__", kind="trigger_binding",
+            evaluation_clock="h1_trigger", intended_tf="H1",
+            actual_input_tf="H1", last_bar_ts=bar_ts,
+            outcome=("candidate_emitted" if candidates
+                     else "not_eligible"),
+            reason_code=("" if candidates
+                         else f"path.binding_{reason}"),
+            reason=text, trigger_stage="binding",
+            candidate=({"direction": int(direction),
+                        "entry": fire_entry}
+                       if fire_entry is not None else None),
+            evidence={"binding": {
+                "decision": decision, "reason": reason,
+                "fire_direction": int(direction),
+                "fire_entry": fire_entry,
+                "bound": bound, "instances": instances}})
+
     # ------------------------------------------- setup lifecycle (§1)
     def _journal_setup_event(self, setup, stage: str,
                              detail: str = "") -> None:
@@ -10468,23 +10588,41 @@ class MT5Runner:
         fall back to the OLDEST instance, the pre-handoff rule.
         ``setups`` arrives in the store's order (oldest first).
         """
+        return self._select_lifecycle_candidate_rule(
+            setups, verdict)[0]
+
+    def _select_lifecycle_candidate_rule(self, setups, verdict):
+        """The WS3 selection AND the rule that decided it —
+        ``(setup, rule)`` with rule one of ``single`` /
+        ``bracket`` / ``nearest`` / ``oldest``.  The binding
+        journal (kind=trigger_binding) names the rule per bound
+        instance, so a bind is auditable from the record alone;
+        the selection itself is byte-identical to
+        :meth:`_select_lifecycle_candidate`."""
         if len(setups) == 1:
-            return setups[0]
+            return setups[0], "single"
         try:
             entry = float((verdict or {}).get("entry"))
         except (TypeError, ValueError):
             entry = None
         if entry is None or not math.isfinite(entry):
-            return setups[0]
+            return setups[0], "oldest"
         for s in setups:
             zone = list(getattr(s, "entry_zone", None) or [])
             if len(zone) == 2:
                 lo, hi = float(min(zone)), float(max(zone))
                 if hi > lo and lo <= entry <= hi:
-                    return s
-        return min(
-            setups,
-            key=lambda s: abs(float(s.entry_ref) - entry))
+                    return s, "bracket"
+        distances = [abs(float(s.entry_ref) - entry)
+                     for s in setups]
+        best = min(distances)
+        picked = setups[distances.index(best)]
+        # A unique nearest wins as ``nearest``; a distance tie
+        # resolves to the oldest of the tied (the list is
+        # oldest-first, so the first minimal index IS the
+        # oldest) and is named for what decided it.
+        return picked, ("nearest" if distances.count(best) == 1
+                        else "oldest")
 
     def _run_signal_path(self, h1: pd.DataFrame, t: int,
                          states, years: float, verdict: dict,
@@ -10632,6 +10770,14 @@ class MT5Runner:
             _lc_dir = int((verdict or {}).get("direction", 0) or 0)
             if _lc_dir in (1, -1) and t < len(h1):
                 _handoff = self._handoff_enabled()
+                # Binding journal: the full armed snapshot (all
+                # directions) at fire time — the selection below
+                # sees only the fire's direction, but the record
+                # must also name what it could NOT bind and why
+                # (opposite-direction / expired / shadow).
+                _armed_all = self._setup_store.active(
+                    armed_only=True)
+                _bind_rules: dict = {}
                 _by_playbook: dict = {}
                 for _s in self._setup_store.active(
                         direction=_lc_dir, armed_only=True):
@@ -10669,11 +10815,20 @@ class MT5Runner:
                         _s.playbook, []).append(_s)
                 for _pb_name, _group in _by_playbook.items():
                     if _handoff and len(_group) > 1:
-                        _lc_candidates[_pb_name] = \
-                            self._select_lifecycle_candidate(
+                        _picked, _rule = \
+                            self._select_lifecycle_candidate_rule(
                                 _group, verdict)
+                        _lc_candidates[_pb_name] = _picked
+                        _bind_rules[_pb_name] = _rule
                     else:
                         _lc_candidates[_pb_name] = _group[0]
+                        _bind_rules[_pb_name] = (
+                            "single" if len(_group) == 1
+                            else "oldest")
+                self._emit_trigger_binding(
+                    direction=_lc_dir, verdict=verdict, h1=h1,
+                    t=t, armed_all=_armed_all,
+                    candidates=_lc_candidates, rules=_bind_rules)
         for pb in self._get_playbooks():
             if pb.name in (self.cfg.disabled_playbooks or ()):
                 # Kill switch (/set) — not evaluated (A14).  FUNNEL:
