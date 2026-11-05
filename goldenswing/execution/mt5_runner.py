@@ -266,6 +266,43 @@ def _tick_now_utc(last_tick: dict | None) -> datetime | None:
         return None
 
 
+#: Per-route Judgment Core authority (completion-02, owner
+#: program 2026-11-05).  The 2026-11-05 promotion made the core
+#: the demo decision authority on the routes it had
+#: shadow-evaluated (the S1–S4 program's history); authority is
+#: therefore a PER-ROUTE state, declared here, never inferred
+#: from the global mode:
+#: - "governing": in active mode the route's orders require a
+#:   core "take" (the _judgment_authority seam refuses abstains).
+#: - "shadow_declared": the route's candidates receive funnel
+#:   evaluation records + journaled core evaluations — a real
+#:   shadow history accrues and is scored like every other
+#:   route's — but the verdict does NOT govern: the route's own
+#:   gate stack still decides.  A shadow-declared route becomes
+#:   governing only by the explicit step (config
+#:   ``judgment_route_modes`` naming it "governing", the same
+#:   kind of separate decision that promoted the core itself),
+#:   never because the global default flipped to active.
+#: The manifest journals this table with each route's effective
+#: state and its judgment-record count for the run.
+JUDGMENT_ROUTE_STATES: dict[str, str] = {
+    "h1_trigger": "governing",
+    "qm_m5_native": "governing",
+    "qm_d1_native": "governing",
+    "hot_scalp_promotion": "shadow_declared",
+    "resting_limit": "shadow_declared",
+}
+
+#: The playbook name a route's judgment records journal under
+#: (the shadow-history counter the manifest reports).  Only the
+#: connected routes need an entry: the governed routes predate
+#: per-route counting (their history is the S1–S4 journal).
+JUDGMENT_ROUTE_PLAYBOOK: dict[str, str] = {
+    "hot_scalp_promotion": "hot_scalp",
+    "resting_limit": "arrival_zone",
+}
+
+
 @dataclass
 class MT5RunnerConfig:
     symbol: str = "XAUUSD"
@@ -350,16 +387,31 @@ class MT5RunnerConfig:
     # evaluation runs regardless of judgment_shadow_enabled
     # (that flag gates only the passive tap): an order without
     # a core record must be impossible, not merely unjournaled.
-    # NOT under the core's authority (named, not silent — the
-    # core has never shadow-evaluated either, so there is no
-    # verdict history to promote): the hot_scalp promotion path
-    # (candidates live in the candidate-chain store, never the
-    # funnel) and the A6 resting limit (playbook "arrival_zone"
-    # — the decision flow itself places it; no playbook
-    # candidate record exists).  Both keep their own gate
-    # stacks; promoting either is a separate build that first
-    # gives it funnel candidate records + a shadow history.
+    # NOT under the core's authority (named, not silent):
+    # the hot_scalp promotion path and the A6 resting limit
+    # (playbook "arrival_zone") had never been shadow-evaluated
+    # at promotion time, so there was no verdict history to
+    # promote.  COMPLETION-02 (2026-11-05) connected both: their
+    # candidates now take funnel evaluation records + journaled
+    # core evaluations (a shadow history accrues), declared
+    # SHADOW per route (JUDGMENT_ROUTE_STATES) — evaluated and
+    # journaled, never governing, until the explicit per-route
+    # promotion below.  Their own gate stacks still decide.
     judgment_mode: str = "active"
+    # PER-ROUTE authority overrides (completion-02): maps a
+    # route name (JUDGMENT_ROUTE_STATES) to "governing" or
+    # "shadow_declared".  This is THE explicit promotion step
+    # for a connected route: naming a shadow-declared route
+    # "governing" here — a deliberate config decision, taken
+    # once its shadow record exists — makes the core's verdict
+    # govern that route at its decision point; naming a
+    # governing route "shadow_declared" demotes it to
+    # observe-only.  Any other value is ignored toward the
+    # route's DECLARED state (a typo can neither silently
+    # promote a route nor silently restore an unjudged path);
+    # the manifest journals configured + effective per route,
+    # so a bad value is a visible fact.
+    judgment_route_modes: dict | None = None
     # JUDGMENT CORE S3 (owner spec 2026-11-02): outcome
     # reconciliation + self-audit — shadow judgments and theses are
     # measured against forward price action, calibration is
@@ -1441,6 +1493,12 @@ class MT5Runner:
         self._config_fingerprint_cache: str | None = None
         self._funnel_seq: int = 0
         self._funnel_counts: dict[str, dict] = {}
+        # Completion-02: judgment_shadow records journaled this
+        # run, per playbook — the accruing shadow history the
+        # manifest's per-route authority table reports (a
+        # shadow-declared route's promotion case is built from
+        # exactly these records + their S3 outcome scoring).
+        self._judgment_record_counts: dict[str, int] = {}
         self._funnel_refusals: dict[str, int] = {}
         self._funnel_trigger: dict | None = None
         # Pending Confirm taps: token -> {"action", "arg"}.
@@ -1673,7 +1731,9 @@ class MT5Runner:
                    trigger_stage: str | None = None,
                    source: str | None = None,
                    assessment: dict | None = None,
-                   precomputed_judgment: dict | None = None
+                   precomputed_judgment: dict | None = None,
+                   desk_cycle: bool = True,
+                   judgment_route: str | None = None
                    ) -> dict | None:
         """Append ONE funnel evaluation record + update the
         in-memory /status counters.  Never raises; returns the
@@ -1686,7 +1746,22 @@ class MT5Runner:
         funnel.terminal_decision), and ``source`` records where
         the evaluation came from (live close / warmup scan /
         trigger path) — provenance is a journal fact, not an
-        inference."""
+        inference.
+
+        Completion-02: ``desk_cycle=False`` is for routes that
+        connect to the funnel from OUTSIDE the bar-clocked desk
+        cycle (the hot_scalp promotion's tick domain, the
+        resting limit's placement): the record, the counters and
+        the judgment journaling all run, but the bar-domain side
+        effects do not — the S3 missed-opportunity audit's
+        evaluated-bar mark (a tick-domain promotion does not
+        discharge an H1 bar's evaluation) and the thesis cycle
+        (those routes' candidates are not thesis children; the
+        hot_scalp chain already records the thesis read as its
+        own evidence).  ``judgment_route`` stamps the tap's
+        passive verdict with its route authority state, like a
+        seam-computed bundle.  Every pre-existing caller takes
+        the defaults; their records are unchanged."""
         self._funnel_seq += 1
         if not getattr(self.cfg, "funnel_enabled", True):
             return None
@@ -1871,7 +1946,8 @@ class MT5Runner:
         # evaluating a second time.  Warmup/replay records are
         # skipped (their bar is historical — a verdict stamped
         # on them would misdescribe the dataset).
-        if candidate is not None and kind != "trigger_event" \
+        if desk_cycle and candidate is not None \
+                and kind != "trigger_event" \
                 and source != "warmup_scan":
             # S3: this bar counts as EVALUATED for the
             # missed-opportunity audit, whatever the desk decided.
@@ -1893,7 +1969,8 @@ class MT5Runner:
                         candidate=candidate, decision=decision,
                         evidence=evidence,
                         intended_tf=intended_tf,
-                        eval_now=_eval_now)
+                        eval_now=_eval_now,
+                        route=judgment_route)
                     _feed_block = _bundle["forecast_evidence"]
                     _judgment = _bundle["judgment"]
                 if _judgment is not None:
@@ -1913,6 +1990,11 @@ class MT5Runner:
                         # evaluation, verbatim — weighed or not.
                         "forecast_evidence": _feed_block,
                         "judgment": _judgment})
+                    _counts = getattr(
+                        self, "_judgment_record_counts", None)
+                    if _counts is not None:
+                        _counts[playbook] = \
+                            _counts.get(playbook, 0) + 1
                     self._audit_register_shadow(
                         _judgment, candidate, _eval_now,
                         playbook=playbook)
@@ -1925,7 +2007,8 @@ class MT5Runner:
         # (decision context + the desk's rolling candidate flow).
         # Journal events: the thesis read itself holds no order
         # authority (the S1 core's authority lives at the seams).
-        if candidate is not None and decision is not None \
+        if desk_cycle and candidate is not None \
+                and decision is not None \
                 and kind != "trigger_event" \
                 and source != "warmup_scan" \
                 and getattr(self.cfg, "judgment_thesis_enabled",
@@ -1960,8 +2043,64 @@ class MT5Runner:
                   or "active").strip().lower()
         return "shadow" if raw == "shadow" else "active"
 
+    def _judgment_route_state(self, route: str) -> str:
+        """One route's declared authority state (completion-02):
+        "governing" or "shadow_declared" — the shipped
+        declaration (JUDGMENT_ROUTE_STATES) as overridden by the
+        explicit per-route config step (judgment_route_modes).
+        An override counts only when it names a state exactly
+        (after case/space normalization); anything else is
+        ignored toward the declared state, so a typo can neither
+        silently promote a shadow-declared route nor silently
+        demote a governing one.  An undeclared route resolves
+        "governing" — the pre-completion behavior of the global
+        mode, so an internal route string can never quietly
+        open an unjudged path."""
+        declared = JUDGMENT_ROUTE_STATES.get(
+            str(route), "governing")
+        overrides = getattr(self.cfg, "judgment_route_modes",
+                            None) or {}
+        raw = overrides.get(str(route)) \
+            if isinstance(overrides, dict) else None
+        if isinstance(raw, str):
+            norm = raw.strip().lower()
+            if norm in ("governing", "shadow_declared"):
+                return norm
+        return declared
+
+    def _judgment_route_table(self) -> list[dict]:
+        """The manifest's per-route authority table
+        (completion-02): every route the core touches, its
+        effective declared state, whether it governs RIGHT NOW
+        (declared governing AND the global mode active), and —
+        for the connected routes — how many judgment records
+        this run has journaled under the route's playbook (the
+        accruing shadow history a promotion case is built
+        from).  Governed routes carry no count: their history
+        is the S1–S4 shadow journal, which predates per-route
+        counting."""
+        counts = getattr(self, "_judgment_record_counts", {})
+        mode = self._judgment_mode()
+        table = []
+        for route, declared in JUDGMENT_ROUTE_STATES.items():
+            state = self._judgment_route_state(route)
+            row = {
+                "route": route,
+                "authority": state,
+                "declared": declared,
+                "governing_now": bool(
+                    state == "governing" and mode == "active"),
+            }
+            playbook = JUDGMENT_ROUTE_PLAYBOOK.get(route)
+            if playbook is not None:
+                row["judgment_records_this_run"] = int(
+                    counts.get(playbook, 0))
+            table.append(row)
+        return table
+
     def _judgment_evaluate(self, *, candidate, decision,
-                           evidence, intended_tf, eval_now):
+                           evidence, intended_tf, eval_now,
+                           route: str | None = None):
         """ONE core evaluation of one candidate, in the exact
         shape the journal carries: returns the bundle
         {"judgment": <block, effective mode stamped over the
@@ -1984,11 +2123,21 @@ class MT5Runner:
                 min_confidence=float(getattr(
                     self.cfg, "judgment_min_confidence", 0.15))))
         judgment["mode"] = self._judgment_mode()
+        if route is not None:
+            # Completion-02: a route-stamped verdict — the
+            # record itself states whether this route's verdict
+            # governed or was shadow-declared observation, so a
+            # shadow history can never be misread as authority
+            # (or an authority record as mere observation).
+            judgment["authority_route"] = str(route)
+            judgment["authority"] = self._judgment_route_state(
+                route)
         return {"judgment": judgment,
                 "forecast_evidence": feed_block}
 
     def _judgment_authority(self, *, candidate, decision,
-                            evidence, intended_tf, eval_now):
+                            evidence, intended_tf, eval_now,
+                            route: str | None = None):
         """The promotion seam, called by every order route the
         core evaluates (H1 roster trigger path, qm_m5, qm_d1)
         at its order decision point — after the route's own
@@ -2015,14 +2164,47 @@ class MT5Runner:
           candidate/setup lifecycle is otherwise untouched).
         - active + evaluation failure: ({"judgment": None},
           reason) — fail closed: no core record, no order; the
-          caller's refusal record states the failure."""
+          caller's refusal record states the failure.
+
+        PER-ROUTE authority (completion-02): a caller naming a
+        route declared "shadow_declared" (hot_scalp promotion,
+        the resting limit) gets the evaluation WITHOUT the
+        authority: active mode evaluates and returns
+        (bundle, None) whatever the verdict — the caller
+        proceeds on its own gate stack and journals the bundle
+        as its record's precomputed_judgment, so the verdict
+        becomes shadow history, scored like every other
+        route's.  An evaluation failure there returns a bundle
+        carrying "evaluation_error" and no refusal: observation
+        must never fail a route it does not govern.  In shadow
+        (global) mode a shadow-declared route returns
+        (None, None) like every route — its terminal record's
+        tap journals the verdict.  A route promoted to
+        "governing" by the explicit config step takes the
+        ordinary active path below, route-stamped."""
+        if route is not None \
+                and self._judgment_route_state(route) \
+                == "shadow_declared":
+            if self._judgment_mode() != "active":
+                return None, None
+            try:
+                bundle = self._judgment_evaluate(
+                    candidate=candidate, decision=decision,
+                    evidence=evidence, intended_tf=intended_tf,
+                    eval_now=eval_now, route=route)
+            except Exception as exc:  # noqa: BLE001 - observe-only
+                return {"judgment": None,
+                        "forecast_evidence": None,
+                        "evaluation_error":
+                            f"{type(exc).__name__}: {exc}"}, None
+            return bundle, None
         if self._judgment_mode() != "active":
             return None, None
         try:
             bundle = self._judgment_evaluate(
                 candidate=candidate, decision=decision,
                 evidence=evidence, intended_tf=intended_tf,
-                eval_now=eval_now)
+                eval_now=eval_now, route=route)
         except Exception as exc:  # noqa: BLE001 - fail closed
             return {"judgment": None, "forecast_evidence": None}, (
                 "judgment core evaluation failed at the order "
@@ -3641,11 +3823,21 @@ class MT5Runner:
                     # manifest journals the EFFECTIVE mode (the
                     # kill switch's real state), the configured
                     # value verbatim, and the authority boundary:
-                    # the routes the core governs vs the two
-                    # order routes it has never evaluated (named
-                    # on the config field — hot_scalp promotion
-                    # and the A6 resting limit keep their own
-                    # gate stacks, not a silent dual path).
+                    # the routes the core governs vs the routes
+                    # it does not (not_authoritative — the
+                    # hot_scalp promotion and the A6 resting
+                    # limit keep their own gate stacks as the
+                    # deciding layer).  COMPLETION-02
+                    # (2026-11-05): those two routes are now
+                    # CONNECTED — funnel records + journaled
+                    # core evaluations, declared shadow per
+                    # route — and route_authority journals every
+                    # route's declared/effective state, whether
+                    # it governs right now, and the connected
+                    # routes' accruing shadow-history counts, so
+                    # "evaluated but not governing" is a stated
+                    # fact with a number, never a silent dual
+                    # path in either direction.
                     "judgment_core": {
                         "mode": self._judgment_mode(),
                         "mode_configured": str(getattr(
@@ -3656,6 +3848,8 @@ class MT5Runner:
                         "not_authoritative": [
                             "hot_scalp_promotion",
                             "resting_limit"],
+                        "route_authority":
+                            self._judgment_route_table(),
                         "enabled": bool(getattr(
                             self.cfg, "judgment_shadow_enabled",
                             True)),
@@ -8844,16 +9038,23 @@ class MT5Runner:
         trigger_source=resting_limit, playbook 'arrival_zone' (the
         decision flow is the actor; no playbook fired).
 
-        PROMOTION BOUNDARY (owner decision 2026-11-05, named —
-        not silent): the Judgment Core's demo authority does NOT
-        extend to this placement.  No funnel candidate record
-        exists for arrival_zone (the actor is the decision flow,
-        not a playbook), so the core has never shadow-evaluated
-        it and there is no verdict history to promote; the floor
-        + RiskGuards + margin stack above remains its whole
-        governance.  Promoting the core here is a separate build
-        that first gives this route funnel candidate records +
-        a shadow history."""
+        JUDGMENT CONNECTION (completion-02, owner program
+        2026-11-05 — supersedes the promotion boundary this
+        docstring used to declare): a candidate record CAN be
+        honestly constructed at placement — direction, the
+        proximal-edge entry, the structural invalidation, the
+        target and the very Asymmetry score + ZONE_PATH floor
+        this flow already computes are exactly the funnel
+        candidate's inputs — so the placement below is preceded
+        by a core evaluation through the shared seam and
+        terminated by a funnel evaluation record (playbook
+        "arrival_zone") carrying the journaled verdict.  The
+        route is declared SHADOW: the verdict is shadow history
+        and the floor + RiskGuards + margin stack remains the
+        deciding governance; only an explicit per-route
+        promotion (config judgment_route_modes naming this
+        route "governing") lets an abstention refuse a
+        placement, via the seam's refusal return."""
         if not self.cfg.resting_limit_enabled:
             return
         if self.cfg.paused or self._regime_pause is not None:
@@ -9022,6 +9223,112 @@ class MT5Runner:
         if not self._check_margin(pb_stub, sig_stub, lots, False,
                                   acct):
             return
+        # JUDGMENT CONNECTION (completion-02): every route gate
+        # has passed and the placement is dispatch-bound — the
+        # decision point.  The candidate is the placement's own
+        # facts (proximal entry, structural invalidation, target,
+        # the Asymmetry breakdown this flow computed, the
+        # ZONE_PATH floor it just enforced); the evidence is the
+        # zone itself plus the HTF bias stance, in the funnel's
+        # idiom.  Declared SHADOW: the seam returns the bundle
+        # and never a refusal, and an observation failure is
+        # swallowed — placement proceeds on its own stack
+        # exactly as before.  A refusal can arrive ONLY under
+        # the explicit per-route promotion to governing; it is
+        # then honored like a governed route's (no placement;
+        # the note + record are deduped by zone key, since this
+        # flow re-evaluates on every tick of the approach).
+        _az_candidate = None
+        _az_evidence = None
+        _az_bundle = None
+        _az_refusal = None
+        try:
+            _az_candidate = self._candidate_dict(
+                sig_stub, score.breakdown())
+            _az_sup: list[str] = []
+            _az_con: list[str] = []
+            _az_groups: dict[str, list[str]] = {}
+
+            def _az_note(bucket, group, text):
+                bucket.append(text)
+                _az_groups.setdefault(group, []).append(text)
+
+            _az_note(_az_sup, "zone_context",
+                     f"fresh MAJOR {major.get('tf', '?')} zone "
+                     f"{float(major['bottom']):.1f}–"
+                     f"{float(major['top']):.1f} ({side}) — "
+                     f"resting at the proximal edge {prox:.1f} "
+                     f"ahead of arrival")
+            _az_d1 = setup.get("bias_d1")
+            if _az_d1:
+                if int(_az_d1) == direction:
+                    _az_note(_az_sup, "htf_structure",
+                             f"with structural D1 bias "
+                             f"{int(_az_d1):+d}")
+                else:
+                    _az_note(_az_con, "htf_structure",
+                             f"against structural D1 bias "
+                             f"{int(_az_d1):+d}")
+            _az_evidence = {
+                "observed": {"bias_d1": setup.get("bias_d1"),
+                             "bias_h4": setup.get("bias_h4"),
+                             "stop_dist": risk},
+                "supporting": _az_sup,
+                "contradictory": _az_con,
+                "evidence_groups": _az_groups,
+                "independent_evidence_groups": sorted(_az_groups),
+            }
+            _az_bundle, _az_refusal = self._judgment_authority(
+                candidate=_az_candidate,
+                decision={"floor_result": {
+                    "floor": float(fl["floor"]),
+                    "total": float(score.total),
+                    "path": "ZONE_PATH"}},
+                evidence=_az_evidence, intended_tf="H1",
+                eval_now=self._evaluation_now(),
+                route="resting_limit")
+        except Exception:
+            _az_candidate = None
+            _az_refusal = None  # observation never breaks placement
+        if _az_refusal is not None:
+            if getattr(self, "_resting_judgment_skip_key",
+                       None) != key:
+                self._resting_judgment_skip_key = key
+                self.journal.log_note(
+                    f"mt5 resting limit: judgment-refused at "
+                    f"fresh MAJOR {major.get('tf', '?')} "
+                    f"{prox:.1f} — {_az_refusal}")
+                try:
+                    self._emit_eval(
+                        playbook="arrival_zone",
+                        evaluation_clock="tick", intended_tf="H1",
+                        actual_input_tf="H1",
+                        outcome="candidate_emitted",
+                        reason_code="judgment.abstain",
+                        reason=_az_refusal,
+                        candidate=_az_candidate,
+                        decision={
+                            "result": "refused",
+                            "reason_code": "judgment.abstain",
+                            "reason": _az_refusal,
+                            "reason_category": (
+                                ((_az_bundle or {}).get("judgment")
+                                 or {}).get("reason_category")
+                                if _az_bundle else None),
+                            "execution_eligible": True,
+                            "order_result": "not_attempted",
+                            **_verdict_blocks(
+                                analytical="qualified",
+                                eligible=True,
+                                execution_code="judgment.abstain",
+                                outcome="not_attempted")},
+                        evidence=_az_evidence,
+                        desk_cycle=False,
+                        judgment_route="resting_limit",
+                        precomputed_judgment=_az_bundle)
+                except Exception:
+                    pass  # evidence only
+            return
         request = OrderRequest(
             symbol=self.cfg.symbol, direction=direction,
             volume=lots, stop_loss=float(stop0),
@@ -9045,8 +9352,49 @@ class MT5Runner:
         placed = self._place_pending_order(
             pb_stub, sig_stub, verdict_stub, "limit", entry,
             request, track_request, stats, bar)
+        if _az_candidate is not None:
+            # The route's terminal funnel record (completion-02):
+            # the placement's outcome, with the seam's verdict
+            # journaled beside it as shadow history.
+            _az_code = ("decision.resting_limit" if placed
+                        else "execution.order_path_refused")
+            _az_reason = (
+                f"resting limit placed at fresh MAJOR "
+                f"{major.get('tf', '?')} proximal edge "
+                f"{entry:.2f} (A6)" if placed else
+                "the order path refused the resting placement "
+                "(journalled there)")
+            try:
+                self._emit_eval(
+                    playbook="arrival_zone",
+                    evaluation_clock="tick", intended_tf="H1",
+                    actual_input_tf="H1",
+                    outcome="candidate_emitted",
+                    reason_code=_az_code, reason=_az_reason,
+                    candidate=_az_candidate,
+                    decision={
+                        "result": ("accepted" if placed
+                                   else "refused"),
+                        "reason_code": _az_code,
+                        "reason": _az_reason,
+                        "execution_eligible": True,
+                        "order_result": (
+                            "placed_pending" if placed
+                            else "refused_in_order_path"),
+                        **_verdict_blocks(
+                            analytical="qualified", eligible=True,
+                            execution_code=_az_code,
+                            outcome=("placed_pending" if placed
+                                     else "refused_in_order_path"))},
+                    evidence=_az_evidence,
+                    desk_cycle=False,
+                    judgment_route="resting_limit",
+                    precomputed_judgment=_az_bundle)
+            except Exception:
+                pass  # evidence only — never a placement input
         if placed:
             self._resting_limit_key = key
+            self._resting_judgment_skip_key = None
             # P3: park the decision context so the FILL registers
             # a full management context (arrival_zone, zone path).
             self._signal_ctx[alert_id] = {
@@ -9304,12 +9652,141 @@ class MT5Runner:
                            stage=stage, status=status, tick=tick,
                            fields=fields)
 
+        # COMPLETION-02 (owner program 2026-11-05): this route
+        # connects to the shared funnel + Judgment Core.  Every
+        # promotion attempt terminates in ONE funnel evaluation
+        # record (playbook "hot_scalp") carrying the candidate in
+        # the funnel's shape, and every such record carries a
+        # journaled core evaluation — computed at the judgment
+        # stage by the authority seam for dispatch-bound
+        # candidates, by the _emit_eval tap for route-gate
+        # refusals.  The route is declared SHADOW
+        # (JUDGMENT_ROUTE_STATES): the verdicts are shadow
+        # history, scored like every other route's; the chain's
+        # own gate stack still decides — unless the route is
+        # explicitly promoted to governing by config, in which
+        # case the seam's abstention refuses the attempt below
+        # exactly as on the governed routes.  The emit is
+        # evidence only: it is guarded so a funnel failure can
+        # never change a claim's fate.
+        _hs_bundle: dict | None = None
+        _hs_emitted = False
+        try:
+            _hs_dir = 1 if int(candidate.get("direction", 0)) > 0 \
+                else -1
+            _hs_entry = float(candidate.get("entry_reference")
+                              or 0.0)
+            _hs_stop = float(candidate.get("structural_stop")
+                             or 0.0)
+            _hs_targets = [float(x) for x in (
+                candidate.get("targets") or (
+                    [candidate.get("target_reference")]
+                    if candidate.get("target_reference") is not None
+                    else []))]
+            _hs_candidate: dict | None = {
+                "direction": _hs_dir,
+                "entry": _hs_entry,
+                "stop": _hs_stop,
+                "targets": _hs_targets,
+                "score": float(candidate.get("score") or 0.0),
+                # Phase-2 naming law (see _candidate_dict): the
+                # sleeve's own score is its BASE score; this route
+                # has no Asymmetry breakdown, so asymmetry_score
+                # stays None and the core judges the candidate on
+                # its geometry + weighed evidence — its record's
+                # score block (total None) says exactly that.
+                "asymmetry_score": None,
+                "sleeve_base_score": float(
+                    candidate.get("score") or 0.0),
+                "score_components": None,
+                "factors": [str(candidate.get("strategy") or "")],
+                "index": -1,
+                "setup_id": sid,
+                "parent_setup_id": parent_id,
+                "strategy": candidate.get("strategy"),
+            }
+        except (TypeError, ValueError):
+            _hs_candidate = None
+        _hs_sup: list[str] = []
+        _hs_con: list[str] = []
+        _hs_groups: dict[str, list[str]] = {}
+
+        def _hs_note(bucket, group, text):
+            bucket.append(text)
+            _hs_groups.setdefault(group, []).append(text)
+
+        if _hs_candidate is not None:
+            _hs_note(_hs_sup, "hot_scalp_signal",
+                     f"signal factor: "
+                     f"{candidate.get('strategy') or 'hot_scalp'} "
+                     f"trigger at {_hs_entry:.2f}")
+            _hs_d1 = (self._live_setup or {}).get("bias_d1")
+            if _hs_d1:
+                if int(_hs_d1) == _hs_dir:
+                    _hs_note(_hs_sup, "htf_structure",
+                             f"with structural D1 bias "
+                             f"{int(_hs_d1):+d}")
+                else:
+                    _hs_note(_hs_con, "htf_structure",
+                             f"against structural D1 bias "
+                             f"{int(_hs_d1):+d}")
+        _hs_evidence = {
+            "observed": {
+                "bias_d1": (self._live_setup or {}).get("bias_d1"),
+                "bias_h4": (self._live_setup or {}).get("bias_h4"),
+                "stop_dist": (abs(_hs_entry - _hs_stop)
+                              if _hs_candidate is not None
+                              else None)},
+            "supporting": _hs_sup,
+            "contradictory": _hs_con,
+            "evidence_groups": _hs_groups,
+            "independent_evidence_groups": sorted(_hs_groups),
+        }
+
+        def _emit_hs(*, result, order_result, reason_code, reason,
+                     eligible):
+            nonlocal _hs_emitted
+            if _hs_emitted or _hs_candidate is None:
+                return
+            _hs_emitted = True
+            try:
+                self._emit_eval(
+                    playbook="hot_scalp",
+                    evaluation_clock="hot_scalp_promotion",
+                    intended_tf="M5", actual_input_tf="M5",
+                    outcome="candidate_emitted",
+                    reason_code=reason_code or "",
+                    reason=reason,
+                    candidate=_hs_candidate,
+                    decision={
+                        "result": result,
+                        "reason_code": reason_code or None,
+                        "reason": reason,
+                        "execution_eligible": eligible,
+                        "order_result": order_result,
+                        **_verdict_blocks(
+                            analytical="qualified",
+                            eligible=eligible,
+                            execution_code=reason_code,
+                            outcome=order_result)},
+                    evidence=_hs_evidence,
+                    desk_cycle=False,
+                    judgment_route="hot_scalp_promotion",
+                    precomputed_judgment=_hs_bundle)
+            except Exception:
+                pass  # evidence only — never a claim-fate input
+
         if not self.cfg.hot_scalp_live_enabled:
             self.journal.log_note(
                 f"mt5: hot_scalp promotion refused {sid}: "
                 f"live authority OFF (hot_scalp_live_enabled=False)")
             _chain("promotion", "refused",
                    {"reason_code": "promotion.live_authority_off"})
+            _emit_hs(result="refused", order_result="not_attempted",
+                     reason_code="promotion.live_authority_off",
+                     reason="hot_scalp live authority OFF "
+                            "(hot_scalp_live_enabled=False)",
+                     eligible=False)
             return False
         if engine is None:
             return False
@@ -9320,6 +9797,11 @@ class MT5Runner:
                 f"by another process ({claim.get('claimant')})")
             _chain("promotion", "refused",
                    {"reason_code": "promotion.claim_owned_elsewhere"})
+            _emit_hs(result="refused", order_result="not_attempted",
+                     reason_code="promotion.claim_owned_elsewhere",
+                     reason="claim owned by another process "
+                            f"({claim.get('claimant')})",
+                     eligible=False)
             return False
 
         def _resolve(exists: bool) -> bool:
@@ -9339,6 +9821,9 @@ class MT5Runner:
             _chain("promotion", "refused",
                    {"reason_code": "promotion.runner_paused"})
             _resolve(False)
+            _emit_hs(result="refused", order_result="not_attempted",
+                     reason_code="promotion.runner_paused",
+                     reason="runner paused", eligible=False)
             return False
         # Flat-only v1: a candidate while holding is not a layer
         # yet — the parent-identity mapping does not exist.
@@ -9349,6 +9834,11 @@ class MT5Runner:
             _chain("promotion", "refused",
                    {"reason_code": "promotion.flat_only_holding"})
             _resolve(False)
+            _emit_hs(result="refused", order_result="not_attempted",
+                     reason_code="promotion.flat_only_holding",
+                     reason="holding — scalp layering not yet "
+                            "promoted (flat-only v1)",
+                     eligible=False)
             return False
         # V2 pre-submit broker check: the broker must agree we are
         # flat before any new risk is submitted.
@@ -9362,6 +9852,11 @@ class MT5Runner:
                 f"lookup failed ({exc}) — claim left claimed")
             _chain("promotion", "withheld",
                    {"reason_code": "promotion.broker_lookup_failed"})
+            _emit_hs(result="refused", order_result="not_attempted",
+                     reason_code="promotion.broker_lookup_failed",
+                     reason=f"broker lookup failed ({exc}) — "
+                            "claim left claimed",
+                     eligible=False)
             return False
         if broker_before:
             self.journal.log_note(
@@ -9369,6 +9864,11 @@ class MT5Runner:
                 f"shows an untracked magic position — claim left claimed")
             _chain("promotion", "refused",
                    {"reason_code": "promotion.broker_untracked_position"})
+            _emit_hs(result="refused", order_result="not_attempted",
+                     reason_code="promotion.broker_untracked_position",
+                     reason="broker shows an untracked magic "
+                            "position — claim left claimed",
+                     eligible=False)
             return False
         # Cost-envelope re-check at the promotion tick: the spread
         # that was tight at trigger time may have widened since.
@@ -9390,6 +9890,12 @@ class MT5Runner:
                    {"reason_code": "promotion.cost_envelope",
                     "spread": spread, "m1_atr": atr1})
             _resolve(False)
+            _emit_hs(result="refused", order_result="not_attempted",
+                     reason_code="promotion.cost_envelope",
+                     reason="cost envelope unverifiable or "
+                            f"exceeded at promotion (spread={spread}, "
+                            f"m1_atr={atr1})",
+                     eligible=False)
             return False
         # Market-shape-only v1: promotion runs on the trigger tick,
         # where price IS the entry, so the shared path must select
@@ -9424,6 +9930,11 @@ class MT5Runner:
                    {"reason_code": "promotion.order_shape_not_market",
                     "order_shape": kind})
             _resolve(False)
+            _emit_hs(result="refused", order_result="not_attempted",
+                     reason_code="promotion.order_shape_not_market",
+                     reason=f"order shape is {kind}, not market "
+                            "(market-shape-only v1)",
+                     eligible=False)
             return False
         _sig_targets = _hot_scalp_order_targets(candidate)
         sig = SimpleNamespace(
@@ -9463,18 +9974,54 @@ class MT5Runner:
         # promotion time, recorded as EVIDENCE on the chain — the
         # chain simply stops being blind to what the wider system
         # believed when this candidate was decided.
-        # PROMOTION BOUNDARY (owner decision 2026-11-05, named —
-        # not silent): the Judgment Core's demo authority does NOT
-        # extend to this promotion path.  The core has never
-        # shadow-evaluated a hot_scalp candidate (these candidates
-        # live in the candidate-chain store and never enter the
-        # funnel record shape the core consumes), so there is no
-        # verdict history to promote; this path keeps its own
-        # gate stack (live authority, claim, flat-only, order
-        # shape, then the shared order path's safeguards).
-        # Promoting the core here is a separate build that first
-        # gives the sleeve funnel candidate records + a shadow
-        # history to be judged against.
+        # JUDGMENT CONNECTION (completion-02, owner program
+        # 2026-11-05 — supersedes the promotion boundary this
+        # block used to declare): the candidate IS evaluated by
+        # the Judgment Core here, at the dispatch-bound point,
+        # through the same seam the governed routes use — on the
+        # funnel-shaped candidate/evidence built at the top of
+        # this function, enriched with the setup payload's own
+        # facts (context direction, entry zone).  The route is
+        # declared SHADOW: the seam returns the bundle and never
+        # a refusal, the verdict journals as this attempt's
+        # funnel record below (shadow history, scored like every
+        # other route's), and this path's own gate stack (live
+        # authority, claim, flat-only, order shape, then the
+        # shared order path's safeguards) still decides.  ONLY
+        # an explicit per-route promotion (config
+        # judgment_route_modes naming this route "governing")
+        # makes the seam's abstention refuse the attempt — the
+        # refusal branch below is that promotion's whole
+        # mechanism, reached only when the seam returns one.
+        if _hs_candidate is not None:
+            _ctx_dir = setup.get("context_direction")
+            if _ctx_dir:
+                if int(_ctx_dir) == direction:
+                    _hs_note(_hs_sup, "hot_scalp_signal",
+                             f"sleeve context direction agrees "
+                             f"({int(_ctx_dir):+d})")
+                else:
+                    _hs_note(_hs_con, "hot_scalp_signal",
+                             f"sleeve context direction opposes "
+                             f"({int(_ctx_dir):+d})")
+            if sig.entry_zone is not None:
+                _hs_note(_hs_sup, "zone_context",
+                         f"entry zone "
+                         f"{sig.entry_zone[0]:.2f}–"
+                         f"{sig.entry_zone[1]:.2f} (M5) — the "
+                         f"trigger fired inside the zone its "
+                         f"structural stop is built under")
+            _hs_evidence["independent_evidence_groups"] = \
+                sorted(_hs_groups)
+        if _hs_candidate is not None:
+            _hs_bundle, _hs_refusal = self._judgment_authority(
+                candidate=_hs_candidate,
+                decision={},
+                evidence=_hs_evidence, intended_tf="M5",
+                eval_now=self._evaluation_now(),
+                route="hot_scalp_promotion")
+        else:
+            _hs_bundle, _hs_refusal = None, None
         _judgment_fields: dict = {
             "intent": {"shape": kind, "direction": direction,
                        "entry_reference": entry_ref,
@@ -9487,6 +10034,42 @@ class MT5Runner:
                                        "target_reference")]),
                        "management": sig.management},
         }
+        if _hs_bundle is not None:
+            _core = _hs_bundle.get("judgment")
+            if _core is not None:
+                _judgment_fields["core"] = {
+                    "decision": _core.get("decision"),
+                    "expected_r": _core.get("expected_r"),
+                    "confidence": _core.get("confidence"),
+                    "authority": _core.get("authority"),
+                    "governing": bool(
+                        _core.get("authority") == "governing"),
+                    "reason": _core.get("reason"),
+                }
+            elif _hs_bundle.get("evaluation_error"):
+                _judgment_fields["core_error"] = \
+                    _hs_bundle["evaluation_error"]
+        if _hs_refusal is not None:
+            # Reachable ONLY under the explicit per-route
+            # promotion to governing (a shadow-declared route's
+            # seam never refuses): the core abstained at the
+            # decision point, so this attempt is refused under
+            # judgment.abstain — the candidate's claim resolves
+            # back to touched like every transient refusal, and
+            # the setup's lifecycle is otherwise untouched.
+            self.journal.log_note(
+                f"mt5: hot_scalp promotion judgment-refused {sid}: "
+                f"{_hs_refusal}")
+            _judgment_fields["core_refusal"] = _hs_refusal
+            _chain("judgment", "refused",
+                   {**_judgment_fields,
+                    "reason_code": "judgment.abstain"})
+            _resolve(False)
+            _emit_hs(result="refused",
+                     order_result="not_attempted",
+                     reason_code="judgment.abstain",
+                     reason=_hs_refusal, eligible=True)
+            return False
         try:
             from .judgment_thesis import assess_market
 
@@ -9545,6 +10128,14 @@ class MT5Runner:
                     else None),
                 "friction_limit": 0.10})
             _resolve(False)
+            _emit_hs(result="refused",
+                     order_result="not_attempted",
+                     reason_code="execution.order_path_refused",
+                     reason="the shared order path refused the "
+                            "promotion (gated and journalled "
+                            "there — the refusal note carries "
+                            "the exact gate)",
+                     eligible=True)
             return False
         try:
             broker_after = [p for p in self.executor.positions()
@@ -9556,6 +10147,12 @@ class MT5Runner:
                 f"confirmation lookup failed ({exc}) — claim left claimed")
             _chain("execution", "fill_unconfirmed",
                    {"reason_code": "execution.broker_lookup_failed"})
+            _emit_hs(result="accepted",
+                     order_result="fill_unconfirmed",
+                     reason_code="execution.broker_lookup_failed",
+                     reason="fill recorded but broker confirmation "
+                            "lookup failed — claim left claimed",
+                     eligible=True)
             return False
         if not broker_after:
             self.journal.log_note(
@@ -9563,10 +10160,23 @@ class MT5Runner:
                 f"shows no new magic position — claim left claimed")
             _chain("execution", "fill_unconfirmed",
                    {"reason_code": "execution.broker_no_position"})
+            _emit_hs(result="accepted",
+                     order_result="fill_unconfirmed",
+                     reason_code="execution.broker_no_position",
+                     reason="fill recorded but broker shows no "
+                            "new magic position — claim left "
+                            "claimed",
+                     eligible=True)
             return False
         _resolve(True)
         _chain("execution", "filled",
                {"tickets": sorted(str(t) for t in tracked_new)})
+        _emit_hs(result="accepted", order_result="filled",
+                 reason_code=None,
+                 reason="promoted: order placed by the shared "
+                        "order path and reconciled at the broker "
+                        "(claim resolved)",
+                 eligible=True)
         self.journal.log_note(
             f"mt5: hot_scalp promoted {sid}: order reconciled at "
             f"broker (claim resolved)")
