@@ -390,6 +390,13 @@ class MT5RunnerConfig:
     # Children of a live thesis and independent flow are
     # untouched; S1 judgment stays shadow-only either way.
     judgment_thesis_active_enabled: bool = True
+    # THESIS PERSISTENCE (WS4 episode-replay residual #1,
+    # 2026-11-04): keeper state is snapshotted beside the
+    # journal on every mutation and restored at the first
+    # thesis-layer touch of a new run — a thesis invalidated
+    # before a restart must never wake up active after one.
+    # None = <journal parent>/judgment_thesis_state.json.
+    judgment_thesis_state_path: Path | None = None
     deterministic_dir: Path | None = None  # default: <journal parent>/deterministic
     risk_state_path: Path = DATA_DIR / "mt5_risk_state.json"
     kill_switch_path: Path = DATA_DIR / "mt5_KILL"
@@ -1885,6 +1892,78 @@ class MT5Runner:
                     f"{playbook}: {type(exc).__name__}: {exc}")
         return record
 
+    def _ensure_thesis_keeper(self):
+        """The one keeper for this run, built at the first touch
+        of the thesis layer (a judgment cycle, the order-boundary
+        gate, a scan adoption) so runner construction order is
+        untouched.
+
+        PERSISTENCE (WS4 episode-replay residual #1): when a
+        state file exists beside the journal, the keeper is
+        RESTORED from it before any use and the restoration is
+        journaled (``thesis_state_restored`` — what was
+        restored, per-thesis status) — an invalidated thesis
+        therefore never wakes up active after a restart, and
+        the order boundary recognises orphans from the moment
+        the new run first trades.  A state file that cannot be
+        trusted REFUSES the layer for this run: the gap is
+        journaled (``thesis_state_unreadable``) and noted, and
+        every caller treats None as abstain — the desk's own
+        layers are unaffected, and no thesis state is ever
+        guessed from an empty keeper while a state file
+        exists."""
+        keeper = getattr(self, "_thesis_keeper", None)
+        if keeper is not None:
+            return keeper
+        if getattr(self, "_thesis_state_refused", False):
+            return None
+        if not getattr(self.cfg, "judgment_thesis_enabled", True):
+            return None
+        import time as _time
+        from pathlib import Path
+
+        from .judgment_thesis import (ThesisConfig, ThesisKeeper,
+                                      ThesisStateError,
+                                      ThesisStateStore)
+
+        keeper = ThesisKeeper(ThesisConfig(
+            ttl_hours=float(getattr(
+                self.cfg, "judgment_thesis_ttl_hours", 24.0)),
+            min_margin=float(getattr(
+                self.cfg, "judgment_thesis_min_margin", 0.08)),
+            weaken_drop=float(getattr(
+                self.cfg, "judgment_thesis_weaken_drop", 0.10))))
+        state_path = getattr(
+            self.cfg, "judgment_thesis_state_path", None) or (
+            Path(self.cfg.journal_path).parent
+            / "judgment_thesis_state.json")
+        store = ThesisStateStore(state_path)
+        try:
+            restored = None
+            if store.exists():
+                restored = keeper.restore(store.load())
+            keeper.store = store
+            self._thesis_keeper = keeper
+            self._thesis_flow: list = []
+            if restored is not None:
+                now = _time.time()
+                self._journal_thesis_events(
+                    [{"event": "thesis_state_restored",
+                      "ts": now, **restored}], now)
+        except ThesisStateError as exc:
+            self._thesis_state_refused = True
+            now = _time.time()
+            self._journal_thesis_events(
+                [{"event": "thesis_state_unreadable",
+                  "ts": now, "error": str(exc),
+                  "state_path": str(state_path)}], now)
+            self.journal.log_note(
+                f"mt5: judgment thesis state refused ({exc}) "
+                "— thesis layer disabled this run; no thesis "
+                "state will be guessed")
+            return None
+        return keeper
+
     def _judgment_thesis_cycle(self, *, candidate, decision,
                                playbook, ts) -> None:
         """One S2 cycle: tally the desk's candidate flow, price the
@@ -1895,19 +1974,13 @@ class MT5Runner:
         order authority."""
         import time as _time
 
-        keeper = getattr(self, "_thesis_keeper", None)
+        keeper = self._ensure_thesis_keeper()
         if keeper is None:
-            from .judgment_thesis import ThesisConfig, ThesisKeeper
-
-            keeper = ThesisKeeper(ThesisConfig(
-                ttl_hours=float(getattr(
-                    self.cfg, "judgment_thesis_ttl_hours", 24.0)),
-                min_margin=float(getattr(
-                    self.cfg, "judgment_thesis_min_margin", 0.08)),
-                weaken_drop=float(getattr(
-                    self.cfg, "judgment_thesis_weaken_drop", 0.10))))
-            self._thesis_keeper = keeper
-            self._thesis_flow: list = []
+            return
+        # The flow tally is created WITH the keeper by
+        # _ensure_thesis_keeper (as it was by the creation
+        # block before it) — direct access preserves the exact
+        # historical semantics for an externally seeded keeper.
         flow_rows = self._thesis_flow
         direction = int(candidate.get("direction") or 0)
         _av = decision.get("analytical_verdict") or {}
@@ -12966,7 +13039,7 @@ class MT5Runner:
         # explicitly: thesis state is never guessed.
         if not is_layer and getattr(
                 self.cfg, "judgment_thesis_active_enabled", True):
-            _keeper = getattr(self, "_thesis_keeper", None)
+            _keeper = self._ensure_thesis_keeper()
             if _keeper is not None:
                 try:
                     _gate = _keeper.gate_check(
@@ -15916,7 +15989,7 @@ class MT5Runner:
             _setup = None
             _thesis_link = None
             if _handoff:
-                _keeper = getattr(self, "_thesis_keeper", None)
+                _keeper = self._ensure_thesis_keeper()
                 if _keeper is not None and bool(getattr(
                         self.cfg, "judgment_thesis_enabled",
                         True)):

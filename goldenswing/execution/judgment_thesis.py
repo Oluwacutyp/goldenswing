@@ -60,11 +60,35 @@ SEPARATE fields, never blended.  Like S1, this is the
 deterministic baseline — stated priors and response constants,
 no fitted probabilities — that a later learned rung must beat
 on chronological walk-forward.
+
+PERSISTENCE (WS4 episode-replay residual #1, 2026-11-04): the
+replay of the Nov 3–4 episode proved the keeper's state did
+not survive engine restarts — journaled assessments stop at
+16:00Z on Nov 3, Nov 4 runs journaled none, and the successor
+thesis was still "active" at the 06:00Z scan only because each
+restarted run re-created its own keeper from nothing.  A
+thesis invalidated before a restart could equally wake up
+active after one.  The keeper now snapshots its FULL state
+(the live thesis with its version/state/children, the closed
+history, the orphan set the order boundary recognises, the id
+sequence) to an atomic JSON store beside the journal — the
+SetupLifecycleStore pattern: tmp + fsync + rename, written on
+EVERY mutation, never flushed at shutdown — and the runner
+restores it at the first thesis-layer touch of a new run,
+journaling the restoration.  A state file that cannot be
+trusted refuses the thesis layer loudly (named event + note);
+no keeper is ever started from a guessed-empty state while a
+state file exists.
 """
 from __future__ import annotations
 
+import copy
+import json
 import math
+import os
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 SCENARIOS = ("bullish", "bearish", "range", "reversal",
              "continuation")
@@ -100,6 +124,109 @@ ORPHAN_WINDOW_SECONDS = 3600.0
 #: Child matching at the boundary uses the same at-level
 #: tolerance as the Step-15 thesis-twin duplicate guard.
 CHILD_MATCH_ATR_FRACTION = 0.25
+
+#: Durable keeper state (WS4 residual #1): envelope identity
+#: for the snapshot file.  A file that is not exactly this
+#: kind/version is not keeper state and is never guessed at.
+STATE_KIND = "judgment_thesis_state"
+STATE_VERSION = 1
+
+#: Keys a state snapshot must carry (the saved_ts stamp is
+#: added by the store at write time and read opportunistically).
+STATE_KEYS = ("seq", "active", "history", "last_emit",
+              "range_challenges", "last_orphans",
+              "orphan_close", "pending_supersedes")
+
+#: The terminal statuses a closed thesis may carry in history.
+CLOSED_THESIS_STATUSES = ("invalidated", "expired",
+                          "superseded")
+
+
+class ThesisStateError(RuntimeError):
+    """Keeper state cannot be safely read, written or trusted.
+
+    Raised with the SPECIFIC gap named (torn JSON, a missing
+    field, an impossible status) — the runner journals it and
+    disables the thesis layer for the run rather than starting
+    from a guessed-empty keeper."""
+
+
+class ThesisStateStore:
+    """Durable keeper state: one atomic JSON snapshot beside
+    the journal — the SetupLifecycleStore pattern (tmp write +
+    fsync + rename, so a crash mid-write never leaves a torn
+    file as the state of record).  The keeper writes on every
+    mutation; this class owns only the file and its envelope.
+    Semantic validation of the thesis records themselves lives
+    on the keeper (``ThesisKeeper._validate_state``)."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+
+    def exists(self) -> bool:
+        return self.path.exists()
+
+    def save(self, state: dict) -> None:
+        payload = dict(state)
+        payload["saved_ts"] = time.time()
+        try:
+            text = json.dumps(payload, default=str)
+        except (TypeError, ValueError) as exc:
+            raise ThesisStateError(
+                f"thesis state is not serializable: {exc}"
+            ) from exc
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(
+                self.path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+            try:  # the rename itself durable, where supported
+                dfd = os.open(str(self.path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
+        except OSError as exc:
+            raise ThesisStateError(
+                f"thesis state write failed: {exc}") from exc
+
+    def load(self) -> dict:
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ThesisStateError(
+                f"thesis state unreadable: {exc}") from exc
+        try:
+            state = json.loads(raw)
+        except ValueError as exc:
+            raise ThesisStateError(
+                f"thesis state is torn (invalid JSON: {exc})"
+            ) from exc
+        if not isinstance(state, dict):
+            raise ThesisStateError(
+                "thesis state is not a state object "
+                f"(got {type(state).__name__})")
+        if state.get("kind") != STATE_KIND:
+            raise ThesisStateError(
+                f"thesis state kind is {state.get('kind')!r}, "
+                f"expected {STATE_KIND!r}")
+        if state.get("version") != STATE_VERSION:
+            raise ThesisStateError(
+                f"thesis state version is "
+                f"{state.get('version')!r}, expected "
+                f"{STATE_VERSION}")
+        missing = [k for k in STATE_KEYS if k not in state]
+        if missing:
+            raise ThesisStateError(
+                "thesis state is missing keys: "
+                + ", ".join(missing))
+        return state
 
 
 @dataclass(frozen=True)
@@ -472,6 +599,164 @@ class ThesisKeeper:
     _last_orphans: list[dict] = field(default_factory=list)
     _orphan_close: dict = field(default_factory=dict)
     _pending_supersedes: str | None = None
+    #: Durable state store (WS4 residual #1): when attached,
+    #: every mutation snapshots the full keeper state as it
+    #: happens.  None = in-memory only (tests, the replay
+    #: harness — the pre-persistence behavior, unchanged).
+    store: ThesisStateStore | None = field(
+        default=None, repr=False, compare=False)
+
+    # -- persistence (WS4 residual #1) --------------------------
+
+    def snapshot(self) -> dict:
+        """The keeper's complete state as plain data: the id
+        sequence, the live thesis (version, weakened state,
+        children, revision chain, standing read), the closed
+        history, and the orphan set + close record the order
+        boundary recognises.  Everything gate_check, child_link
+        and status can answer is derivable from this alone."""
+        return {
+            "kind": STATE_KIND,
+            "version": STATE_VERSION,
+            "seq": self._seq,
+            "active": copy.deepcopy(self.active),
+            "history": copy.deepcopy(self.history),
+            "last_emit": self._last_emit,
+            "range_challenges": self._range_challenges,
+            "last_orphans": copy.deepcopy(self._last_orphans),
+            "orphan_close": copy.deepcopy(self._orphan_close),
+            "pending_supersedes": self._pending_supersedes,
+        }
+
+    @staticmethod
+    def _validate_state(state: dict) -> None:
+        """Refuse a snapshot that cannot reconstruct the keeper
+        EXACTLY.  Every check names its gap — a torn or partial
+        state is a loud ThesisStateError, never a silent fresh
+        keeper pretending there were no theses."""
+
+        def gap(msg: str) -> None:
+            raise ThesisStateError(f"thesis state invalid: {msg}")
+
+        seq = state.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) \
+                or seq < 0:
+            gap(f"'seq' is not a non-negative int (got {seq!r})")
+        active = state.get("active")
+        if active is not None:
+            if not isinstance(active, dict):
+                gap("'active' is not a thesis record")
+            for key in ("id", "created_ts", "updated_ts",
+                        "scenario", "direction", "status",
+                        "version", "state", "invalidation",
+                        "plan", "children", "revisions",
+                        "standing"):
+                if key not in active:
+                    gap(f"active thesis missing '{key}'")
+            if active.get("status") != "active":
+                gap(f"active thesis status is "
+                    f"{active.get('status')!r}, not 'active'")
+            if active.get("scenario") not in SCENARIOS:
+                gap(f"active thesis scenario is "
+                    f"{active.get('scenario')!r}")
+            if active.get("state") not in ("intact", "weakened"):
+                gap(f"active thesis state is "
+                    f"{active.get('state')!r}")
+            version = active.get("version")
+            if not isinstance(version, int) or version < 1:
+                gap(f"active thesis version is {version!r}")
+            if not isinstance(active.get("children"), list):
+                gap("active thesis 'children' is not a list")
+            for i, child in enumerate(
+                    active.get("children") or []):
+                if not isinstance(child, dict) \
+                        or child.get("thesis_id") \
+                        != active.get("id"):
+                    gap(f"active thesis child #{i} does not "
+                        f"carry its parent link")
+            if not isinstance(active.get("revisions"), list):
+                gap("active thesis 'revisions' is not a list")
+        history = state.get("history")
+        if not isinstance(history, list):
+            gap("'history' is not a list")
+        for i, thesis in enumerate(history or []):
+            if not isinstance(thesis, dict) \
+                    or not thesis.get("id"):
+                gap(f"history thesis #{i} has no id")
+            if thesis.get("status") not in \
+                    CLOSED_THESIS_STATUSES:
+                gap(f"history thesis #{i} status is "
+                    f"{thesis.get('status')!r}, not a closed "
+                    f"status")
+        if not isinstance(state.get("last_emit"), (int, float)):
+            gap("'last_emit' is not a timestamp")
+        challenges = state.get("range_challenges")
+        if not isinstance(challenges, int) or challenges < 0:
+            gap(f"'range_challenges' is {challenges!r}")
+        orphans = state.get("last_orphans")
+        if not isinstance(orphans, list) \
+                or any(not isinstance(o, dict) for o in orphans):
+            gap("'last_orphans' is not a list of records")
+        close = state.get("orphan_close")
+        if not isinstance(close, dict):
+            gap("'orphan_close' is not a record")
+        if orphans and not close.get("thesis_id"):
+            gap("orphaned children are recorded without their "
+                "close record (orphan_close.thesis_id)")
+        pending = state.get("pending_supersedes")
+        if pending is not None and not isinstance(pending, str):
+            gap(f"'pending_supersedes' is {pending!r}")
+
+    def restore(self, state: dict) -> dict:
+        """Rebuild this keeper from a validated snapshot and
+        return the restoration summary the runner journals
+        (what was restored, per-thesis status).  An invalidated
+        thesis restores as HISTORY — it can never come back as
+        the active thesis — and the orphan set restores with
+        it, so the order boundary keeps cutting its children
+        inside the window."""
+        self._validate_state(state)
+        self._seq = int(state["seq"])
+        self.active = copy.deepcopy(state["active"])
+        self.history = copy.deepcopy(state["history"])
+        self._last_emit = float(state["last_emit"])
+        self._range_challenges = int(state["range_challenges"])
+        self._last_orphans = copy.deepcopy(state["last_orphans"])
+        self._orphan_close = copy.deepcopy(state["orphan_close"])
+        self._pending_supersedes = state["pending_supersedes"]
+        active = self.active
+        theses = [{"id": t.get("id"), "status": t.get("status")}
+                  for t in self.history]
+        if active is not None:
+            theses.append({"id": active.get("id"),
+                           "status": "active"})
+        return {
+            "seq": self._seq,
+            "active_thesis": (
+                {"id": active.get("id"),
+                 "scenario": active.get("scenario"),
+                 "direction": active.get("direction"),
+                 "state": active.get("state"),
+                 "version": active.get("version"),
+                 "children": len(active.get("children") or [])}
+                if active is not None else None),
+            "closed_total": len(self.history),
+            "theses": theses,
+            "orphan_thesis_id":
+                self._orphan_close.get("thesis_id"),
+            "orphan_close_status":
+                self._orphan_close.get("status"),
+            "orphans_recognized": len(self._last_orphans),
+            "state_saved_ts": state.get("saved_ts"),
+        }
+
+    def _persist(self) -> None:
+        """Write the state as it happens (never a shutdown
+        flush): a crash between two mutations loses at most
+        the mutation in flight, and the journal holds that
+        mutation's events regardless."""
+        if self.store is not None:
+            self.store.save(self.snapshot())
 
     def _new_thesis(self, assessment: dict, ts: float,
                     candidate: dict | None,
@@ -660,6 +945,7 @@ class ThesisKeeper:
                                              ts)
         if child is None or not is_new or self.active is None:
             return None
+        self._persist()
         return {
             "event": "thesis_child_registered", "ts": ts,
             "thesis_id": self.active["id"],
@@ -862,6 +1148,21 @@ class ThesisKeeper:
                candidate: dict | None = None,
                playbook: str = "",
                price: float | None = None) -> list[dict]:
+        """One evaluation cycle (see _update_cycle); the full
+        keeper state is persisted after EVERY cycle when a
+        store is attached — created, weakened, invalidated and
+        maintained are all state changes, and a restart must
+        find the latest of them, not the last graceful exit."""
+        events = self._update_cycle(
+            assessment, ts=ts, candidate=candidate,
+            playbook=playbook, price=price)
+        self._persist()
+        return events
+
+    def _update_cycle(self, assessment: dict, *, ts: float,
+                      candidate: dict | None = None,
+                      playbook: str = "",
+                      price: float | None = None) -> list[dict]:
         cfg = self.config
         events: list[dict] = []
         winner = assessment.get("winner")
