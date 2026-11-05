@@ -1992,7 +1992,7 @@ class MT5Runner:
                     _feed_block = _bundle["forecast_evidence"]
                     _judgment = _bundle["judgment"]
                 if _judgment is not None:
-                    self.journal.append({
+                    _shadow_record = {
                         "type": "judgment_shadow",
                         "ts": str(_eval_now),
                         "run_id": self._run_id,
@@ -2007,7 +2007,16 @@ class MT5Runner:
                         # E3: what the forecast feed said at this
                         # evaluation, verbatim — weighed or not.
                         "forecast_evidence": _feed_block,
-                        "judgment": _judgment})
+                        "judgment": _judgment}
+                    # Completion-05: the self-audit's standing
+                    # per-route rates, cited on the record as
+                    # evidence.  Attached after the verdict —
+                    # evaluate_judgment never sees it.
+                    _audit_fb = self._audit_feedback_for(playbook)
+                    if _audit_fb is not None:
+                        _shadow_record["audit_feedback"] = \
+                            _audit_fb
+                    self.journal.append(_shadow_record)
                     _counts = getattr(
                         self, "_judgment_record_counts", None)
                     if _counts is not None:
@@ -2412,7 +2421,11 @@ class MT5Runner:
                           "r_degenerate_excluded": 0,
                           "dropped": 0},
               "reconciled_total": 0, "since_summary": 0,
-              "last_summary_bar": None}
+              "last_summary_bar": None,
+              # Completion-05: the unified self-audit's standing
+              # block (self_audit.new_state()) — same file, same
+              # quarantine, lazily merged by _self_audit_state().
+              "self_audit": None}
         path = self._audit_state_path()
         try:
             if path.exists():
@@ -2440,6 +2453,82 @@ class MT5Runner:
             tmp.replace(path)
         except Exception as exc:  # noqa: BLE001 - audit must not die
             _log.error("judgment audit state save failed: %s", exc)
+
+    # ---- Unified self-audit (completion-05) -------------------
+    # The five-category audit (missed opportunities, wrong
+    # judgments, weak setups, premature exits, execution
+    # failures) rides the S3 cycle below: same H1 cadence,
+    # same state file, same journal.  It reads the journal
+    # window since its standing byte watermark; the pure core
+    # is execution/self_audit.py.  Findings are journal
+    # records + standing state, rendered on /status and the
+    # manifest; they feed back ONLY as a journaled annotation
+    # on judgment records (evidence a reader can cite), never
+    # as a decision input, a parameter change or a demotion.
+    def _self_audit_state(self) -> dict:
+        from . import self_audit as _self_audit
+
+        st = self._audit_state()
+        sub = st.get("self_audit")
+        if not isinstance(sub, dict):
+            sub = _self_audit.new_state()
+            st["self_audit"] = sub
+        else:
+            for key, value in _self_audit.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _self_audit_phase(self, bar_key, h1) -> None:
+        """One completion-05 cycle over the journal window
+        since the watermark.  Called from inside the S3
+        cycle's guarded body, right before its state save;
+        a failure here is logged by that guard like any audit
+        failure and never reaches a decision path."""
+        from pathlib import Path
+
+        from . import self_audit as _self_audit
+
+        sub = self._self_audit_state()
+        from_offset = int(sub.get("journal_offset") or 0)
+        records, new_offset, damaged = _self_audit.read_window(
+            Path(self.cfg.journal_path), from_offset)
+        sub["journal_offset"] = new_offset
+        bars = []
+        try:
+            for ts, row in h1.iterrows():
+                bars.append({"ts": str(ts),
+                             "high": float(row["high"]),
+                             "low": float(row["low"])})
+        except Exception:  # noqa: BLE001 - no bars, exits read
+            bars = []          # unmeasurable, never estimated
+        record = _self_audit.audit_cycle(
+            state=sub, records=records, bars=bars,
+            now=pd.Timestamp(bar_key), damaged_lines=damaged,
+            window={"from_offset": from_offset,
+                    "to_offset": new_offset,
+                    "records": len(records)},
+            run_id=self._run_id, bar=bar_key)
+        if record is not None:
+            self.journal.append(record)
+
+    def _audit_feedback_for(self, playbook) -> dict | None:
+        """Completion-05 feedback, journal-only: the standing
+        per-route audit rates for this playbook, attached to
+        the judgment record AFTER its verdict is computed —
+        evidence the record can cite, never an input to
+        evaluate_judgment (the decision path is byte-identical
+        with the audit on or off; the parity is test-pinned)."""
+        try:
+            from . import self_audit as _self_audit
+
+            sub = self._self_audit_state()
+            fb = _self_audit.route_feedback(sub).get(playbook)
+            if not fb:
+                return None
+            return {"source": "self_audit",
+                    "cycles": int(sub.get("cycles") or 0), **fb}
+        except Exception:  # noqa: BLE001 - annotation is evidence
+            return None
 
     def _audit_mark_evaluated(self, ts) -> None:  # type: ignore[no-untyped-def]
         try:
@@ -3241,6 +3330,10 @@ class MT5Runner:
                             "unmeasured — validation queued in the "
                             "S4 chronological harness"),
                     }})
+            # Completion-05: the unified self-audit rides this
+            # cadence — same fresh-bar gate, same state file,
+            # persisted by the save below.
+            self._self_audit_phase(bar_key, h1)
             self._audit_save()
         except Exception as exc:  # noqa: BLE001 - audit never breaks
             _log.error("judgment audit cycle failed: %s", exc)
@@ -3882,6 +3975,35 @@ class MT5Runner:
             out["management"] = dict(_mgmt)
         return out
 
+    def _self_audit_manifest_block(self) -> dict:
+        """Completion-05: the unified self-audit's standing
+        state for the run manifest — cycles run, cycles
+        degraded by journal damage, per-category running
+        totals (found vs unmeasurable), the last cycle's bar,
+        and the per-route feedback rates.  Self-guarded like
+        _forecast_manifest_block: a gap reads as an empty
+        block, never a crash and never a fabricated zero
+        history (cycles stay 0 until a cycle has run)."""
+        block: dict = {"cycles": 0, "damaged_cycles": 0,
+                       "totals": {}, "routes": {},
+                       "last_cycle_bar": None}
+        try:
+            from . import self_audit as _self_audit
+
+            sub = self._self_audit_state()
+            block["cycles"] = int(sub.get("cycles") or 0)
+            block["damaged_cycles"] = int(
+                sub.get("damaged_cycles") or 0)
+            block["totals"] = {
+                c: dict(t) for c, t in
+                (sub.get("totals") or {}).items()}
+            block["routes"] = _self_audit.route_feedback(sub)
+            last = sub.get("last_cycle") or {}
+            block["last_cycle_bar"] = last.get("bar")
+        except Exception:  # noqa: BLE001 — manifest must not die
+            pass
+        return block
+
     def _forecast_manifest_block(self) -> dict:
         """Completion-04: the predictive system's standing state
         for the run manifest — retrain accrual for both
@@ -4073,7 +4195,12 @@ class MT5Runner:
                                 self._audit_state()[
                                     "reconciled_total"],
                             "pending": len(
-                                self._audit_state()["pending"])}}},
+                                self._audit_state()["pending"])},
+                        # Completion-05: the unified self-audit
+                        # (five categories, standing totals +
+                        # per-route feedback rates).
+                        "self_audit":
+                            self._self_audit_manifest_block()}},
                 # FORECAST LOOP (completion-04): the predictive
                 # system's standing state in the same manifest —
                 # retrain accrual for both lifecycles, per-horizon
@@ -5674,6 +5801,20 @@ class MT5Runner:
         except Exception:  # noqa: BLE001 — status must not die
             pass
         return lines
+
+    def self_audit_line(self) -> str:
+        """One /status Self-Audit block (completion-05): the
+        unified self-audit's standing findings in plain words —
+        per-category counts for the last cycle plus running
+        totals, with "could not be measured" always named as
+        such, never folded into a zero."""
+        try:
+            from . import self_audit as _self_audit
+
+            return "\n".join(_self_audit.render_lines(
+                self._self_audit_state()))
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"self-audit: unavailable ({exc})"
 
     def forecast_line(self) -> str:
         """One /status Forecast block from real runtime values (never

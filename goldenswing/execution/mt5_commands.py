@@ -529,6 +529,17 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("🔮", "Forecast"))
             lines.append(forecast())
             lines.append("")
+    # Unified self-audit (completion-05): the five-category
+    # audit's standing findings — missed opportunities, wrong
+    # judgments, weak setups, premature exits, execution
+    # failures — from the runner's self_audit_line.  Guarded —
+    # old runners lack it.
+    if ctrl is not None:
+        self_audit = getattr(ctrl, "self_audit_line", None)
+        if callable(self_audit):
+            lines.append(fmt_section("🩺", "Self-Audit"))
+            lines.append(self_audit())
+            lines.append("")
     if cfg is not None:
         lines.append(fmt_section("🔧", "Config"))
         lines.append(
