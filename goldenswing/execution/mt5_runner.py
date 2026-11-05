@@ -5120,6 +5120,21 @@ class MT5Runner:
                             "reason": reason,
                             "pnl_money": float(pnl_money),
                             "r_net": float(total_r)})
+                # COMPLETION-03: the parent thesis record tracks
+                # the close too — its remaining children and their
+                # aggregate exposure after this child leaves.
+                _parent = (getattr(self, "_hs_parents", {})
+                           or {}).get(_sid)
+                if _parent:
+                    self._hs_chain(
+                        chain_id=str(_parent), parent_id=None,
+                        stage="sleeve", status="position_closed",
+                        tick=None,
+                        fields={**self._hot_scalp_parent_view(
+                                    str(_parent),
+                                    exclude_ticket=int(ticket)),
+                                "closed_setup_id": _sid,
+                                "closed_ticket": int(ticket)})
         except Exception:  # noqa: BLE001 - outcome link is evidence
             pass
         self.journal.log_note(
@@ -9612,6 +9627,93 @@ class MT5Runner:
                        stage=stage, status=stage, tick=tick,
                        fields=fields)
 
+    # ------------------------------------------------- Hot Scalp sleeve
+    def _hot_scalp_sleeve_positions(self) -> list[dict]:
+        """Open positions born from the Hot Scalp sleeve, with
+        their chain identity: [{ticket, setup_id, parent_id, pos}].
+
+        Identity comes from the step-17 open-identity map
+        (alert_id -> setup_key "hot_scalp:<setup_id>") and the
+        chain parent map — the same sources the close path uses to
+        complete a candidate's chain.  A tracked position with no
+        sleeve identity (another playbook's trade, a restart
+        adoption) is NOT a sleeve position: it is invisible to the
+        sleeve's parent accounting, but the shared order path's
+        RiskGuards still see it (open risk + count) before any new
+        order is placed.  In-run only, like the identity map
+        itself."""
+        out: list[dict] = []
+        identity = getattr(self, "_open_identity", {}) or {}
+        parents = getattr(self, "_hs_parents", {}) or {}
+        try:
+            tickets = self.tick_manager.tickets()
+        except Exception:
+            return out
+        for ticket in tickets:
+            pos = self.tick_manager.position(ticket)
+            if pos is None:
+                continue
+            ident = identity.get(str(getattr(pos, "alert_id", "") or ""))
+            setup_key = str(ident[0]) if ident else ""
+            if not setup_key.startswith("hot_scalp:"):
+                continue
+            open_sid = setup_key.split(":", 1)[1]
+            out.append({
+                "ticket": int(ticket), "setup_id": open_sid,
+                "parent_id": str(parents.get(open_sid) or open_sid),
+                "pos": pos})
+        return out
+
+    def _hot_scalp_exposure_money(self, sleeve_entry: dict,
+                                  spec) -> float:
+        """One open sleeve position's current stop exposure, in
+        money: the position's RiskPool consumption when a pool
+        exists (the ledger that books true exposure and rolls with
+        every stop move), else the money distance from entry to
+        the position's active stop at its remaining volume."""
+        pool = (getattr(self, "_pools", {}) or {}).get(
+            int(sleeve_entry["ticket"]))
+        if pool is not None:
+            try:
+                return float(pool.consumption())
+            except Exception:
+                pass
+        pos = sleeve_entry["pos"]
+        try:
+            return float(spec.money_for_move(
+                abs(float(pos.entry_price) - float(pos.active_stop)),
+                float(pos.volume)))
+        except Exception:
+            return 0.0
+
+    def _hot_scalp_parent_view(self, parent_id: str,
+                               *, exclude_ticket: int | None = None
+                               ) -> dict:
+        """The parent thesis record's live sleeve view: its open
+        children (setup ids + tickets) and their aggregate stop
+        exposure.  Read off the same sleeve state the promotion
+        gate accounts against; the aggregate is None when the
+        symbol spec cannot be read (the view is evidence — it
+        never guesses a number)."""
+        children = [s for s in self._hot_scalp_sleeve_positions()
+                    if s["parent_id"] == str(parent_id)
+                    and s["ticket"] != exclude_ticket]
+        aggregate = None
+        if children:
+            try:
+                spec = self.executor.symbol_spec(self.cfg.symbol)
+                aggregate = float(sum(
+                    self._hot_scalp_exposure_money(s, spec)
+                    for s in children))
+            except Exception:
+                aggregate = None
+        return {
+            "parent_setup_id": str(parent_id),
+            "open_positions": len(children),
+            "child_setups": [s["setup_id"] for s in children],
+            "child_tickets": [s["ticket"] for s in children],
+            "aggregate_stop_exposure": aggregate}
+
     def _promote_hot_scalp_candidate(self, candidate: dict, tick: dict,
                                      stats: dict) -> bool:
         """Promote one shadow candidate to the SHARED order path (step 6).
@@ -9623,7 +9725,9 @@ class MT5Runner:
         claim's fate follows the refusal kind:
 
         - transient refusals (paused, spread widened, order-path
-          refusal with nothing placed) resolve the claim back to
+          refusal with nothing placed, sleeve-gate refusals: setup
+          already open, thesis invalidated, zone consumed,
+          aggregate budget) resolve the claim back to
           "touched" via an authoritative False — the setup stays
           live and may re-trigger;
         - disagreement/ambiguity (broker shows an untracked magic
@@ -9634,10 +9738,11 @@ class MT5Runner:
         - success resolves to "order_reconciled" only after the
           broker itself shows the new magic position.
 
-        v1 scope, stated honestly: flat-only (a candidate while
-        holding is refused — scalp layering needs the parent
-        identity mapping between hot-scalp setup IDs and live
-        alert IDs, which does not exist yet) and market-shape-only
+        Scope, stated honestly: multi-position since completion-03
+        (a candidate while holding is a STACK — gated on its own
+        setup identity, same-thesis revalidation read fresh from
+        the setup store, and the aggregate parent/sleeve risk
+        budget; flat-only v1 is superseded) and market-shape-only
         (a candidate whose promotion tick would select a pending
         order is refused — pending-fill claim resolution is not
         built yet, and a pending that later fills must never leave
@@ -9825,23 +9930,313 @@ class MT5Runner:
                      reason_code="promotion.runner_paused",
                      reason="runner paused", eligible=False)
             return False
-        # Flat-only v1: a candidate while holding is not a layer
-        # yet — the parent-identity mapping does not exist.
-        if self.tick_manager.tickets():
-            self.journal.log_note(
-                f"mt5: hot_scalp promotion refused {sid}: holding — "
-                f"scalp layering not yet promoted (flat-only v1)")
-            _chain("promotion", "refused",
-                   {"reason_code": "promotion.flat_only_holding"})
-            _resolve(False)
-            _emit_hs(result="refused", order_result="not_attempted",
-                     reason_code="promotion.flat_only_holding",
-                     reason="holding — scalp layering not yet "
-                            "promoted (flat-only v1)",
-                     eligible=False)
-            return False
-        # V2 pre-submit broker check: the broker must agree we are
-        # flat before any new risk is submitted.
+        # COMPLETION-03 (owner program 2026-11-05): the sleeve is
+        # multi-position — flat-only v1 is GONE as a blanket rule.
+        # This gate runs only when a sleeve position is already
+        # open (a first position takes the path exactly as before)
+        # and decides whether the triggered candidate may STACK:
+        #   - the same setup never opens twice (its own identity,
+        #     not a re-fire);
+        #   - a stack on the SAME parent thesis revalidates at
+        #     promotion time, read fresh from the setup store —
+        #     thesis not invalidated, zone not consumed — while
+        #     the chain's judgment stage below re-runs for THIS
+        #     setup, never inheriting the open position's read;
+        #   - aggregate stop exposure (per parent thesis, and
+        #     across the sleeve) plus the candidate's estimated
+        #     exposure must fit the envelope the RiskPool ledger
+        #     budgets one position with — equity x risk_pct x
+        #     layer_max_total_risk_mult; the sleeve scope scales
+        #     it by the guards' position cap.  The shared order
+        #     path's RiskGuards re-check the whole book with the
+        #     real sized lots downstream: this gate accounts, it
+        #     does not replace them.
+        _sleeve = self._hot_scalp_sleeve_positions()
+        if _sleeve:
+            _cand_parent = str(parent_id or sid)
+            _same_setup = [s for s in _sleeve
+                           if s["setup_id"] == sid]
+            if _same_setup:
+                self.journal.log_note(
+                    f"mt5: hot_scalp promotion refused {sid}: this "
+                    f"setup already holds position ticket "
+                    f"{_same_setup[0]['ticket']} — a setup never "
+                    f"opens twice")
+                _chain("promotion", "refused",
+                       {"reason_code": "promotion.setup_already_open",
+                        "ticket": _same_setup[0]["ticket"]})
+                _resolve(False)
+                _emit_hs(result="refused",
+                         order_result="not_attempted",
+                         reason_code="promotion.setup_already_open",
+                         reason="this setup already holds a position "
+                                f"(ticket {_same_setup[0]['ticket']})"
+                                " — a setup never opens twice",
+                         eligible=False)
+                return False
+            _same_thesis = [s for s in _sleeve
+                            if s["parent_id"] == _cand_parent]
+            _cand_row = None
+            if _same_thesis:
+                try:
+                    _cand_row = engine.store.get(sid)
+                except Exception as exc:
+                    self.journal.log_note(
+                        f"mt5: hot_scalp promotion withheld {sid}: "
+                        f"same-thesis revalidation could not read "
+                        f"the setup store ({exc}) — claim left "
+                        f"claimed")
+                    _chain("promotion", "withheld",
+                           {"reason_code":
+                            "promotion.sleeve_state_unavailable"})
+                    _emit_hs(result="refused",
+                             order_result="not_attempted",
+                             reason_code=
+                             "promotion.sleeve_state_unavailable",
+                             reason="same-thesis revalidation could "
+                                    f"not read the setup store "
+                                    f"({exc}) — claim left claimed",
+                             eligible=False)
+                    return False
+                _row_status = str((_cand_row or {}).get("status")
+                                  or "")
+                if _row_status == "invalidated":
+                    self.journal.log_note(
+                        f"mt5: hot_scalp promotion refused {sid}: "
+                        f"the setup was invalidated after its "
+                        f"trigger — parent thesis {_cand_parent} "
+                        f"no longer stands (same-thesis "
+                        f"revalidation)")
+                    _chain("promotion", "refused",
+                           {"reason_code":
+                            "promotion.thesis_invalidated",
+                            "parent_setup_id": _cand_parent,
+                            "terminal_reason":
+                            (_cand_row or {}).get("terminal_reason")})
+                    _resolve(False)
+                    _emit_hs(result="refused",
+                             order_result="not_attempted",
+                             reason_code="promotion.thesis_invalidated",
+                             reason="the setup was invalidated after "
+                                    "its trigger — a stale trigger "
+                                    "does not ride a dead thesis "
+                                    "read (same-thesis revalidation)",
+                             eligible=False)
+                    return False
+                # Live-at-promotion statuses are 'claimed' (direct
+                # claim) and 'shadow_triggered' (the engine finished
+                # its shadow bookkeeping before this promotion ran);
+                # only the genuinely dead states refuse here.
+                if _row_status in ("expired", "blocked"):
+                    self.journal.log_note(
+                        f"mt5: hot_scalp promotion refused {sid}: "
+                        f"the setup is no longer live (store status "
+                        f"{_row_status}) — same-thesis revalidation")
+                    _chain("promotion", "refused",
+                           {"reason_code":
+                            "promotion.setup_no_longer_live",
+                            "store_status": _row_status})
+                    _resolve(False)
+                    _emit_hs(result="refused",
+                             order_result="not_attempted",
+                             reason_code=
+                             "promotion.setup_no_longer_live",
+                             reason=f"the setup is no longer live "
+                                    f"(store status {_row_status}) "
+                                    f"— same-thesis revalidation",
+                             eligible=False)
+                    return False
+                # Zone consumption: a same-thesis position already
+                # born from this exact zone has spent it — a second
+                # position on identical ground is the same trade,
+                # not an independent stack.
+                _cand_zone = None
+                _row_payload = (_cand_row or {}).get("payload") or {}
+                try:
+                    _zlo = float(_row_payload.get("zone_low"))
+                    _zhi = float(_row_payload.get("zone_high"))
+                    if _zhi > _zlo > 0:
+                        _cand_zone = (_zlo, _zhi)
+                except (TypeError, ValueError):
+                    _cand_zone = None
+                if _cand_zone is not None:
+                    _zone_holder = None
+                    for _s in _same_thesis:
+                        _oz = self.tick_manager.entry_zone(
+                            _s["ticket"])
+                        if _oz is not None and \
+                                abs(_oz[0] - _cand_zone[0]) <= 0.005 \
+                                and abs(_oz[1] - _cand_zone[1]) \
+                                <= 0.005:
+                            _zone_holder = _s
+                            break
+                    if _zone_holder is not None:
+                        self.journal.log_note(
+                            f"mt5: hot_scalp promotion refused "
+                            f"{sid}: entry zone "
+                            f"{_cand_zone[0]:.2f}–{_cand_zone[1]:.2f} "
+                            f"already carries same-thesis position "
+                            f"ticket {_zone_holder['ticket']} — "
+                            f"zone consumed")
+                        _chain("promotion", "refused",
+                               {"reason_code":
+                                "promotion.zone_already_consumed",
+                                "parent_setup_id": _cand_parent,
+                                "ticket": _zone_holder["ticket"],
+                                "zone": list(_cand_zone)})
+                        _resolve(False)
+                        _emit_hs(result="refused",
+                                 order_result="not_attempted",
+                                 reason_code=
+                                 "promotion.zone_already_consumed",
+                                 reason="the entry zone already "
+                                        "carries a same-thesis "
+                                        "position (ticket "
+                                        f"{_zone_holder['ticket']}) "
+                                        f"— zone consumed",
+                                 eligible=False)
+                        return False
+            # Aggregate budget — any stack, same thesis or not.
+            # The candidate's estimated stop exposure uses the
+            # order path's own sizing idiom at the authorized risk
+            # (planned broker stop; size_for_risk applies the
+            # min-lot floor, so the estimate carries the same
+            # widening the fill journal reports).
+            try:
+                _spec = self.executor.symbol_spec(self.cfg.symbol)
+                _acct = self.feed.account_state()
+                _equity = float(_acct.get("equity", 0.0) or 0.0)
+                _g_dir = 1 if int(candidate.get("direction", 0)) > 0 \
+                    else -1
+                _g_entry = float(candidate.get("entry_reference")
+                                 or 0.0)
+                _g_stop = float(candidate.get("structural_stop")
+                                or 0.0)
+                _g_atr = 0.0
+                if _cand_row is None:
+                    # Different-thesis stack: no revalidation read
+                    # was owed, but the estimate wants the payload's
+                    # ATR for the buffered stop.  Best-effort only —
+                    # a failed read leaves the unbuffered (smaller
+                    # distance) estimate, never a withheld claim.
+                    try:
+                        _cand_row = engine.store.get(sid)
+                    except Exception:
+                        _cand_row = None
+                if _cand_row is not None:
+                    try:
+                        _g_atr = float(((_cand_row.get("payload")
+                                          or {}).get("atr_m5"))
+                                       or 0.0)
+                    except (TypeError, ValueError):
+                        _g_atr = 0.0
+                _est = None
+                if _equity > 0 and _g_entry > 0 and _g_stop > 0:
+                    _stop0 = TickManager.planned_stop(OrderRequest(
+                        symbol=self.cfg.symbol, direction=_g_dir,
+                        volume=0.0, stop_loss=_g_stop, atr=_g_atr))
+                    _sized = size_for_risk(
+                        _equity * float(self.cfg.risk_pct),
+                        abs(_g_entry - _stop0), _spec)
+                    if _sized.ok:
+                        _est = float(_sized.estimated_stop_exposure)
+                if _est is not None:
+                    _open_exp = {
+                        s["ticket"]:
+                        self._hot_scalp_exposure_money(s, _spec)
+                        for s in _sleeve}
+                    _sleeve_open = float(sum(_open_exp.values()))
+                    _parent_open = float(sum(
+                        _open_exp[s["ticket"]] for s in _same_thesis))
+                    _envelope = _equity * float(self.cfg.risk_pct) \
+                        * float(self.cfg.layer_max_total_risk_mult)
+                    _sleeve_cap = _envelope * float(
+                        self.guards.cfg.max_positions)
+                    if _same_thesis and \
+                            _parent_open + _est > _envelope + 1e-9:
+                        self.journal.log_note(
+                            f"mt5: hot_scalp promotion refused "
+                            f"{sid}: parent thesis {_cand_parent} "
+                            f"risk budget — aggregate stop exposure "
+                            f"{_parent_open + _est:.2f} (open "
+                            f"{_parent_open:.2f} + candidate est. "
+                            f"{_est:.2f}) exceeds the authorized "
+                            f"envelope {_envelope:.2f}")
+                        _chain("promotion", "refused",
+                               {"reason_code":
+                                "promotion.parent_risk_budget",
+                                "parent_setup_id": _cand_parent,
+                                "authorized_envelope": _envelope,
+                                "open_exposure": _parent_open,
+                                "candidate_estimated_exposure": _est,
+                                "aggregate_exposure":
+                                _parent_open + _est})
+                        _resolve(False)
+                        _emit_hs(result="refused",
+                                 order_result="not_attempted",
+                                 reason_code=
+                                 "promotion.parent_risk_budget",
+                                 reason="parent thesis aggregate "
+                                        f"exposure "
+                                        f"{_parent_open + _est:.2f} "
+                                        f"(open {_parent_open:.2f} + "
+                                        f"candidate est. {_est:.2f}) "
+                                        f"exceeds the authorized "
+                                        f"envelope {_envelope:.2f}",
+                                 eligible=False)
+                        return False
+                    if _sleeve_open + _est > _sleeve_cap + 1e-9:
+                        self.journal.log_note(
+                            f"mt5: hot_scalp promotion refused "
+                            f"{sid}: sleeve risk budget — aggregate "
+                            f"stop exposure {_sleeve_open + _est:.2f} "
+                            f"(open {_sleeve_open:.2f} + candidate "
+                            f"est. {_est:.2f}) exceeds the sleeve "
+                            f"envelope {_sleeve_cap:.2f}")
+                        _chain("promotion", "refused",
+                               {"reason_code":
+                                "promotion.sleeve_risk_budget",
+                                "authorized_envelope": _sleeve_cap,
+                                "open_exposure": _sleeve_open,
+                                "candidate_estimated_exposure": _est,
+                                "aggregate_exposure":
+                                _sleeve_open + _est})
+                        _resolve(False)
+                        _emit_hs(result="refused",
+                                 order_result="not_attempted",
+                                 reason_code=
+                                 "promotion.sleeve_risk_budget",
+                                 reason="sleeve aggregate exposure "
+                                        f"{_sleeve_open + _est:.2f} "
+                                        f"(open {_sleeve_open:.2f} + "
+                                        f"candidate est. {_est:.2f}) "
+                                        f"exceeds the sleeve envelope "
+                                        f"{_sleeve_cap:.2f}",
+                                 eligible=False)
+                        return False
+            except Exception as exc:
+                self.journal.log_note(
+                    f"mt5: hot_scalp promotion withheld {sid}: "
+                    f"sleeve aggregate accounting failed ({exc}) — "
+                    f"claim left claimed")
+                _chain("promotion", "withheld",
+                       {"reason_code":
+                        "promotion.sleeve_accounting_failed"})
+                _emit_hs(result="refused",
+                         order_result="not_attempted",
+                         reason_code=
+                         "promotion.sleeve_accounting_failed",
+                         reason=f"sleeve aggregate accounting "
+                                f"failed ({exc}) — claim left claimed",
+                         eligible=False)
+                return False
+        # V2 pre-submit broker check: every magic position the
+        # broker shows must be one the tick manager tracks (ours,
+        # this sleeve's stacks included).  A magic position nobody
+        # tracks is a disagreement — fail closed, claim left
+        # claimed.  (Completion-03: tracked holdings no longer
+        # refuse per se; the flat-only reading of this check is
+        # superseded by the sleeve gate above.)
         try:
             broker_before = [p for p in self.executor.positions()
                              if int(getattr(p, "magic", -1))
@@ -9858,7 +10253,11 @@ class MT5Runner:
                             "claim left claimed",
                      eligible=False)
             return False
-        if broker_before:
+        _tracked_now = set(self.tick_manager.tickets())
+        _untracked = [p for p in broker_before
+                      if int(getattr(p, "ticket", -1))
+                      not in _tracked_now]
+        if _untracked:
             self.journal.log_note(
                 f"mt5: hot_scalp promotion refused {sid}: broker "
                 f"shows an untracked magic position — claim left claimed")
@@ -9907,12 +10306,22 @@ class MT5Runner:
         mid = float(tick.get("mid") or entry_ref)
         setup_row = None
         try:
-            for row in engine.store.active():
-                if str(row.get("setup_id")) == sid:
-                    setup_row = row
-                    break
+            # The candidate's own row, any status: at promotion
+            # time it is 'claimed' or 'shadow_triggered', neither
+            # of which active() returns — reading only active()
+            # silently dropped the payload (atr, zone, context)
+            # the rest of this path is built on.
+            setup_row = engine.store.get(sid)
         except Exception:
             setup_row = None
+        if setup_row is None:
+            try:
+                for row in engine.store.active():
+                    if str(row.get("setup_id")) == sid:
+                        setup_row = row
+                        break
+            except Exception:
+                setup_row = None
         setup = (setup_row or {}).get("payload") or {}
         atr_m5 = 0.0
         try:
@@ -9986,7 +10395,7 @@ class MT5Runner:
         # a refusal, the verdict journals as this attempt's
         # funnel record below (shadow history, scored like every
         # other route's), and this path's own gate stack (live
-        # authority, claim, flat-only, order shape, then the
+        # authority, claim, sleeve gate, order shape, then the
         # shared order path's safeguards) still decides.  ONLY
         # an explicit per-route promotion (config
         # judgment_route_modes naming this route "governing")
@@ -10154,7 +10563,9 @@ class MT5Runner:
                             "lookup failed — claim left claimed",
                      eligible=True)
             return False
-        if not broker_after:
+        _after_tickets = {int(getattr(p, "ticket", -1))
+                          for p in broker_after}
+        if not {int(t) for t in tracked_new} <= _after_tickets:
             self.journal.log_note(
                 f"mt5: hot_scalp fill recorded {sid} but broker "
                 f"shows no new magic position — claim left claimed")
@@ -10180,6 +10591,22 @@ class MT5Runner:
         self.journal.log_note(
             f"mt5: hot_scalp promoted {sid}: order reconciled at "
             f"broker (claim resolved)")
+        # COMPLETION-03: the parent thesis record on the chain
+        # ledger gains its sleeve view — its open children and
+        # their aggregate exposure — at every open, so the parent
+        # thread shows the sleeve's state, not just each child's
+        # own thread.  Evidence only, like every chain write.
+        try:
+            self._hs_chain(
+                chain_id=str(parent_id or sid), parent_id=None,
+                stage="sleeve", status="position_opened", tick=tick,
+                fields={**self._hot_scalp_parent_view(
+                            str(parent_id or sid)),
+                        "opened_setup_id": sid,
+                        "opened_tickets": sorted(
+                            int(t) for t in tracked_new)})
+        except Exception:
+            pass  # evidence only — never a claim-fate input
         return True
 
     def _evaluate_live_tick(self, tick: dict, stats: dict) -> None:

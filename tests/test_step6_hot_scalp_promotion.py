@@ -11,8 +11,8 @@ Claim fates (the V2 contract):
 - success -> "order_reconciled", and only after the broker
   itself shows the new magic position;
 - transient refusals (paused, spread widened, order-path refusal
-  with nothing placed, holding in flat-only v1) -> back to
-  "touched", re-triggerable;
+  with nothing placed, sleeve-gate refusals since completion-03)
+  -> back to "touched", re-triggerable;
 - disagreement/ambiguity (broker shows an untracked magic
   position, broker lookup failed, fill without broker
   confirmation) -> claim LEFT claimed, fail closed.
@@ -212,10 +212,16 @@ def test_broker_lookup_failure_leaves_claim(tmp_path):
     assert _status(runner) == "claimed"
 
 
-def test_holding_refuses_flat_only_and_releases(tmp_path):
+def test_holding_foreign_position_no_longer_refuses(tmp_path):
+    # SUPERSEDED CONTRACT (completion-03, owner program
+    # 2026-11-05): this pin used to assert flat-only v1 — a
+    # tracked position from another sleeve blanket-refused every
+    # promotion (promotion.flat_only_holding).  The sleeve is
+    # multi-position now: a FOREIGN position is not a sleeve
+    # position, so the sleeve gate does not fire; the shared
+    # order path's RiskGuards (count + open risk) remain the
+    # whole-book check, and the promotion proceeds inside them.
     runner = _runner(tmp_path, live=True)
-    # Tracked position from another sleeve: promotion must not
-    # stack onto it (flat-only v1).
     from goldenswing.execution.executor import OrderRequest
     req = OrderRequest(symbol="XAUUSD", direction=1, volume=1.0,
                        stop_loss=1990.0, entry_ref=2000.0,
@@ -223,10 +229,11 @@ def test_holding_refuses_flat_only_and_releases(tmp_path):
     runner.tick_manager.open(ticket=101, request=req, fill_price=2000.0,
                              entry_bar=6, broker_sl=1987.5)
     cand = _candidate(runner)
-    assert runner._promote_hot_scalp_candidate(cand, _tick(), {}) is False
-    assert runner.executor.placed == []
-    assert _status(runner) == "touched"
-    assert "flat-only v1" in _notes(runner)
+    assert runner._promote_hot_scalp_candidate(cand, _tick(), {}) is True
+    assert len(runner.executor.placed) == 1
+    assert len(runner.tick_manager.tickets()) == 2
+    assert _status(runner) == "order_reconciled"
+    assert "flat-only" not in _notes(runner)
 
 
 def test_wide_spread_at_promotion_refuses_and_releases(tmp_path):

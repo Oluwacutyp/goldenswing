@@ -571,6 +571,15 @@ class TickManager:
                              if st.profit_lock_zone_cap is not None
                              else None)}
 
+    def entry_zone(self, ticket: int) -> tuple | None:
+        """The entry zone the position was born from (see
+        :meth:`open`), or None when the zone is unknown or the
+        ticket is not tracked.  Read-only view for the runner's
+        sleeve accounting (zone-consumption checks when a second
+        position stacks onto the same parent thesis)."""
+        st = self._states.get(ticket)
+        return st.entry_zone if st is not None else None
+
     def book_external_partial(self, ticket: int,
                               volume: float) -> bool:
         """Book a partial the RUNNER executed outside the tick

@@ -135,6 +135,29 @@ class SetupStore:
         except (sqlite3.Error, ValueError) as exc:
             raise SetupStoreError(f"could not read active setups: {exc}") from exc
 
+    def get(self, setup_id: str) -> dict | None:
+        """One setup row by id, ANY status (``active()`` covers
+        only armed/touched; promotion-time revalidation must see
+        claimed and terminal rows too — a claimed setup can be
+        invalidated by a later scan before its promotion runs).
+        Same row shape as ``active()`` (payload parsed)."""
+        try:
+            with self._connect() as con:
+                row = con.execute("""SELECT setup_id, symbol, strategy,
+                    direction, status, version, fencing_token, claimed_by,
+                    formed_at, armed_at, touched_at, triggered_at,
+                    invalidated_at, expires_at, updated_at, terminal_reason,
+                    payload_json
+                    FROM hot_scalp_setups WHERE setup_id=?""",
+                    (str(setup_id),)).fetchone()
+            if row is None:
+                return None
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json"))
+            return item
+        except (sqlite3.Error, ValueError) as exc:
+            raise SetupStoreError(f"could not read setup: {exc}") from exc
+
     def mark_touched(self, setup_id: str, now: Any) -> bool:
         try:
             with self._connect() as con:
