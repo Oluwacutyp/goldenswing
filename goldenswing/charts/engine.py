@@ -1914,12 +1914,12 @@ def _render_role_entry(frame, es, lc, *, instrument: str,
     return _role_finish(fig, ax, x_hi, specs)
 
 
-def render_mt5_roles(*, frames: dict, lifecycle, context=None,
-                     entry_study=None, instrument: str = "XAUUSD",
-                     playbook: str = "", score_line: str = "",
-                     entry_clock: str = "M15",
-                     roles=ROLE_ORDER) -> list[bytes]:
-    """The role trio: one PNG per role, in ROLE_ORDER.
+def _render_mt5_roles_mpl(*, frames: dict, lifecycle, context=None,
+                          entry_study=None, instrument: str = "XAUUSD",
+                          playbook: str = "", score_line: str = "",
+                          entry_clock: str = "M15",
+                          roles=ROLE_ORDER) -> list[bytes]:
+    """The role trio, matplotlib rung: one PNG per role.
 
     ``frames`` maps timeframe -> OHLCV frame (the stack the alert
     already holds); ``lifecycle`` is the canonical LifecycleStudy;
@@ -1965,3 +1965,75 @@ def render_mt5_roles(*, frames: dict, lifecycle, context=None,
                     tf_label=entry_clock, playbook=playbook,
                     score_line=score_line))
     return out
+
+
+# ------------------------------------------------------------- rung ladder
+#: The renderer rung that produced the last render_mt5_roles
+#: output, one entry per role PNG — the record that keeps a
+#: fallback render from ever being mistaken for the TV render.
+#: Also stamped into every PNG's own metadata (tEXt "Renderer").
+_LAST_ROLE_RUNGS: list = []
+_LAST_TV_ERROR: str | None = None
+
+
+def last_role_render_rungs() -> list:
+    """Rung labels for the most recent render_mt5_roles call."""
+    return list(_LAST_ROLE_RUNGS)
+
+
+def last_tv_error() -> str | None:
+    """Why the TV rung last fell back (None when it rendered)."""
+    return _LAST_TV_ERROR
+
+
+def render_mt5_roles(*, frames: dict, lifecycle, context=None,
+                     entry_study=None, instrument: str = "XAUUSD",
+                     playbook: str = "", score_line: str = "",
+                     entry_clock: str = "M15",
+                     roles=ROLE_ORDER) -> list[bytes]:
+    """The role trio: one PNG per role, in ROLE_ORDER.
+
+    Renderer ladder (implementation-ladder doctrine): the pages
+    are built ONCE by ``tv_page`` (TradingView Lightweight
+    Charts) and screenshotted by the first available browser rung
+    (system browser, then self-provisioned Chromium — see
+    ``screenshot``); when no browser rung exists or a shot fails,
+    the whole trio falls back to the matplotlib rung
+    (``_render_mt5_roles_mpl``) — an alert never fails because
+    the pretty rung is missing, and the trio never mixes rungs.
+    The rung used is recorded per PNG (``last_role_render_rungs``
+    + the PNG's own "Renderer" metadata stamp).
+    """
+    global _LAST_ROLE_RUNGS, _LAST_TV_ERROR
+    from . import screenshot, tv_page
+    kw = dict(frames=frames, lifecycle=lifecycle, context=context,
+              entry_study=entry_study, instrument=instrument,
+              playbook=playbook, score_line=score_line,
+              entry_clock=entry_clock, roles=roles)
+    try:
+        pages = tv_page.build_role_pages(**kw)
+        pngs: list = []
+        rungs: list = []
+        for role, page in zip(roles, pages):
+            shot = screenshot.screenshot_html(
+                page, width=tv_page.PAGE_W, height=tv_page.PAGE_H)
+            if shot is None:
+                raise RuntimeError("no browser rung available")
+            png, rung = shot
+            rungs.append(rung)
+            pngs.append(screenshot.stamp_png_text(png, {
+                "Software": "GoldenSwing charts",
+                "Renderer": (f"lightweight-charts-"
+                             f"{tv_page.LWC_VERSION}+{rung}"),
+                "Chart-Role": role}))
+        _LAST_ROLE_RUNGS = rungs
+        _LAST_TV_ERROR = None
+        return pngs
+    except Exception as exc:  # the fallback rung is the contract
+        _LAST_TV_ERROR = f"{type(exc).__name__}: {exc}"
+        _LAST_ROLE_RUNGS = ["matplotlib"] * len(roles)
+        return [screenshot.stamp_png_text(png, {
+                    "Renderer": "matplotlib-fallback",
+                    "Chart-Role": role})
+                for png, role in zip(_render_mt5_roles_mpl(**kw),
+                                     roles)]

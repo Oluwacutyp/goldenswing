@@ -86,14 +86,27 @@ def test_payload_carries_bars_studies_and_analysis():
 
 def test_self_contained_no_external_resources():
     html = _build({"H1": _frame(50, "2026-10-26", "h")})
-    assert "src=" not in html and "http://" not in html
-    assert "https://" not in html
+    # PIN UPDATED (TV renderer pass): the page now embeds the
+    # vendored Lightweight Charts bundle, whose inert text
+    # contains an SVG xmlns namespace string, the Apache license
+    # URL and the (disabled) attribution constant — none of them
+    # is a resource reference and nothing is ever fetched. The
+    # offline law is pinned on the resource surface instead:
+    # no external script/link/img and no http(s) attribute.
+    assert "<script src" not in html and "<link" not in html
+    assert "<img" not in html
+    assert 'src="http' not in html and "src='http" not in html
+    assert 'href="http' not in html and "href='http" not in html
 
 
 def test_payload_cannot_break_out_of_script_block():
     html = _build({"H1": _frame(50, "2026-10-26", "h")},
                   playbook='</script><img src=x onerror=alert(1)>')
-    assert html.count("</script>") == 2  # data block + chart block only
+    # PIN UPDATED (TV renderer pass): four script blocks by
+    # design — vendored library, data, shared chart builder,
+    # study driver. The breakout contract is unchanged: the
+    # payload's own closing tags stay escaped inside the JSON.
+    assert html.count("</script>") == 4
     assert "<img src=x" not in html
     p = _payload(html)
     assert p["meta"]["playbook"].startswith("</script>")

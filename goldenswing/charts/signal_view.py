@@ -7,6 +7,10 @@ needs no server and no network: open it in a browser, switch
 timeframes, toggle overlays, zoom/pan, crosshair. No CDN, no external
 assets — the page must open on a phone with poor connectivity.
 
+Rendering is TradingView Lightweight Charts™ via the ONE shared
+page builder (``charts.tv_page``) — the same builder that produces
+the alert PNGs, so the study and the PNG can never drift apart.
+
 Analysis is FROZEN at signal time: the record of what the engine saw
 when it flagged the signal, not a live view. A live-updating
 current-market view is a separate step, not this page.
@@ -50,8 +54,12 @@ def _bars_for_json(frame) -> list:
     for ts, row in frame.iloc[-_BARS_CAP:].iterrows():
         try:
             iso = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            vol = None
+            if "volume" in frame.columns:
+                v = float(row["volume"])
+                vol = v if v == v and v > 0 else None
             rows.append([iso, float(row["open"]), float(row["high"]),
-                         float(row["low"]), float(row["close"])])
+                         float(row["low"]), float(row["close"]), vol])
         except Exception:
             continue
     return rows
@@ -247,6 +255,7 @@ def build_signal_view_html(*, frames, entry: float, stop: float,
                             if broker_stop is not None else None),
             "effective_r": eff_r,
             "targets": [float(t) for t in drawn_targets],
+            "target_ranks": [int(r) for r, _t in _shown_t],
             "targets_total": _total_t,
             "fill": float(fill_price) if fill_price is not None else None,
             "alert_id": alert_id, "signal_time": signal_time or "",
@@ -306,15 +315,28 @@ def build_signal_view_html(*, frames, entry: float, stop: float,
         f"{tf} · {panel_role(tf, playbook=playbook, entry_clock=entry_clock)}"
         f"</button>" for tf in tfs)
     data_json = _json_for_html(payload)
-    return (_PAGE.replace("{buttons}", buttons)
-                 .replace("{data}", data_json))
-
-
-_PAGE = """<!DOCTYPE html>
+    from . import tv_page
+    return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Signal view</title>
-<style>
+<style>{_STUDY_CSS}</style></head><body data-theme="dark">
+<h1 id="title">Signal view</h1><div id="meta"></div>
+<div id="tfs">{buttons}</div>
+<div><button id="theme-btn">Light theme</button></div>
+<div id="toggles"><label><input type="checkbox" id="ov-zone" checked> Zone</label><label><input type="checkbox" id="ov-nearby" checked> Nearby levels</label><label><input type="checkbox" id="ov-fib" checked> Fib + OTE</label><label><input type="checkbox" id="ov-prem" checked> Premium/Discount</label><label><input type="checkbox" id="ov-sess" checked> Sessions</label><label><input type="checkbox" id="ov-levels" checked> Entry/SL/TP</label><label><input type="checkbox" id="ov-qm" checked> QM pattern</label></div>
+<div id="wrap"><div id="chart"></div></div>
+<div id="readout">Hover a candle for its values. Scroll to zoom, drag to pan, double-click to reset.</div>
+<h2>Analysis on this timeframe</h2><div id="analysis"></div>
+<div id="foot">Frozen at signal time — the record of what the engine saw when it flagged this signal, not a live view. Rendered by TradingView Lightweight Charts™ (vendored — works offline).</div>
+<script>{tv_page.lwc_js()}</script>
+<script id="signal-data" type="application/json">{data_json}</script>
+<script>{tv_page.CHART_BUILDER_JS}</script>
+<script>{_STUDY_JS}</script>
+</body></html>"""
+
+
+_STUDY_CSS = """
 body{background:var(--bg);color:var(--txt);font-family:system-ui,sans-serif;margin:0;padding:12px}
 body[data-theme="dark"]{--bg:#11141a;--txt:#e0e0e0;--panel:#0b0e13;--line:#3a4356;--muted:#aaa;--gold:#f7b924;--btn:#1e2530}
 body[data-theme="light"]{--bg:#f6f7f9;--txt:#1a1d23;--panel:#ffffff;--line:#c9ced6;--muted:#5a6472;--gold:#8a6d00;--btn:#e8ecf1}
@@ -327,137 +349,240 @@ button.tf.on{background:var(--gold);color:#111;border-color:var(--gold)}
 #toggles label{display:flex;align-items:center;gap:6px;min-height:44px;padding:0 12px;border:1px solid var(--line);border-radius:8px;font-size:14px}
 #toggles input{width:18px;height:18px}
 #wrap{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:8px}
-canvas{display:block;width:100%;height:520px;touch-action:none}
+#chart{width:100%;height:520px}
 #readout{font-family:monospace;font-size:13px;color:var(--gold);min-height:18px;margin:6px 0}
 #analysis{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 14px;line-height:1.6}
 #foot{color:var(--muted);font-size:12px;margin-top:10px}
-</style></head><body data-theme="dark">
-<h1 id="title">Signal view</h1><div id="meta"></div>
-<div id="tfs">{buttons}</div>
-<div><button id="theme-btn">Light theme</button></div>
-<div id="toggles"><label><input type="checkbox" id="ov-zone" checked> Zone</label><label><input type="checkbox" id="ov-nearby" checked> Nearby levels</label><label><input type="checkbox" id="ov-fib" checked> Fib + OTE</label><label><input type="checkbox" id="ov-prem" checked> Premium/Discount</label><label><input type="checkbox" id="ov-sess" checked> Sessions</label><label><input type="checkbox" id="ov-levels" checked> Entry/SL/TP</label><label><input type="checkbox" id="ov-qm" checked> QM pattern</label></div>
-<div id="wrap"><canvas id="cv" width="900" height="520"></canvas></div>
-<div id="readout">Hover a candle for its values. Scroll to zoom, drag to pan, double-click to reset.</div>
-<h2>Analysis on this timeframe</h2><div id="analysis"></div>
-<div id="foot">Frozen at signal time — the record of what the engine saw when it flagged this signal, not a live view.</div>
-<script id="signal-data" type="application/json">{data}</script>
-<script>
-const D=JSON.parse(document.getElementById('signal-data').textContent);
-const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
-const PALETTES={dark:{UP:'#26a69a',DN:'#ef5350',GOLD:'#f7b924',TXT:'#e0e0e0',GRID:'#2a3242'},
-  light:{UP:'#00897b',DN:'#d32f2f',GOLD:'#8a6d00',TXT:'#1a1d23',GRID:'#d5dae2'}};
-let PAL=PALETTES.dark;
-let UP=PAL.UP,DN=PAL.DN,GOLD=PAL.GOLD,TXT=PAL.TXT,GRID=PAL.GRID;
-function setTheme(name){PAL=PALETTES[name];UP=PAL.UP;DN=PAL.DN;GOLD=PAL.GOLD;TXT=PAL.TXT;GRID=PAL.GRID;
-  document.body.dataset.theme=name;
-  document.getElementById('theme-btn').textContent=name==='dark'?'Light theme':'Dark theme';draw();}
-let tf=(D.meta.entry_clock&&D.tfs[D.meta.entry_clock])?D.meta.entry_clock:(D.tfs.H1?'H1':Object.keys(D.tfs)[0]);
-let start=0,end=0,hover=-1,dragX=null;
-function bars(){return D.tfs[tf].bars}
-function resetWin(){const n=bars().length;end=n;start=Math.max(0,n-120)}
-function ov(id){return document.getElementById(id).checked}
-function fmt(x){return x.toLocaleString(undefined,{minimumFractionDigits:1,maximumFractionDigits:1})}
-function showTF(t){tf=t;resetWin();document.querySelectorAll('button.tf').forEach(b=>b.classList.toggle('on',b.dataset.tf===t));
-  const an=document.getElementById('analysis');an.innerHTML='';
-  D.tfs[t].analysis.forEach(l=>{const d=document.createElement('div');d.textContent=l;an.appendChild(d)});
-  draw();}
-function yRange(bs,lo,hi){let mn=Infinity,mx=-Infinity;
-  for(let i=lo;i<hi;i++){mn=Math.min(mn,bs[i][3]);mx=Math.max(mx,bs[i][2])}
-  const span=Math.max(mx-mn,1e-9);
-  [D.meta.entry,D.meta.stop].concat(D.meta.broker_stop===null?[]:[D.meta.broker_stop]).concat(D.meta.targets).concat(D.zone?[D.zone.top,D.zone.bottom]:[]).concat(D.qm?[D.qm.head,D.qm.neckline].concat(D.qm.level===null?[]:[D.qm.level]):[]).forEach(v=>{
-    if(v>=mn-1.6*span&&v<=mx+1.6*span){mn=Math.min(mn,v);mx=Math.max(mx,v)}});
-  const pad=0.07*(mx-mn);return [mn-pad,mx+pad];}
-function draw(){const bs=bars();if(!bs.length)return;
-  const W=cv.clientWidth,H=cv.height;cv.width=W;
-  const lo=start,hi=end,n=hi-lo;if(n<=0)return;
-  const [mn,mx]=yRange(bs,lo,hi);
-  const X=i=>((i-lo+0.5)/n)*W, Y=v=>H-((v-mn)/(mx-mn))*H;
-  ctx.clearRect(0,0,W,H);
-  ctx.strokeStyle=GRID;ctx.lineWidth=0.5;
-  for(let g=0;g<=4;g++){const y=H*g/4;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();
-    ctx.fillStyle='#777';ctx.font='11px monospace';ctx.fillText(fmt(mx-(mx-mn)*g/4),4,y-2);}
-  if(ov('ov-sess')){ctx.fillStyle='rgba(247,185,36,0.07)';
-    D.tfs[tf].sessions.forEach(s=>{const a=Math.max(s[0],lo),b=Math.min(s[1],hi);
-      if(b>a)ctx.fillRect(X(a)-W/(2*n),0,(b-a)*W/n,H);});}
-  if(ov('ov-prem')&&D.fib.range){const rlo=D.fib.range[0],rhi=D.fib.range[1],eq=(rlo+rhi)/2;
-    ctx.fillStyle='rgba(239,83,80,0.05)';ctx.fillRect(0,Y(rhi),W,Y(eq)-Y(rhi));
-    ctx.fillStyle='rgba(38,166,154,0.05)';ctx.fillRect(0,Y(eq),W,Y(rlo)-Y(eq));
-    ctx.strokeStyle=TXT;ctx.setLineDash([4,3]);ctx.beginPath();ctx.moveTo(0,Y(eq));ctx.lineTo(W,Y(eq));ctx.stroke();ctx.setLineDash([]);}
-  if(ov('ov-zone')&&D.zone){ctx.fillStyle='rgba(247,185,36,0.25)';
-    ctx.fillRect(0,Y(D.zone.top),W,Y(D.zone.bottom)-Y(D.zone.top));}
-  if(ov('ov-nearby')){D.nearby.forEach(z=>{ctx.strokeStyle=z.side==='support'?UP:z.side==='resistance'?DN:TXT;
-    ctx.lineWidth=z.tier==='MAJOR'?1.2:0.7;ctx.setLineDash(z.tier==='MAJOR'?[]:[6,3]);
-    ctx.beginPath();ctx.moveTo(0,Y(z.level));ctx.lineTo(W,Y(z.level));ctx.stroke();ctx.setLineDash([]);
-    ctx.fillStyle=ctx.strokeStyle;ctx.font='11px monospace';
-    ctx.fillText((z.tier?z.tier+' ':'')+fmt(z.level),W-110,Y(z.level)-2);});}
-  if(ov('ov-fib')){D.fib.levels.forEach(l=>{ctx.strokeStyle='#8d6e00';ctx.lineWidth=0.7;ctx.setLineDash([4,3]);
-    ctx.beginPath();ctx.moveTo(0,Y(l[1]));ctx.lineTo(W,Y(l[1]));ctx.stroke();ctx.setLineDash([]);
-    ctx.fillStyle='#8d6e00';ctx.font='11px monospace';ctx.fillText(l[0].toFixed(3),W-70,Y(l[1])-2);});
-    if(D.fib.ote){ctx.fillStyle='rgba(141,110,0,0.12)';ctx.fillRect(0,Y(D.fib.ote[1]),W,Y(D.fib.ote[0])-Y(D.fib.ote[1]));}}
-  if(ov('ov-qm')&&D.qm){const QM='#8e24aa';ctx.strokeStyle=QM;ctx.fillStyle=QM;ctx.font='11px monospace';
-    const ql=(v,dash,lab)=>{ctx.lineWidth=0.9;ctx.setLineDash(dash);ctx.beginPath();ctx.moveTo(0,Y(v));ctx.lineTo(W,Y(v));ctx.stroke();ctx.setLineDash([]);ctx.fillText(lab+' '+fmt(v),W-170,Y(v)-2);};
-    ql(D.qm.head,[2,2],'QM HEAD');ql(D.qm.neckline,[5,3],'QM NECKLINE');
-    if(D.qm.level!==null)ql(D.qm.level,[6,2,2,2],'QM LEVEL');}
-  const bw=Math.max(2,(W/n)*0.7);
-  for(let i=lo;i<hi;i++){const b=bs[i],up=b[4]>=b[1],col=up?UP:DN;
-    ctx.strokeStyle=col;ctx.fillStyle=col;ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(X(i),Y(b[2]));ctx.lineTo(X(i),Y(b[3]));ctx.stroke();
-    const t=Y(Math.max(b[1],b[4])),bt=Y(Math.min(b[1],b[4]));
-    ctx.fillRect(X(i)-bw/2,t,bw,Math.max(bt-t,1));}
-  if(ov('ov-levels')){
-    const rows=[];
-    const push=(v,col,w,dash,lab)=>{if(v===null||v===undefined)return;rows.push({v,col,w,dash,lab});};
-    push(D.meta.entry,GOLD,1.6,[],'ENTRY '+fmt(D.meta.entry));
-    push(D.meta.stop,'#d32f2f',1.6,[],'STOP '+fmt(D.meta.stop)+' (structural)');
-    push(D.meta.broker_stop,'#ff7043',1.6,[],'BROKER SL '+fmt(D.meta.broker_stop));
-    D.meta.targets.forEach((t,j)=>push(t,'#2e7d32',1.1,[6,3],'T'+(j+1)+' '+fmt(t)));
-    push(D.meta.fill,'#7e57c2',1.4,[8,3],'FILL '+fmt(D.meta.fill));
-    rows.forEach(r=>{r.y=Y(r.v);});
-    rows.sort((a,b)=>a.y-b.y);
-    for(let i=1;i<rows.length;i++){if(rows[i].y<rows[i-1].y+16)rows[i].y=rows[i-1].y+16;}
-    rows.forEach(r=>{
-      const yTrue=Y(r.v);
-      ctx.strokeStyle=r.col;ctx.lineWidth=r.w;ctx.setLineDash(r.dash);
-      ctx.beginPath();ctx.moveTo(0,yTrue);ctx.lineTo(W,yTrue);ctx.stroke();ctx.setLineDash([]);
-      if(Math.abs(r.y-yTrue)>1){ctx.strokeStyle=r.col;ctx.lineWidth=0.7;
-        ctx.beginPath();ctx.moveTo(W-150,yTrue);ctx.lineTo(W-150,r.y);ctx.stroke();}
-      ctx.fillStyle=r.col;ctx.font='bold 12px monospace';
-      ctx.fillText(r.lab,W-150,r.y-3);});}
-  if(hover>=lo&&hover<hi){const b=bs[hover];
-    ctx.strokeStyle='#fff';ctx.lineWidth=0.8;ctx.setLineDash([3,3]);
-    ctx.beginPath();ctx.moveTo(X(hover),0);ctx.lineTo(X(hover),H);ctx.stroke();
-    ctx.beginPath();ctx.moveTo(0,Y(b[4]));ctx.lineTo(W,Y(b[4]));ctx.stroke();ctx.setLineDash([]);
-    document.getElementById('readout').textContent=
-      b[0].slice(0,16).replace('T',' ')+'  O '+fmt(b[1])+'  H '+fmt(b[2])+'  L '+fmt(b[3])+'  C '+fmt(b[4]);}
-  else{document.getElementById('readout').textContent='Hover a candle for its values. Scroll to zoom, drag to pan, double-click to reset.';}}
-function barAt(e){const r=cv.getBoundingClientRect();const x=(e.clientX-r.left)/r.width;
-  return Math.floor(start+x*(end-start));}
-cv.addEventListener('mousemove',e=>{hover=barAt(e);draw();});
-cv.addEventListener('mouseleave',()=>{hover=-1;draw();});
-cv.addEventListener('wheel',e=>{e.preventDefault();const c=barAt(e);const n=end-start;
-  const f=e.deltaY<0?0.8:1.25;let nn=Math.max(10,Math.round(n*f));
-  let ns=Math.round(c-(c-start)*nn/n);ns=Math.max(0,Math.min(bsLen()-nn,ns));
-  start=ns;end=ns+nn;draw();},{passive:false});
-function bsLen(){return bars().length}
-cv.addEventListener('mousedown',e=>{dragX=e.clientX;});
-window.addEventListener('mousemove',e=>{if(dragX===null)return;
-  const r=cv.getBoundingClientRect();const dx=e.clientX-dragX;dragX=e.clientX;
-  const db=Math.round(dx/r.width*(end-start));let ns=start-db;
-  ns=Math.max(0,Math.min(bsLen()-(end-start),ns));start=ns;end=ns+(end-start);draw();});
-window.addEventListener('mouseup',()=>{dragX=null;});
-cv.addEventListener('dblclick',()=>{resetWin();draw();});
-document.querySelectorAll('button.tf').forEach(b=>b.addEventListener('click',()=>showTF(b.dataset.tf)));
-['ov-zone','ov-nearby','ov-fib','ov-prem','ov-sess','ov-levels','ov-qm'].forEach(id=>
-  document.getElementById(id).addEventListener('change',draw));
-document.getElementById('theme-btn').addEventListener('click',()=>
-  setTheme(document.body.dataset.theme==='dark'?'light':'dark'));
-(function(){const m=D.meta,arrow=m.direction===1?'▲ LONG':m.direction===-1?'▼ SHORT':'FLAT';
-  document.getElementById('title').textContent=m.instrument+' · Signal view · '+m.playbook+' · '+arrow;
-  document.getElementById('meta').textContent=m.score_text+' · Entry '+fmt(m.entry)+' · Structural stop '+fmt(m.structural_stop)+
-    (m.broker_stop===null?' · Broker SL pending at placement':' · Broker SL '+fmt(m.broker_stop)+
-      (m.effective_r===null?'':' (effective R '+m.effective_r.toFixed(2)+')'))+
-    (m.targets.length?' · Targets '+m.targets.map(fmt).join(', '):'')+(m.alert_id?' · '+m.alert_id:'')+
-    (m.verdict_lines.length?' · '+m.verdict_lines.join(' · '):'');
-  resetWin();showTF(tf);})();
-</script></body></html>
+"""
+
+#: The study driver: builds the shared-builder config from the
+#: frozen payload. Overlay semantics mirror the retired canvas
+#: page exactly (same toggles, same studies, same admission rule
+#: for the price range) — only the renderer changed.
+_STUDY_JS = r"""
+(function(){
+"use strict";
+const D = JSON.parse(document.getElementById('signal-data').textContent);
+const GOLD = () => document.body.dataset.theme === 'dark'
+  ? '#f7b924' : '#8a6d00';
+const SOLID = 0, DOTTED = 1, DASHED = 2, LARGE_DASHED = 3;
+let tf = (D.meta.entry_clock && D.tfs[D.meta.entry_clock])
+  ? D.meta.entry_clock
+  : (D.tfs.H1 ? 'H1' : Object.keys(D.tfs)[0]);
+let built = null;
+function ov(id){ return document.getElementById(id).checked; }
+function fmt(x){ return x.toLocaleString('en-US',
+  {minimumFractionDigits: 1, maximumFractionDigits: 1}); }
+function epoch(iso){ return Math.floor(Date.parse(iso) / 1000); }
+
+function tfData(t){
+  const rows = D.tfs[t].bars;
+  const bars = [], volume = [];
+  const dark = document.body.dataset.theme === 'dark';
+  rows.forEach(function(r){
+    const time = epoch(r[0]);
+    bars.push({time: time, open: r[1], high: r[2], low: r[3],
+               close: r[4]});
+    if (r[5] !== null && r[5] !== undefined){
+      volume.push({time: time, value: r[5],
+        color: (r[4] >= r[1] ? 'rgba(38,166,154,' : 'rgba(239,83,80,')
+               + (dark ? '0.75)' : '0.55)')});
+    }
+  });
+  return {bars: bars, volume: volume.length ? volume : null,
+          rows: rows};
+}
+
+function yRange(bars){
+  const n = bars.length;
+  const win = bars.slice(Math.max(0, n - 120));
+  let mn = Infinity, mx = -Infinity;
+  win.forEach(function(b){
+    mn = Math.min(mn, b.low); mx = Math.max(mx, b.high); });
+  const span = Math.max(mx - mn, 1e-9);
+  const cand = [D.meta.entry, D.meta.stop]
+    .concat(D.meta.broker_stop === null ? [] : [D.meta.broker_stop])
+    .concat(D.meta.targets)
+    .concat(D.zone ? [D.zone.top, D.zone.bottom] : [])
+    .concat(D.qm ? [D.qm.head, D.qm.neckline]
+      .concat(D.qm.level === null ? [] : [D.qm.level]) : []);
+  cand.forEach(function(v){
+    if (v >= mn - 1.6 * span && v <= mx + 1.6 * span){
+      mn = Math.min(mn, v); mx = Math.max(mx, v); } });
+  const pad = 0.07 * Math.max(mx - mn, 1e-9);
+  return [mn - pad, mx + pad];
+}
+
+function tfCfg(t){
+  const data = tfData(t);
+  const lines = [], bands = [], timeBands = [];
+  const L = function(price, color, title, width, style){
+    lines.push({price: price, color: color, title: title,
+                width: width || 2, style: style || 0}); };
+  if (ov('ov-sess')){
+    const rows = data.rows;
+    (D.tfs[t].sessions || []).forEach(function(s){
+      const a = Math.max(0, Math.min(s[0], rows.length - 1));
+      const b = Math.max(0, Math.min(s[1], rows.length - 1));
+      if (rows[a] && rows[b] && b >= a){
+        timeBands.push({from: epoch(rows[a][0]),
+                        to: epoch(rows[b][0]),
+                        fill: 'rgba(247,185,36,0.07)'}); } });
+  }
+  if (ov('ov-prem') && D.fib.range){
+    const rlo = D.fib.range[0], rhi = D.fib.range[1],
+          eq = (rlo + rhi) / 2;
+    bands.push({top: rhi, bottom: eq, from: null, to: null,
+                fill: 'rgba(239,83,80,0.05)', stroke: null});
+    bands.push({top: eq, bottom: rlo, from: null, to: null,
+                fill: 'rgba(38,166,154,0.05)', stroke: null});
+    L(eq, '#787b86', 'EQ ' + fmt(eq), 1, DASHED);
+  }
+  if (ov('ov-zone') && D.zone){
+    bands.push({top: D.zone.top, bottom: D.zone.bottom,
+                from: null, to: null,
+                fill: 'rgba(247,185,36,0.25)', stroke: null});
+    L(D.zone.top, GOLD(),
+      (D.zone.kind ? D.zone.kind + ' ' : '') + 'ZONE ' +
+      fmt(D.zone.bottom) + '–' + fmt(D.zone.top), 1, DASHED);
+  }
+  if (ov('ov-nearby')){
+    D.nearby.forEach(function(z){
+      const col = z.side === 'support' ? '#26a69a'
+        : z.side === 'resistance' ? '#ef5350' : '#787b86';
+      L(z.level, col,
+        (z.tier ? z.tier + ' ' : '') + fmt(z.level),
+        z.tier === 'MAJOR' ? 2 : 1,
+        z.tier === 'MAJOR' ? SOLID : DASHED); });
+  }
+  if (ov('ov-fib')){
+    D.fib.levels.forEach(function(l){
+      L(l[1], '#8d6e00', l[0].toFixed(3), 1, DASHED); });
+    if (D.fib.ote){
+      bands.push({top: D.fib.ote[1], bottom: D.fib.ote[0],
+                  from: null, to: null,
+                  fill: 'rgba(141,110,0,0.12)', stroke: null}); }
+  }
+  if (ov('ov-qm') && D.qm){
+    L(D.qm.head, '#8e24aa', 'QM HEAD ' + fmt(D.qm.head), 1, DOTTED);
+    L(D.qm.neckline, '#8e24aa', 'QM NECKLINE ' + fmt(D.qm.neckline),
+      1, DASHED);
+    if (D.qm.level !== null){
+      L(D.qm.level, '#8e24aa', 'QM LEVEL ' + fmt(D.qm.level), 1,
+        LARGE_DASHED); }
+  }
+  if (ov('ov-levels')){
+    L(D.meta.entry, GOLD(), 'ENTRY ' + fmt(D.meta.entry), 2, SOLID);
+    L(D.meta.stop, '#d32f2f',
+      'STOP ' + fmt(D.meta.stop) + ' (structural)', 2, SOLID);
+    if (D.meta.broker_stop !== null){
+      L(D.meta.broker_stop, '#ff7043',
+        'BROKER SL ' + fmt(D.meta.broker_stop), 2, SOLID); }
+    D.meta.targets.forEach(function(tgt, j){
+      const rank = (D.meta.target_ranks || [])[j] || (j + 1);
+      L(tgt, '#2e7d32', 'T' + rank + ' ' + fmt(tgt) + ' (planned)',
+        1, DASHED); });
+    if (D.meta.fill !== null){
+      L(D.meta.fill, '#7e57c2', 'FILL ' + fmt(D.meta.fill), 2,
+        DASHED); }
+  }
+  return {bars: data.bars, volume: data.volume, lines: lines,
+          lineSeries: [], bands: bands, timeBands: timeBands,
+          markers: [], edgeTags: [], priceRange: yRange(data.bars)};
+}
+
+function defaultRange(){
+  const n = D.tfs[tf].bars.length;
+  return {from: Math.max(0, n - 120), to: n + 2};
+}
+
+function rebuild(keepRange){
+  const el = document.getElementById('chart');
+  let prev = null;
+  if (built){
+    try { prev = built.chart.timeScale().getVisibleLogicalRange(); }
+    catch (e) { prev = null; }
+    built.chart.remove();
+    built = null;
+  }
+  built = window.GsChart.build(el, tfCfg(tf), {
+    interactive: true, autoSize: true, fontSize: 13,
+    dark: document.body.dataset.theme === 'dark'});
+  const ts = built.chart.timeScale();
+  ts.setVisibleLogicalRange(
+    keepRange && prev ? prev : defaultRange());
+  built.chart.subscribeCrosshairMove(function(param){
+    const ro = document.getElementById('readout');
+    if (!param || !param.time || !built){
+      ro.textContent = 'Hover a candle for its values. Scroll to ' +
+        'zoom, drag to pan, double-click to reset.';
+      return; }
+    const bar = param.seriesData.get(built.candle);
+    if (!bar){ return; }
+    const iso = new Date(param.time * 1000).toISOString();
+    ro.textContent = iso.slice(0, 16).replace('T', ' ') +
+      '  O ' + fmt(bar.open) + '  H ' + fmt(bar.high) +
+      '  L ' + fmt(bar.low) + '  C ' + fmt(bar.close);
+  });
+}
+
+function showTF(t){
+  tf = t;
+  document.querySelectorAll('button.tf').forEach(function(b){
+    b.classList.toggle('on', b.dataset.tf === t); });
+  const an = document.getElementById('analysis');
+  an.innerHTML = '';
+  D.tfs[t].analysis.forEach(function(l){
+    const d = document.createElement('div');
+    d.textContent = l; an.appendChild(d); });
+  rebuild(false);
+}
+
+function setTheme(name){
+  document.body.dataset.theme = name;
+  document.getElementById('theme-btn').textContent =
+    name === 'dark' ? 'Light theme' : 'Dark theme';
+  rebuild(true);
+}
+
+document.querySelectorAll('button.tf').forEach(function(b){
+  b.addEventListener('click', function(){ showTF(b.dataset.tf); });
+});
+['ov-zone', 'ov-nearby', 'ov-fib', 'ov-prem', 'ov-sess', 'ov-levels',
+ 'ov-qm'].forEach(function(id){
+  document.getElementById(id).addEventListener('change',
+    function(){ rebuild(true); });
+});
+document.getElementById('theme-btn').addEventListener('click',
+  function(){
+    setTheme(document.body.dataset.theme === 'dark'
+      ? 'light' : 'dark'); });
+document.getElementById('chart').addEventListener('dblclick',
+  function(){
+    if (built){
+      built.chart.timeScale().setVisibleLogicalRange(
+        defaultRange()); } });
+
+(function(){
+  const m = D.meta;
+  const arrow = m.direction === 1 ? '▲ LONG'
+    : m.direction === -1 ? '▼ SHORT' : 'FLAT';
+  document.getElementById('title').textContent =
+    m.instrument + ' · Signal view · ' + m.playbook + ' · ' + arrow;
+  document.getElementById('meta').textContent =
+    m.score_text + ' · Entry ' + fmt(m.entry) +
+    ' · Structural stop ' + fmt(m.structural_stop) +
+    (m.broker_stop === null
+      ? ' · Broker SL pending at placement'
+      : ' · Broker SL ' + fmt(m.broker_stop) +
+        (m.effective_r === null
+          ? '' : ' (effective R ' + m.effective_r.toFixed(2) + ')')) +
+    (m.targets.length
+      ? ' · Targets ' + m.targets.map(fmt).join(', ') : '') +
+    (m.alert_id ? ' · ' + m.alert_id : '') +
+    (m.verdict_lines.length
+      ? ' · ' + m.verdict_lines.join(' · ') : '');
+  showTF(tf);
+})();
+})();
 """

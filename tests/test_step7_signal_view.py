@@ -153,7 +153,11 @@ def test_html_self_contained_and_has_theme_and_level_toggles():
     html = _html(decision_score=32.71, broker_stop=4054.4)
     assert "<script src" not in html
     assert "<link" not in html
-    assert "https://" not in html
+    # PIN UPDATED (TV renderer pass): the vendored Lightweight
+    # Charts bundle's inert text carries https:// strings (the
+    # Apache license URL, the disabled attribution constant) —
+    # never fetched. The offline law is the resource surface:
+    assert 'src="http' not in html and 'href="http' not in html
     assert 'id="theme-btn"' in html
     assert 'data-theme="dark"' in html
     assert 'id="ov-levels"' in html
