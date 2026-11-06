@@ -540,6 +540,17 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("🩺", "Self-Audit"))
             lines.append(self_audit())
             lines.append("")
+    # §G range promotion evaluation: per-route verdicts over
+    # the range family's own route-stamped shadow history —
+    # from the runner's range_promotion_line, beside the
+    # self-audit it rides on.  Guarded — old runners lack it.
+    if ctrl is not None:
+        range_promotion = getattr(ctrl, "range_promotion_line",
+                                  None)
+        if callable(range_promotion):
+            lines.append(fmt_section("📐", "Range Promotion"))
+            lines.append(range_promotion())
+            lines.append("")
     if cfg is not None:
         lines.append(fmt_section("🔧", "Config"))
         lines.append(

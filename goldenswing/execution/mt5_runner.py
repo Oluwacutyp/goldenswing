@@ -291,6 +291,22 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     "qm_d1_native": "governing",
     "hot_scalp_promotion": "shadow_declared",
     "resting_limit": "shadow_declared",
+    # §G RANGE FAMILY (promotion-evaluation wiring, 2026-11-05):
+    # the four range playbooks' §G scan route (playbook_registry
+    # ROUTE_RANGE_H4_H1) declared shadow per playbook — route
+    # name == playbook name, because the journal's shadow
+    # records are keyed by playbook and the promotion evaluation
+    # (execution/range_promotion.py) reads per-playbook history.
+    # The scans hold no order authority in any mode (the §G
+    # contract); the same playbooks' roster orders remain under
+    # the h1_trigger route, untouched.  Declaring the routes
+    # also closes a latent hazard: an undeclared route name
+    # resolves "governing" by default, so an accidental seam
+    # call under one of these names would have governed.
+    "range_sweep_reclaim": "shadow_declared",
+    "range_qm": "shadow_declared",
+    "range_mean_reversion": "shadow_declared",
+    "range_compression_breakout": "shadow_declared",
 }
 
 #: The playbook name a route's judgment records journal under
@@ -300,7 +316,18 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
 JUDGMENT_ROUTE_PLAYBOOK: dict[str, str] = {
     "hot_scalp_promotion": "hot_scalp",
     "resting_limit": "arrival_zone",
+    "range_sweep_reclaim": "range_sweep_reclaim",
+    "range_qm": "range_qm",
+    "range_mean_reversion": "range_mean_reversion",
+    "range_compression_breakout": "range_compression_breakout",
 }
+
+#: The §G range playbooks whose scheduled scans journal
+#: route-stamped shadow verdicts (derived from the registry's
+#: RANGE_SPECS — one truth; range_promotion.RANGE_JUDGMENT_ROUTES
+#: is pinned to this set by test).
+RANGE_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
+    spec.name for spec in RANGE_SPECS)
 
 
 @dataclass
@@ -2510,6 +2537,53 @@ class MT5Runner:
             run_id=self._run_id, bar=bar_key)
         if record is not None:
             self.journal.append(record)
+        # §G range promotion evaluation: the same window, the
+        # same cadence, the same state file — no new scheduler.
+        self._range_promotion_phase(
+            records, bar_key, damaged_lines=damaged,
+            window={"from_offset": from_offset,
+                    "to_offset": new_offset,
+                    "records": len(records)})
+
+    # ---- §G range promotion evaluation ----------------------
+    # The verdict machinery is execution/range_promotion.py;
+    # this is only its host (the self-audit's arrangement: a
+    # standing block inside the S3 state file, fed the audit's
+    # journal windows, journaled on change, rendered on
+    # /status and the manifest).  Findings feed back nowhere —
+    # a verdict is a recommendation record, never a decision
+    # input, a parameter change or a demotion.
+    def _range_promotion_state(self) -> dict:
+        from . import range_promotion as _range_promotion
+
+        st = self._audit_state()
+        sub = st.get("range_promotion")
+        if not isinstance(sub, dict):
+            sub = _range_promotion.new_state()
+            st["range_promotion"] = sub
+        else:
+            for key, value in _range_promotion.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _range_promotion_phase(self, records, bar_key, *,
+                               damaged_lines: int = 0,
+                               window: dict | None = None) -> None:
+        """One §G promotion-evaluation cycle over the
+        self-audit's journal window.  Called from inside
+        _self_audit_phase (itself inside the S3 cycle's guarded
+        body): a failure here is logged by that guard like any
+        audit failure and never reaches a decision path."""
+        from . import range_promotion as _range_promotion
+
+        sub = self._range_promotion_state()
+        record = _range_promotion.cycle(
+            state=sub, records=records,
+            now=pd.Timestamp(bar_key),
+            damaged_lines=damaged_lines, window=window,
+            run_id=self._run_id, bar=bar_key)
+        if record is not None:
+            self.journal.append(record)
 
     def _audit_feedback_for(self, playbook) -> dict | None:
         """Completion-05 feedback, journal-only: the standing
@@ -4004,6 +4078,33 @@ class MT5Runner:
             pass
         return block
 
+    def _range_promotion_manifest_block(self) -> dict:
+        """§G range promotion evaluation: the standing verdict
+        snapshot for the run manifest — per route: evaluated /
+        paired arms (hit rates, median R), degenerate
+        exclusions, the verdict and its reason, and the
+        evaluation window's opening stamp.  Self-guarded like
+        _self_audit_manifest_block: a gap reads as an empty
+        block, never a crash and never a fabricated history
+        (routes stay absent until a cycle has run)."""
+        block: dict = {"cycles": 0, "damaged_cycles": 0,
+                       "last_cycle_bar": None, "routes": {}}
+        try:
+            sub = self._range_promotion_state()
+            block["cycles"] = int(sub.get("cycles") or 0)
+            block["damaged_cycles"] = int(
+                sub.get("damaged_cycles") or 0)
+            block["last_cycle_bar"] = sub.get("last_cycle_bar")
+            snap = sub.get("last_snapshot") or {}
+            block["horizon_h"] = snap.get("horizon_h")
+            block["floors"] = snap.get("floors")
+            block["window_start"] = snap.get("window_start")
+            block["window_basis"] = snap.get("window_basis")
+            block["routes"] = snap.get("routes") or {}
+        except Exception:  # noqa: BLE001 — manifest must not die
+            pass
+        return block
+
     def _forecast_manifest_block(self) -> dict:
         """Completion-04: the predictive system's standing state
         for the run manifest — retrain accrual for both
@@ -4200,7 +4301,16 @@ class MT5Runner:
                         # (five categories, standing totals +
                         # per-route feedback rates).
                         "self_audit":
-                            self._self_audit_manifest_block()}},
+                            self._self_audit_manifest_block(),
+                        # §G range promotion evaluation: the
+                        # four range routes' verdicts over their
+                        # own route-stamped shadow history
+                        # (recommendations to the owner; this
+                        # block promotes nothing — the explicit
+                        # promotion step stays
+                        # judgment_route_modes).
+                        "range_promotion":
+                            self._range_promotion_manifest_block()}},
                 # FORECAST LOOP (completion-04): the predictive
                 # system's standing state in the same manifest —
                 # retrain accrual for both lifecycles, per-horizon
@@ -5815,6 +5925,23 @@ class MT5Runner:
                 self._self_audit_state()))
         except Exception as exc:  # noqa: BLE001 — status must not die
             return f"self-audit: unavailable ({exc})"
+
+    def range_promotion_line(self) -> str:
+        """One /status Range Promotion block (§G evaluation):
+        per range route, the promotion verdict over its own
+        route-stamped shadow history in plain words — takes vs
+        abstains (median R, hit rate, paired n at +4h), with
+        "not enough data yet" and "no candidates observed"
+        stated as the different facts they are.  A
+        promotion_ready line is a recommendation; promotion
+        itself is the owner's separate decision."""
+        try:
+            from . import range_promotion as _range_promotion
+
+            return "\n".join(_range_promotion.render_lines(
+                self._range_promotion_state()))
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"range promotion: unavailable ({exc})"
 
     def forecast_line(self) -> str:
         """One /status Forecast block from real runtime values (never
@@ -18402,11 +18529,25 @@ class MT5Runner:
                 _rec_evidence["parent_setup_id"] = \
                     _setup.parent_setup_id
                 _rec_evidence["thesis_id"] = _setup.thesis_id
+            # §G promotion-evaluation wiring (2026-11-05): a
+            # shadow scan of a range playbook stamps the tap's
+            # passive verdict with its declared judgment route,
+            # exactly like the completion-02 seams stamp theirs
+            # — the verdict, the evidence and the scan's own
+            # decision are unchanged; the stamp is what makes
+            # the §G shadow history identifiable as THIS route's
+            # (and countable in the manifest's route table).
+            # Non-range and non-shadow scans pass no route, as
+            # before.
             self._emit_eval(
                 **base, outcome="candidate_emitted",
                 reason_code=_disp_code, reason=_disp_why,
                 candidate=candidate_dict,
-                decision=decision, evidence=_rec_evidence)
+                decision=decision, evidence=_rec_evidence,
+                judgment_route=(
+                    name if shadow
+                    and name in RANGE_JUDGMENT_ROUTE_NAMES
+                    else None))
             if _handoff:
                 # The judgment cycle inside this record's own
                 # _emit_eval may have created the keeper / adopted

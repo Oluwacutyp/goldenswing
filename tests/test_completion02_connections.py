@@ -330,9 +330,15 @@ def test_manifest_route_authority_table(tmp_path):
         "hot_scalp_promotion", "resting_limit"]
     table = {row["route"]: row
              for row in core["route_authority"]}
+    # Extended by the §G promotion-evaluation wiring
+    # (2026-11-05): the four range routes are declared
+    # shadow_declared and join the census — the pin's intent
+    # (an exact route census) is preserved.
     assert set(table) == {
         "h1_trigger", "qm_m5_native", "qm_d1_native",
-        "hot_scalp_promotion", "resting_limit"}
+        "hot_scalp_promotion", "resting_limit",
+        "range_sweep_reclaim", "range_qm",
+        "range_mean_reversion", "range_compression_breakout"}
     assert table["h1_trigger"]["authority"] == "governing"
     assert table["h1_trigger"]["governing_now"] is True
     hs = table["hot_scalp_promotion"]
@@ -342,6 +348,13 @@ def test_manifest_route_authority_table(tmp_path):
     assert hs["judgment_records_this_run"] == 1
     assert table["resting_limit"][
         "judgment_records_this_run"] == 0
+    for route in ("range_sweep_reclaim", "range_qm",
+                  "range_mean_reversion",
+                  "range_compression_breakout"):
+        assert table[route]["authority"] == "shadow_declared"
+        assert table[route]["governing_now"] is False
+        assert table[route][
+            "judgment_records_this_run"] == 0
 
 
 # ------------------------------------------------ §G shadow route
