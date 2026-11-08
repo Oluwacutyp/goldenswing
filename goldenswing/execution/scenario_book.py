@@ -669,6 +669,213 @@ class ScenarioBook:
                 scenario.get("version"),
         }
 
+    # -- proposals from non-lifecycle candidates (Pass 3) --------
+    # The book's population completes: the synchronous native
+    # routes (qm_m5 / qm_d1) and the Hot Scalp sleeve never
+    # pass through the setup lifecycle store, so their
+    # candidates arrive here directly, keyed by the identity
+    # their own funnel records carry (the candidate_lifecycle
+    # instance key; the sleeve's stable setup id).  Same
+    # discipline as the lifecycle bridge: the book MIRRORS the
+    # candidate and its disposition — it originates neither.
+
+    def propose_scenario(self, scenario_id: str, *, ts,
+                         family: str, route: str | None,
+                         direction: int, horizon: str,
+                         clocks: dict, geometry: dict,
+                         invalidation_terms,
+                         validity: dict | None = None,
+                         situation_id=None,
+                         authority: str = "shadow",
+                         management: dict | None = None,
+                         score: float = 0.0,
+                         initial_state: str = "proposed",
+                         stage: str = "candidate_emitted",
+                         detail: str = "scenario proposed "
+                                       "from candidate",
+                         extras: dict | None = None
+                         ) -> list[dict]:
+        """A non-lifecycle candidate becomes a book scenario
+        (identity = the candidate's own stable key — the same
+        candidate is the same scenario across re-evaluations
+        and restarts; re-proposal of a live scenario is a
+        refresh, never a duplicate, and of a closed one a
+        no-op: a terminal life stays as the audit of the
+        first life)."""
+        existing = self.scenarios.get(scenario_id)
+        if existing is not None:
+            changed = False
+            for key, value in (extras or {}).items():
+                if existing.get(key) != value:
+                    existing[key] = copy.deepcopy(value)
+                    changed = True
+            if changed:
+                self._bump(existing, ts, "refreshed",
+                           "candidate facts refreshed")
+                self._persist()
+            return []
+        if any(c.get("scenario_id") == scenario_id
+               for c in self.closed):
+            return []
+        self._seq += 1
+        scenario = {
+            "scenario_id": scenario_id,
+            "family": family,
+            "route": route,
+            "authority": authority,
+            "direction": int(direction),
+            "horizon": horizon,
+            "clocks": dict(clocks or {}),
+            "state": initial_state,
+            "close_reason": None,
+            "geometry": {
+                "entry": geometry.get("entry"),
+                "stop": geometry.get("stop"),
+                "targets": list(geometry.get("targets") or []),
+                "zone_id": geometry.get("zone_id")},
+            "invalidation": {
+                "price": geometry.get("stop"),
+                "terms": list(invalidation_terms or [])},
+            "validity": dict(validity or {
+                "formed_bar_ts": None, "touch_ts": None,
+                "expires_ts": None, "validity_bars": None}),
+            "formed_situation_id": situation_id,
+            "parent_scenario_id": None,
+            "thesis_id": None,
+            "thesis_version": None,
+            "evidence_groups": [],
+            "counter_evidence_groups": [],
+            "management": copy.deepcopy(management or {}),
+            "management_context": None,
+            "ticket": None,
+            "alert_id": None,
+            "setup_stage": None,
+            "score": float(score or 0.0),
+            "standing": {"p": None, "peak_p": None,
+                         "state": "intact"},
+            "s1": None,
+            "version": 1,
+            "history": [{"version": 1, "ts": ts,
+                         "kind": "proposed",
+                         "detail": detail}],
+            "relationships": [],
+            "created_ts": ts,
+            "updated_ts": ts,
+        }
+        for key, value in (extras or {}).items():
+            scenario[key] = copy.deepcopy(value)
+        self.scenarios[scenario_id] = scenario
+        records = [self._transition_record(
+            scenario, ts=ts, from_state=None, stage=stage,
+            detail=detail, situation_id=situation_id)]
+        # The transition record for a scenario born past
+        # "proposed" (a sleeve setup is born armed) must name
+        # the state it was born into.
+        records[0]["to_state"] = initial_state
+        self._persist()
+        return records
+
+    def sync_scenario(self, scenario_id: str, *, ts,
+                      to_state: str | None = None,
+                      close_reason: str | None = None,
+                      stage: str = "", detail: str = "",
+                      situation_id=None,
+                      geometry_patch: dict | None = None
+                      ) -> list[dict]:
+        """Mirror one disposition of a non-lifecycle scenario:
+        a state move, a terminal close, a geometry refinement
+        (a sleeve trigger naming its targets), or — with none
+        of those — a journal-only history note.  The mirror
+        never invents a transition the source did not make:
+        an unknown or already-closed scenario is a no-op."""
+        scenario = self.scenarios.get(scenario_id)
+        if scenario is None:
+            return []
+        records: list[dict] = []
+        if geometry_patch:
+            geometry = scenario.setdefault("geometry", {})
+            changed = False
+            for key, value in geometry_patch.items():
+                if geometry.get(key) != value:
+                    geometry[key] = copy.deepcopy(value)
+                    changed = True
+            if changed and to_state is None \
+                    and close_reason is None:
+                # A refinement standing alone is its own
+                # version; one riding a transition folds into
+                # the transition's version below.
+                self._bump(scenario, ts, "refreshed",
+                           detail or "geometry refined",
+                           stage=stage)
+                self._persist()
+        if close_reason is not None:
+            records.append(self._close(
+                scenario, ts=ts, close_reason=close_reason,
+                stage=stage, detail=detail,
+                situation_id=situation_id))
+            self._persist()
+            return records
+        if to_state is not None and to_state != scenario["state"]:
+            from_state = scenario["state"]
+            scenario["state"] = to_state
+            if to_state == "entered":
+                self._freeze_management_context(scenario, ts)
+            self._bump(scenario, ts, "transition", detail,
+                       stage=stage)
+            records.append(self._transition_record(
+                scenario, ts=ts, from_state=from_state,
+                stage=stage, detail=detail,
+                situation_id=situation_id))
+            self._persist()
+        elif geometry_patch is None:
+            scenario["history"].append(
+                {"version": scenario["version"], "ts": ts,
+                 "kind": "stage", "stage": stage,
+                 "detail": detail})
+            scenario["updated_ts"] = ts
+            self._persist()
+        return records
+
+    def note_position(self, scenario_id: str, ticket: int, *,
+                      ts, situation_id=None) -> list[dict]:
+        """Attach a broker ticket the runner resolved for this
+        scenario (the step-17 open-identity map: alert_id ->
+        setup key).  A scenario whose trade is open becomes
+        ENTERED with its management context frozen — the same
+        transition a lifecycle fill produces — so the cycle's
+        position reconciliation can carry it from there.
+        Re-noting the same ticket is a no-op."""
+        scenario = self.scenarios.get(scenario_id)
+        if scenario is None:
+            return []
+        ticket = int(ticket)
+        if scenario.get("ticket") == ticket \
+                and scenario["state"] in POSITION_STATES:
+            return []
+        scenario["ticket"] = ticket
+        if scenario["state"] in ("proposed", "forming",
+                                 "armed", "triggered"):
+            from_state = scenario["state"]
+            scenario["state"] = "entered"
+            self._freeze_management_context(scenario, ts)
+            self._bump(scenario, ts, "transition",
+                       "broker position open for this "
+                       "scenario (ticket resolved from the "
+                       "open-identity map)",
+                       stage="position_open")
+            self._persist()
+            return [self._transition_record(
+                scenario, ts=ts, from_state=from_state,
+                stage="position_open",
+                detail="broker position open",
+                situation_id=situation_id)]
+        scenario["history"].append(
+            {"version": scenario["version"], "ts": ts,
+             "kind": "ticket_noted", "ticket": ticket})
+        scenario["updated_ts"] = ts
+        self._persist()
+        return []
+
     def note_judgment(self, scenario_id: str, *, ts, s1=None,
                       groups_for=None, groups_against=None
                       ) -> list[dict]:
@@ -1012,7 +1219,8 @@ class ScenarioBook:
         self._persist()
         return records
 
-    def _summary_record(self, *, ts, situation_id) -> dict:
+    def _summary_record(self, *, ts, situation_id,
+                        extras: dict | None = None) -> dict:
         by_state: dict[str, int] = {}
         by_horizon: dict[str, int] = {}
         by_authority: dict[str, int] = {}
@@ -1052,7 +1260,7 @@ class ScenarioBook:
             {"a": rel["a"], "b": rel["b"]}
             for rel in self.relationships.values()
             if rel.get("kind") == "competing"]
-        return {
+        summary = {
             "type": "scenario_book",
             "ts": ts,
             "situation_id": situation_id,
@@ -1074,9 +1282,21 @@ class ScenarioBook:
                            in group_funders.items()
                            if len(ids) > 1}},
             "scenarios": rows}
+        # Pass 3: the book-judgment cycle's account rides the
+        # summary — its outcome counts always, its strongest
+        # coverage gap when one is active — so the per-H1
+        # summary is the book's complete account of itself.
+        if extras:
+            if extras.get("judgment") is not None:
+                summary["judgment"] = extras["judgment"]
+            if extras.get("coverage_gap") is not None:
+                summary["coverage_gap"] = \
+                    extras["coverage_gap"]
+        return summary
 
     def cycle(self, *, ts, situation_id=None, assessment=None,
-              open_tickets=None) -> list[dict]:
+              open_tickets=None,
+              summary_extras: dict | None = None) -> list[dict]:
         """One book cycle (H1 close, per SPEC §5.1's cadence):
         reconcile open positions, score every live scenario
         with the assessor (shadow), refresh pair relationships,
@@ -1092,5 +1312,6 @@ class ScenarioBook:
         records += self.refresh_relationships(
             ts=ts, situation_id=situation_id)
         records.append(self._summary_record(
-            ts=ts, situation_id=situation_id))
+            ts=ts, situation_id=situation_id,
+            extras=summary_extras))
         return records

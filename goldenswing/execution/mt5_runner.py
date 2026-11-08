@@ -410,6 +410,17 @@ class MT5RunnerConfig:
     # situation program's gate: with situation_enabled off the
     # book is silent too, so record shapes stay byte-identical.
     scenario_book_enabled: bool = True
+    # BOOK JUDGMENT (MarketSituation Pass 3, shadow): per H1
+    # book cycle, Judgment reads the WHOLE book — competing
+    # pairs resolved on the record, lone triggered scenarios
+    # judged on their own S1 verdicts, coverage gaps journaled
+    # (execution/judgment_book.py) — and the book summary gains
+    # the cycle's judgment counts + strongest gap.
+    # OBSERVATION-ONLY: governed routes keep their legacy
+    # authority until Pass 5; nothing here is read by a
+    # decision path.  Rides the book's gates (silent when the
+    # book or the situation program is off).
+    judgment_book_enabled: bool = True
     # JUDGMENT CORE (owner rulings 2026-10-23; build ordered
     # 2026-11-02): evaluation of every candidate-bearing funnel
     # record — market-state estimation -> competing scenarios ->
@@ -1961,13 +1972,35 @@ class MT5Runner:
         five-scenario assessment (or a fresh read of the
         current decision context when no thesis cycle has run
         yet), refresh pair relationships, journal the summary.
-        Never raises."""
+
+        PASS 3: broker tickets resolve onto scenarios first
+        (native / sleeve fills carry no lifecycle ticket), then
+        Judgment reads the whole book — competing pairs
+        resolved, lone triggered scenarios judged, coverage
+        gaps read against the current situation — and its
+        account rides the summary.  Never raises."""
         try:
             if "H1" not in (appended or []):
                 return
             book = self._scenario_book_get()
             if book is None:
                 return
+            ts = (str(asof) if asof is not None
+                  else str(self._evaluation_now()))
+            situation_id = self._current_situation_id()
+            self._book_sync_position_tickets(
+                book, ts=ts, situation_id=situation_id)
+            extras = None
+            if getattr(self.cfg, "judgment_book_enabled",
+                       True):
+                # Relationships first, so the judgment reads
+                # THIS cycle's pairs (the cycle's own refresh
+                # below then finds nothing new to journal).
+                self._book_journal(book.refresh_relationships(
+                    ts=ts, situation_id=situation_id))
+                records, extras = self._book_judgment(
+                    book, ts=ts, situation_id=situation_id)
+                self._book_journal(records)
             assessment = getattr(self, "_last_thesis_assessment",
                                  None)
             if assessment is None:
@@ -1982,14 +2015,377 @@ class MT5Runner:
                 except Exception:
                     open_tickets = None
             self._book_journal(book.cycle(
-                ts=(str(asof) if asof is not None
-                    else str(self._evaluation_now())),
-                situation_id=self._current_situation_id(),
+                ts=ts,
+                situation_id=situation_id,
                 assessment=assessment,
-                open_tickets=open_tickets))
+                open_tickets=open_tickets,
+                summary_extras=extras))
         except Exception as exc:  # noqa: BLE001 — observation-only
             _log.warning("mt5: scenario book cycle failed "
                          "(observation-only): %s", exc)
+
+    def _book_sync_position_tickets(self, book, *, ts,
+                                    situation_id) -> None:
+        """Resolve broker tickets onto book scenarios through
+        the step-17 open-identity map (alert_id -> setup key):
+        lifecycle setups carry their ticket on the tracked
+        setup, but native-route and Hot Scalp fills are known
+        to the book only by their candidate identity — this is
+        where their scenarios learn their ticket, become
+        ENTERED, and freeze their management context (the
+        cycle's own position reconciliation carries them from
+        there).  Best-effort; never raises."""
+        try:
+            tickets = self.tick_manager.tickets()
+        except Exception:
+            return
+        identity = getattr(self, "_open_identity", {}) or {}
+        for ticket in tickets or []:
+            try:
+                pos = self.tick_manager.position(ticket)
+            except Exception:
+                continue
+            if pos is None:
+                continue
+            ident = identity.get(
+                str(getattr(pos, "alert_id", "") or ""))
+            if not ident:
+                continue
+            setup_key = str(ident[0])
+            candidates = [setup_key]
+            if setup_key.startswith("hot_scalp:"):
+                candidates.append(setup_key.split(":", 1)[1])
+            for scenario_id in candidates:
+                if book.get(scenario_id) is not None:
+                    self._book_journal(book.note_position(
+                        scenario_id, int(ticket), ts=ts,
+                        situation_id=situation_id))
+                    break
+
+    def _book_judgment(self, book, *, ts, situation_id):
+        """The Pass 3 book-judgment cycle's runner seam: the
+        current situation (the keeper's latest — the same one
+        the cycle's records cite), the coverage tracker this
+        run carries, and the desk's stated bars from the same
+        config fields S1 reads.  Returns (records, extras)."""
+        from . import judgment_book as _jb
+        keeper = self._situation_keeper_get()
+        situation = keeper.latest() if keeper is not None \
+            else None
+        tracker = getattr(self, "_coverage_tracker", None)
+        if tracker is None:
+            tracker = self._coverage_tracker = \
+                _jb.CoverageTracker()
+        cfg = _jb.BookJudgmentConfig(
+            min_expected_r=float(getattr(
+                self.cfg, "judgment_min_expected_r", 0.05)),
+            min_confidence=float(getattr(
+                self.cfg, "judgment_min_confidence", 0.15)))
+        return _jb.evaluate_book(
+            book, ts=ts, situation_id=situation_id,
+            situation=situation, tracker=tracker, cfg=cfg)
+
+    # --------------------------------------- Pass 3 mirrors
+    # The book's population completes: the synchronous native
+    # routes and the Hot Scalp sleeve never pass through the
+    # setup lifecycle store, so their candidates mirror here —
+    # at the same seams their funnel records are born, keyed
+    # by the identity those records carry.  The book mirrors,
+    # never originates; every helper is best-effort and may
+    # never raise into a route.
+
+    def _book_mirror_native(self, playbook: str, route: str, *,
+                            key: str, sig, prov: dict | None,
+                            disposition: str,
+                            detail: str = "") -> None:
+        """Mirror one native-route candidate (qm_m5 / qm_d1)
+        and its disposition into the book.  ``disposition`` is
+        "proposed" (born, execution follows — the funnel tap
+        can then attach the candidate's S1 verdict to a LIVE
+        scenario), "triggered" (accepted / friction-alive:
+        the scenario stands), or "closed" (terminally
+        disposed: the scenario closes rejected with the
+        route's own reason in the detail)."""
+        book = self._scenario_book_get()
+        if book is None:
+            return
+        try:
+            ts = str(self._evaluation_now())
+            situation_id = self._current_situation_id()
+            records: list = []
+            if book.get(key) is None and not any(
+                    c.get("scenario_id") == key
+                    for c in book.closed):
+                from .playbook_registry import spec_for
+                spec = spec_for(playbook)
+                native_tf = (spec.native_tf if spec is not None
+                             else "H1")
+                management: dict = {}
+                try:
+                    management = management_block_for(
+                        playbook, sig) or {}
+                except Exception:
+                    management = {}
+                clocks = {
+                    "formation_tf": native_tf,
+                    "refinement_tf": (spec.refinement_tf
+                                      if spec is not None
+                                      else None),
+                    "trigger_tf": native_tf,
+                    "entry_tf": native_tf,
+                    "management_tf": (management.get(
+                        "management_context_timeframe")
+                        or native_tf)}
+                if spec is not None and spec.clocks:
+                    clocks.update(dict(spec.clocks))
+                prov = prov or {}
+                records += book.propose_scenario(
+                    key, ts=ts, family=playbook, route=route,
+                    direction=int(sig.direction),
+                    horizon=(spec.management_horizon
+                             if spec is not None else "intraday"),
+                    clocks=clocks,
+                    geometry={
+                        "entry": float(sig.entry_ref),
+                        "stop": float(sig.invalidation),
+                        "targets": [float(x) for x in
+                                    (sig.targets or [])],
+                        "zone_id": None},
+                    invalidation_terms=[
+                        f"close beyond invalidation "
+                        f"{float(sig.invalidation):.2f} "
+                        f"(native route lifecycle)"],
+                    validity={
+                        "formed_bar_ts": prov.get(
+                            "pattern_formation_ts"),
+                        "touch_ts": prov.get(
+                            "pattern_touch_ts"),
+                        "expires_ts": None,
+                        "validity_bars": prov.get(
+                            "validity_window_bars")},
+                    situation_id=situation_id,
+                    authority=("governing"
+                               if self._judgment_route_state(
+                                   route) == "governing"
+                               else "shadow"),
+                    management=management,
+                    score=float(getattr(sig, "score", 0.0)
+                                or 0.0),
+                    detail="scenario proposed from native "
+                           "candidate",
+                    extras={"provenance": dict(prov)})
+            if disposition == "triggered":
+                records += book.sync_scenario(
+                    key, ts=ts, to_state="triggered",
+                    stage="candidate_emitted", detail=detail,
+                    situation_id=situation_id)
+            elif disposition == "closed":
+                records += book.sync_scenario(
+                    key, ts=ts, close_reason="rejected",
+                    stage="candidate_disposed", detail=detail,
+                    situation_id=situation_id)
+            self._book_journal(records)
+        except Exception as exc:  # noqa: BLE001 — mirror only
+            self.journal.log_note(
+                f"scenario_book: native mirror failed for "
+                f"{key}: {type(exc).__name__}: {exc}")
+
+    def _book_mirror_scan_residue(self, *, key: str, name: str,
+                                  spec, sig, prov: dict | None,
+                                  source: str,
+                                  code: str) -> None:
+        """Mirror a scan candidate the lifecycle never
+        registered (warmup / catch-up / replay scans, or a
+        handoff-off configuration): its candidate_emitted
+        record exists, so its scenario exists — born and
+        closed in the same mirror, an observed candidate that
+        was never routed (the audit's completeness is
+        funnel-wide, not live-close-only)."""
+        book = self._scenario_book_get()
+        if book is None:
+            return
+        try:
+            if book.get(key) is not None or any(
+                    c.get("scenario_id") == key
+                    for c in book.closed):
+                return
+            ts = str(self._evaluation_now())
+            situation_id = self._current_situation_id()
+            from .playbook_registry import spec_for
+            rspec = spec_for(name)
+            native_tf = (rspec.native_tf if rspec is not None
+                         else "H1")
+            clocks = {
+                "formation_tf": native_tf,
+                "refinement_tf": (rspec.refinement_tf
+                                  if rspec is not None
+                                  else None),
+                "trigger_tf": native_tf,
+                "entry_tf": native_tf,
+                "management_tf": native_tf}
+            if rspec is not None and rspec.clocks:
+                clocks.update(dict(rspec.clocks))
+            records = book.propose_scenario(
+                key, ts=ts, family=name,
+                route=getattr(spec, "route", None),
+                direction=int(sig.direction),
+                horizon=(rspec.management_horizon
+                         if rspec is not None else "intraday"),
+                clocks=clocks,
+                geometry={
+                    "entry": float(sig.entry_ref),
+                    "stop": float(sig.invalidation),
+                    "targets": [float(x) for x in
+                                (sig.targets or [])],
+                    "zone_id": None},
+                invalidation_terms=[
+                    f"close beyond invalidation "
+                    f"{float(sig.invalidation):.2f}"],
+                validity={
+                    "formed_bar_ts": (prov or {}).get(
+                        "pattern_formation_ts"),
+                    "touch_ts": (prov or {}).get(
+                        "pattern_touch_ts"),
+                    "expires_ts": None,
+                    "validity_bars": (prov or {}).get(
+                        "validity_window_bars")},
+                situation_id=situation_id, authority="shadow",
+                score=float(getattr(sig, "score", 0.0) or 0.0),
+                detail="scenario proposed from scan candidate "
+                       "(unregistered residue)",
+                extras={"provenance": dict(prov or {})})
+            records += book.sync_scenario(
+                key, ts=ts, close_reason="rejected",
+                stage="candidate_disposed",
+                detail=(f"scan-observed only (source "
+                        f"{source}; disposition {code}) — "
+                        f"never registered as a setup instance, "
+                        f"never routed"),
+                situation_id=situation_id)
+            self._book_journal(records)
+        except Exception as exc:  # noqa: BLE001 — mirror only
+            self.journal.log_note(
+                f"scenario_book: scan residue mirror failed "
+                f"for {key}: {type(exc).__name__}: {exc}")
+
+    def _book_mirror_hs_event(self, event: dict,
+                              tick: dict) -> None:
+        """Mirror one Hot Scalp sleeve event into the book
+        (SPEC §4.4: the sleeve's setups map to scenarios with
+        entry_tf M1; the SetupStore remains the claim/fencing
+        substrate — the book reads its lifecycle, it does not
+        re-implement it).  Shadow instances stay intrinsically
+        stamped: the scenario's authority is the promotion
+        route's declared state, which is shadow_declared."""
+        name = str(event.get("event", ""))
+        setup = event.get("setup") or {}
+        sid = event.get("setup_id") or setup.get("setup_id")
+        if not sid:
+            return
+        book = self._scenario_book_get()
+        if book is None:
+            return
+        try:
+            ts = str((tick or {}).get("time"))
+            situation_id = self._current_situation_id()
+            records: list = []
+            if name == "setup_armed" and setup:
+                from .playbook_registry import \
+                    management_horizon_for
+                stop = float(setup.get("stop") or 0.0)
+                records += book.propose_scenario(
+                    str(sid), ts=ts, family="hot_scalp",
+                    route="hot_scalp_promotion",
+                    direction=int(setup.get("direction") or 0),
+                    horizon=management_horizon_for("hot_scalp"),
+                    clocks={"formation_tf": "M5",
+                            "refinement_tf": None,
+                            "trigger_tf": "M1",
+                            "entry_tf": "M1",
+                            "management_tf": "M5"},
+                    geometry={
+                        "entry": float(setup.get("level")
+                                       or 0.0),
+                        "stop": stop,
+                        "targets": [],
+                        "zone_id": None},
+                    invalidation_terms=[
+                        f"price through structural stop "
+                        f"{stop:.2f} (hot scalp sleeve)"],
+                    validity={
+                        "formed_bar_ts": setup.get(
+                            "formation_ts"),
+                        "touch_ts": None,
+                        "expires_ts": setup.get("expires_at"),
+                        "validity_bars": None},
+                    situation_id=situation_id,
+                    authority=(
+                        "governing"
+                        if self._judgment_route_state(
+                            "hot_scalp_promotion") == "governing"
+                        else "shadow"),
+                    initial_state="armed",
+                    stage="setup_armed",
+                    detail="hot scalp setup armed (sleeve "
+                           "SetupStore)",
+                    extras={
+                        "strategy": setup.get("strategy"),
+                        "parent_setup_id": setup.get(
+                            "parent_setup_id"),
+                        "zone": {
+                            "low": setup.get("zone_low"),
+                            "high": setup.get("zone_high")}})
+            elif name == "candidate_shadow":
+                targets = [float(x) for x in (
+                    event.get("targets") or (
+                        [event.get("target_reference")]
+                        if event.get("target_reference")
+                        is not None else []))]
+                records += book.sync_scenario(
+                    str(sid), ts=ts, to_state="triggered",
+                    stage="candidate_shadow",
+                    detail="sleeve candidate triggered "
+                           "(shadow bookkeeping complete)",
+                    situation_id=situation_id,
+                    geometry_patch={
+                        "entry": float(
+                            event.get("entry_reference")
+                            or 0.0),
+                        "stop": float(
+                            event.get("structural_stop")
+                            or 0.0),
+                        "targets": targets})
+            elif name == "candidate_blocked":
+                records += book.sync_scenario(
+                    str(sid), ts=ts, close_reason="rejected",
+                    stage="candidate_blocked",
+                    detail=(f"sleeve candidate blocked: "
+                            f"{event.get('reason_code') or ''}"),
+                    situation_id=situation_id)
+            elif name == "setup_invalidated":
+                records += book.sync_scenario(
+                    str(sid), ts=ts,
+                    close_reason="invalidated",
+                    stage="setup_invalidated",
+                    detail=(f"sleeve setup invalidated: "
+                            f"{event.get('reason_code') or ''}"),
+                    situation_id=situation_id)
+            elif name == "setup_expired":
+                records += book.sync_scenario(
+                    str(sid), ts=ts, close_reason="expired",
+                    stage="setup_expired",
+                    detail="sleeve setup expired untriggered",
+                    situation_id=situation_id)
+            elif name in ("setup_touched", "setup_extended"):
+                records += book.sync_scenario(
+                    str(sid), ts=ts, stage=name,
+                    detail=f"sleeve setup {name}",
+                    situation_id=situation_id)
+            self._book_journal(records)
+        except Exception as exc:  # noqa: BLE001 — mirror only
+            self.journal.log_note(
+                f"scenario_book: hot scalp mirror failed for "
+                f"{sid}: {type(exc).__name__}: {exc}")
 
     def _situation_on_closes(self, appended, tick) -> None:
         """Refresh the situation for the TFs that just closed
@@ -2607,8 +3003,24 @@ class MT5Runner:
                     # record's S1 verdict + the correlation
                     # groups S1's weighing assigned (the book
                     # never re-derives either).
+                    # PASS 3 — the identity channel completes:
+                    # a native candidate's identity is its
+                    # lifecycle provenance key, a Hot Scalp
+                    # candidate's is the setup id its funnel
+                    # candidate carries.  The channels are
+                    # disjoint in practice; the precedence is
+                    # the lifecycle's own first.
                     _bk_setup_id = (evidence or {}).get(
                         "setup_id")
+                    if not _bk_setup_id:
+                        _bk_prov = (evidence or {}).get(
+                            "provenance")
+                        if isinstance(_bk_prov, dict):
+                            _bk_setup_id = _bk_prov.get(
+                                "instance_key")
+                    if not _bk_setup_id \
+                            and isinstance(candidate, dict):
+                        _bk_setup_id = candidate.get("setup_id")
                     if _bk_setup_id:
                         _bk = self._scenario_book_get()
                         if _bk is not None:
@@ -10856,6 +11268,10 @@ class MT5Runner:
                 # If journaling fails, this sleeve remains non-executable.
                 _log.error("hot_scalp: journal write failed: %s", exc)
             self._hs_chain_from_event(event, tick)
+            # PASS 3 — the book mirrors the sleeve's setups
+            # (§4.4): armed / triggered / terminal events land
+            # as scenario transitions beside the chain records.
+            self._book_mirror_hs_event(event, tick)
             if name in ("setup_armed", "candidate_shadow", "candidate_blocked",
                         "setup_invalidated", "setup_expired", "scan_degraded"):
                 try:
@@ -17534,6 +17950,13 @@ class MT5Runner:
                     self._mark_instance_seen(
                         key, elig_code or "ineligible")
                     seen[key] = elig_code or "ineligible"
+                    # PASS 3 — the book mirrors the ineligible
+                    # candidate too: born and closed on the
+                    # record above (funnel-wide audit).
+                    self._book_mirror_native(
+                        "qm_m5", "qm_m5_native", key=key,
+                        sig=sig, prov=prov, disposition="closed",
+                        detail=f"{elig_code}: {elig_reason}")
                     self._qm_m5_last_logged = max(
                         self._qm_m5_last_logged,
                         int(cand.signal_index))
@@ -17549,6 +17972,20 @@ class MT5Runner:
                     "native route)"
                     + (f" tags:{','.join(touch['tags'])}"
                        if touch["tags"] else ""))
+                # PASS 3 — the scenario is proposed BEFORE the
+                # order path runs, so the candidate's funnel tap
+                # (inside execute) attaches its S1 verdict to a
+                # live scenario; the disposition mirror below
+                # classifies the outcome from the order-desk
+                # counters, exactly as the funnel does.
+                self._book_mirror_native(
+                    "qm_m5", "qm_m5_native", key=key, sig=sig,
+                    prov=prov, disposition="proposed")
+                _pre = self._order_snapshot(stats)
+                try:
+                    _holding = bool(self.tick_manager.tickets())
+                except Exception:
+                    _holding = False
                 _outcome_code = None
                 try:
                     _outcome_code = self._execute_qm_m5_candidate(
@@ -17574,6 +18011,7 @@ class MT5Runner:
                         source=source)
                     self._mark_instance_seen(key, "path.exception")
                     seen[key] = "path.exception"
+                    _outcome_code = "path.exception"
                 if _outcome_code == _FRICTION_CODE:
                     # RULING 6: a friction refusal does NOT
                     # consume the setup — the dedupe cursor holds
@@ -17595,6 +18033,58 @@ class MT5Runner:
                         self._mark_instance_seen(
                             key, _outcome_code or "terminal")
                         seen[key] = _outcome_code or "terminal"
+                # PASS 3 — the disposition mirror: friction
+                # leaves the scenario standing as triggered
+                # (RULING 6 — it re-evaluates next close and the
+                # refresh path re-attaches its verdict); an
+                # order-path exception closes it with the
+                # exception named; anything else is classified
+                # from the order-desk counters.
+                if _outcome_code == _FRICTION_CODE:
+                    self._book_mirror_native(
+                        "qm_m5", "qm_m5_native", key=key,
+                        sig=sig, prov=prov,
+                        disposition="triggered",
+                        detail="friction refusal (risk.friction) "
+                               "— setup stays alive for "
+                               "re-evaluation (RULING 6)")
+                elif _outcome_code == "path.exception":
+                    self._book_mirror_native(
+                        "qm_m5", "qm_m5_native", key=key,
+                        sig=sig, prov=prov, disposition="closed",
+                        detail="order path raised "
+                               "(path.exception) — see the "
+                               "candidate's funnel record")
+                else:
+                    _ores, _ocode = self._order_outcome(
+                        stats, _pre, holding=_holding)
+                    if _ores in ("filled", "layer_filled",
+                                 "placed_pending",
+                                 "layer_pending"):
+                        self._book_mirror_native(
+                            "qm_m5", "qm_m5_native", key=key,
+                            sig=sig, prov=prov,
+                            disposition="triggered",
+                            detail="accepted — shared order path "
+                                   f"outcome: {_ores}")
+                        _bk = self._scenario_book_get()
+                        if _bk is not None:
+                            self._book_sync_position_tickets(
+                                _bk,
+                                ts=str(self._evaluation_now()),
+                                situation_id=(
+                                    self._current_situation_id()))
+                    else:
+                        _code_txt = (_outcome_code or _ocode
+                                     or "none")
+                        self._book_mirror_native(
+                            "qm_m5", "qm_m5_native", key=key,
+                            sig=sig, prov=prov,
+                            disposition="closed",
+                            detail="native disposition: order "
+                                   f"outcome {_ores} (code "
+                                   f"{_code_txt}) — see the "
+                                   "candidate's funnel record")
             if out:
                 stats["qm_m5_signals"] = stats.get(
                     "qm_m5_signals", 0) + len(out)
@@ -18443,6 +18933,12 @@ class MT5Runner:
                     self._mark_instance_seen(
                         key, elig_code or "ineligible")
                     seen[key] = elig_code or "ineligible"
+                    # PASS 3 — the book mirrors the ineligible
+                    # candidate too (funnel-wide audit).
+                    self._book_mirror_native(
+                        "qm_d1", "qm_d1_native", key=key,
+                        sig=sig, prov=prov, disposition="closed",
+                        detail=f"{elig_code}: {elig_reason}")
                     continue
                 self.journal.log_note(
                     f"mt5 qm_d1 "
@@ -18454,10 +18950,26 @@ class MT5Runner:
                     "live order on the D1 clock (P3/A14)"
                     + (f" tags:{','.join(touch['tags'])}"
                        if touch["tags"] else ""))
+                # PASS 3 — the scenario is proposed BEFORE the
+                # order path runs (the funnel tap inside execute
+                # attaches the S1 verdict to a live scenario);
+                # the disposition mirror below classifies the
+                # outcome from the order-desk counters.
+                self._book_mirror_native(
+                    "qm_d1", "qm_d1_native", key=key, sig=sig,
+                    prov=prov, disposition="proposed")
+                _pre = (self._order_snapshot(stats)
+                        if isinstance(stats, dict) else None)
+                try:
+                    _holding = bool(self.tick_manager.tickets())
+                except Exception:
+                    _holding = False
+                _d1_failed = False
                 try:
                     self._execute_qm_d1_candidate(
                         pb, sig, d1_df, ctx, stats, provenance=prov)
                 except Exception as exc:
+                    _d1_failed = True
                     self.journal.log_note(
                         f"mt5: qm_d1 order path failed for the "
                         f"{touch['touch_ts'].date()} touch: {exc}")
@@ -18478,6 +18990,55 @@ class MT5Runner:
                         source=source)
                 self._mark_instance_seen(key, "terminal")
                 seen[key] = "terminal"
+                # PASS 3 — the disposition mirror.  The D1 route
+                # consumes every touch it evaluates (the seen
+                # mark above is unconditional): an accepted
+                # order stands as triggered, everything else
+                # closes with the route's own accounting named.
+                if _d1_failed:
+                    self._book_mirror_native(
+                        "qm_d1", "qm_d1_native", key=key,
+                        sig=sig, prov=prov, disposition="closed",
+                        detail="order path raised "
+                               "(path.exception) — see the "
+                               "candidate's funnel record")
+                elif _pre is None:
+                    self._book_mirror_native(
+                        "qm_d1", "qm_d1_native", key=key,
+                        sig=sig, prov=prov, disposition="closed",
+                        detail="route consumed the touch (no "
+                               "order counters at this seam — "
+                               "disposition of record is the "
+                               "candidate's funnel record)")
+                else:
+                    _ores, _ocode = self._order_outcome(
+                        stats, _pre, holding=_holding)
+                    if _ores in ("filled", "layer_filled",
+                                 "placed_pending",
+                                 "layer_pending"):
+                        self._book_mirror_native(
+                            "qm_d1", "qm_d1_native", key=key,
+                            sig=sig, prov=prov,
+                            disposition="triggered",
+                            detail="accepted — shared order path "
+                                   f"outcome: {_ores}")
+                        _bk = self._scenario_book_get()
+                        if _bk is not None:
+                            self._book_sync_position_tickets(
+                                _bk,
+                                ts=str(self._evaluation_now()),
+                                situation_id=(
+                                    self._current_situation_id()))
+                    else:
+                        self._book_mirror_native(
+                            "qm_d1", "qm_d1_native", key=key,
+                            sig=sig, prov=prov,
+                            disposition="closed",
+                            detail="native disposition: order "
+                                   f"outcome {_ores} (code "
+                                   f"{_ocode or 'none'}) — see "
+                                   "the candidate's funnel "
+                                   "record")
             if out and stats is not None:
                 stats["qm_d1_signals"] = stats.get(
                     "qm_d1_signals", 0) + len(out)
@@ -19391,6 +19952,17 @@ class MT5Runner:
                     self.journal.log_note(
                         f"setup_lifecycle: registration failed "
                         f"for {name}: {_reg_exc}")
+            # PASS 3 — book population audit: a scan candidate
+            # that no registration path took (warmup / catch-up
+            # / replay source, handoff off, or a failed
+            # registration) still emitted its candidate_emitted
+            # record above, so the book mirrors it — born and
+            # closed as an observed, never-routed candidate.
+            # A registered candidate's scenario already exists
+            # and this is a no-op for it.
+            self._book_mirror_scan_residue(
+                key=prov["instance_key"], name=name, spec=spec,
+                sig=sig, prov=prov, source=source, code=_disp_code)
 
     def _run_roster_close_evals(self, stats: dict | None = None,
                                 *, source: str) -> None:
