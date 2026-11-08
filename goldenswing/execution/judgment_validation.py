@@ -384,6 +384,27 @@ def validate(records: list[dict], *, horizon_h: int = 4,
     }
 
 
+def compare_priors(records: list[dict], *,
+                   horizon_h: int = 4) -> dict[str, Any]:
+    """Pass 4's gate, producible from the journal alone: the
+    measured-priors rung vs the stated-priors baseline on the
+    locked chronological holdout.
+
+    The measurement machinery is execution/
+    judgment_calibration.py (imported lazily — it builds on
+    this module's build_pairs, so the import cannot run the
+    other way at module load).  Returns the verdict body the
+    runner journals as ``judgment_priors_verdict``; the
+    PriorsProvider puts measured priors in force only on a
+    "measured_wins" verdict, under config.  This function
+    promotes nothing by itself."""
+    from . import judgment_calibration as _cal
+
+    pairs = _cal.build_calibration_pairs(
+        records, horizon_h=horizon_h)
+    return _cal.compare_prior_sets(pairs)
+
+
 def _r(value: Any) -> str:
     return "—" if value is None else f"{float(value):+.2f}R"
 

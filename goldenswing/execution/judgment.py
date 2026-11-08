@@ -24,11 +24,15 @@ decision path (explanation drafting only, elsewhere).
 
 The directive's neural ladder is baseline-first: THIS is the
 baseline — a deterministic, fully inspectable estimator whose
-every input is a value the funnel record already carries.  No
-probability here is learned or fitted; the priors and response
-coefficients below are stated constants, and the shadow journal
-is the dataset a later fitted rung must beat on chronological
-walk-forward with a locked holdout.
+every input is a value the funnel record already carries.  The
+response coefficients below are stated constants.  The scenario
+priors are stated constants BY DEFAULT; Pass 4
+(execution/judgment_calibration.py) measures them from the
+shadow journal itself and a verdict may price from the
+measured set only through the ``priors_for`` input, only when
+the measured rung has beaten this baseline on chronological
+walk-forward with a locked holdout — the discipline this
+docstring always promised the dataset.
 
 Evidence honesty rules (mirroring the funnel record's own
 doctrine):
@@ -190,13 +194,24 @@ def _bias_alignment(observed: dict, direction: int) -> tuple[int, bool]:
 # ------------------------------------------------------------ the core
 def evaluate_judgment(*, candidate: dict, decision: dict | None,
                       evidence: dict | None, context: dict | None,
-                      config: JudgmentConfig | None = None) -> dict:
+                      config: JudgmentConfig | None = None,
+                      priors_for=None) -> dict:
     """One shadow judgment for one evaluated candidate.
 
     Pure: same record in, same verdict out.  The returned block
     is journaled on the ``judgment_shadow`` record, with the
     runner overstamping ``mode`` with the effective authority
-    mode (see the module docstring)."""
+    mode (see the module docstring).
+
+    ``priors_for`` (Pass 4, SPEC §5.3): an optional callable
+    ``(structure=, rel_dir=, volatility=) -> dict`` resolving
+    the scenario priors for this candidate's cell — the
+    judgment_calibration PriorsProvider's bound method on the
+    live path.  It returns {continuation, reversal, chop,
+    source, version, cell, n}; the verdict then journals the
+    trace under "priors".  Absent (every pre-Pass-4 caller),
+    the stated constants price the scenarios and the returned
+    block is byte-identical to the pre-Pass-4 shape."""
     cfg = config or JudgmentConfig()
     candidate = candidate or {}
     decision = decision or {}
@@ -312,12 +327,39 @@ def evaluate_judgment(*, candidate: dict, decision: dict | None,
         target_r = 1.0
     target_r = max(MIN_TARGET_R, min(MAX_TARGET_R, target_r))
 
-    w_cont = PRIOR_CONTINUATION * math.exp(
+    # ---- scenario priors (stated constants, or the measured
+    # set when a provider resolves them — Pass 4) --------------
+    prior_cont, prior_rev, prior_chop = (
+        PRIOR_CONTINUATION, PRIOR_REVERSAL, PRIOR_CHOP)
+    priors_trace = None
+    if priors_for is not None:
+        _word = {"up": 1, "down": -1}.get(
+            str(regime.get("direction") or ""))
+        if _word is None or direction not in (1, -1):
+            _rel_dir = "no_bias"
+        elif direction == _word:
+            _rel_dir = "with_bias"
+        else:
+            _rel_dir = "against_bias"
+        _resolved = priors_for(
+            structure=structure, rel_dir=_rel_dir,
+            volatility=regime.get("volatility"))
+        if _resolved:
+            prior_cont = float(_resolved["continuation"])
+            prior_rev = float(_resolved["reversal"])
+            prior_chop = float(_resolved["chop"])
+            priors_trace = {
+                "source": _resolved.get("source"),
+                "version": _resolved.get("version"),
+                "cell": _resolved.get("cell"),
+                "n": _resolved.get("n")}
+
+    w_cont = prior_cont * math.exp(
         RESPONSE * support_score)
-    w_rev = PRIOR_REVERSAL * math.exp(
+    w_rev = prior_rev * math.exp(
         RESPONSE * (-support_score)
         + OPPOSITION_RESPONSE * opposition / 2.0)
-    w_chop = PRIOR_CHOP * math.exp(CHOP_RESPONSE * chop_affinity)
+    w_chop = prior_chop * math.exp(CHOP_RESPONSE * chop_affinity)
     total_w = w_cont + w_rev + w_chop
     p_cont = w_cont / total_w
     p_rev = w_rev / total_w
@@ -375,7 +417,7 @@ def evaluate_judgment(*, candidate: dict, decision: dict | None,
                       f"(continuation {p_cont:.2f} / reversal "
                       f"{p_rev:.2f} / chop {p_chop:.2f})")
 
-    return {
+    verdict_block = {
         "mode": "shadow",
         "decision": verdict,
         "expected_r": round(expected_r, 4),
@@ -393,3 +435,6 @@ def evaluate_judgment(*, candidate: dict, decision: dict | None,
         "thresholds": {"min_expected_r": cfg.min_expected_r,
                        "min_confidence": cfg.min_confidence},
     }
+    if priors_trace is not None:
+        verdict_block["priors"] = priors_trace
+    return verdict_block

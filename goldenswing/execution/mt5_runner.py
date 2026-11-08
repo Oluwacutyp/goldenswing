@@ -463,6 +463,21 @@ class MT5RunnerConfig:
     # journaled, never governing, until the explicit per-route
     # promotion below.  Their own gate stacks still decide.
     judgment_mode: str = "active"
+    # MEASURED PRIORS (MarketSituation Pass 4; SPEC §5.3 +
+    # AMENDMENTS-1 §A3): the S1 core's scenario priors are the
+    # stated constants (0.42/0.38/0.20) unless this reads
+    # "calibrated" AND the calibration's locked-holdout verdict
+    # (a judgment_priors_verdict record, recomputed on the S3
+    # cycle from the reconciliation book) is a measured WIN.
+    # "stated" (default): the measured set is computed and
+    # journaled but never prices a verdict — every verdict
+    # still journals its priors trace (source/version/cell/n)
+    # under both settings.  "calibrated": the verdict of record
+    # rules — no verdict or a loss, and the stated constants
+    # price, automatically.  The measurement is
+    # execution/judgment_calibration.py; RESPONSE / OPPOSITION
+    # / CHOP coefficients stay stated under the same rule.
+    judgment_priors: str = "stated"
     # PER-ROUTE authority overrides (completion-02): maps a
     # route name (JUDGMENT_ROUTE_STATES) to "governing" or
     # "shadow_declared".  This is THE explicit promotion step
@@ -3149,6 +3164,48 @@ class MT5Runner:
             table.append(row)
         return table
 
+    def _priors_provider(self):  # type: ignore[no-untyped-def]
+        """The live priors provider (Pass 4) over the standing
+        calibration state, or None when the measurement layer
+        cannot be read — None prices exactly as pre-Pass-4
+        (stated constants, no trace), so a calibration fault
+        can never reach the decision path."""
+        try:
+            from . import judgment_calibration as _cal
+
+            mode = str(getattr(
+                self.cfg, "judgment_priors", "stated") or "stated")
+            if mode not in ("stated", "calibrated"):
+                mode = "stated"
+            return _cal.provider_from_state(
+                self._priors_state(), mode=mode)
+        except Exception:  # noqa: BLE001 - measurement is evidence
+            return None
+
+    def _priors_for_candidate(self, candidate, intended_tf):  # type: ignore[no-untyped-def]
+        """The priors_for callable for one evaluation: the
+        provider bound to this candidate's family/timeframe
+        (the assessor itself supplies structure / direction /
+        volatility from its own estimation).  The candidate
+        dicts on the funnel do not reliably carry a playbook
+        name (the seam's playbook is a separate value), so the
+        family sub-cell resolves only where the candidate
+        names one; tf / regime / base resolution is unaffected."""
+        provider = self._priors_provider()
+        if provider is None:
+            return None
+        playbook = None
+        if isinstance(candidate, dict):
+            playbook = candidate.get("playbook") \
+                or candidate.get("strategy")
+
+        def _priors_for(*, structure, rel_dir, volatility):
+            return provider.for_cell(
+                structure, rel_dir, playbook=playbook,
+                intended_tf=intended_tf, volatility=volatility)
+
+        return _priors_for
+
     def _judgment_evaluate(self, *, candidate, decision,
                            evidence, intended_tf, eval_now,
                            route: str | None = None):
@@ -3168,6 +3225,8 @@ class MT5Runner:
             candidate=candidate, decision=decision,
             evidence=judgment_evidence,
             context=self._decision_context(),
+            priors_for=self._priors_for_candidate(
+                candidate, intended_tf),
             config=JudgmentConfig(
                 min_expected_r=float(getattr(
                     self.cfg, "judgment_min_expected_r", 0.05)),
@@ -3565,6 +3624,13 @@ class MT5Runner:
             window={"from_offset": from_offset,
                     "to_offset": new_offset,
                     "records": len(records)})
+        # Pass 4 measured priors: the same window, the same
+        # cadence, the same state file — no new scheduler.
+        self._priors_phase(
+            records, bar_key, damaged_lines=damaged,
+            window={"from_offset": from_offset,
+                    "to_offset": new_offset,
+                    "records": len(records)})
 
     # ---- §G range promotion evaluation ----------------------
     # The verdict machinery is execution/range_promotion.py;
@@ -3604,6 +3670,46 @@ class MT5Runner:
             damaged_lines=damaged_lines, window=window,
             run_id=self._run_id, bar=bar_key)
         if record is not None:
+            self.journal.append(record)
+
+    # ---- Measured priors (Pass 4) -----------------------------
+    # The measurement machinery is execution/
+    # judgment_calibration.py; this is only its host (the
+    # range-promotion arrangement: a standing block inside the
+    # S3 state file, fed the audit's journal windows, journaled
+    # on change).  The calibration's ONLY decision-path contact
+    # is the priors provider the judgment seam consults —
+    # gated by config + the journaled holdout verdict, and
+    # fail-soft to the stated constants on any fault.
+    def _priors_state(self) -> dict:
+        from . import judgment_calibration as _cal
+
+        st = self._audit_state()
+        sub = st.get("priors")
+        if not isinstance(sub, dict):
+            sub = _cal.new_state()
+            st["priors"] = sub
+        else:
+            for key, value in _cal.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _priors_phase(self, records, bar_key, *,
+                      damaged_lines: int = 0,
+                      window: dict | None = None) -> None:
+        """One Pass-4 calibration cycle over the self-audit's
+        journal window.  Called from inside _self_audit_phase
+        (itself inside the S3 cycle's guarded body): a failure
+        here is logged by that guard like any audit failure and
+        never reaches a decision path."""
+        from . import judgment_calibration as _cal
+
+        sub = self._priors_state()
+        for record in _cal.cycle(
+                state=sub, records=records,
+                now=pd.Timestamp(bar_key),
+                damaged_lines=damaged_lines, window=window,
+                run_id=self._run_id, bar=bar_key):
             self.journal.append(record)
 
     def _audit_feedback_for(self, playbook) -> dict | None:
