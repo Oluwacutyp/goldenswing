@@ -14,7 +14,7 @@ from mt5_fakes import FakeMT5
 
 
 def test_tick_logger_exact_rows(tmp_path):
-    logger = TickLogger(tmp_path)
+    logger = TickLogger(tmp_path, symbol="XAUUSD")
     ticks = [
         {"time": datetime(2026, 10, 14, 10, 0, 0, tzinfo=timezone.utc),
          "bid": 4160.10, "ask": 4160.40, "tick_volume": 3,
@@ -28,10 +28,12 @@ def test_tick_logger_exact_rows(tmp_path):
     day_file = tmp_path / "mt5_ticks_20261014.csv"
     assert day_file.exists()
     rows = day_file.read_text().strip().splitlines()
-    assert rows[0] == "time,bid,ask,tick_volume,real_volume,spread"
+    # §3.11: every row is LABELED with the series symbol.
+    assert rows[0] == "symbol,time,bid,ask,tick_volume,real_volume,spread"
     assert len(rows) == 3  # header + 2 ticks, exactly as seen
-    assert rows[1].split(",")[1:4] == ["4160.10000", "4160.40000", "3"]
-    assert rows[2].split(",")[1:4] == ["4160.20000", "4160.50000", "1"]
+    assert rows[1].split(",")[0] == "XAUUSD"
+    assert rows[1].split(",")[2:5] == ["4160.10000", "4160.40000", "3"]
+    assert rows[2].split(",")[2:5] == ["4160.20000", "4160.50000", "1"]
 
 
 def test_tick_logger_rotates_per_day(tmp_path):
@@ -64,17 +66,19 @@ def test_export_tick_history_uses_terminal_rows(tmp_path):
                                      tmp_path / "ticks.csv")
     assert rows == 3  # FakeMT5 copy_ticks_range returns exactly 3 rows
     text = path.read_text().strip().splitlines()
-    assert text[0] == "time,bid,ask,tick_volume,real_volume,spread"
+    assert text[0] == "symbol,time,bid,ask,tick_volume,real_volume,spread"
     assert len(text) == 4
-    # spread is recomputed ask - bid, never assumed
+    # §3.11: export rows carry the feed's symbol label.
     first = text[1].split(",")
-    assert float(first[5]) == pytest.approx(float(first[2])
-                                             - float(first[1]))
+    assert first[0] == "XAUUSD"
+    # spread is recomputed ask - bid, never assumed
+    assert float(first[6]) == pytest.approx(float(first[3])
+                                             - float(first[2]))
 
 
 def test_normalize_tick_frame_empty():
     import pandas as pd
     out = normalize_tick_frame(pd.DataFrame())
-    assert list(out.columns) == ["time", "bid", "ask", "tick_volume",
-                                 "real_volume", "spread"]
+    assert list(out.columns) == ["symbol", "time", "bid", "ask",
+                                 "tick_volume", "real_volume", "spread"]
     assert len(out) == 0

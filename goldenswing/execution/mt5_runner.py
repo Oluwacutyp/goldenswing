@@ -212,6 +212,11 @@ DATA_DIR = REPO_ROOT / "data"
 # must not manufacture a phantom partial fill.
 _VOL_EPS = 1e-9
 
+# Price tolerance for reconcile drift comparisons: a broker SL/TP
+# or pending price within this of the tracked value is the same
+# price — float dust must not manufacture a phantom drift note.
+_PRICE_EPS = 1e-6
+
 _log = logging.getLogger(__name__)
 
 
@@ -1161,6 +1166,11 @@ class MT5Runner:
         # keyed (ticket, capped level): a held lock notes once
         # per capped level, never once per tick (2026-11-05).
         self._pl_zone_noted: set = set()
+        # Reconcile-drift episodes already journalled, keyed by
+        # ticket (positions) or ("pending", ticket): the broker
+        # state signature last noted, so a standing drift notes
+        # once per episode, never once per reconcile cycle.
+        self._drift_noted: dict = {}
         # Setup lifecycle (owner rulings 2026-10-30 §1): scan-detected
         # roster setups persist across restarts so a later trigger
         # fire can route them to execution evaluation.  A store that
@@ -1509,6 +1519,7 @@ class MT5Runner:
         # Per-day tick CSV logger (next to the journal; None = disabled).
         self._tick_logger = TickLogger(
             self.cfg.journal_path.parent,
+            symbol=self.cfg.symbol,
             retain_days=self.cfg.tick_csv_retain_days) \
             if self.cfg.tick_log else None
         self._charts_dir = self.cfg.charts_dir or (
@@ -5158,13 +5169,22 @@ class MT5Runner:
         source priced the exit, so misses stay countable."""
         getter = getattr(self.executor, "closing_deal", None)
         if getter is None:
-            return fallback, None
+            return fallback, (
+                f"mt5 close: ticket {ticket} exit priced from "
+                f"the tick snapshot @ {fallback:.2f} — executor "
+                f"has no closing-deal history (fallback, counted)")
         try:
             deal = getter(int(ticket))
         except Exception:
-            return fallback, None
+            return fallback, (
+                f"mt5 close: ticket {ticket} exit priced from "
+                f"the tick snapshot @ {fallback:.2f} — closing-"
+                f"deal lookup failed (fallback, counted)")
         if not deal or not float(deal.get("price") or 0.0):
-            return fallback, None
+            return fallback, (
+                f"mt5 close: ticket {ticket} exit priced from "
+                f"the tick snapshot @ {fallback:.2f} — no closing "
+                f"deal in broker history yet (fallback, counted)")
         price = float(deal["price"])
         return price, (
             f"mt5 close: ticket {ticket} exit priced from the "
@@ -5215,7 +5235,90 @@ class MT5Runner:
                     f"mt5 reconcile: adopted ticket {ticket} "
                     f"({'+' if pos.direction > 0 else '-'}1 "
                     f"@{pos.entry_price:.2f})")
+        self._reconcile_drift(live, stats)
         self._reconcile_pending(live, stats)
+
+    def _reconcile_drift(self, live: dict, stats: dict) -> None:
+        """Modified-state reconciliation for TRACKED positions
+        (§3.11 audit): a broker-side change the engine did not
+        make — a stop moved or removed in the terminal, a TP
+        changed, volume partially closed by hand — used to be
+        invisible here: ``_reconcile`` compared only presence, so
+        the tick manager kept managing (and the close classifier
+        kept classifying) against a stop the broker no longer
+        held, with no journal trace.
+
+        Broker state is the truth for the stop record: a drifted
+        SL is journaled with BOTH values and the tick manager's
+        broker-stop record is synced to the broker's (that is a
+        ledger correction, never an order — this method sends
+        nothing).  TP and volume drift are journaled the same
+        way but NOT auto-booked: the signal's targets are the
+        journal's own record, and an external partial's money
+        belongs to its broker deal, not to a guess here.  Each
+        distinct drift episode notes once (signature-keyed);
+        when the drift clears, the episode resets.
+        """
+        noted = getattr(self, "_drift_noted", None)
+        if noted is None:
+            noted = self._drift_noted = {}
+        for ticket in list(self.tick_manager.tickets()):
+            pos = self.tick_manager.position(ticket)
+            if pos is None or pos.closed:
+                continue
+            broker = live.get(ticket)
+            if broker is None:
+                continue  # vanished — the close path above owns it
+            facts: list[str] = []
+            sync_stop = False
+            bsl = getattr(broker, "sl", None)
+            tracked_stop = self.tick_manager.effective_stop(ticket)
+            if bsl is None:
+                if tracked_stop is not None:
+                    facts.append(
+                        f"broker stop MISSING (tracked "
+                        f"{float(tracked_stop):.2f})")
+                    sync_stop = True
+            elif tracked_stop is None \
+                    or abs(float(bsl) - float(tracked_stop)) \
+                    > _PRICE_EPS:
+                tracked_txt = "none" if tracked_stop is None \
+                    else f"{float(tracked_stop):.2f}"
+                facts.append(
+                    f"broker SL {float(bsl):.2f} != tracked "
+                    f"{tracked_txt}")
+                sync_stop = True
+            btp = getattr(broker, "tp", None)
+            targets = list(getattr(pos, "targets", None) or [])
+            if btp and targets \
+                    and abs(float(btp) - float(targets[0])) \
+                    > _PRICE_EPS:
+                facts.append(
+                    f"broker TP {float(btp):.2f} != tracked first "
+                    f"target {float(targets[0]):.2f}")
+            bvol = float(getattr(broker, "volume", 0.0) or 0.0)
+            tvol = float(getattr(pos, "volume", 0.0) or 0.0)
+            if abs(bvol - tvol) > _VOL_EPS:
+                facts.append(
+                    f"broker volume {bvol} != tracked {tvol}")
+            if not facts:
+                noted.pop(ticket, None)
+                continue
+            sig = (bsl, btp, bvol)
+            if noted.get(ticket) == sig:
+                continue
+            noted[ticket] = sig
+            stats["reconcile_drift"] = stats.get(
+                "reconcile_drift", 0) + 1
+            self.journal.log_note(
+                f"mt5 reconcile: ticket {ticket} broker drift "
+                f"— " + "; ".join(facts) +
+                " (external modify at the broker; both values "
+                "journaled, nothing smoothed)")
+            if sync_stop and self.tick_manager.note_external_stop(
+                    ticket, bsl) and bsl is not None:
+                self._pool_sync_stop(
+                    ticket, pos.alert_id, float(bsl))
 
     def _reconcile_pending(self, live_positions: dict, stats: dict) -> None:
         """Pending orders vs the broker: fills become positions,
@@ -5246,12 +5349,59 @@ class MT5Runner:
             if state is None:
                 continue
             still_resting = ticket in live_pending
+            if still_resting:
+                # Modified-state reconciliation (§3.11 audit): a
+                # resting order changed at the broker (price or SL
+                # edited in the terminal) — journal the drift once
+                # per episode with both values.  Placed state is
+                # NOT rewritten mid-flight (decay/expiry semantics
+                # belong to the placed order); when it fills, the
+                # fill books the broker's own price regardless.
+                order = live_pending[ticket]
+                pfacts: list[str] = []
+                if getattr(order, "price", None) \
+                        and getattr(state, "level", None) \
+                        and abs(float(order.price)
+                                - float(state.level)) > _PRICE_EPS:
+                    pfacts.append(
+                        f"broker price {float(order.price):.2f} "
+                        f"!= placed {float(state.level):.2f}")
+                if getattr(order, "sl", None) \
+                        and getattr(state, "sl", None) \
+                        and abs(float(order.sl)
+                                - float(state.sl)) > _PRICE_EPS:
+                    pfacts.append(
+                        f"broker SL {float(order.sl):.2f} "
+                        f"!= placed {float(state.sl):.2f}")
+                _noted = getattr(self, "_drift_noted", None)
+                if _noted is None:
+                    _noted = self._drift_noted = {}
+                _key = ("pending", ticket)
+                if not pfacts:
+                    _noted.pop(_key, None)
+                else:
+                    _sig = (getattr(order, "price", None),
+                            getattr(order, "sl", None))
+                    if _noted.get(_key) != _sig:
+                        _noted[_key] = _sig
+                        stats["reconcile_drift"] = stats.get(
+                            "reconcile_drift", 0) + 1
+                        self.journal.log_note(
+                            f"mt5 reconcile: pending ticket "
+                            f"{ticket} broker drift — "
+                            + "; ".join(pfacts) +
+                            " (external modify at the broker; "
+                            "placed state kept, fill books the "
+                            "broker's own price)")
             mine = [p for p in live_positions.values()
                     if p.alert_id == state.alert_id
                     and p.magic == self.cfg.magic]
             if not mine:
                 if not still_resting:
                     del self._pending_orders[ticket]
+                    _noted = getattr(self, "_drift_noted", None)
+                    if _noted is not None:
+                        _noted.pop(("pending", ticket), None)
                     stats["pending_cancelled"] = stats.get(
                         "pending_cancelled", 0) + 1
                     self.journal.log_note(
@@ -16379,8 +16529,19 @@ class MT5Runner:
         except Exception:
             risk_money = 0.0
         _decision_score = float(state.placed_score or 0.0)
-        if not _decision_score and sig is not None:
-            _decision_score = float(getattr(sig, "score", 0.0) or 0.0)
+        if not _decision_score:
+            # §3.11: NO substitute score.  This used to fall back
+            # to sig.score — the very sleeve-base placeholder step
+            # 2 removed from this record (a flat 60.0 riding as
+            # the "decision" score while the signal record said
+            # 32.71).  An unrecorded decision score is journaled
+            # as 0 with this note, never smoothed over with a
+            # different number — the same contract the fill chart
+            # already kept (step 7: placed_score or unavailable).
+            self.journal.log_note(
+                f"mt5 fill: ticket {pos.ticket} has no recorded "
+                f"decision score (placed_score missing) — open "
+                f"record carries 0, never a substitute score")
         self.journal.log_open(
             alert_id=state.alert_id, instrument=self.cfg.symbol,
             mode="MT5", playbook=state.playbook or "pending",

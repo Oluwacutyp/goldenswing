@@ -777,6 +777,32 @@ class TickManager:
         return st is not None and \
             st.playbook in self.tick_cfg.fixed_bracket_playbooks
 
+    def note_external_stop(self, ticket: int,
+                           level: float | None) -> bool:
+        """Record a broker-side stop change the ENGINE did not
+        make (§3.11 reconcile drift): ``broker_sl`` is defined as
+        the SL actually on the broker, so when reconcile finds
+        the broker holding a different stop (or none), the record
+        follows the broker — a ledger correction, never an order:
+        nothing is sent, no management state beyond the stop
+        record changes, and step 13 is untouched (``apply`` still
+        refuses to book ENGINE modifies for fixed-bracket
+        playbooks; this seam exists precisely because an external
+        move is not an engine modify).  The close classifier will
+        name a later stop exit "external" — the truthful label
+        for a stop whose last move was not the engine's.
+        Returns False when the ticket is untracked."""
+        st = self._states.get(ticket)
+        if st is None:
+            return False
+        st.broker_sl = float(level) if level is not None else None
+        st.last_sl_reason = "external"
+        if level is not None:
+            st.events.append({
+                "kind": "sl", "ts": time.time(),
+                "level": float(level), "reason": "external"})
+        return True
+
     # ---------------------------------------------------------------- layers
     def layers(self, ticket: int) -> list[Layer]:
         """Entry legs of a position (base first).  Copy — mutate via

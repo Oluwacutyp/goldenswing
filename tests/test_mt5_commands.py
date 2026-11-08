@@ -234,7 +234,7 @@ def test_mt5_ticks_command_exports_terminal_history(tmp_path):
     res, _ = router.dispatch(_update("/ticks"), ctx)
     assert res.document is not None
     rows = Path(res.document).read_text().strip().splitlines()
-    assert rows[0] == "time,bid,ask,tick_volume,real_volume,spread"
+    assert rows[0] == "symbol,time,bid,ask,tick_volume,real_volume,spread"
     assert len(rows) == 4  # header + FakeMT5's 3 history rows
 
 
@@ -395,14 +395,14 @@ def test_tick_csv_rows_match_ticks_fed(tmp_path):
     csv_path = tmp_path / f"mt5_ticks_{day}.csv"
     assert csv_path.exists()
     rows = csv_path.read_text().strip().splitlines()
-    assert rows[0] == "time,bid,ask,tick_volume,real_volume,spread"
+    assert rows[0] == "symbol,time,bid,ask,tick_volume,real_volume,spread"
     assert len(rows) == 3  # header + exactly the 2 ticks pumped
     # connect()'s UTC-offset calibration consumes script entry 0, so
     # the pump delivers entry 1, then the last price repeated with
     # advancing time (pump dedup keys on time+bid+ask).
-    assert rows[1].split(",")[1:3] == ["2000.10000", "2000.40000"]
-    assert rows[2].split(",")[1:3] == ["2000.10000", "2000.40000"]
-    assert rows[1].split(",")[0] != rows[2].split(",")[0]
+    assert rows[1].split(",")[2:4] == ["2000.10000", "2000.40000"]
+    assert rows[2].split(",")[2:4] == ["2000.10000", "2000.40000"]
+    assert rows[1].split(",")[1] != rows[2].split(",")[1]
 
 
 # ------------------------------------------------------------ charts
