@@ -16,6 +16,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+#: MarketSituation Pass 6 (SPEC §7.1): the declared reduce /
+#: preserve rules every horizon plan carries.  The reduce rule
+#: is the desk's standing S10 behaviour stated as the plan's
+#: own term (the profile partial ladder is what a stall trim
+#: banks through); the preserve rule is the standing
+#: structure-intact discipline (the through-CHoCH test is
+#: live/management.py's check_invalidation).
+REDUCE_RULE = ("profile partial ladder fires on stall evidence "
+               "as well as on R targets")
+PRESERVE_RULE = ("runner preserved while structure intact on "
+                 "management_tf (no through-CHoCH) and targets "
+                 "remain")
+
+
 @dataclass(frozen=True)
 class ManagementProfile:
     name: str
@@ -26,13 +40,36 @@ class ManagementProfile:
     drift_margin: float       # score pts below entry floor = decay
     trail_method: str         # "structure" | "atr"
     partial_style: str        # "ladder" | "value" | "zone"
+    # MarketSituation Pass 6 (SPEC §7.1): the four horizon
+    # fields, all expressed in the position's MANAGEMENT clock
+    # (the XD-4 conversion table below is the units authority).
+    # validity_window_bars: max hold in management-TF bars —
+    # the desk's standing staleness rule made a plan term (the
+    # runner already exits a position after a SECOND full
+    # progress window without progress; the validity window is
+    # that horizon: two progress windows).  stall_definition
+    # formalises the progress pair in management-clock bars
+    # (by_bar trigger bars on the profile's clock; the H1 form
+    # stays in progress_h1_bars / progress_floor_r and the two
+    # agree by the XD-4 conversion).  exit_clock: the TF whose
+    # closes evaluate structural exits for this profile.
+    validity_window_bars: int = 0
+    stall_definition: dict = None
+    reduce_rule: str = REDUCE_RULE
+    preserve_rule: str = PRESERVE_RULE
+    exit_clock: str = ""
 
     def journal(self) -> dict:
         return {"profile": self.name, "be": self.be_mode,
                 "backstop_r": self.be_backstop_r,
                 "progress": [self.progress_h1_bars,
                              self.progress_floor_r],
-                "trail": self.trail_method}
+                "trail": self.trail_method,
+                "partial_style": self.partial_style,
+                "validity_window_bars": self.validity_window_bars,
+                "stall": (dict(self.stall_definition)
+                          if self.stall_definition else None),
+                "exit_clock": self.exit_clock}
 
 
 #: Trigger bars per H1 bar, by clock.  Slow clocks are FRACTIONS:
@@ -92,35 +129,48 @@ def profile_for(*, style: str = "intraday",
     def h1(trigger_bars: int) -> int:
         return max(1, round(trigger_bars / per_h1))
 
+    def build(name: str, *, be_mode: str, be_backstop_r: float,
+              trigger_bars: int, floor_r: float,
+              trail_method: str,
+              partial_style: str) -> ManagementProfile:
+        # Pass 6: the horizon fields derive from the branch's
+        # OWN progress pair — the stall definition is that pair
+        # stated in management-clock bars, and the validity
+        # window is two full progress windows (the runner's
+        # standing second-window staleness exit, named as the
+        # plan's max hold).  No new numbers.
+        return ManagementProfile(
+            name, be_mode=be_mode, be_backstop_r=be_backstop_r,
+            progress_h1_bars=h1(trigger_bars),
+            progress_floor_r=floor_r,
+            drift_margin=10.0, trail_method=trail_method,
+            partial_style=partial_style,
+            validity_window_bars=2 * int(trigger_bars),
+            stall_definition={"by_bar": int(trigger_bars),
+                              "below_r": float(floor_r)},
+            exit_clock=str(clock_tf))
+
     if late_confirm or high_vol:
-        return ManagementProfile(
-            "late_high_vol", be_mode="touch", be_backstop_r=0.0,
-            progress_h1_bars=h1(4), progress_floor_r=0.3,
-            drift_margin=10.0, trail_method="atr",
-            partial_style="ladder")
+        return build("late_high_vol", be_mode="touch",
+                     be_backstop_r=0.0, trigger_bars=4,
+                     floor_r=0.3, trail_method="atr",
+                     partial_style="ladder")
     if style == "scalp":
-        return ManagementProfile(
-            "scalp", be_mode="earned", be_backstop_r=1.5,
-            progress_h1_bars=h1(12), progress_floor_r=0.3,
-            drift_margin=10.0, trail_method="atr",
-            partial_style="ladder")
+        return build("scalp", be_mode="earned", be_backstop_r=1.5,
+                     trigger_bars=12, floor_r=0.3,
+                     trail_method="atr", partial_style="ladder")
     if style == "v_reversal":
-        return ManagementProfile(
-            "v_reversal", be_mode="earned", be_backstop_r=1.25,
-            progress_h1_bars=h1(6), progress_floor_r=0.4,
-            drift_margin=10.0, trail_method="structure",
-            partial_style="zone")
+        return build("v_reversal", be_mode="earned",
+                     be_backstop_r=1.25, trigger_bars=6,
+                     floor_r=0.4, trail_method="structure",
+                     partial_style="zone")
     if philosophy == "range":
-        return ManagementProfile(
-            "range", be_mode="earned", be_backstop_r=1.5,
-            progress_h1_bars=h1(6), progress_floor_r=0.5,
-            drift_margin=10.0, trail_method="atr",
-            partial_style="value")
-    return ManagementProfile(
-        "trend", be_mode="earned", be_backstop_r=2.0,
-        progress_h1_bars=h1(8), progress_floor_r=0.5,
-        drift_margin=10.0, trail_method="structure",
-        partial_style="ladder")
+        return build("range", be_mode="earned", be_backstop_r=1.5,
+                     trigger_bars=6, floor_r=0.5,
+                     trail_method="atr", partial_style="value")
+    return build("trend", be_mode="earned", be_backstop_r=2.0,
+                 trigger_bars=8, floor_r=0.5,
+                 trail_method="structure", partial_style="ladder")
 
 
 # ------------------------------------------------------------ verdicts
@@ -211,3 +261,231 @@ def tp_ladder(*, entry: float, stop: float, direction: int,
         out["exit_all_at_tp2"] = False
         out["allow_runner"] = False
     return out
+
+
+# --------------------------------------- Pass 6: horizon plans
+# MarketSituation Pass 6 (SPEC §7): the declared management
+# PLAN.  A scenario declares its plan at proposal time, keyed
+# to its horizon class through its resolved policy; the plan
+# is part of the scenario version and freezes into the
+# position's management context at fill.  Every number in a
+# plan comes from an established rule set — the profile above,
+# the standing TickConfig tiers, the sleeve's own target
+# hierarchy — never from this module inventing one.
+
+#: The thesis-exit arming a non-bracket plan declares: when
+#: the scenario's parent S2 thesis is invalidated by the
+#: keeper (its named conditions met), the position's thesis
+#: is done and the manager exits on that evidence.
+THESIS_EXIT_PARENT_INVALIDATION = "parent_thesis_invalidation"
+
+
+def build_management_plan(*, policy_id: str, policy_version: int,
+                          horizon: str, management_tf: str,
+                          policy_params: dict,
+                          profile: ManagementProfile | None,
+                          invalidation_price: float | None,
+                          invalidation_terms=(),
+                          targets=(), partial_tiers=(),
+                          tier_min_volume: float = 0.03,
+                          sleeve_targets=()) -> dict:
+    """Assemble one scenario's declared management plan.
+
+    ``policy_params`` is the registry's parameter bundle for
+    the resolved policy (profile style, profit-lock mode,
+    partial source, thesis-exit arming); ``profile`` is the
+    policy's canonical ManagementProfile on the management
+    clock (None for the fixed bracket, which declares no
+    profile — the placement bracket is its whole plan).
+    Pure and JSON-safe: the plan rides the scenario, the
+    lifecycle store and the journal unchanged."""
+    target_list = [float(t) for t in (targets or ()) if t]
+    base = {
+        "policy_id": str(policy_id),
+        "policy_version": int(policy_version),
+        "horizon": str(horizon),
+        "management_tf": str(management_tf),
+        "invalidation": {
+            "price": (float(invalidation_price)
+                      if invalidation_price is not None
+                      else None),
+            "terms": [str(t) for t in (invalidation_terms or ())],
+            "thesis_exit": None},
+    }
+    if str(policy_id) == "fixed_bracket_v1" or profile is None:
+        # Step 13 / D7: the placement bracket ONLY — no time
+        # stop, no trail, no profit-lock, no thesis exit.  The
+        # plan states the bracket so the freeze carries the
+        # whole truth about how this position is managed.
+        base["profile"] = None
+        base["time_stop"] = None
+        base["partial_schedule"] = {
+            "source": "placement_bracket", "tiers": [],
+            "tier_min_volume": float(tier_min_volume),
+            "style": None, "targets": target_list}
+        base["trail"] = {"method": "none"}
+        base["profit_lock"] = {"mode": "none"}
+        return base
+    style = policy_params.get("partial_style_override") \
+        or profile.partial_style
+    source = str(policy_params.get("partial_source")
+                 or "tick_tiers")
+    sched_targets = target_list
+    if source == "sleeve_target_hierarchy":
+        sleeve = [float(t) for t in (sleeve_targets or ()) if t]
+        if sleeve:
+            sched_targets = sleeve
+    base["profile"] = profile.journal()
+    base["time_stop"] = {
+        "validity_window_bars": int(profile.validity_window_bars),
+        "clock": str(management_tf),
+        "progress": (dict(profile.stall_definition)
+                     if profile.stall_definition else None),
+        "basis": "two full progress windows without progress "
+                 "= stale (the desk's standing S10 exit, named "
+                 "as the plan's max hold)"}
+    base["invalidation"]["thesis_exit"] = \
+        policy_params.get("thesis_exit")
+    base["partial_schedule"] = {
+        "source": source,
+        "tiers": [[float(r), float(f)]
+                  for r, f in (partial_tiers or ())],
+        "tier_min_volume": float(tier_min_volume),
+        "style": style,
+        "targets": sched_targets}
+    base["trail"] = {"method": profile.trail_method}
+    base["profit_lock"] = {
+        "mode": str(policy_params.get("profit_lock_mode")
+                    or "standard")}
+    return base
+
+
+def structural_verdicts(profile: ManagementProfile, *,
+                        direction: int, elapsed_mgmt_bars: int,
+                        best_r: float, tf_state: dict | None = None,
+                        targets_open: bool = True) -> dict:
+    """The structural management verdicts for one position on
+    one management-TF close (SPEC §7.2): stall (the plan's
+    reduce evidence), validity expiry (the plan's close
+    review), structure break (exit review — a CHoCH/MSCH
+    against the position on its OWN management TF, from the
+    situation's TFState), and the preserve rule (structure
+    intact on the management TF and targets remain).  Pure:
+    the runner enacts and journals; nothing here touches a
+    broker.  The stall test is the profile's progress rule
+    stated in management-clock bars — it agrees with
+    progress_due's H1 form by the XD-4 conversion."""
+    stall_def = profile.stall_definition or {
+        "by_bar": profile.progress_h1_bars,
+        "below_r": profile.progress_floor_r}
+    stall = int(elapsed_mgmt_bars) >= int(stall_def["by_bar"]) \
+        and float(best_r) < float(stall_def["below_r"])
+    validity = int(profile.validity_window_bars or 0) > 0 \
+        and int(elapsed_mgmt_bars) \
+        >= int(profile.validity_window_bars)
+    event = (tf_state or {}).get("last_structure_event") or {}
+    kind = str(event.get("kind") or "")
+    ev_dir = event.get("direction")
+    structure_break = kind in ("choch", "msch") \
+        and ev_dir is not None \
+        and int(ev_dir) == -int(direction)
+    preserve = (not structure_break) and bool(targets_open)
+    facts: list[str] = []
+    if stall:
+        facts.append(
+            f"stall: {int(elapsed_mgmt_bars)} management bars "
+            f">= by_bar {int(stall_def['by_bar'])} with best_r "
+            f"{float(best_r):.2f} < {float(stall_def['below_r'])}R "
+            "— reduce evidence (plan reduce rule)")
+    if validity:
+        facts.append(
+            f"validity expired: {int(elapsed_mgmt_bars)} "
+            f"management bars >= validity window "
+            f"{int(profile.validity_window_bars)} — close review")
+    if structure_break:
+        facts.append(
+            f"structure break: {kind} against the position on "
+            f"{profile.exit_clock or 'its management TF'} "
+            f"(event ts {event.get('ts')}) — exit review")
+    if preserve:
+        facts.append(
+            "preserve: structure intact on the management TF "
+            "and targets remain — runner preserved")
+    return {"stall": bool(stall),
+            "validity_expired": bool(validity),
+            "structure_break": bool(structure_break),
+            "preserve": bool(preserve),
+            "facts": facts}
+
+
+def management_census(records) -> dict:
+    """Per-horizon census over management records (SPEC §10
+    Pass 6 evidence): verdict counts and rates, validity
+    windows in MINUTES (the minutes-vs-days separation the
+    demo proof names), and exit reasons — grouped by the
+    horizon stamped on each record.  A horizon policy whose
+    census signature (validity window, stall rate, structure
+    rate) is identical to standard_v1's is reported in
+    ``indistinguishable_from_standard`` — such a policy does
+    not promote on this evidence.  Pure over record dicts."""
+    by_horizon: dict[str, dict] = {}
+    windows: dict[str, list[float]] = {}
+
+    def cell(horizon: str) -> dict:
+        return by_horizon.setdefault(horizon, {
+            "verdicts": 0, "stall": 0, "validity_expired": 0,
+            "structure_break": 0, "thesis_exits": 0,
+            "exit_reasons": {}, "validity_window_minutes": None})
+
+    for rec in records or ():
+        if not isinstance(rec, dict):
+            continue
+        rtype = rec.get("type")
+        if rtype == "management_verdict":
+            horizon = str(rec.get("horizon") or "unstamped")
+            c = cell(horizon)
+            c["verdicts"] += 1
+            for key in ("stall", "validity_expired",
+                        "structure_break"):
+                if rec.get(key):
+                    c[key] += 1
+            tf = str(rec.get("management_tf") or "")
+            bars = rec.get("validity_window_bars")
+            if tf in TF_MINUTES and bars:
+                windows.setdefault(horizon, []).append(
+                    float(bars) * TF_MINUTES[tf])
+        elif rtype == "signal" \
+                and rec.get("decision") == "management":
+            ctx = rec.get("context") or {}
+            horizon = str(ctx.get("management_horizon")
+                          or "unstamped")
+            c = cell(horizon)
+            reason = str(rec.get("reason") or "")
+            c["exit_reasons"][reason] = \
+                c["exit_reasons"].get(reason, 0) + 1
+            if reason == "thesis_exit":
+                c["thesis_exits"] += 1
+    for horizon, values in windows.items():
+        if values:
+            ordered = sorted(values)
+            by_horizon[horizon]["validity_window_minutes"] = \
+                ordered[len(ordered) // 2]
+
+    def signature(horizon: str):
+        c = by_horizon.get(horizon)
+        if not c or not c["verdicts"]:
+            return None
+        n = c["verdicts"]
+        return (c["validity_window_minutes"],
+                round(c["stall"] / n, 4),
+                round(c["structure_break"] / n, 4))
+
+    std = signature("intraday")
+    indistinguishable: list[str] = []
+    if std is not None:
+        for horizon in ("scalp", "swing"):
+            sig = signature(horizon)
+            if sig is not None and sig == std:
+                indistinguishable.append(horizon)
+    return {"by_horizon": by_horizon,
+            "indistinguishable_from_standard": indistinguishable}

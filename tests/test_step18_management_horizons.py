@@ -57,10 +57,15 @@ def test_shadow_playbooks_gain_no_authority_from_declaring():
 def test_policy_resolution_uses_only_established_rule_sets():
     assert management_policy_for("qm_m5") == ("fixed_bracket_v1", 1)
     assert management_policy_for("sweep_reversal") == ("standard_v1", 1)
-    assert management_policy_for("qm_d1") == ("standard_v1", 1)
-    assert management_policy_for("hot_scalp") == ("standard_v1", 1)
+    # MarketSituation Pass 6 (SPEC §7.1): the horizon resolution
+    # Step 18 was plumbed for — swing resolves to the swing
+    # policy, scalp (hot_scalp) to the scalp policy; both are
+    # built only from established rule sets (SPEC §7.1 table).
+    assert management_policy_for("qm_d1") == ("standard_swing_v1", 1)
+    assert management_policy_for("hot_scalp") == ("standard_scalp_v1", 1)
     for pid in MANAGEMENT_POLICIES:
-        assert pid in ("fixed_bracket_v1", "standard_v1")
+        assert pid in ("fixed_bracket_v1", "standard_v1",
+                       "standard_scalp_v1", "standard_swing_v1")
 
 
 def test_management_block_carries_all_six_fields():
@@ -68,7 +73,12 @@ def test_management_block_carries_all_six_fields():
                           invalidation=1990.0, targets=[2040.0, 2060.0],
                           atr=10.0)
     block = management_block_for("sweep_reversal", sig)
-    assert block == {
+    # The six Step-18 fields, exactly as before Pass 6...
+    assert {k: block[k] for k in (
+        "management_horizon", "management_policy_id",
+        "management_policy_version",
+        "management_context_timeframe", "management_invalidation",
+        "management_target")} == {
         "management_horizon": "intraday",
         "management_policy_id": "standard_v1",
         "management_policy_version": 1,
@@ -76,13 +86,16 @@ def test_management_block_carries_all_six_fields():
         "management_invalidation": 1990.0,
         "management_target": 2040.0,
     }
+    # ...plus the Pass 6 declared management plan.
+    assert block["management_plan"]["policy_id"] == "standard_v1"
+    assert block["management_plan"]["horizon"] == "intraday"
     qm = management_block_for("qm_m5", sig)
     assert qm["management_horizon"] == "scalp"
     assert qm["management_policy_id"] == "fixed_bracket_v1"
     assert qm["management_context_timeframe"] == "M5"
     hs = management_block_for("hot_scalp", sig)
     assert hs["management_horizon"] == "scalp"
-    assert hs["management_policy_id"] == "standard_v1"
+    assert hs["management_policy_id"] == "standard_scalp_v1"
     assert hs["management_context_timeframe"] == "M5"
     d1 = management_block_for("qm_d1", sig)
     assert d1["management_horizon"] == "swing"

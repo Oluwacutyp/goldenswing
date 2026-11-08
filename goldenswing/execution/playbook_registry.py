@@ -307,23 +307,103 @@ MANAGEMENT_HORIZONS: tuple[str, ...] = ("scalp", "intraday", "swing")
 #: - "standard_v1": the desk's standing TickConfig exactly as
 #:   the runner constructs it (earned breakeven, profit lock,
 #:   R-trail, Chandelier, tiered partials).
+#: - "standard_scalp_v1" / "standard_swing_v1" (MarketSituation
+#:   Pass 6, SPEC §7.1): the horizon resolutions.  Their
+#:   parameters come ONLY from established rule sets — the
+#:   scalp policy is Hot Scalp's own established treatment
+#:   (its profile, its earned-by-acceptance profit lock, its
+#:   sleeve target hierarchy); the swing policy is the standard
+#:   profile read on the D1 management clock with structure
+#:   trail and value partials.  Where no established rule set
+#:   exists for a horizon parameter, the parameter inherits
+#:   standard_v1's value (POLICY_PARAMS says so per policy).
 MANAGEMENT_POLICIES: dict[str, int] = {
     "fixed_bracket_v1": 1,
     "standard_v1": 1,
+    "standard_scalp_v1": 1,
+    "standard_swing_v1": 1,
+}
+
+#: MarketSituation Pass 6 (SPEC §7.1): each policy's parameter
+#: bundle — the canonical profile style its declared plan is
+#: built from, how its profit lock arms, where its partial
+#: schedule's targets come from, and whether its plan arms the
+#: thesis exit (a parent S2 thesis invalidation exits the
+#: position on that evidence).  "inherits_standard" names the
+#: fields a horizon policy deliberately takes from standard_v1
+#: unchanged (the spec's inheritance rule, stated not hidden).
+POLICY_PARAMS: dict[str, dict] = {
+    "fixed_bracket_v1": {
+        "profile_style": None,
+        "profit_lock_mode": "none",
+        "partial_source": "placement_bracket",
+        "thesis_exit": None,
+        "inherits_standard": (),
+    },
+    "standard_v1": {
+        "profile_style": "trend",
+        "profit_lock_mode": "standard",
+        "partial_source": "tick_tiers",
+        "thesis_exit": "parent_thesis_invalidation",
+        "inherits_standard": (),
+    },
+    "standard_scalp_v1": {
+        # Hot Scalp's established rule set, lifted: the scalp
+        # profile (earned BE, 1.5R backstop, ATR trail), the
+        # earned-by-acceptance profit lock (TickConfig's
+        # profit_lock_earned_playbooks treatment), and partial
+        # targets from the sleeve's own target hierarchy.
+        "profile_style": "scalp",
+        "profit_lock_mode": "earned_acceptance",
+        "partial_source": "sleeve_target_hierarchy",
+        "thesis_exit": "parent_thesis_invalidation",
+        "inherits_standard": ("partial_tiers", "tier_min_volume",
+                              "breakeven_backstop_r"),
+    },
+    "standard_swing_v1": {
+        # The standard profile read on the swing management
+        # clock (D1): structure trail, progress windows in D1
+        # bars (the XD-4 conversion), partial style "value"
+        # (bank at value/zone, per the profile vocabulary).
+        "profile_style": "trend",
+        "partial_style_override": "value",
+        "profit_lock_mode": "standard",
+        "partial_source": "tick_tiers",
+        "thesis_exit": "parent_thesis_invalidation",
+        "inherits_standard": ("partial_tiers", "tier_min_volume",
+                              "breakeven_mode",
+                              "breakeven_backstop_r",
+                              "profit_lock"),
+    },
 }
 
 
+def policy_params_for(policy_id: str) -> dict:
+    """The Pass 6 parameter bundle for a resolved policy id
+    (a copy; {} for an unknown id)."""
+    params = POLICY_PARAMS.get(str(policy_id))
+    return dict(params) if params is not None else {}
+
+
 def management_policy_for(name: str) -> tuple[str, int]:
-    """Step 18: resolve a playbook's management policy
-    (policy_id, version).  qm_m5's fixed bracket is the only
-    playbook-specific rule set in force; every other playbook —
-    registered or not (hot_scalp) — resolves to the standard
-    policy.  A horizon-specific policy may be added here ONLY
-    after chronological, cost-aware demo evaluation (rulings
-    §4); the horizon declaration travels with the setup either
-    way, so that promotion needs no re-plumbing."""
+    """Resolve a playbook's management policy (policy_id,
+    version).  Step 18 resolved only qm_m5's fixed bracket;
+    MarketSituation Pass 6 (SPEC §7.1) completes the horizon
+    resolution the Step-18 declaration was plumbed for: qm_m5
+    keeps fixed_bracket_v1 (D7 — untouched), the scalp horizon
+    resolves to standard_scalp_v1, the swing horizon to
+    standard_swing_v1, and intraday keeps standard_v1 with
+    byte-identical parameters (the flip renames nothing about
+    how an intraday position is managed)."""
     if str(name) == "qm_m5":
         return "fixed_bracket_v1", MANAGEMENT_POLICIES["fixed_bracket_v1"]
+    horizon = management_horizon_for(name)
+    if horizon == "scalp":
+        return ("standard_scalp_v1",
+                MANAGEMENT_POLICIES["standard_scalp_v1"])
+    if horizon == "swing":
+        return ("standard_swing_v1",
+                MANAGEMENT_POLICIES["standard_swing_v1"])
     return "standard_v1", MANAGEMENT_POLICIES["standard_v1"]
 
 

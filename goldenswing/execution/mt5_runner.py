@@ -95,10 +95,13 @@ from ..live.funding import (SMT_PLAYBOOKS as _SMT_PLAYBOOKS,
                             smt_funding_event)
 from ..live.health import HealthMonitor
 from ..live.management_profiles import (
+    build_management_plan as _build_management_plan,
     drift_triggered as _drift_triggered,
     elapsed_h1_bars as _mgmt_elapsed_h1,
+    management_census as _management_census,
     mgmt_clock_due as _mgmt_clock_due,
     profile_for as _mgmt_profile_for, progress_due as _progress_due,
+    structural_verdicts as _structural_verdicts,
     tp_ladder as _tp_ladder)
 from ..live.news import preprint_action as _preprint_action
 from ..live.smt import detect_smt as _detect_smt
@@ -201,6 +204,8 @@ from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 management_policy_for as
                                 _management_policy_for,
                                 native_tf_of as _native_tf,
+                                policy_params_for as
+                                _policy_params_for,
                                 spec_for as _spec_for)
 from .risk import RiskConfig, RiskGuards
 from .tick_manager import (DEFAULT_TIME_EXIT_BARS, TickAction, TickConfig,
@@ -1033,18 +1038,78 @@ def management_block_for(pb_name: str, sig=None) -> dict:
     policy_id, policy_version = _management_policy_for(name)
     targets = list(getattr(sig, "targets", None) or [])
     inval = getattr(sig, "invalidation", None)
-    return {
+    context_tf = (
+        spec.native_tf if spec is not None
+        else "M5" if name == "hot_scalp" else "")
+    block = {
         "management_horizon": _management_horizon_for(name),
         "management_policy_id": policy_id,
         "management_policy_version": int(policy_version),
-        "management_context_timeframe": (
-            spec.native_tf if spec is not None
-            else "M5" if name == "hot_scalp" else ""),
+        "management_context_timeframe": context_tf,
         "management_invalidation": (
             float(inval) if inval is not None else None),
         "management_target": (
             float(targets[0]) if targets else None),
     }
+    # MarketSituation Pass 6 (SPEC §7): the DECLARED management
+    # plan, part of the scenario from proposal — time stop,
+    # thesis-invalidation exit, partial schedule and trail mode
+    # from the resolved policy's established rule set, frozen
+    # into the management context at fill.  The canonical
+    # profile is the policy's own (profile style on the
+    # management clock); the tiers are the standing TickConfig
+    # defaults the policies inherit.
+    params = _policy_params_for(policy_id)
+    profile = None
+    if params.get("profile_style"):
+        profile = _mgmt_profile_for(
+            style=params["profile_style"],
+            clock_tf=context_tf or "H1")
+        if params.get("partial_style_override"):
+            profile = replace(
+                profile,
+                partial_style=params["partial_style_override"])
+    terms: list[str] = []
+    if inval is not None:
+        terms.append(
+            f"close beyond invalidation {float(inval):.2f} "
+            "(declared at proposal)")
+    if params.get("thesis_exit"):
+        terms.append(
+            "parent thesis invalidated by the S2 keeper's "
+            "named conditions")
+    _tick_defaults = TickConfig()
+    block["management_plan"] = _build_management_plan(
+        policy_id=policy_id, policy_version=int(policy_version),
+        horizon=block["management_horizon"],
+        management_tf=context_tf,
+        policy_params=params, profile=profile,
+        invalidation_price=(
+            float(inval) if inval is not None else None),
+        invalidation_terms=terms,
+        targets=targets,
+        partial_tiers=_tick_defaults.partial_tiers,
+        tier_min_volume=_tick_defaults.tier_min_volume,
+        sleeve_targets=list(
+            getattr(sig, "planned_targets", None) or []))
+    return block
+
+
+#: Pass 6: management-record reasons that execute a step of
+#: the position's declared plan, named by the plan step they
+#: execute.  A management action whose reason is NOT in this
+#: map and is not a plan step (a safeguard intervention) is
+#: journaled as a safeguard_override record instead — plan
+#: conformance is therefore auditable from the journal alone.
+_PLAN_STEP_BY_REASON: dict[str, str] = {
+    "progress_trim": "stall_reduce",
+    "progress_exit": "stall_exit",
+    "thesis_drift": "drift_exit",
+    "defended_stop": "structure_exit",
+    "tp_zone": "partial_schedule",
+    "adr_bank": "partial_schedule",
+    "thesis_exit": "thesis_exit",
+}
 
 
 def _hot_scalp_order_targets(candidate: dict) -> list[float]:
@@ -1316,6 +1381,12 @@ class MT5Runner:
         # book cycle scores against it.
         self._scenario_book = None
         self._last_thesis_assessment = None
+        # PASS 6 — management verdict records accumulated since
+        # the last book cycle; the cycle consumes them into one
+        # management_census record and clears the window (a
+        # windowed census: a restart starts a fresh window,
+        # stated in the census hook).
+        self._mgmt_verdict_window: list = []
         # PASS 1 — live-reaction note throttle (the keeper's
         # provisional block refreshes on price movement or every
         # few dozen ticks, never per tick).
@@ -2059,6 +2130,23 @@ class MT5Runner:
                 assessment=assessment,
                 open_tickets=open_tickets,
                 summary_extras=extras))
+            # PASS 6 — the per-horizon management census over
+            # the verdict window since the last cycle (SPEC
+            # §10 Pass 6 demo proof: management records must
+            # separate measurably by horizon in the live
+            # journal; a horizon whose census signature matches
+            # standard_v1's is named in the record).
+            _window6 = getattr(self, "_mgmt_verdict_window",
+                               None)
+            if _window6:
+                self.journal.append({
+                    "type": "management_census",
+                    "ts": ts,
+                    "run_id": self._run_id,
+                    "situation_id": situation_id,
+                    "window": "since_last_book_cycle",
+                    **_management_census(list(_window6))})
+                _window6.clear()
         except Exception as exc:  # noqa: BLE001 — observation-only
             _log.warning("mt5: scenario book cycle failed "
                          "(observation-only): %s", exc)
@@ -6764,6 +6852,17 @@ class MT5Runner:
                                 f"threshold — closed @ {price:.2f}")
                     else:
                         self._record_close(ticket, price, "panic", stats)
+                    # Pass 6: the panic close is a hard-safeguard
+                    # intervention, never a step of the position's
+                    # declared plan — journaled as an override.
+                    if pos is not None:
+                        self._journal_safeguard_override(
+                            ticket, pos, safeguard="panic_candle",
+                            action="close_position",
+                            detail="adverse excursion past the "
+                                   "panic threshold (3x ATR, "
+                                   "severity > 1.5) — emergency "
+                                   "close outside the plan")
                 elif action.kind == "scalp_cap":
                     # Scalp holding cap: wall-clock hold past the cap
                     # — close the whole position NOW.
@@ -8937,14 +9036,51 @@ class MT5Runner:
             ctx.update(extra)
         return ctx
 
+    def _plan_for_ticket(self, ticket: int) -> dict | None:
+        """Pass 6: the management plan governing a position —
+        the scenario book's FROZEN plan where the book holds
+        the scenario (authoritative: it is the scenario's own
+        frozen context), else the plan stamped on the position
+        ctx at fill registration.  None when neither carries
+        one (adopted positions, pre-Pass-6 restores)."""
+        book = getattr(self, "_scenario_book", None)
+        if book is not None and book is not False:
+            try:
+                scenario = book.scenario_for_ticket(int(ticket))
+            except Exception:
+                scenario = None
+            if scenario is not None:
+                frozen = scenario.get("management_context") \
+                    or {}
+                if frozen.get("management_plan"):
+                    return frozen["management_plan"]
+        ctx = self._position_ctx.get(int(ticket)) or {}
+        return ctx.get("management_plan")
+
     def _log_management(self, ticket: int, pos, reason: str,
                         note: str) -> None:
         """Journal one position-management event (P3 J): a text
         note AND a structured management record carrying the
         scenario context — the per-playbook demo record is the
-        confirmation evidence (A14), management included."""
+        confirmation evidence (A14), management included.
+
+        Pass 6 (SPEC §7.2): the record's context gains the
+        governing plan's stamps — policy_id + horizon +
+        management_tf — and, for actions that execute a step
+        of the position's declared plan, the plan step's name
+        (deviations journal separately as safeguard_override
+        records, so conformance is auditable)."""
         self.journal.log_note(note)
         try:
+            plan = self._plan_for_ticket(int(ticket))
+            extra = None
+            if plan:
+                extra = {
+                    "management_policy_id": plan.get("policy_id"),
+                    "management_horizon": plan.get("horizon"),
+                    "management_tf": plan.get("management_tf"),
+                    "plan_step": _PLAN_STEP_BY_REASON.get(reason),
+                }
             log_signal(
                 self.journal, signal_id=str(pos.alert_id),
                 playbook=self._playbook_from_alert_id(pos.alert_id),
@@ -8952,9 +9088,35 @@ class MT5Runner:
                 score=float((self._position_ctx.get(int(ticket))
                              or {}).get("entry_total") or 0.0),
                 decision="management", reason=reason,
-                context=self._decision_context())
+                context=self._decision_context(extra))
         except Exception:
             pass
+
+    def _journal_safeguard_override(self, ticket: int, pos, *,
+                                    safeguard: str, action: str,
+                                    detail: str) -> None:
+        """Pass 6: journal a management action that is NOT in
+        the position's declared plan — a hard-safeguard
+        intervention (panic candle, news pre-print securing,
+        ...).  The record names the safeguard, so a deviation
+        from the plan is never indistinguishable from a plan
+        step in the journal."""
+        ctx = self._position_ctx.get(int(ticket)) or {}
+        plan = self._plan_for_ticket(int(ticket)) or {}
+        self.journal.append({
+            "type": "safeguard_override",
+            "ts": str(time.time()),
+            "run_id": self._run_id,
+            "ticket": int(ticket),
+            "alert_id": str(getattr(pos, "alert_id", "") or ""),
+            "playbook": str(ctx.get("playbook") or ""),
+            "safeguard": safeguard,
+            "action": action,
+            "detail": detail,
+            "policy_id": plan.get("policy_id"),
+            "horizon": plan.get("horizon"),
+            "management_tf": plan.get("management_tf"),
+        })
 
     def _runner_partial(self, ticket: int, pos, frac: float,
                         reason: str, stats: dict,
@@ -10708,6 +10870,100 @@ class MT5Runner:
                 entry_mgmt_bar=int(ctx.get(
                     "entry_mgmt_bar", ctx["entry_bar"])),
                 current_mgmt_bar=now_mgmt)
+            # PASS 6 — the position's declared plan governs this
+            # pass: (a) a thesis exit the book has marked (the
+            # scenario's parent thesis invalidated on the
+            # keeper's named conditions) is ENACTED here, on the
+            # position's own management clock, and journaled as
+            # a thesis exit — distinct from stop / target / time
+            # exits; (b) the structural verdicts (stall /
+            # validity / structure break / preserve) are
+            # computed against the position's own profile +
+            # the situation's TFState for its management TF and
+            # journaled per close, feeding the per-horizon
+            # census.  Fixed-bracket positions declare no
+            # verdicts and no thesis exit (D7): the bracket is
+            # their whole plan, so this layer skips them.
+            _plan6 = self._plan_for_ticket(int(ticket))
+            if _plan6 is not None \
+                    and _plan6.get("policy_id") \
+                    != "fixed_bracket_v1":
+                _book6 = getattr(self, "_scenario_book", None)
+                _scenario6 = None
+                if _book6 is not None and _book6 is not False:
+                    try:
+                        _scenario6 = _book6.scenario_for_ticket(
+                            int(ticket))
+                    except Exception:
+                        _scenario6 = None
+                _mark6 = (_scenario6 or {}).get(
+                    "thesis_invalidated")
+                if _mark6 and ((_plan6.get("invalidation")
+                                or {}).get("thesis_exit")):
+                    res = self.executor.close_position(
+                        int(ticket))
+                    if res.ok:
+                        self._log_management(
+                            ticket, pos, "thesis_exit",
+                            f"mt5 thesis exit: ticket {ticket} "
+                            f"parent thesis "
+                            f"{_mark6.get('thesis_id')} "
+                            f"invalidated ({_mark6.get('detail')}"
+                            ") — the scenario's thesis is done; "
+                            "exit on the evidence, not the stop "
+                            "(Pass 6 plan thesis exit)")
+                        self._record_close(int(ticket), mid,
+                                           "thesis_exit", stats)
+                    continue
+                try:
+                    _keeper6 = getattr(
+                        self, "_situation_keeper", None)
+                    _latest6 = (_keeper6.latest()
+                                if _keeper6 is not None
+                                and _keeper6 is not False
+                                else None)
+                    _tf_state6 = ((_latest6 or {}).get("per_tf")
+                                  or {}).get(clock_tf) \
+                        if _latest6 else None
+                    _elapsed_mgmt6 = int(now_mgmt) - int(ctx.get(
+                        "entry_mgmt_bar", ctx["entry_bar"]))
+                    _verdicts6 = _structural_verdicts(
+                        profile, direction=d,
+                        elapsed_mgmt_bars=_elapsed_mgmt6,
+                        best_r=float(pos.best_r),
+                        tf_state=_tf_state6,
+                        targets_open=bool(pos.targets))
+                    _record6 = {
+                        "type": "management_verdict",
+                        "ts": str(time.time()),
+                        "run_id": self._run_id,
+                        "ticket": int(ticket),
+                        "alert_id": str(pos.alert_id),
+                        "playbook": str(ctx.get("playbook") or ""),
+                        "policy_id": _plan6.get("policy_id"),
+                        "horizon": _plan6.get("horizon"),
+                        "management_tf": clock_tf,
+                        "elapsed_mgmt_bars": _elapsed_mgmt6,
+                        "elapsed_h1_bars": int(elapsed),
+                        "best_r": float(pos.best_r),
+                        "validity_window_bars": int(
+                            profile.validity_window_bars),
+                        "stall": _verdicts6["stall"],
+                        "validity_expired":
+                            _verdicts6["validity_expired"],
+                        "structure_break":
+                            _verdicts6["structure_break"],
+                        "preserve": _verdicts6["preserve"],
+                        "facts": _verdicts6["facts"],
+                        "situation_id":
+                            self._current_situation_id(),
+                    }
+                    self.journal.append(_record6)
+                    self._mgmt_verdict_window.append(_record6)
+                except Exception as _v6_exc:
+                    _log.warning(
+                        "mt5: management verdict failed for "
+                        "ticket %s: %s", ticket, _v6_exc)
             # Earned profit-lock (hot_scalp): ACCEPTANCE earns
             # the lock — an M5 close beyond the position's first
             # target in its favour (acceptance-by-closes, the
@@ -10950,6 +11206,17 @@ class MT5Runner:
                     f"to breakeven into {ev.title} (window opens "
                     f"in {mins:.0f}m) (S5)")
                 acted = True
+        if acted:
+            # Pass 6: pre-print securing is the news safeguard
+            # intervening in the position's management — not a
+            # step of its declared plan; journaled as an
+            # override naming the safeguard.
+            self._journal_safeguard_override(
+                ticket, pos, safeguard="news_preprint",
+                action=mode,
+                detail=f"securing into extreme title {ev.title} "
+                       f"(window opens in {mins:.0f}m) — action "
+                       "outside the position's plan")
         return acted
 
     def _on_h1_close(self, tick: dict, stats: dict) -> None:
@@ -14393,6 +14660,24 @@ class MT5Runner:
             "drift_trimmed": False, "preprint_key": None,
             "zone_banked": False, "adr_banked": False,
         }
+        # Pass 6: the position's declared management plan (the
+        # same builder that stamps candidates at proposal, fed
+        # the fill facts known here).  The scenario book's
+        # FROZEN plan is authoritative where the book holds the
+        # scenario; this ctx plan is the manager's copy for
+        # positions the book does not carry.
+        _tm_pos = None
+        try:
+            _tm_pos = self.tick_manager.position(int(ticket))
+        except Exception:
+            _tm_pos = None
+        ctx["management_plan"] = management_block_for(
+            pb_name,
+            SimpleNamespace(
+                invalidation=float(stop),
+                targets=(list(_tm_pos.targets)
+                         if _tm_pos is not None else []),
+                planned_targets=[])).get("management_plan")
         self._position_ctx[int(ticket)] = ctx
         # S11 churn bookkeeping: opens count against the style's
         # daily ceiling (reset on the NY trading day).

@@ -191,6 +191,36 @@ class TickConfig:
     #: structure.  The runner default is DEFAULT_TIME_EXIT_BARS
     #: (engine-derived values, see below).
     time_exit_bars: dict[str, int] | None = None
+    def policy_parameters(self) -> dict:
+        """MarketSituation Pass 6: this config's policy-relevant
+        parameters as data — the surface a declared management
+        plan stamps and the registry's POLICY_PARAMS are pinned
+        against, so a horizon policy's inherited parameters are
+        read from the LIVE config, never copied constants that
+        could drift apart.  Read-only view; changes nothing."""
+        return {
+            "breakeven_mode": self.breakeven_mode,
+            "breakeven_trigger_r": self.breakeven_trigger_r,
+            "breakeven_backstop_r": self.breakeven_backstop_r,
+            "partial_tiers": [list(t) for t in self.partial_tiers],
+            "tier_min_volume": self.tier_min_volume,
+            "profit_lock_enabled": self.profit_lock_enabled,
+            "profit_lock_trigger_r": self.profit_lock_trigger_r,
+            "profit_lock_progress": self.profit_lock_progress,
+            "profit_lock_backstop_r": self.profit_lock_backstop_r,
+            "profit_lock_earned_playbooks":
+                list(self.profit_lock_earned_playbooks),
+            "profit_lock_progress_excluded_playbooks":
+                list(self.profit_lock_progress_excluded_playbooks),
+            "fixed_bracket_playbooks":
+                list(self.fixed_bracket_playbooks),
+            "scalp_cap_minutes": self.scalp_cap_minutes,
+            "chandelier_enabled": self.chandelier_enabled,
+            "chandelier_atr_mult": self.chandelier_atr_mult,
+            "chandelier_activation_r": self.chandelier_activation_r,
+        }
+
+
 #: Default regime-dependent time-exit map (H1 bars from the signal
 #: bar), set deliberately from THIS engine's own evidence — NOT the
 #: owner's old-bot 8–20 values, whose bar unit is unverified (copying

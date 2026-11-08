@@ -409,6 +409,25 @@ class ScenarioBook:
         return [copy.deepcopy(self.scenarios[sid])
                 for sid in sorted(self.scenarios)]
 
+    def scenario_for_ticket(self, ticket) -> dict | None:
+        """Pass 6: the live POSITION scenario carrying a broker
+        ticket (a copy, read-only) — the manager's lookup when
+        it enacts what the book knows about a position (the
+        frozen management context, a thesis-invalidation mark).
+        None when no live position scenario carries it."""
+        try:
+            wanted = int(ticket)
+        except (TypeError, ValueError):
+            return None
+        for sid in sorted(self.scenarios):
+            scenario = self.scenarios[sid]
+            if scenario["state"] not in POSITION_STATES:
+                continue
+            held = scenario.get("ticket")
+            if held is not None and int(held) == wanted:
+                return copy.deepcopy(scenario)
+        return None
+
     # -- internals ------------------------------------------------
 
     def _bump(self, scenario: dict, ts, kind: str,
@@ -530,6 +549,7 @@ class ScenarioBook:
             "counter_evidence_groups": [],
             "management": copy.deepcopy(setup.management or {}),
             "management_context": None,
+            "thesis_invalidated": None,
             "ticket": (int(setup.ticket)
                        if setup.ticket is not None else None),
             "alert_id": setup.alert_id,
@@ -747,6 +767,7 @@ class ScenarioBook:
             "counter_evidence_groups": [],
             "management": copy.deepcopy(management or {}),
             "management_context": None,
+            "thesis_invalidated": None,
             "ticket": None,
             "alert_id": None,
             "setup_stage": None,
@@ -923,6 +944,50 @@ class ScenarioBook:
                 stage=f"thesis_{thesis.get('status')}",
                 detail=str(thesis.get("close_reason") or ""),
                 situation_id=situation_id))
+            if thesis.get("status") == "invalidated":
+                # Pass 6: a thesis INVALIDATION marks every
+                # live POSITION scenario parented to it — the
+                # scenario's thesis is done on the keeper's own
+                # named conditions.  The book marks; it does
+                # not close the scenario (its broker position
+                # may still be open): the manager enacts the
+                # thesis exit the frozen plan declares, and the
+                # position reconciliation closes the scenario
+                # when the trade is actually complete.
+                for child in list(self.scenarios.values()):
+                    if child["scenario_id"] == thesis.get("id"):
+                        continue
+                    if child["state"] not in POSITION_STATES:
+                        continue
+                    if child.get("thesis_id") != thesis.get("id") \
+                            and child.get(
+                                "parent_scenario_id") \
+                            != thesis.get("id"):
+                        continue
+                    if child.get("thesis_invalidated"):
+                        continue
+                    child["thesis_invalidated"] = {
+                        "ts": ts,
+                        "thesis_id": thesis.get("id"),
+                        "detail": str(
+                            thesis.get("close_reason") or "")}
+                    child["history"].append({
+                        "version": child["version"], "ts": ts,
+                        "kind": "thesis_invalidated",
+                        "detail": "parent thesis invalidated — "
+                                  "the frozen plan's thesis exit "
+                                  "is armed for the manager"})
+                    records.append({
+                        "type": "scenario_thesis_invalidated",
+                        "ts": ts,
+                        "scenario_id": child["scenario_id"],
+                        "family": child.get("family"),
+                        "version": child["version"],
+                        "thesis_id": thesis.get("id"),
+                        "ticket": child.get("ticket"),
+                        "detail": str(
+                            thesis.get("close_reason") or ""),
+                        "situation_id": situation_id})
         if active is not None:
             tid = active.get("id")
             scenario = self.scenarios.get(tid)
@@ -969,6 +1034,7 @@ class ScenarioBook:
                     "counter_evidence_groups": [],
                     "management": {},
                     "management_context": None,
+                    "thesis_invalidated": None,
                     "ticket": None,
                     "alert_id": None,
                     "setup_stage": None,

@@ -220,6 +220,16 @@ class ManagementAction:
     plan: dict = field(default_factory=dict)  # updated plan copy
     remaining_pct: float = 1.0
     log: list = field(default_factory=list)
+    # MarketSituation Pass 6 (SPEC §7.2): the structural
+    # verdicts, computed only when the caller supplies the
+    # position's ManagementProfile (+ the situation's TFState
+    # for its management TF).  All False / empty when not
+    # supplied — the pre-Pass-6 evaluation is unchanged.
+    stall: bool = False
+    validity_expired: bool = False
+    structure_break: bool = False
+    preserve: bool = False
+    verdict_facts: list = field(default_factory=list)
 
 
 def breakeven_threshold_r(plan: dict, atr_ratio: float) -> float:
@@ -315,7 +325,11 @@ def evaluate_management(*, plan: dict, direction: int,
                         bars_since_entry_m15: int | None = None,
                         volume_ratio: float | None = None,
                         structure_level: float | None = None,
-                        already_taken: tuple = ()) -> ManagementAction:
+                        already_taken: tuple = (),
+                        profile=None, tf_state: dict | None = None,
+                        best_r: float | None = None,
+                        elapsed_mgmt_bars: int | None = None
+                        ) -> ManagementAction:
     """STATE 6, one evaluation.  Pure: never mutates the
     input plan, never touches the broker.
 
@@ -323,13 +337,45 @@ def evaluate_management(*, plan: dict, direction: int,
     partials / trailing / upgrade.  The returned plan is a
     copy with any upgrade applied; bookkeeping (partials
     taken, breakeven moved) is the caller's job — the action
-    reports newly-hit TPs, not cumulative state."""
+    reports newly-hit TPs, not cumulative state.
+
+    Pass 6 (SPEC §7.2): with ``profile`` (the position's
+    ManagementProfile) supplied, the action ALSO carries the
+    structural verdicts for this management-TF close —
+    stall / validity expiry / structure break / preserve —
+    computed by live/management_profiles.structural_verdicts
+    from the profile, ``elapsed_mgmt_bars`` (management-clock
+    bars since entry), ``best_r`` (defaults to the current R)
+    and ``tf_state`` (the situation's TFState for the
+    management TF).  Judgment's MANAGE verdicts consume these
+    same fields as evidence; there is no second management
+    logic."""
     action = ManagementAction(plan=dict(plan))
     r = abs(entry_price - stop)
     if r <= 0 or direction not in (1, -1):
         action.log.append("STATE 6: invalid entry/stop — no action")
         return action
     current_r = (current_price - entry_price) * direction / r
+    if profile is not None:
+        from .management_profiles import structural_verdicts
+        verdicts = structural_verdicts(
+            profile, direction=direction,
+            elapsed_mgmt_bars=int(
+                elapsed_mgmt_bars
+                if elapsed_mgmt_bars is not None else elapsed_h1),
+            best_r=float(best_r if best_r is not None
+                         else current_r),
+            tf_state=tf_state,
+            targets_open=any(plan.get(k) is not None
+                             for k in ("tp1", "tp2", "tp3")))
+        action.stall = verdicts["stall"]
+        action.validity_expired = verdicts["validity_expired"]
+        action.structure_break = verdicts["structure_break"]
+        action.preserve = verdicts["preserve"]
+        action.verdict_facts = verdicts["facts"]
+        action.log.extend(
+            f"STATE 6 verdict: {fact}"
+            for fact in verdicts["facts"])
 
     # Invalidation first: close back through CHoCH extreme
     # AND confirm FVG mitigated.
