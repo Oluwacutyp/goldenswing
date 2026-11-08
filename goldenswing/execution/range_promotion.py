@@ -196,13 +196,23 @@ def _arm(r_values: list, hits: int) -> dict:
     }
 
 
-def verdict_for(slot: dict) -> tuple[str, str]:
+def verdict_for(slot: dict, *, family: str = "§G",
+                binds: bool = False) -> tuple[str, str]:
     """One route's verdict from its accumulated arms — the
-    rule, exactly as coded (see the module docstring)."""
+    rule, exactly as coded (see the module docstring).
+
+    ``family`` names the route family in the no-candidates
+    reason (the range family is §G; route_promotion passes its
+    own label).  ``binds`` (Pass 5, route_promotion only)
+    changes the promotion_ready reason's tail: a binding
+    evaluation's verdict is an authority effect under the
+    owner's 2026-11-08 ruling, not a recommendation — the
+    BAR itself (floors, medians, discrimination) is identical
+    either way; one evaluator, one rule."""
     evaluated = int(slot.get("evaluated") or 0)
     if evaluated == 0:
         return VERDICT_INSUFFICIENT, (
-            "no candidates observed — the §G route has "
+            f"no candidates observed — the {family} route has "
             "journaled no core-evaluated candidates since the "
             "evaluation window opened")
     take = _arm(slot.get("take_r") or [],
@@ -235,6 +245,19 @@ def verdict_for(slot: dict) -> tuple[str, str]:
             f"would-takes (median {take_med:+.2f}R, hit rate "
             f"{take['hit_rate']:.0%}); a route whose abstains "
             f"beat its takes can never read promotion-ready")
+    if binds:
+        return VERDICT_READY, (
+            f"measured, right-way discrimination on both "
+            f"reads: would-takes median {take_med:+.2f}R / "
+            f"hit rate {take['hit_rate']:.0%} over "
+            f"{take['paired']} paired, would-abstains median "
+            f"{abstain_med:+.2f}R / hit rate "
+            f"{abstain['hit_rate']:.0%} over "
+            f"{abstain['paired']} paired — under the owner's "
+            f"2026-11-08 ruling this verdict BINDS: the route "
+            f"is promoted to governing through the judgment "
+            f"seam until a fresh evaluation or an invariant "
+            f"violation demotes it")
     return VERDICT_READY, (
         f"measured, right-way discrimination on both reads: "
         f"would-takes median {take_med:+.2f}R / hit rate "
@@ -247,20 +270,32 @@ def verdict_for(slot: dict) -> tuple[str, str]:
         f"action")
 
 
-def snapshot(state: dict) -> dict:
+def snapshot(state: dict, *, routes_map: dict | None = None,
+             playbooks: tuple | None = None,
+             basis: str | None = None, family: str = "§G",
+             binds: bool = False) -> dict:
     """The per-route verdict table, as journaled / rendered /
     manifested.  Every registered range route is present —
-    absence of data is a stated verdict, never a missing row."""
+    absence of data is a stated verdict, never a missing row.
+
+    The keyword parameters are the Pass-5 generalisation
+    (execution/route_promotion.py reuses this ONE evaluator
+    for the hot_scalp_promotion / resting_limit routes): a
+    different playbook→route map, playbook set, window basis
+    and verdict voice — the computation is unchanged."""
+    routes_map = routes_map or RANGE_JUDGMENT_ROUTES
+    playbooks = playbooks or RANGE_PLAYBOOKS
     routes: dict[str, Any] = {}
     pending_counts: dict[str, int] = {}
     for entry in state.get("pending") or []:
         pb = str(entry.get("playbook") or "")
         pending_counts[pb] = pending_counts.get(pb, 0) + 1
-    for playbook in RANGE_PLAYBOOKS:
+    for playbook in playbooks:
         slot = (state.get("routes") or {}).get(playbook) or {}
-        verdict, reason = verdict_for(slot)
+        verdict, reason = verdict_for(
+            slot, family=family, binds=binds)
         routes[playbook] = {
-            "route": RANGE_JUDGMENT_ROUTES[playbook],
+            "route": routes_map[playbook],
             "playbook": playbook,
             "authority": "shadow_declared",
             "evaluated": int(slot.get("evaluated") or 0),
@@ -282,21 +317,25 @@ def snapshot(state: dict) -> dict:
         "horizon_h": HORIZON_H,
         "floors": {"min_paired_per_arm": MIN_PAIRED_PER_ARM},
         "window_start": state.get("window_start"),
-        "window_basis": _WINDOW_BASIS,
+        "window_basis": basis or _WINDOW_BASIS,
         "routes": routes,
     }
 
 
 # ------------------------------------------------------------ accumulate
 
-def _stamped_shadow(row: dict) -> str | None:
+def _stamped_shadow(row: dict, routes_map: dict | None = None
+                    ) -> str | None:
     """The §G route a journal row belongs to, or None: the row
     must be a judgment_shadow whose judgment block carries the
-    route stamp for one of the range routes."""
+    route stamp for one of the range routes.  ``routes_map``
+    is the Pass-5 generalisation (playbook -> route); the
+    default is the range family's map."""
+    routes_map = routes_map or RANGE_JUDGMENT_ROUTES
     if row.get("type") != "judgment_shadow":
         return None
     playbook = str(row.get("playbook") or "")
-    route = RANGE_JUDGMENT_ROUTES.get(playbook)
+    route = routes_map.get(playbook)
     if route is None:
         return None
     judgment = row.get("judgment") or {}
@@ -326,7 +365,10 @@ def _shadow_row(row: dict) -> dict:
 
 
 def accumulate(state: dict, records: list[dict], *,
-               now=None) -> dict:
+               now=None, routes_map: dict | None = None,
+               playbooks: tuple | None = None,
+               basis: str | None = None, family: str = "§G",
+               binds: bool = False) -> dict:
     """Fold one journal window into the standing state and
     return the new snapshot.
 
@@ -336,6 +378,10 @@ def accumulate(state: dict, records: list[dict], *,
     within SHADOW_MAX_AGE_H is unmeasurable, not pending
     forever.  Folding is keyed and remembered, so re-reading a
     window (or a duplicated journal row) can never grade twice.
+
+    The keyword parameters are the Pass-5 generalisation (see
+    snapshot): route_promotion folds the hot_scalp /
+    arrival_zone histories through this same machinery.
     """
     for key, value in new_state().items():
         state.setdefault(key, value)
@@ -354,7 +400,7 @@ def accumulate(state: dict, records: list[dict], *,
             str((e.get("judgment") or {}).get("decision")),
             str((e.get("judgment") or {}).get("expected_r"))))
     for row in records:
-        playbook = _stamped_shadow(row)
+        playbook = _stamped_shadow(row, routes_map)
         if playbook is None:
             continue
         judgment = row.get("judgment") or {}
@@ -477,7 +523,9 @@ def accumulate(state: dict, records: list[dict], *,
     state["pending"] = still_pending
     folded_list = sorted(folded)
     state["folded_keys"] = folded_list[-_KEY_CAP:]
-    return snapshot(state)
+    return snapshot(state, routes_map=routes_map,
+                    playbooks=playbooks, basis=basis,
+                    family=family, binds=binds)
 
 
 # ------------------------------------------------------------ the cycle

@@ -182,6 +182,13 @@ def test_flag_off_places_nothing_and_leaves_claim(tmp_path):
 
 def test_happy_path_promotes_and_reconciles(tmp_path):
     runner = _runner(tmp_path, live=True)
+    # PASS 5 (owner ruling 2026-11-08): placement requires a
+    # governing route — this suite pins the promotion chain's
+    # mechanics under the owner's explicit config step; the
+    # boundary at the declared posture is pinned in
+    # tests/test_route_authority.py.
+    runner.cfg.judgment_route_modes = {
+        "hot_scalp_promotion": "governing"}
     cand = _candidate(runner)
     assert runner._promote_hot_scalp_candidate(cand, _tick(), {}) is True
     assert len(runner.executor.placed) == 1
@@ -222,6 +229,10 @@ def test_holding_foreign_position_no_longer_refuses(tmp_path):
     # order path's RiskGuards (count + open risk) remain the
     # whole-book check, and the promotion proceeds inside them.
     runner = _runner(tmp_path, live=True)
+    # PASS 5: governing via the explicit config step, as in
+    # test_happy_path_promotes_and_reconciles above.
+    runner.cfg.judgment_route_modes = {
+        "hot_scalp_promotion": "governing"}
     from goldenswing.execution.executor import OrderRequest
     req = OrderRequest(symbol="XAUUSD", direction=1, volume=1.0,
                        stop_loss=1990.0, entry_ref=2000.0,
@@ -265,6 +276,10 @@ def test_shadow_events_flow_into_promotion_on_the_live_tick(tmp_path):
     # The live-loop wiring shape: shadow returns events, and the
     # flag-gated loop promotes this tick's candidates.
     runner = _runner(tmp_path, live=True)
+    # PASS 5: governing via the explicit config step, as in
+    # test_happy_path_promotes_and_reconciles above.
+    runner.cfg.judgment_route_modes = {
+        "hot_scalp_promotion": "governing"}
     store = runner._hot_scalp.store
     store.arm({
         "setup_id": "hs-test-parent-1", "symbol": "XAUUSD",

@@ -551,6 +551,20 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("📐", "Range Promotion"))
             lines.append(range_promotion())
             lines.append("")
+    # Judgment authority (Pass 5): every route's effective
+    # state + its source (declared / config / verdict /
+    # demoted) and the two binding routes' standing verdicts
+    # — from the runner's judgment_authority_line, which
+    # renders the same route table the per-cycle
+    # judgment_authority journal record carries.  Guarded —
+    # old runners lack it.
+    if ctrl is not None:
+        judgment_authority = getattr(
+            ctrl, "judgment_authority_line", None)
+        if callable(judgment_authority):
+            lines.append(fmt_section("⚖️", "Judgment Authority"))
+            lines.append(judgment_authority())
+            lines.append("")
     if cfg is not None:
         lines.append(fmt_section("🔧", "Config"))
         lines.append(

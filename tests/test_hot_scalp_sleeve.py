@@ -95,11 +95,19 @@ class _MarketExec:
 
 
 def _runner(tmp_path, *, equity=1100.0):
+    # PASS 5 (owner ruling 2026-11-08): this suite pins the
+    # sleeve's stacking / risk mechanics, which operate on
+    # placed orders — so its runners carry the owner's
+    # explicit config promotion for the route.  The boundary
+    # at the declared posture is pinned in
+    # tests/test_route_authority.py.
     cfg = MT5RunnerConfig(
         journal_path=tmp_path / "mt5_journal.jsonl",
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
-        news_pause_enabled=False, hot_scalp_live_enabled=True)
+        news_pause_enabled=False, hot_scalp_live_enabled=True,
+        judgment_route_modes={"hot_scalp_promotion":
+                              "governing"})
     feed = SimpleNamespace(
         account_state=lambda: {"equity": equity, "balance": equity,
                                "free_margin": equity},

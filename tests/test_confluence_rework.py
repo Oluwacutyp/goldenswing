@@ -508,6 +508,13 @@ def test_point3_fresh_h4_poi_absorption_produces_layer1_authorization_without_st
 
 def test_resting_limit_placed_for_fresh_major_zone(tmp_path):
     runner = _runner(tmp_path, resting_limit_enabled=True)
+    # PASS 5 (owner ruling 2026-11-08): the resting limit
+    # rests only while its route governs — this placement pin
+    # drives under the owner's explicit config step; the
+    # boundary at the declared posture is pinned in
+    # tests/test_route_authority.py.
+    runner.cfg.judgment_route_modes = {
+        "resting_limit": "governing"}
     frames = _point3_frames()
     runner._stack = SimpleNamespace(frames=frames)
     zone = StructuralZone(

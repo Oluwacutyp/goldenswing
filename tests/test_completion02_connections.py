@@ -113,7 +113,14 @@ def test_route_override_typos_never_promote_or_demote(tmp_path):
 # ------------------------------------------------ hot_scalp
 
 def test_hot_scalp_promotion_journals_funnel_and_core(tmp_path):
+    # PASS 5 (owner ruling 2026-11-08): an unpromoted route
+    # submits no independent demo orders, so this journaling
+    # pin drives the promotion under the owner's explicit
+    # config step — the placement then flows through the seam
+    # as a governing route's does, and the stamps say so.
     runner = _hs_runner(tmp_path, live=True)
+    runner.cfg.judgment_route_modes = {
+        "hot_scalp_promotion": "governing"}
     cand = _hs_cand(runner)
     assert runner._promote_hot_scalp_candidate(
         cand, _hs_tick(), {}) is True
@@ -136,37 +143,48 @@ def test_hot_scalp_promotion_journals_funnel_and_core(tmp_path):
     # Phase-2 naming honesty: sleeve base score, no asymmetry.
     assert cand_block["asymmetry_score"] is None
     assert cand_block["sleeve_base_score"] == pytest.approx(60.0)
-    # ONE core evaluation, route-stamped shadow-declared.
+    # ONE core evaluation, route-stamped with the authority
+    # the route actually rode in under (config-governing).
     shadows = _shadows(runner, "hot_scalp")
     assert len(shadows) == 1
     j = shadows[0]["judgment"]
     assert j["decision"] == "take"
     assert j["mode"] == "active"
-    assert j["authority"] == "shadow_declared"
+    assert j["authority"] == "governing"
     assert j["authority_route"] == "hot_scalp_promotion"
     assert shadows[0]["gate_order_result"] == "filled"
     # The chain's judgment stage carries the core summary too.
     judged = _chain(runner, "judgment")
     assert len(judged) == 1
     assert judged[0]["core"]["decision"] == "take"
-    assert judged[0]["core"]["governing"] is False
+    assert judged[0]["core"]["governing"] is True
     # Funnel counters reconcile the sleeve like any playbook.
     totals = runner.funnel_totals()
     assert totals["candidates"] >= 1 and totals["ordered"] >= 1
 
 
 def test_hot_scalp_abstain_is_journaled_not_governing(tmp_path):
-    """THE shadow-declared contract: the core abstains (forced
-    by an unreachable expected-R bar), the verdict is journaled
-    as shadow history — and the chain's own stack still decides:
-    the promotion succeeds exactly as it did pre-connection."""
+    """SUPERSEDED CONTRACT (Pass 5, owner ruling 2026-11-08):
+    this pin used to assert the shadow-declared contract —
+    the core abstains, the verdict journals as shadow history,
+    and the chain's own stack still decides, so the promotion
+    succeeded.  The ruling ends that posture: an unpromoted
+    route submits NO independent demo orders.  What survives
+    of the old pin is its first half — the abstention is
+    journaled as shadow history, route-stamped — and what
+    replaces the second half is the boundary: no placement,
+    the claim resolves back to touched, and the funnel record
+    terminates as judgment.route_not_promoted.  (Under an
+    explicit promotion the same abstention refuses as
+    judgment.abstain — see
+    test_hot_scalp_explicit_promotion_makes_abstain_govern.)"""
     runner = _hs_runner(tmp_path, live=True)
     runner.cfg.judgment_min_expected_r = 99.0
     cand = _hs_cand(runner)
     assert runner._promote_hot_scalp_candidate(
-        cand, _hs_tick(), {}) is True
-    assert len(runner.executor.placed) == 1
-    assert _hs_status(runner) == "order_reconciled"
+        cand, _hs_tick(), {}) is False
+    assert runner.executor.placed == []
+    assert _hs_status(runner) == "touched"
     shadows = _shadows(runner, "hot_scalp")
     assert len(shadows) == 1
     j = shadows[0]["judgment"]
@@ -174,6 +192,12 @@ def test_hot_scalp_abstain_is_journaled_not_governing(tmp_path):
     assert j["authority"] == "shadow_declared"
     assert _chain(runner, "judgment")[0]["core"]["decision"] \
         == "abstain"
+    evs = _evals(runner, "hot_scalp")
+    assert len(evs) == 1
+    assert evs[0]["decision"]["reason_code"] \
+        == "judgment.route_not_promoted"
+    assert evs[0]["decision"]["order_result"] \
+        == "not_attempted"
 
 
 def test_hot_scalp_route_gate_refusal_also_journals(tmp_path):
@@ -268,7 +292,14 @@ def _az_drive(tmp_path, **cfg):
 
 def test_arrival_zone_placement_journals_funnel_and_core(
         tmp_path):
-    runner = _az_drive(tmp_path)
+    # PASS 5 (owner ruling 2026-11-08): the resting limit
+    # rests nothing while its route does not govern, so this
+    # journaling pin drives the placement under the owner's
+    # explicit config step; the core stamp then reads
+    # governing, as the placement's authority in fact was.
+    runner = _az_drive(
+        tmp_path,
+        judgment_route_modes={"resting_limit": "governing"})
     # The placement itself is exactly as before the connection.
     assert len(runner._pending_orders) == 1
     state = next(iter(runner._pending_orders.values()))
@@ -286,17 +317,33 @@ def test_arrival_zone_placement_journals_funnel_and_core(
     shadows = _shadows(runner, "arrival_zone")
     assert len(shadows) == 1
     j = shadows[0]["judgment"]
-    assert j["authority"] == "shadow_declared"
+    assert j["authority"] == "governing"
     assert j["authority_route"] == "resting_limit"
     assert j["mode"] == "active"
 
 
-def test_arrival_zone_abstain_does_not_block_placement(tmp_path):
+def test_arrival_zone_abstain_journaled_and_boundary_blocks(
+        tmp_path):
+    """SUPERSEDED CONTRACT (Pass 5, owner ruling 2026-11-08):
+    this pin (formerly ..._abstain_does_not_block_placement)
+    asserted that a shadow-declared route's abstention was
+    journaled while the placement proceeded on the route's
+    own governance.  The ruling ends that posture: while the
+    route does not govern it rests NOTHING — the abstention
+    still journals as shadow history, and the approach's one
+    funnel record terminates as judgment.route_not_promoted.
+    (Under an explicit promotion the same abstention refuses
+    as judgment.abstain — see
+    test_arrival_zone_explicit_promotion_governs.)"""
     runner = _az_drive(tmp_path, judgment_min_expected_r=99.0)
-    assert len(runner._pending_orders) == 1
+    assert runner._pending_orders == {}
     j = _shadows(runner, "arrival_zone")[0]["judgment"]
     assert j["decision"] == "abstain"
     assert j["authority"] == "shadow_declared"
+    evs = _evals(runner, "arrival_zone")
+    assert len(evs) == 1
+    assert evs[0]["decision"]["reason_code"] \
+        == "judgment.route_not_promoted"
 
 
 def test_arrival_zone_explicit_promotion_governs(tmp_path):
@@ -317,8 +364,13 @@ def test_arrival_zone_explicit_promotion_governs(tmp_path):
 def test_manifest_route_authority_table(tmp_path):
     runner = _hs_runner(tmp_path, live=True)
     cand = _hs_cand(runner)
+    # PASS 5 (owner ruling 2026-11-08): at the declared
+    # posture the attempt no longer places — it is preserved
+    # as shadow, which is exactly the history this manifest
+    # census counts below (one hot_scalp judgment record,
+    # route still shadow_declared, governing_now False).
     assert runner._promote_hot_scalp_candidate(
-        cand, _hs_tick(), {}) is True
+        cand, _hs_tick(), {}) is False
     runner._journal_manifest()
     core = [r for r in runner.journal.records()
             if r.get("type") == "manifest"][-1][
