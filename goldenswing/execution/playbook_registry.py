@@ -134,6 +134,21 @@ class PlaybookSpec:
     #: parameters require chronological, cost-aware demo
     #: evaluation before they may resolve here (rulings §4).
     management_horizon: str = "intraday"
+    #: MarketSituation Pass 2 (SPEC §4.4 / §8.4): the chart
+    #: studies this family declares for its chart clocks —
+    #: METADATA ONLY in this pass; the consumer is the chart
+    #: program (Pass 10).  Empty = the family declares no
+    #: studies of its own (the renderer's base set applies).
+    chart_studies: tuple[str, ...] = ()
+    #: MarketSituation Pass 2 (SPEC §4.4 / §6): optional CLOCK
+    #: ROLE overrides for families whose roles differ from the
+    #: route default — (role, timeframe) pairs over the roles
+    #: formation_tf / refinement_tf / trigger_tf / entry_tf /
+    #: management_tf.  The scenario book reads them when it
+    #: builds a scenario's clocks; empty = the route default
+    #: (native / refinement / trigger / trigger / management
+    #: context) applies.  Metadata only: no detector reads this.
+    clocks: tuple[tuple[str, str], ...] = ()
 
 
 #: The registry, in canonical display order: the H1-clocked roster

@@ -398,6 +398,18 @@ class MT5RunnerConfig:
     # OBSERVATION-ONLY: no decision path reads it in Pass 0; the
     # flag exists so a test (or a forensic A/B) can prove that.
     situation_enabled: bool = True
+    # SCENARIO BOOK (MarketSituation Pass 2, shadow): every
+    # tracked setup becomes a book scenario (execution/
+    # scenario_book.py); the S2 thesis is mirrored into the
+    # book; per-H1-close the live book is scored with the
+    # five-scenario assessor and its pair relationships +
+    # summary are journaled.  OBSERVATION-ONLY: the book
+    # mirrors the lifecycle store's transitions and Judgment's
+    # records; no decision path reads it, and governed routes
+    # keep reading the legacy thesis path.  The book rides the
+    # situation program's gate: with situation_enabled off the
+    # book is silent too, so record shapes stay byte-identical.
+    scenario_book_enabled: bool = True
     # JUDGMENT CORE (owner rulings 2026-10-23; build ordered
     # 2026-11-02): evaluation of every candidate-bearing funnel
     # record — market-state estimation -> competing scenarios ->
@@ -1245,6 +1257,15 @@ class MT5Runner:
         # (and never spams) — observation degrades, decisions do
         # not depend on it.
         self._situation_keeper = None
+        # PASS 2 — scenario book (lazy; built on first touch by
+        # _scenario_book_get).  False marks a book whose state
+        # could not be trusted, so the layer never retries (and
+        # never spams) — observation degrades, decisions do not
+        # depend on it.  _last_thesis_assessment is the freshest
+        # five-scenario read the thesis cycle produced; the
+        # book cycle scores against it.
+        self._scenario_book = None
+        self._last_thesis_assessment = None
         # PASS 1 — live-reaction note throttle (the keeper's
         # provisional block refreshes on price movement or every
         # few dozen ticks, never per tick).
@@ -1836,6 +1857,140 @@ class MT5Runner:
         except Exception:  # noqa: BLE001
             return None
 
+    # ------------------------------------------------ BOOK (Pass 2)
+    # Scenario book (execution/scenario_book.py): the tracked
+    # setups' second home — many concurrent scenarios with their
+    # own clocks, pair relationships, assessor standings and a
+    # per-H1-close summary, journaled beside the live paths.
+    # OBSERVATION-ONLY: the book mirrors the lifecycle store and
+    # the judgment taps; nothing in the decision path reads it,
+    # and nothing here may raise into a cycle.
+
+    def _scenario_book_get(self):
+        """The book, built lazily on first touch; None when
+        disabled (its own flag or the situation program's) or
+        when its persisted state cannot be trusted (marked
+        False so it is never retried)."""
+        if not getattr(self.cfg, "scenario_book_enabled", True) \
+                or not getattr(self.cfg, "situation_enabled",
+                               True):
+            return None
+        book = getattr(self, "_scenario_book", None)
+        if book is not None:
+            return book or None
+        try:
+            from .scenario_book import (ScenarioBook,
+                                        ScenarioBookStore)
+            journal_dir = os.path.dirname(os.path.abspath(
+                str(self.cfg.journal_path)))
+            book = ScenarioBook(store=ScenarioBookStore(
+                os.path.join(journal_dir, "scenario_book.json")))
+            if book.scenarios or book.closed:
+                self.journal.log_note(
+                    "scenario_book: restored "
+                    f"{len(book.scenarios)} live + "
+                    f"{len(book.closed)} closed scenarios from "
+                    "the persisted book state")
+            self._scenario_book = book
+        except Exception as exc:  # noqa: BLE001 — observation-only
+            _log.warning("mt5: scenario book unavailable: %s",
+                         exc)
+            self.journal.log_note(
+                "scenario_book: disabled for this run "
+                f"({type(exc).__name__}: {exc}) — book state "
+                "could not be trusted; live decisions are "
+                "unaffected (shadow layer)")
+            self._scenario_book = False
+            return None
+        return book
+
+    def _book_journal(self, records) -> None:
+        """Append book records to the journal with this run's
+        id (the ThesisKeeper event contract).  Best-effort: a
+        journal failure must never break the signal path."""
+        for rec in records or []:
+            payload = dict(rec)
+            payload.setdefault("run_id", self._run_id)
+            try:
+                self.journal.append(payload)
+            except Exception:
+                pass
+
+    def _book_authority_for(self, setup) -> str:
+        """A book scenario's authority stamp: a shadow instance
+        is shadow intrinsically (WS3); a lifecycle-routed setup
+        rides the h1_trigger route, so its stamp is that
+        route's declared state."""
+        if getattr(setup, "shadow", False):
+            return "shadow"
+        return ("governing" if self._judgment_route_state(
+            "h1_trigger") == "governing" else "shadow")
+
+    def _book_propose_setup(self, setup) -> None:
+        book = self._scenario_book_get()
+        if book is None:
+            return
+        try:
+            self._book_journal(book.propose_from_setup(
+                setup, ts=str(self._evaluation_now()),
+                situation_id=self._current_situation_id(),
+                authority=self._book_authority_for(setup)))
+        except Exception as exc:  # noqa: BLE001 — observation-only
+            self.journal.log_note(
+                f"scenario_book: proposal failed for "
+                f"{setup.setup_id}: {type(exc).__name__}: {exc}")
+
+    def _book_sync_setup(self, setup, stage=None,
+                         detail: str = "") -> None:
+        book = self._scenario_book_get()
+        if book is None:
+            return
+        try:
+            self._book_journal(book.sync_setup(
+                setup, ts=str(self._evaluation_now()),
+                stage=stage, detail=detail,
+                situation_id=self._current_situation_id()))
+        except Exception as exc:  # noqa: BLE001 — observation-only
+            self.journal.log_note(
+                f"scenario_book: sync failed for "
+                f"{setup.setup_id}: {type(exc).__name__}: {exc}")
+
+    def _book_cycle(self, appended, asof) -> None:
+        """One scenario-book cycle per H1 close: reconcile open
+        positions, score the live book against the freshest
+        five-scenario assessment (or a fresh read of the
+        current decision context when no thesis cycle has run
+        yet), refresh pair relationships, journal the summary.
+        Never raises."""
+        try:
+            if "H1" not in (appended or []):
+                return
+            book = self._scenario_book_get()
+            if book is None:
+                return
+            assessment = getattr(self, "_last_thesis_assessment",
+                                 None)
+            if assessment is None:
+                from .judgment_thesis import assess_market
+                assessment = assess_market(
+                    context=self._decision_context(), flow={})
+            ctx = getattr(self, "_position_ctx", None)
+            open_tickets = None
+            if isinstance(ctx, dict):
+                try:
+                    open_tickets = {int(t) for t in ctx}
+                except Exception:
+                    open_tickets = None
+            self._book_journal(book.cycle(
+                ts=(str(asof) if asof is not None
+                    else str(self._evaluation_now())),
+                situation_id=self._current_situation_id(),
+                assessment=assessment,
+                open_tickets=open_tickets))
+        except Exception as exc:  # noqa: BLE001 — observation-only
+            _log.warning("mt5: scenario book cycle failed "
+                         "(observation-only): %s", exc)
+
     def _situation_on_closes(self, appended, tick) -> None:
         """Refresh the situation for the TFs that just closed
         (called from _refresh_bars after the append phase).
@@ -1883,6 +2038,10 @@ class MT5Runner:
                     forecast_outlook=outlook,
                     m1_last_close=m1_last, blocks=blocks,
                     price=price, hierarchy_reading=reading)
+            # PASS 2 — one scenario-book cycle rides the H1
+            # close (shadow scoring + relationships + summary),
+            # after the situation it reports on exists.
+            self._book_cycle(appended, asof)
         except Exception as exc:  # noqa: BLE001 — observation-only
             _log.warning("mt5: situation refresh failed "
                          "(observation-only): %s", exc)
@@ -2443,6 +2602,33 @@ class MT5Runner:
                         _shadow_record["audit_feedback"] = \
                             _audit_fb
                     self.journal.append(_shadow_record)
+                    # PASS 2 — when the candidate is a tracked
+                    # setup's, the scenario book adopts this
+                    # record's S1 verdict + the correlation
+                    # groups S1's weighing assigned (the book
+                    # never re-derives either).
+                    _bk_setup_id = (evidence or {}).get(
+                        "setup_id")
+                    if _bk_setup_id:
+                        _bk = self._scenario_book_get()
+                        if _bk is not None:
+                            try:
+                                _bal = _judgment.get(
+                                    "evidence_balance") or {}
+                                _bk.note_judgment(
+                                    _bk_setup_id,
+                                    ts=str(_eval_now), s1=_judgment,
+                                    groups_for=_bal.get(
+                                        "groups_for"),
+                                    groups_against=_bal.get(
+                                        "groups_against"))
+                            except Exception as _bk_exc:
+                                self.journal.log_note(
+                                    "scenario_book: judgment "
+                                    f"note failed for "
+                                    f"{_bk_setup_id}: "
+                                    f"{type(_bk_exc).__name__}: "
+                                    f"{_bk_exc}")
                     _counts = getattr(
                         self, "_judgment_record_counts", None)
                     if _counts is not None:
@@ -2798,7 +2984,31 @@ class MT5Runner:
         events = keeper.update(
             assessment, ts=_time.time(), candidate=candidate,
             playbook=playbook, price=_price)
+        # PASS 2 — the freshest assessor read, kept for the
+        # scenario book's H1-close scoring cycle.
+        self._last_thesis_assessment = assessment
         self._journal_thesis_events(events, ts)
+        # PASS 2 — mirror the thesis into the scenario book
+        # (shadow): book scenarios parent to the thesis there,
+        # and the book's relationships see it.  The keeper's
+        # own lifecycle + order-boundary gate are untouched.
+        _bk = self._scenario_book_get()
+        if _bk is not None:
+            try:
+                _bk_closed = [e.get("thesis") for e in events
+                              if e.get("event") in (
+                                  "thesis_invalidated",
+                                  "thesis_expired",
+                                  "thesis_superseded")
+                              and e.get("thesis")]
+                self._book_journal(_bk.sync_thesis(
+                    keeper.active, ts=str(ts),
+                    closed_theses=_bk_closed,
+                    situation_id=self._current_situation_id()))
+            except Exception as _bk_exc:
+                self.journal.log_note(
+                    "scenario_book: thesis sync failed: "
+                    f"{type(_bk_exc).__name__}: {_bk_exc}")
         self._audit_sync_thesis()
 
     def _journal_thesis_events(self, events, ts) -> None:
@@ -4156,6 +4366,10 @@ class MT5Runner:
             detail=detail, **kw)
         if ev is not None:
             self._journal_setup_event(setup, stage, detail)
+            # PASS 2 — the book mirrors the accepted transition
+            # (the store owns it; the book never originates one).
+            self._book_sync_setup(setup, stage=stage,
+                                  detail=detail)
 
     def _rebuild_setup_signal(self, setup, t: int):
         """The detector's candidate, rebuilt from its persisted
@@ -4278,6 +4492,9 @@ class MT5Runner:
             formation_ts=formation_ts, eval_now=eval_now,
             intended_tf=intended_tf)
         if self._setup_store.register(setup, ts=str(eval_now)):
+            # PASS 2 — the registered setup is also a book
+            # scenario from birth (same instance key).
+            self._book_propose_setup(setup)
             self._journal_setup_event(
                 setup, _setup_lc.STAGE_DETECTED,
                 f"scan-detected {setup.playbook} "
@@ -4320,7 +4537,15 @@ class MT5Runner:
         if not is_new:
             # Dedupe: the re-scan found the same setup — the
             # existing instance carries the disposition.
-            return self._setup_store.get(setup.setup_id) or setup
+            existing = self._setup_store.get(setup.setup_id) \
+                or setup
+            # PASS 2 — a re-detection refreshes the book
+            # scenario's facts (never a duplicate scenario).
+            self._book_sync_setup(existing)
+            return existing
+        # PASS 2 — the registered setup is also a book scenario
+        # from birth (same instance key, thesis link included).
+        self._book_propose_setup(setup)
         if shadow:
             detected_detail = (
                 f"scan-detected {setup.playbook} "
@@ -19140,6 +19365,9 @@ class MT5Runner:
                                 f"(adopted by the judgment "
                                 f"cycle of this scan's own "
                                 f"record)")
+                            # PASS 2 — the book scenario adopts
+                            # the same parent link.
+                            self._book_sync_setup(_setup)
             elif not shadow and self._setup_store is not None \
                     and source == _lifecycle.SOURCE_LIVE_CLOSE:
                 # Setup lifecycle (owner rulings 2026-10-30
