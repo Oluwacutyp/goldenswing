@@ -85,7 +85,9 @@ from ..live.asymmetry import (STYLE_FLOORS, ScoreContext, floor_for,
 from ..live.atr_regime import (atr_regime as _atr_regime,
                                baseline_atr as _baseline_atr,
                                scaled_thresholds as _scaled_thresholds)
-from ..live.dxy import DXYTracker
+from ..live.dxy import DXYTracker, dxy_bonus as _dxy_bonus
+from ..live import relationships as _relationships
+from ..live.data_health import check_data_health as _check_data_health
 from ..live import day_context as _day_context
 from ..live import posture as _posture_mod
 from ..live.funding import (SMT_PLAYBOOKS as _SMT_PLAYBOOKS,
@@ -1243,6 +1245,11 @@ class MT5Runner:
         # (and never spams) — observation degrades, decisions do
         # not depend on it.
         self._situation_keeper = None
+        # PASS 1 — live-reaction note throttle (the keeper's
+        # provisional block refreshes on price movement or every
+        # few dozen ticks, never per tick).
+        self._sit_live_tick = -10 ** 9
+        self._sit_live_price: float | None = None
         # F2: the trained-estimator service (lazy — artifact lives
         # beside the ensemble bundle) + retrain bookkeeping.  The
         # train outcome is journaled by the calibration cycle on
@@ -1851,18 +1858,297 @@ class MT5Runner:
             if m1_frame is not None and len(m1_frame):
                 m1_last = m1_frame.index[-1]
             outlook = getattr(self, "_forecast_last_outlook", None)
+            price = None
+            if isinstance(tick, dict):
+                price = tick.get("mid") or tick.get("bid")
+            blocks = self._situation_blocks(tick, asof, price)
             order = [t for t in ("D1", "H4", "M30", "M15", "M5")
                      if t in appended]
             if "H1" in appended:
                 order.append("H1")
             for tf in order:
+                reading = ...
+                if tf == "H1":
+                    # The hierarchy's own D1->H1 reading (§2.3):
+                    # a verdict computed HERE, in the observation
+                    # seam, and journaled as one row among the
+                    # relationship rows — its gate authority in
+                    # the decision path is untouched.
+                    reading = _relationships.hierarchy_reading(
+                        self._stack,
+                        asof=self._stack.cursors.get("H1"),
+                        qm_touch=getattr(self, "_qm_touch", None))
                 keeper.on_tf_close(
                     tf, self._stack, asof=asof,
                     forecast_outlook=outlook,
-                    m1_last_close=m1_last)
+                    m1_last_close=m1_last, blocks=blocks,
+                    price=price, hierarchy_reading=reading)
         except Exception as exc:  # noqa: BLE001 — observation-only
             _log.warning("mt5: situation refresh failed "
                          "(observation-only): %s", exc)
+
+    def _situation_blocks(self, tick, asof, price) -> dict:
+        """The §3.3 situation-level blocks, assembled from the
+        runner's own live organs (day object, bedrock, zone
+        store, DXY tracker + SMT read, news calendar, spread
+        book, data-health gate).  Every sub-block is guarded on
+        its own: a block whose organ is unavailable is simply
+        absent from the dict, and the situation names it missing
+        — nothing is synthesized.  Never raises."""
+        blocks: dict = {}
+        frames = self._stack.frames if self._stack else {}
+        h1 = frames.get("H1")
+        if price is None and h1 is not None and len(h1):
+            price = float(h1["close"].iloc[-1])
+        day = getattr(self, "_day_ctx", None)
+
+        # --- regime: bedrock label (the situation re-derives
+        # the per-TF labels itself) + the day object.
+        try:
+            regime: dict = {}
+            bedrock = getattr(self, "_bedrock", None)
+            if bedrock is not None:
+                regime["bedrock_label_h1"] = bedrock.label()
+            if day is not None:
+                prior = day.prior or {}
+                regime["day"] = {
+                    "day_type": day.day_type,
+                    "adr_pct": float(day.adr_consumed_pct),
+                    "adr_state": day.adr_state,
+                    "opening_type": day.ny_open_type
+                    or day.london_open_type,
+                    "london_open_type": day.london_open_type,
+                    "ny_open_type": day.ny_open_type,
+                    "prior_day": {
+                        "vah": prior.get("vah"),
+                        "val": prior.get("val"),
+                        "poc": prior.get("poc")},
+                }
+            if regime:
+                blocks["regime"] = regime
+        except Exception:  # noqa: BLE001 — observation-only
+            pass
+
+        # --- location: value, zones, pools, premium/discount.
+        try:
+            location: dict = {"price": price,
+                              "magnet_room_r": None}
+            if day is not None and day.poc_now:
+                location["value"] = {
+                    "poc": float(day.poc_now),
+                    "vah": float(day.vah_now),
+                    "val": float(day.val_now),
+                    "developing": True}
+            elif h1 is not None and len(h1):
+                days = _day_context.group_days(h1)
+                if days:
+                    vp = volume_profile(days[max(days.keys())])
+                    location["value"] = {
+                        "poc": vp.get("poc"), "vah": vp.get("vah"),
+                        "val": vp.get("val"), "developing": True}
+            store = self._get_zone_store()
+            active = store.active_zones() if store else []
+            if price is not None:
+                above = sorted(
+                    (z for z in active if z.bottom > price),
+                    key=lambda z: z.proximal)[:3]
+                below = sorted(
+                    (z for z in active if z.top < price),
+                    key=lambda z: -z.proximal)[:3]
+            else:
+                above, below = [], []
+            location["zones_above"] = [
+                {**z.to_dict(), "zone_id": z.zone_id,
+                 "risk_tier": _zone_risk_tier(z)} for z in above]
+            location["zones_below"] = [
+                {**z.to_dict(), "zone_id": z.zone_id,
+                 "risk_tier": _zone_risk_tier(z)} for z in below]
+            pools = _ev_liquidity_pools(h1) if h1 is not None \
+                else []
+            if price is not None:
+                location["pools_above"] = sorted(
+                    (p for p in pools
+                     if p.get("side") == "buy_side"
+                     and p.get("level") is not None
+                     and p["level"] > price),
+                    key=lambda p: p["level"])[:3]
+                location["pools_below"] = sorted(
+                    (p for p in pools
+                     if p.get("side") == "sell_side"
+                     and p.get("level") is not None
+                     and p["level"] < price),
+                    key=lambda p: -p["level"])[:3]
+            pd_read = _ev_premium_discount(frames.get("D1"))
+            location["premium_discount"] = {
+                "zone": pd_read.get("zone"),
+                "equilibrium": pd_read.get("eq"),
+                "range_high": pd_read.get("range_high"),
+                "range_low": pd_read.get("range_low")}
+            levels = day.session_levels if day is not None \
+                else {}
+            location["day_levels"] = {
+                "ib_high": (float(day.ib_high)
+                            if day is not None and day.ib_complete
+                            else None),
+                "ib_low": (float(day.ib_low)
+                           if day is not None and day.ib_complete
+                           else None),
+                "overnight_high": (levels or {}).get("asia_high"),
+                "overnight_low": (levels or {}).get("asia_low")}
+            blocks["location"] = location
+        except Exception:  # noqa: BLE001 — observation-only
+            pass
+
+        # --- activity: session, spread, volume character, news.
+        try:
+            activity: dict = {}
+            stamp = asof
+            if stamp is None and h1 is not None and len(h1):
+                stamp = h1.index[-1]
+            if stamp is not None:
+                session, killzone = session_of(stamp)
+                activity["session"] = session
+                activity["killzone"] = killzone
+            if isinstance(tick, dict):
+                activity["spread"] = tick.get("spread")
+            activity["spread_ratio"] = getattr(
+                self, "_spread_ratio", None)
+            rvol: dict = {}
+            for tf_name, frame in frames.items():
+                if frame is not None and len(frame):
+                    rvol[tf_name] = volume_features(
+                        frame).get("volume_ratio")
+            activity["rvol"] = rvol
+            activity["vwap_session"] = None
+            if h1 is not None and len(h1):
+                days = _day_context.group_days(h1)
+                if days:
+                    activity["vwap_session"] = volume_features(
+                        days[max(days.keys())]).get("vwap")
+            activity["news_blackout"] = None
+            news = getattr(self, "news", None)
+            if news is not None:
+                try:
+                    state = news.execution_state()
+                    activity["news_blackout"] = bool(state.paused)
+                except Exception:  # noqa: BLE001
+                    activity["news_blackout"] = None
+            blocks["activity"] = activity
+        except Exception:  # noqa: BLE001 — observation-only
+            pass
+
+        # --- cross-asset: the DXY tracker + SMT read the runner
+        # already maintains.  Relative-strength vs silver/DXY
+        # has no live feed in the runner (features/relstrength
+        # is a backtest-path organ) — those fields read None,
+        # honestly absent, never invented.
+        try:
+            cross: dict = {"silver_rs": None, "dxy_rs": None}
+            tracker = getattr(self, "_dxy", None)
+            state = getattr(tracker, "state", None)
+            if state is not None:
+                bonus = _dxy_bonus(state.corr)[0] \
+                    if state.available else 0.0
+                cross["dxy"] = {
+                    "available": bool(state.available),
+                    "correlation": state.corr,
+                    "bias": state.bias, "bonus": bonus,
+                    "status": state.status}
+            read = getattr(self, "_smt_read", None)
+            event = getattr(read, "event", None) \
+                if read is not None else None
+            if read is not None and read.available \
+                    and event is not None:
+                cross["smt_event"] = {
+                    "kind": event.kind,
+                    "direction": event.direction,
+                    "level": event.level}
+            else:
+                cross["smt_event"] = None
+            blocks["cross_asset"] = cross
+        except Exception:  # noqa: BLE001 — observation-only
+            pass
+
+        # --- data quality: the feed layer's own health gate.
+        try:
+            cursors = self._stack.cursors if self._stack else {}
+            h4_close = d1_close = None
+            if cursors.get("H4") is not None:
+                h4_close = (pd.Timestamp(cursors["H4"])
+                            + pd.Timedelta(
+                                minutes=TF_MINUTES["H4"])
+                            ).to_pydatetime()
+            if cursors.get("D1") is not None:
+                d1_close = (pd.Timestamp(cursors["D1"])
+                            + pd.Timedelta(
+                                minutes=TF_MINUTES["D1"])
+                            ).to_pydatetime()
+            health = _check_data_health(h4_close, d1_close)
+            word = "healthy" if health.healthy else (
+                "halt" if health.d1_stale else "degraded")
+            blocks["data_quality"] = {
+                "health": word, "reason": health.reason,
+                "h4_gap_bars": health.h4_gap_bars,
+                "d1_stale": bool(health.d1_stale)}
+        except Exception:  # noqa: BLE001 — observation-only
+            pass
+        return blocks
+
+    def _situation_note_live(self, tick, price) -> None:
+        """Feed the keeper's provisional live-reaction block
+        (A4.2) from the management cycle: price inside active
+        zones + open positions, throttled to price movement or
+        every 25 ticks.  Observation-only; never raises; a no-op
+        until the keeper exists (the block is a reaction layer
+        on the situation, not a reason to build one early)."""
+        try:
+            if not getattr(self.cfg, "situation_enabled", True):
+                return
+            keeper = getattr(self, "_situation_keeper", None)
+            if not keeper:
+                return
+            last_price = self._sit_live_price
+            if last_price is not None \
+                    and abs(price - last_price) < 1.0 \
+                    and self._tick_count - self._sit_live_tick < 25:
+                return
+            self._sit_live_tick = self._tick_count
+            self._sit_live_price = price
+            zones_inside = []
+            store = getattr(self, "_zone_store", None)
+            if store is not None:
+                for zone in store.active_zones():
+                    if zone.bottom <= price <= zone.top:
+                        zones_inside.append({
+                            "zone_id": zone.zone_id,
+                            "side": zone.side, "tf": zone.tf,
+                            "relation": "inside"})
+                    if len(zones_inside) >= 5:
+                        break
+            positions = []
+            for ticket in list(self.tick_manager.tickets()):
+                pos = self.tick_manager.position(ticket)
+                if pos is None or pos.closed:
+                    continue
+                r_mult = None
+                if pos.risk_price:
+                    r_mult = (pos.direction
+                              * (price - pos.entry_price)
+                              / pos.risk_price)
+                positions.append({
+                    "ticket": ticket,
+                    "direction": pos.direction,
+                    "entry": pos.entry_price,
+                    "stop": pos.stop0,
+                    "price": price, "r": r_mult,
+                    "best_r": pos.best_r})
+            keeper.note_live(
+                price,
+                asof=tick.get("time") if isinstance(tick, dict)
+                else None,
+                zones_inside=zones_inside, positions=positions)
+        except Exception:  # noqa: BLE001 — observation-only
+            pass
 
     def _emit_eval(self, *, playbook: str, evaluation_clock: str,
                    intended_tf: str | None = None,
@@ -4900,6 +5186,11 @@ class MT5Runner:
                 self._manage_tick(price, stats,
                                   bid=tick.get("bid"),
                                   ask=tick.get("ask"))
+            # PASS 1 — the situation's provisional live-reaction
+            # block (A4.2) refreshes from this same management
+            # cycle: price inside zones / positions, stamped
+            # unconfirmed.  Observation-only; never raises.
+            self._situation_note_live(tick, price)
             if self._tick_count % self.cfg.reconcile_every_ticks == 0:
                 if self._regime_pause != "paused_complete":
                     self._reconcile(price, stats)

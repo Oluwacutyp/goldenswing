@@ -46,6 +46,40 @@ SHADOW: nothing in the decision path reads the situation in
 Pass 0.  The only outward effect is journal records and the
 ``situation_id`` stamp on the funnel records of the cycle that
 consumed the situation (execution/mt5_runner._emit_eval).
+
+Pass 1 completes the §3.1 schema and adds the A4 update layer:
+
+- The snapshot gains the §3.3 situation-level blocks (regime /
+  location / activity / cross_asset / data_quality).  The pure
+  builder derives the regime skeleton and the data-quality
+  skeleton from the per-TF states themselves; the runner
+  supplies the blocks that need live engine organs (day object,
+  zone store, DXY tracker, news calendar) through the keeper,
+  and a block the runner cannot supply reads absent — named in
+  ``data_quality.missing`` — never synthesized.
+- ``relationships`` (live/relationships.py) rides every
+  assembled situation: the cross-timeframe pair kinds plus, on
+  H1 closes, the hierarchy's own D1→H1 reading as one row among
+  rows.  Any TF close recomputes the pairs touching it; a pair
+  kind change journals a delta even when no TF state changed
+  (price alone can break a defended swing).
+- ``situation_event`` records (AMENDMENTS-1 §A4.1) journal the
+  transitions detected between refreshes: structure-event
+  episodes (appearance = ``structure_event``, kind/direction
+  change = ``structural_break``), volatility-state changes and
+  liquidity-pool entries/takes measured against the location
+  block.  An event anchors a delta on the situation_id chain so
+  the moment is reconstructable (A4.3).
+- The ``live`` block (A4.2) carries intrabar reaction — price
+  inside active zones and open positions — fed by the runner's
+  management cycle via :meth:`SituationKeeper.note_live`.
+  Every field is stamped ``provisional``: it is reaction, not
+  truth, and it NEVER writes into the closed-bar state fields
+  (the separation is test-pinned).
+
+SHADOW discipline is unchanged: with the keeper disabled the
+record shapes are byte-identical to before Pass 0, and no
+decision record changes shape in any mode.
 """
 from __future__ import annotations
 
@@ -59,6 +93,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import multitf
+from . import relationships as _relationships
 from .atr_regime import atr_regime as _atr_regime
 from .atr_regime import atr_series as _atr_series
 from .hierarchy import _pending_swings
@@ -82,6 +117,18 @@ MIN_BARS_READY = SHORT_WINDOW + 5
 
 SNAPSHOT_KIND = "situation_snapshot"
 DELTA_KIND = "situation_delta"
+EVENT_KIND = "situation_event"
+
+#: The §3.3 situation-level block keys, in schema order.
+BLOCK_KEYS = ("regime", "location", "activity", "cross_asset",
+              "data_quality")
+
+#: Event types journaled as ``situation_event`` records
+#: (AMENDMENTS-1 §A4.1).
+EVENT_STRUCTURE = "structure_event"
+EVENT_STRUCTURAL_BREAK = "structural_break"
+EVENT_VOLATILITY = "volatility_change"
+EVENT_LIQUIDITY = "liquidity_event"
 
 _JOURNAL_FILE = "situations.jsonl"
 _LATEST_FILE = "situation_latest.json"
@@ -292,24 +339,100 @@ def stack_clocks(stack, *, m1_last_close=None) -> dict:
     return clocks
 
 
+def _missing_inputs(per_tf: dict, blocks: dict) -> list[str]:
+    """The named absent inputs of a situation (SPEC §3.3
+    data_quality.missing): every timeframe that could not be
+    fully read, and every situation-level block that no supplier
+    provided.  Absent stays absent — and named."""
+    missing: list[str] = []
+    for tf in SITUATION_TFS:
+        state = per_tf.get(tf) or {}
+        readiness = state.get("readiness")
+        if readiness != READINESS_READY:
+            missing.append(f"{tf}:{readiness or 'unknown'}")
+    for key in ("location", "activity", "cross_asset"):
+        if blocks.get(key) is None:
+            missing.append(key)
+    return missing
+
+
+def assemble_blocks(per_tf: dict, supplied: dict | None) -> dict:
+    """The §3.3 blocks of a situation.  ``supplied`` is the
+    runner's organ-derived blocks (any subset of BLOCK_KEYS);
+    the regime and data-quality skeletons are derived here from
+    the per-TF states and MERGED under whatever the supplier
+    provided (its day object, its health verdict), so a supplied
+    block never has to repeat what the states already measured.
+    location / activity / cross_asset have no state-derived
+    skeleton: unsupplied, they are None and named missing."""
+    supplied = supplied or {}
+    regime = {
+        "bedrock_label_h1": (per_tf.get("H1") or {}).get(
+            "regime_label"),
+        "per_tf_labels": {tf: (per_tf.get(tf) or {}).get(
+            "regime_label") for tf in SITUATION_TFS},
+        "day": None,
+    }
+    if isinstance(supplied.get("regime"), dict):
+        regime.update(copy.deepcopy(supplied["regime"]))
+    data_quality = {
+        "health": None,
+        "per_tf_freshness_s": {tf: (per_tf.get(tf) or {}).get(
+            "freshness_s") for tf in SITUATION_TFS},
+        "missing": [],
+    }
+    if isinstance(supplied.get("data_quality"), dict):
+        extra = copy.deepcopy(supplied["data_quality"])
+        extra_missing = extra.pop("missing", None)
+        data_quality.update(extra)
+        if extra_missing:
+            data_quality["missing"] = list(extra_missing)
+    blocks = {
+        "regime": regime,
+        "location": copy.deepcopy(supplied.get("location")),
+        "activity": copy.deepcopy(supplied.get("activity")),
+        "cross_asset": copy.deepcopy(supplied.get("cross_asset")),
+        "data_quality": data_quality,
+    }
+    seen = list(data_quality.get("missing") or [])
+    for name in _missing_inputs(per_tf, blocks):
+        if name not in seen:
+            seen.append(name)
+    data_quality["missing"] = seen
+    return blocks
+
+
 def build_situation(stack, *, symbol: str = "XAUUSD", asof=None,
                     situation_id: str = "",
                     prev_situation_id: str | None = None,
                     forecast_outlook: dict | None = None,
                     m1_last_close=None,
-                    swing_n: int = 3) -> dict:
+                    swing_n: int = 3,
+                    blocks: dict | None = None,
+                    relationships: list | None = None,
+                    price: float | None = None,
+                    live: dict | None = None) -> dict:
     """The full MarketSituation from the whole stack (pure).
 
     ``forecast_outlook`` is carried VERBATIM (a deep copy — the
     situation is a carrier, never a re-interpretation, SPEC §3.4);
-    ``None`` when no outlook exists.  Nothing here raises on a
-    short or missing frame: that TF's state says so instead.
+    ``None`` when no outlook exists.  ``blocks`` is the runner's
+    §3.3 organ blocks (see :func:`assemble_blocks`);
+    ``relationships`` when omitted is computed from the per-TF
+    states at ``price``; ``live`` is the keeper's provisional
+    reaction block, carried — never merged into the closed-bar
+    fields.  Nothing here raises on a short or missing frame:
+    that TF's state says so instead.
     """
     frames = getattr(stack, "frames", {}) or {}
     per_tf = {tf: build_tf_state(tf, frames.get(tf), asof=asof,
                                  swing_n=swing_n)
               for tf in SITUATION_TFS}
-    return {
+    assembled = assemble_blocks(per_tf, blocks)
+    if relationships is None:
+        relationships = _relationships.compute_relationships(
+            per_tf, price=price)
+    situation = {
         "version": SITUATION_VERSION,
         "situation_id": situation_id,
         "prev_situation_id": prev_situation_id,
@@ -317,8 +440,13 @@ def build_situation(stack, *, symbol: str = "XAUUSD", asof=None,
         "created_at": _iso(asof),
         "clocks": stack_clocks(stack, m1_last_close=m1_last_close),
         "per_tf": per_tf,
+        "relationships": copy.deepcopy(relationships),
         "forecasts": {"outlook": copy.deepcopy(forecast_outlook)},
+        "live": copy.deepcopy(live),
     }
+    for key in BLOCK_KEYS:
+        situation[key] = assembled[key]
+    return situation
 
 
 def _state_changed(old: dict | None, new: dict) -> bool:
@@ -347,6 +475,141 @@ def _compact_id(created_iso: str | None, seq: int) -> str:
         except Exception:  # noqa: BLE001
             stamp = "unknown"
     return f"{stamp}-{seq:04d}"
+
+
+# ------------------------------------------------------------------
+# Pass 1 event layer (AMENDMENTS-1 §A4.1) + price derivation
+# ------------------------------------------------------------------
+def _derive_price(stack) -> float | None:
+    """The current price from the stack itself: the last close
+    of the finest TF frame present (all frames share one price
+    axis).  None when no frame has bars."""
+    frames = getattr(stack, "frames", {}) or {}
+    for tf in ("M5", "M15", "M30", "H1", "H4", "D1"):
+        frame = frames.get(tf)
+        if frame is not None and len(frame):
+            try:
+                return _finite(frame["close"].iloc[-1])
+            except Exception:  # noqa: BLE001
+                continue
+    return None
+
+
+def _event_fingerprint(state: dict | None) -> dict:
+    """What the event layer remembers of one TF between
+    refreshes: the structure-event EPISODE (kind + direction —
+    consecutive continuation bars of the same episode are one
+    event, not a flood) and the volatility state."""
+    event = (state or {}).get("last_structure_event") or {}
+    volatility = (state or {}).get("volatility") or {}
+    return {
+        "event_kind": (str(event.get("kind")).upper()
+                       if event.get("kind") else None),
+        "event_direction": event.get("direction"),
+        "atr_state": volatility.get("atr_state"),
+    }
+
+
+def _detect_state_events(tf: str, old_state: dict | None,
+                         new_state: dict) -> list[dict]:
+    """Transitions between two measured states of one TF, as
+    event payloads (``event_type`` / ``tf`` / ``detail``):
+    a new structure-event episode, a kind/direction change of
+    the episode (a structural break of the previous read), and
+    a volatility-state change.  Appearance of an episode whose
+    kind matches the previous episode's kind but follows a
+    silent gap still counts as a new episode."""
+    events: list[dict] = []
+    old_fp = _event_fingerprint(old_state)
+    new_fp = _event_fingerprint(new_state)
+    new_event = new_state.get("last_structure_event")
+    if new_event and (new_fp["event_kind"], new_fp["event_direction"]) != (
+            old_fp["event_kind"], old_fp["event_direction"]):
+        if old_fp["event_kind"] is None:
+            etype = EVENT_STRUCTURE
+        else:
+            etype = EVENT_STRUCTURAL_BREAK
+        events.append({
+            "event_type": etype, "tf": tf,
+            "detail": {
+                "event": copy.deepcopy(new_event),
+                "previous": {
+                    "kind": old_fp["event_kind"],
+                    "direction": old_fp["event_direction"]},
+            }})
+    old_atr = old_fp["atr_state"]
+    new_atr = new_fp["atr_state"]
+    if old_atr and new_atr and old_atr != new_atr:
+        vol = new_state.get("volatility") or {}
+        events.append({
+            "event_type": EVENT_VOLATILITY, "tf": tf,
+            "detail": {"from": old_atr, "to": new_atr,
+                       "atr": vol.get("atr"),
+                       "atr_ratio": vol.get("atr_ratio")}})
+    return events
+
+
+def _nearest_pools(location: dict | None) -> dict:
+    """The location block's nearest pool per side (zone dicts,
+    or None)."""
+    location = location or {}
+    above = location.get("zones_above") or []
+    below = location.get("zones_below") or []
+    return {"above": above[0] if above else None,
+            "below": below[0] if below else None}
+
+
+def _liquidity_events(prev_pools: dict, location: dict | None,
+                      price: float | None, inside_before,
+                      taken_before: set):
+    """Pool entries and takes at one refresh.  Entries are read
+    against the NEW location block (price inside a nearest
+    pool's band [bottom, top]); takes are read against the
+    PREVIOUS refresh's nearest pools — a pool price has swept
+    through (beyond its distal edge) leaves the nearest list
+    precisely because it was taken, so the old map is the only
+    place the take is visible.  Nearest-pool identity changes
+    themselves ride the location block silently: they are map
+    changes, not price action.
+
+    Returns ``(events, inside_now, taken_now, pools_now)``;
+    ``taken`` is cumulative — a taken pool stays taken."""
+    pools_now = _nearest_pools(location)
+    taken_now = set(taken_before or ())
+    inside_now = None
+    events: list[dict] = []
+    if price is None:
+        return events, inside_before, taken_now, pools_now
+    for side in ("above", "below"):
+        zone = pools_now.get(side)
+        if not zone:
+            continue
+        bottom, top = zone.get("bottom"), zone.get("top")
+        if bottom is not None and top is not None \
+                and bottom <= price <= top:
+            inside_now = zone.get("zone_id")
+    if inside_now and inside_now != inside_before:
+        events.append({
+            "event_type": EVENT_LIQUIDITY, "tf": None,
+            "detail": {"change": "entered_pool",
+                       "zone_id": inside_now, "price": price}})
+    for side, beyond in (("above", 1), ("below", -1)):
+        zone = (prev_pools or {}).get(side)
+        if not zone:
+            continue
+        zone_id = zone.get("zone_id")
+        edge = zone.get("distal")
+        if zone_id is None or edge is None \
+                or zone_id in taken_now:
+            continue
+        if (beyond > 0 and price > edge) or \
+                (beyond < 0 and price < edge):
+            taken_now.add(zone_id)
+            events.append({
+                "event_type": EVENT_LIQUIDITY, "tf": None,
+                "detail": {"change": "pool_taken",
+                           "zone_id": zone_id, "price": price}})
+    return events, inside_now, taken_now, pools_now
 
 
 # ------------------------------------------------------------------
@@ -387,6 +650,19 @@ class SituationKeeper:
         self._forecast_outlook: dict | None = None
         self._seq = 0
         self._latest: dict | None = None
+        # Pass 1 retained views: the runner-supplied §3.3 blocks,
+        # the current relationship list, the provisional live
+        # block, and the transition fingerprints the event layer
+        # diffs between refreshes (per-TF structure-event episode
+        # + volatility state; the location pools being sat in /
+        # already taken).
+        self._blocks: dict | None = None
+        self._relationships: list = []
+        self._live: dict | None = None
+        self._event_fp: dict[str, dict] = {}
+        self._pool_inside = None
+        self._pool_taken: set = set()
+        self._pool_prev: dict = {"above": None, "below": None}
         self._recover()
 
     # ------------------------------------------------ recovery
@@ -432,7 +708,12 @@ class SituationKeeper:
                                    for tf in SITUATION_TFS},
                         "per_tf": {tf: None
                                    for tf in SITUATION_TFS},
+                        "regime": None, "location": None,
+                        "activity": None, "cross_asset": None,
+                        "data_quality": None,
+                        "relationships": [],
                         "forecasts": {"outlook": None},
+                        "live": None,
                     }
                 tf = rec.get("tf")
                 if tf in SITUATION_TFS:
@@ -440,6 +721,9 @@ class SituationKeeper:
                         rec.get("state"))
                 if isinstance(rec.get("clocks"), dict):
                     current["clocks"] = copy.deepcopy(rec["clocks"])
+                if isinstance(rec.get("relationships"), list):
+                    current["relationships"] = copy.deepcopy(
+                        rec["relationships"])
                 current["situation_id"] = rec.get("situation_id")
                 current["prev_situation_id"] = rec.get(
                     "prev_situation_id")
@@ -469,6 +753,16 @@ class SituationKeeper:
         self._clocks = dict(latest.get("clocks") or self._clocks)
         self._forecast_outlook = copy.deepcopy(
             (latest.get("forecasts") or {}).get("outlook"))
+        blocks = {key: copy.deepcopy(latest.get(key))
+                  for key in BLOCK_KEYS
+                  if latest.get(key) is not None}
+        self._blocks = blocks or None
+        self._relationships = copy.deepcopy(
+            latest.get("relationships") or [])
+        self._live = copy.deepcopy(latest.get("live"))
+        self._event_fp = {tf: _event_fingerprint(
+            self._states.get(tf)) for tf in SITUATION_TFS}
+        self._pool_prev = _nearest_pools(latest.get("location"))
         # Sequence continues from the last record's own seq stamp.
         last = records[-1]
         seq = last.get("seq")
@@ -507,40 +801,138 @@ class SituationKeeper:
 
     # ------------------------------------------------ cadence
     def on_tf_close(self, tf: str, stack, *, asof=None,
-                    forecast_outlook=..., m1_last_close=None
-                    ) -> dict | None:
+                    forecast_outlook=..., m1_last_close=None,
+                    blocks=..., price: float | None = None,
+                    hierarchy_reading=...) -> dict | None:
         """One TF closed a bar.  Returns the journaled record, or
         None when nothing was journaled (unchanged state).
 
         H1 closes always journal the full snapshot; any other
         situation TF journals a delta only on a real measurement
-        change.  ``forecast_outlook`` uses ``...`` as "keep the
-        carried outlook"; pass a dict or None to replace it.
+        change — a changed TF state, a changed relationship
+        kind, or a detected event (Pass 1).  ``forecast_outlook``
+        uses ``...`` as "keep the carried outlook"; pass a dict
+        or None to replace it.  ``blocks`` likewise: ``...``
+        keeps the runner-supplied §3.3 blocks, a dict replaces
+        them.  ``hierarchy_reading`` (H1 closes): ``...`` keeps
+        the retained hierarchy row, a dict replaces it, None
+        drops it for this snapshot.
         """
         if tf not in SITUATION_TFS:
             return None
         if forecast_outlook is not ...:
             self._forecast_outlook = copy.deepcopy(forecast_outlook)
+        if blocks is not ...:
+            self._blocks = copy.deepcopy(blocks)
         clocks = stack_clocks(stack, m1_last_close=m1_last_close)
         self._clocks = clocks
         created = _iso(asof) or _iso(pd.Timestamp.now(tz="UTC"))
+        if price is None:
+            price = _derive_price(stack)
         if tf == "H1":
             situation = build_situation(
                 stack, symbol=self.symbol, asof=asof,
                 forecast_outlook=self._forecast_outlook,
                 m1_last_close=m1_last_close,
-                swing_n=self._swing_n)
+                swing_n=self._swing_n, blocks=self._blocks,
+                price=price, live=self._live)
+            events: list[dict] = []
+            for t in SITUATION_TFS:
+                events.extend(_detect_state_events(
+                    t, self._states.get(t),
+                    situation["per_tf"][t]))
             self._states = {t: situation["per_tf"][t]
                             for t in SITUATION_TFS}
-            return self._publish_snapshot(situation, created)
+            pairs = _relationships.compute_relationships(
+                situation["per_tf"], price=price)
+            reading = self._retained_hierarchy() \
+                if hierarchy_reading is ... else hierarchy_reading
+            situation["relationships"] = \
+                _relationships.with_hierarchy(pairs, reading)
+            self._relationships = situation["relationships"]
+            events.extend(self._refresh_pools(price))
+            record = self._publish_snapshot(situation, created)
+            self._sync_fingerprints()
+            for event in events:
+                self._publish_event(event, created)
+            return record
         frames = getattr(stack, "frames", {}) or {}
         new_state = build_tf_state(tf, frames.get(tf), asof=asof,
                                    swing_n=self._swing_n)
+        events = _detect_state_events(
+            tf, self._states.get(tf), new_state)
         changed = _state_changed(self._states.get(tf), new_state)
         self._states[tf] = new_state
-        if not changed:
+        pairs = _relationships.compute_relationships(
+            self._states, price=price)
+        new_relationships = _relationships.with_hierarchy(
+            pairs, self._retained_hierarchy())
+        kinds_changed = _relationships.kinds_map(
+            new_relationships) != _relationships.kinds_map(
+                self._relationships)
+        self._relationships = new_relationships
+        events.extend(self._refresh_pools(price))
+        if not changed and not kinds_changed and not events:
+            self._sync_fingerprints()
             return None
-        return self._publish_delta(tf, new_state, created)
+        record = self._publish_delta(
+            tf, new_state, created,
+            relationships=(new_relationships
+                           if kinds_changed else None),
+            trigger=("event" if events and not changed
+                     and not kinds_changed else None))
+        self._sync_fingerprints()
+        for event in events:
+            self._publish_event(event, created)
+        return record
+
+    # ------------------------------------------------ Pass 1 views
+    def _retained_hierarchy(self) -> dict | None:
+        """The hierarchy row of the current relationship list,
+        retained across non-H1 refreshes (it is an H1-cadence
+        reading)."""
+        for rel in self._relationships or []:
+            if rel.get("source") == "hierarchy":
+                return rel
+        return None
+
+    def _refresh_pools(self, price: float | None) -> list[dict]:
+        """Liquidity events against the retained location block;
+        updates the pool fingerprints either way."""
+        location = (self._blocks or {}).get("location")
+        events, inside, taken, pools = _liquidity_events(
+            self._pool_prev, location, price, self._pool_inside,
+            self._pool_taken)
+        self._pool_inside = inside
+        self._pool_taken = taken
+        self._pool_prev = pools
+        return events
+
+    def _sync_fingerprints(self) -> None:
+        self._event_fp = {tf: _event_fingerprint(
+            self._states.get(tf)) for tf in SITUATION_TFS}
+
+    def note_live(self, price: float, *, asof=None,
+                  zones_inside=None, positions=None) -> None:
+        """The provisional live-reaction block (A4.2): intrabar
+        price behaviour inside active zones and open positions,
+        fed by the runner's management cycle.  Stored on the
+        keeper and stamped into the latest situation + every
+        subsequent record — stamped ``provisional`` with its own
+        asof, and NEVER written into a closed-bar state field:
+        the per-TF states are rebuilt only from closed bars, so
+        reaction can never contaminate truth."""
+        block = {
+            "asof": _iso(asof)
+            or _iso(pd.Timestamp.now(tz="UTC")),
+            "price": _finite(price),
+            "provisional": True,
+            "zones": copy.deepcopy(zones_inside or []),
+            "positions": copy.deepcopy(positions or []),
+        }
+        self._live = block
+        if self._latest is not None:
+            self._latest["live"] = copy.deepcopy(block)
 
     # ------------------------------------------------ publishing
     def _publish_snapshot(self, situation: dict,
@@ -563,11 +955,16 @@ class SituationKeeper:
         return record
 
     def _publish_delta(self, tf: str, state: dict,
-                       created: str) -> dict:
+                       created: str, *,
+                       relationships: list | None = None,
+                       trigger: str | None = None) -> dict:
         self._seq += 1
         situation_id = _compact_id(created, self._seq)
         prev = self._latest.get("situation_id") if self._latest \
             else None
+        per_tf = {t: copy.deepcopy(self._states.get(t))
+                  for t in SITUATION_TFS}
+        assembled = assemble_blocks(per_tf, self._blocks)
         situation = {
             "version": SITUATION_VERSION,
             "situation_id": situation_id,
@@ -576,23 +973,51 @@ class SituationKeeper:
             "created_at": created,
             "seq": self._seq,
             "clocks": dict(self._clocks),
-            "per_tf": {t: copy.deepcopy(self._states.get(t))
-                       for t in SITUATION_TFS},
+            "per_tf": per_tf,
+            "relationships": copy.deepcopy(self._relationships),
             "forecasts": {"outlook": copy.deepcopy(
                 self._forecast_outlook)},
+            "live": copy.deepcopy(self._live),
         }
+        for key in BLOCK_KEYS:
+            situation[key] = assembled[key]
         record = {"type": "situation", "kind": DELTA_KIND,
                   "ts": created, "seq": self._seq,
                   "situation_id": situation_id,
                   "prev_situation_id": prev, "symbol": self.symbol,
                   "tf": tf, "state": copy.deepcopy(state),
                   "clocks": dict(self._clocks)}
+        if relationships is not None:
+            record["relationships"] = copy.deepcopy(relationships)
+        if trigger:
+            record["trigger"] = trigger
         self._commit(record, situation)
         return record
 
-    def _commit(self, record: dict, situation: dict) -> None:
-        """Append to the keeper JSONL, mirror into the live
-        journal when wired, and hold the assembled situation."""
+    def _publish_event(self, event: dict, created: str) -> dict:
+        """A ``situation_event`` record (A4.1), anchored to the
+        situation the refresh just published (its id + seq), so
+        the transition is reconstructable on the chain.  Events
+        consume no sequence number of their own — the chain is
+        the snapshot/delta chain; events hang off it."""
+        latest = self._latest or {}
+        record = {"type": "situation", "kind": EVENT_KIND,
+                  "ts": created, "seq": self._seq,
+                  "situation_id": latest.get("situation_id"),
+                  "prev_situation_id": latest.get(
+                      "prev_situation_id"),
+                  "symbol": self.symbol,
+                  "event_type": event.get("event_type"),
+                  "tf": event.get("tf"),
+                  "detail": copy.deepcopy(event.get("detail")
+                                          or {})}
+        self._append_record(record)
+        return record
+
+    def _append_record(self, record: dict) -> None:
+        """Append to the keeper JSONL and mirror into the live
+        journal when wired (best-effort; the JSONL is the
+        authority)."""
         line = json.dumps(record, default=str)
         with self.jsonl_path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
@@ -603,6 +1028,11 @@ class SituationKeeper:
                 self._journal_append(record)
             except Exception:  # noqa: BLE001 — mirroring is
                 pass  # best-effort; the JSONL is the authority
+
+    def _commit(self, record: dict, situation: dict) -> None:
+        """Append the record and hold the assembled situation
+        as the latest."""
+        self._append_record(record)
         self._latest = situation
         self._ring.append(copy.deepcopy(situation))
 
