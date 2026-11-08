@@ -388,6 +388,14 @@ class MT5RunnerConfig:
     # never change a decision (test-pinned on/off identity).  The
     # flag exists so a test (or a forensic A/B) can prove that.
     funnel_enabled: bool = True
+    # MARKET SITUATION (Pass 0, shadow): the shared per-TF market
+    # read (live/situation.py), rebuilt on TF closes after the
+    # append phase, journaled as a full snapshot on H1 closes
+    # (deltas on real state changes at other closes), and stamped
+    # onto the cycle's funnel records as ``situation_id``.
+    # OBSERVATION-ONLY: no decision path reads it in Pass 0; the
+    # flag exists so a test (or a forensic A/B) can prove that.
+    situation_enabled: bool = True
     # JUDGMENT CORE (owner rulings 2026-10-23; build ordered
     # 2026-11-02): evaluation of every candidate-bearing funnel
     # record — market-state estimation -> competing scenarios ->
@@ -1229,6 +1237,12 @@ class MT5Runner:
         # F1: the last outlook block built (for /status); the
         # journal holds the durable copy on each forecast record.
         self._forecast_last_outlook = None
+        # PASS 0 — MarketSituation keeper (lazy; built on the
+        # first TF close by _situation_keeper_get).  False marks a
+        # keeper that failed to build, so the cycle never retries
+        # (and never spams) — observation degrades, decisions do
+        # not depend on it.
+        self._situation_keeper = None
         # F2: the trained-estimator service (lazy — artifact lives
         # beside the ensemble bundle) + retrain bookkeeping.  The
         # train outcome is journaled by the calibration cycle on
@@ -1775,6 +1789,81 @@ class MT5Runner:
             now_ref = now_ref.tz_localize("UTC")
         return now_ref
 
+    # ------------------------------------------------ SITUATION (Pass 0)
+    # MarketSituation (live/situation.py): the shared per-TF
+    # market read, refreshed from TF closes AFTER the append
+    # phase and BEFORE this cycle's evaluations run, so the
+    # funnel records those evaluations emit carry the situation
+    # they consumed.  OBSERVATION-ONLY: nothing in the decision
+    # path reads the situation, and nothing here may raise into
+    # the cycle — every entry point degrades to silence.
+
+    def _situation_keeper_get(self):
+        """The keeper, built lazily on first use; None when the
+        build failed (marked False so it is never retried)."""
+        keeper = getattr(self, "_situation_keeper", None)
+        if keeper is not None:
+            return keeper or None
+        try:
+            from ..live.situation import SituationKeeper
+            journal_dir = os.path.dirname(os.path.abspath(
+                str(self.cfg.journal_path)))
+            keeper = SituationKeeper(
+                journal_dir,
+                symbol=getattr(self.cfg, "symbol", "XAUUSD"),
+                journal_append=self.journal.append)
+            self._situation_keeper = keeper
+        except Exception as exc:  # noqa: BLE001 — observation-only
+            _log.warning("mt5: situation keeper unavailable: %s",
+                         exc)
+            self._situation_keeper = False
+            return None
+        return keeper
+
+    def _current_situation_id(self) -> str | None:
+        keeper = getattr(self, "_situation_keeper", None)
+        if not keeper:
+            return None
+        try:
+            return keeper.latest_id()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _situation_on_closes(self, appended, tick) -> None:
+        """Refresh the situation for the TFs that just closed
+        (called from _refresh_bars after the append phase).
+        Slower TFs first, H1 last: the H1 snapshot assembles the
+        freshest states of this same tick.  Never raises."""
+        try:
+            if not getattr(self.cfg, "situation_enabled", True):
+                return
+            if self._stack is None or not appended:
+                return
+            keeper = self._situation_keeper_get()
+            if keeper is None:
+                return
+            asof = tick.get("time") if isinstance(tick, dict) \
+                else None
+            m1_last = None
+            aux = getattr(self, "_hot_scalp_aux_frames", None) \
+                or {}
+            m1_frame = aux.get("M1")
+            if m1_frame is not None and len(m1_frame):
+                m1_last = m1_frame.index[-1]
+            outlook = getattr(self, "_forecast_last_outlook", None)
+            order = [t for t in ("D1", "H4", "M30", "M15", "M5")
+                     if t in appended]
+            if "H1" in appended:
+                order.append("H1")
+            for tf in order:
+                keeper.on_tf_close(
+                    tf, self._stack, asof=asof,
+                    forecast_outlook=outlook,
+                    m1_last_close=m1_last)
+        except Exception as exc:  # noqa: BLE001 — observation-only
+            _log.warning("mt5: situation refresh failed "
+                         "(observation-only): %s", exc)
+
     def _emit_eval(self, *, playbook: str, evaluation_clock: str,
                    intended_tf: str | None = None,
                    actual_input_tf: str | None = None,
@@ -1890,6 +1979,14 @@ class MT5Runner:
             "candidate_bar": _sess(last_bar_ts),
             "evaluation": _sess(_eval_now),
         }
+        # PASS 0 — MarketSituation (shadow): stamp the situation
+        # this evaluation consumed, when one exists.  Additive:
+        # the key is ABSENT before the first situation is built
+        # (and no keeper ever exists with situation_enabled off),
+        # so pre-situation records are byte-identical to before.
+        _sit_id = self._current_situation_id()
+        if _sit_id is not None:
+            record["situation_id"] = _sit_id
         # Amendment 3 (owner, 2026-10-23): every evaluation record
         # carries a renderable MARKET ASSESSMENT — structure read,
         # HTF context, itemized evidence (detector + source-bar
@@ -2046,6 +2143,11 @@ class MT5Runner:
                         # evaluation, verbatim — weighed or not.
                         "forecast_evidence": _feed_block,
                         "judgment": _judgment}
+                    # PASS 0 — the shadow verdict consumed the
+                    # same situation as its evaluation record.
+                    if record.get("situation_id") is not None:
+                        _shadow_record["situation_id"] = \
+                            record["situation_id"]
                     # Completion-05: the self-audit's standing
                     # per-route rates, cited on the record as
                     # evidence.  Attached after the verdict —
@@ -6467,6 +6569,11 @@ class MT5Runner:
                     self._stack.frames.get("D1"), stats)
             if tf == "H1":
                 h1_accepted += accepted
+        # PASS 0 — MarketSituation (shadow): refresh the shared
+        # market read from the just-appended closes, BEFORE this
+        # cycle's evaluations run, so their funnel records carry
+        # this situation's id.  Observation-only; never raises.
+        self._situation_on_closes(appended, tick)
         # MacroTrend alignment refreshes ONLY on D1/W1/MN1 closes
         # (EMA200 bias moves only when a macro bar closes).  It never
         # refreshes hierarchy legs — alignment is sizing +
