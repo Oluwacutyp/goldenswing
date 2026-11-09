@@ -6,9 +6,11 @@ trades / win% / total R / PF / MaxDD / period from a list of trade
 rows (each with ``r_net`` and ``pnl``).  :func:`write_report`
 writes a markdown report file.  :func:`chunk_text` splits long
 summaries into Telegram-sized chunks (4096 chars) so the bot can
-send them without truncation.  The owner drops the exported file
-back to Muse for review — the file is the contract, the chat
-summary is only a pointer.
+send them without truncation — its implementation lives in
+:func:`goldenswing.alerts.markup.split_text` (WS1-P7: markup is
+the one splitting authority; this module keeps the public name).
+The owner drops the exported file back to Muse for review — the
+file is the contract, the chat summary is only a pointer.
 """
 from __future__ import annotations
 
@@ -102,38 +104,12 @@ def write_report(trades: list[dict], path: str | Path, *,
 def chunk_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     """Split ``text`` into Telegram-sized chunks on line boundaries.
 
-    A single line longer than ``limit`` is hard-split into
-    limit-sized pieces — otherwise one long line would produce one
-    over-limit chunk.
+    Delegates to :func:`goldenswing.alerts.markup.split_text` —
+    one splitting authority for Telegram-bound output
+    (``render_messages`` for HTML surfaces, ``split_text`` for
+    plain text).  Behavior is unchanged: lossless chunks of at
+    most ``limit`` chars, split on line boundaries, with a single
+    over-long line hard-split into limit-sized pieces.
     """
-    if len(text) <= limit:
-        return [text]
-    chunks: list[str] = []
-    current: list[str] = []
-    size = 0
-
-    def _flush():
-        nonlocal current, size
-        if current:
-            chunks.append("".join(current))
-            current, size = [], 0
-
-    for line in text.splitlines(keepends=True):
-        while len(line) > limit:
-            room = limit - size
-            if room <= 0:
-                _flush()
-                room = limit
-            take = line[:room]
-            current.append(take)
-            size += len(take)
-            line = line[room:]
-            if size >= limit:
-                _flush()
-        if line:
-            if size + len(line) > limit:
-                _flush()
-            current.append(line)
-            size += len(line)
-    _flush()
-    return chunks
+    from goldenswing.alerts.markup import split_text
+    return split_text(text, limit)

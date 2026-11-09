@@ -45,6 +45,9 @@ import zipfile
 from pathlib import Path
 from typing import Callable
 
+from .bundle import (BUNDLE_MANIFEST_NAME, bundle_manifest_bytes,
+                     bytes_member)
+
 #: name -> (description, handler).  Populated by @command.
 COMMANDS: dict[str, tuple[str, Callable]] = {}
 
@@ -927,12 +930,31 @@ def build_zip_bundle(*, out_dir: Path, zip_prefix: str,
                                 "sha256": _sha256_file(p)})
             results_md = results_md_fn(
                 {**manifest, "files": entries, "skipped": skipped})
-            zf.writestr("RESULTS.md", results_md)
+            results_bytes = results_md.encode("utf-8")
+            zf.writestr("RESULTS.md", results_bytes)
             full_manifest = {**manifest, "files": entries,
                              "skipped": skipped,
                              "zip_bytes": 0}
-            zf.writestr("manifest.json",
-                         json.dumps(full_manifest, indent=2, default=str))
+            family_bytes = json.dumps(
+                full_manifest, indent=2, default=str).encode("utf-8")
+            zf.writestr("manifest.json", family_bytes)
+            # WS1 bundle contract (alerts/bundle.py — the shape
+            # Devon's Archivist reads): the contract manifest rides
+            # LAST and lists EVERY other member — data files,
+            # RESULTS.md and the family manifest.json alike — so a
+            # Devon reader verifies the whole bundle, family
+            # manifest included, with nothing unmanifested.
+            bundle_members = [
+                {"name": e["arcname"], "size": e["bytes"],
+                 "sha256": e["sha256"], "is_dir": False}
+                for e in entries]
+            bundle_members.append(
+                bytes_member("RESULTS.md", results_bytes))
+            bundle_members.append(
+                bytes_member("manifest.json", family_bytes))
+            zf.writestr(BUNDLE_MANIFEST_NAME, bundle_manifest_bytes(
+                bundle_members, created_by="goldenswing",
+                kind="harvest"))
         return {"files": entries, "skipped": skipped}
 
     zip_path = out_dir / f"{zip_prefix}-{stamp}.zip"
@@ -994,6 +1016,311 @@ def build_harvest_bundle(ctx: CommandContext, scope: str = "all") -> tuple[Path,
         files=chosen, data_dir=data_dir, manifest_base=manifest_base,
         results_md_fn=lambda m: _harvest_results_md(ctx, scope, m),
         slim_files=journal_only)
+
+
+# ------------------------------------------------------------------ /statebundle
+# /db sends the journal alone and /harvest mixes journal + state +
+# results for review; neither is a RECOVERY bundle.  /statebundle
+# is: the trade journal + the guard state + the deterministic
+# (GSJ1) journal and its snapshot manifest, packed as ONE bundle
+# carrying the WS1 contract manifest (alerts/bundle.py), so the
+# trading engine's world is recoverable as one file — and readable
+# by Devon's bundle verbs.
+#
+# Integrity is verified BEFORE anything is packed, and any damage
+# REFUSES the export with the damage named: a bundle that silently
+# carried a damaged journal as if it were whole would be worse
+# than no bundle.  The trade journal is judged by its own tolerant
+# read (records_with_health semantics: any unreadable line is
+# damage); the deterministic journal by a pure read-only frame
+# walk (magic / CRC / chain / sequence — the checks
+# DeterministicJournal itself enforces) that NEVER constructs the
+# journal on the path, because its loader truncates a torn tail
+# and an export must not mutate what it copies; JSON state files
+# must parse.  A bundle over the 45MB send cap is refused whole —
+# state is never sliced.
+
+
+class StateBundleError(Exception):
+    """Integrity refusal — the export names the damage, never
+    bundles it."""
+
+
+def _jsonl_health(path: Path) -> tuple[int, int]:
+    """(records, bad_lines) for a JSONL file, judged exactly the
+    way TradeJournal.records_with_health judges: blank lines are
+    skipped; unparseable or non-object lines are damage."""
+    records = 0
+    bad = 0
+    with path.open("rb") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                bad += 1
+                continue
+            if not isinstance(rec, dict):
+                bad += 1
+                continue
+            records += 1
+    return records, bad
+
+
+def _trade_journal_health(ctx: CommandContext) -> tuple[int, int]:
+    """(records, bad_lines) for the trade journal — through the
+    attached journal's own read when one is attached (the same
+    read /journal reports), else the identical file walk."""
+    if ctx.journal is not None:
+        records, bad, error = read_journal_records(ctx)
+        if error is not None:
+            raise StateBundleError(f"journal read failed: {error}")
+        return len(records), int(bad)
+    path = Path(ctx.journal_path) if ctx.journal_path else None
+    if path is None or not path.is_file():
+        raise StateBundleError("no journal file to export")
+    return _jsonl_health(path)
+
+
+def verify_deterministic_journal(path: Path) -> tuple[int, str]:
+    """Pure read-only verification of a GSJ1 deterministic journal.
+
+    Returns (frames, head_chain_hex).  Raises StateBundleError
+    naming the damage — bad magic / CRC (decode_frame's own
+    checks), a chain mismatch, a sequence gap, or a torn tail.
+    Read-only by construction: no DeterministicJournal is
+    constructed, so a torn tail is REPORTED, never truncated.
+    """
+    from goldenswing.engine.journal import (CorruptionError, _HEADER,
+                                            _ZERO_CHAIN, decode_frame)
+    buf = path.read_bytes()
+    offset = 0
+    prev = _ZERO_CHAIN
+    expect_seq = 1
+    frames = 0
+    while offset < len(buf):
+        try:
+            frame, nxt = decode_frame(buf, offset)
+        except CorruptionError as exc:
+            raise StateBundleError(
+                f"deterministic journal corrupt: {exc}") from exc
+        if frame is None:
+            raise StateBundleError(
+                f"deterministic journal has a torn tail: "
+                f"{len(buf) - offset} uncommitted byte(s) after seq "
+                f"{expect_seq - 1} — its loader would truncate them; "
+                f"export refused rather than bundle the journal "
+                f"as if it were whole")
+        expected = hashlib.sha256(
+            prev + buf[offset:offset + _HEADER.size +
+                       len(frame["payload"]) + 4]).digest()
+        if frame["chain"] != expected:
+            raise StateBundleError(
+                f"deterministic journal corrupt: chain mismatch at "
+                f"seq {frame['seq']} offset {offset}")
+        if frame["seq"] != expect_seq:
+            raise StateBundleError(
+                f"deterministic journal corrupt: sequence gap "
+                f"{expect_seq - 1} -> {frame['seq']} at offset {offset}")
+        prev = frame["chain"]
+        offset = nxt
+        expect_seq += 1
+        frames += 1
+    return frames, prev.hex()
+
+
+def _deterministic_dir(ctx: CommandContext,
+                       data_dir: Path) -> Path | None:
+    """The deterministic engine's directory: the attached
+    runtime's journal parent when one is attached, else the
+    conventional ``<data_dir>/deterministic`` when it exists."""
+    det = getattr(ctx, "deterministic", None)
+    journal = getattr(det, "journal", None) if det is not None else None
+    jpath = getattr(journal, "path", None) if journal is not None else None
+    if jpath:
+        return Path(jpath).parent
+    candidate = data_dir / "deterministic"
+    return candidate if candidate.is_dir() else None
+
+
+def _state_bundle_files(ctx: CommandContext, data_dir: Path,
+                        journal_path: Path) -> list[Path]:
+    """Journal + the state files that matter, in stable order."""
+    names: list[Path] = [journal_path]
+    for rel in ("confluence_journal.jsonl", "risk_state.json",
+                "mt5_risk_state.json"):
+        names.append(data_dir / rel)
+    paper_dir = data_dir / "paper_state"
+    names.append(paper_dir / "paper.json")
+    names.append(paper_dir / "meta.json")
+    det_dir = _deterministic_dir(ctx, data_dir)
+    if det_dir is not None:
+        names.append(det_dir / "deterministic.gsj")
+        names.append(det_dir / "deterministic_snapshots" / "manifest.json")
+    seen: set[str] = set()
+    out: list[Path] = []
+    for p in names:
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.is_file():
+            out.append(p)
+    return out
+
+
+def _state_arcname(p: Path, data_dir: Path) -> str:
+    """Bundle member name for ``p``: data-dir-relative (POSIX), so
+    deterministic/ and paper_state/ keep their shape; a name that
+    would collide with the generated members is namespaced by its
+    parent directory."""
+    try:
+        arc = p.relative_to(data_dir).as_posix()
+    except ValueError:
+        arc = p.name
+    if arc in ("STATE.md", "manifest.json", BUNDLE_MANIFEST_NAME):
+        arc = f"{p.parent.name}/{arc}"
+    return arc
+
+
+def build_state_bundle(ctx: CommandContext, *,
+                       zip_prefix: str = "goldenswing-state"
+                       ) -> tuple[Path, dict]:
+    """Build the verified journal+state bundle.  Returns
+    (zip_path, manifest).  Raises StateBundleError — with the
+    damage named — when any integrity check fails or the bundle
+    exceeds the send cap; nothing is packed before verification
+    passes."""
+    journal_path = None
+    if ctx.journal_path:
+        journal_path = Path(ctx.journal_path)
+    elif ctx.journal is not None and getattr(ctx.journal, "path", None):
+        journal_path = Path(ctx.journal.path)
+    if journal_path is None or not journal_path.is_file():
+        raise StateBundleError("no journal file to export")
+    data_dir = journal_path.parent
+
+    # ---- verify BEFORE packing: any damage refuses the export.
+    records, bad = _trade_journal_health(ctx)
+    if bad:
+        raise StateBundleError(
+            f"trade journal integrity check failed: {bad} unreadable "
+            f"line(s) in {journal_path.name} — export refused; the "
+            f"bundle would misrepresent a damaged journal as whole")
+    det_dir = _deterministic_dir(ctx, data_dir)
+    det_path = det_dir / "deterministic.gsj" if det_dir else None
+    det_frames: int | None = None
+    det_chain: str | None = None
+    if det_path is not None and det_path.is_file():
+        det_frames, det_chain = verify_deterministic_journal(det_path)
+    files = _state_bundle_files(ctx, data_dir, journal_path)
+    for p in files:
+        if p.suffix == ".jsonl" and p != journal_path:
+            _recs, cbad = _jsonl_health(p)
+            if cbad:
+                raise StateBundleError(
+                    f"journal integrity check failed: {cbad} "
+                    f"unreadable line(s) in {p.name} — export refused")
+        elif p.suffix == ".json":
+            try:
+                json.loads(p.read_text(encoding="utf-8"))
+            except (ValueError, OSError, UnicodeDecodeError) as exc:
+                raise StateBundleError(
+                    f"state file {p.name} is not readable JSON: "
+                    f"{exc}") from exc
+
+    # ---- pack: journal + state, then STATE.md, then the family
+    # manifest, then the contract manifest LAST.
+    out_dir = Path(ctx.reports_dir) if ctx.reports_dir else \
+        data_dir / "reports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    zip_path = out_dir / f"{zip_prefix}-{stamp}.zip"
+    entries: list[dict] = []
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in files:
+            arc = _state_arcname(p, data_dir)
+            zf.write(p, arc)
+            entries.append({"arcname": arc,
+                            "bytes": p.stat().st_size,
+                            "sha256": _sha256_file(p)})
+        family: dict = {
+            "bundle": "goldenswing state export",
+            "exported_utc": datetime.now(timezone.utc).isoformat(),
+            "journal": str(journal_path),
+            "journal_records": records,
+            "deterministic_frames": det_frames,
+            "deterministic_head_chain": det_chain,
+            "files": entries,
+            "zip_bytes": 0,
+        }
+        md_lines = [
+            "# GoldenSwing state bundle", "",
+            f"exported_utc: {family['exported_utc']}",
+            f"journal: {journal_path.name} — {records} records, "
+            f"integrity verified (0 unreadable lines)", ""]
+        if det_frames is not None:
+            md_lines.append(
+                f"deterministic journal: {det_frames} frames, "
+                f"chain verified, head {det_chain[:12]}…")
+        else:
+            md_lines.append("deterministic journal: not present")
+        md_lines += ["", "## Files in this bundle", ""]
+        for e in entries:
+            md_lines.append(f"- {e['arcname']} ({e['bytes']} bytes, "
+                            f"sha256 {e['sha256'][:12]}…)")
+        md_lines += ["",
+                     "Integrity was verified BEFORE packing; any "
+                     "damage would have refused the export.  The "
+                     "bundle carries bundle.manifest.json (the "
+                     "nomorals-bundle contract) — Devon opens and "
+                     "verifies it natively.", ""]
+        state_bytes = "\n".join(md_lines).encode("utf-8")
+        zf.writestr("STATE.md", state_bytes)
+        family_bytes = json.dumps(
+            family, indent=2, default=str).encode("utf-8")
+        zf.writestr("manifest.json", family_bytes)
+        bundle_members = [
+            {"name": e["arcname"], "size": e["bytes"],
+             "sha256": e["sha256"], "is_dir": False}
+            for e in entries]
+        bundle_members.append(bytes_member("STATE.md", state_bytes))
+        bundle_members.append(
+            bytes_member("manifest.json", family_bytes))
+        zf.writestr(BUNDLE_MANIFEST_NAME, bundle_manifest_bytes(
+            bundle_members, created_by="goldenswing",
+            kind="journal-state"))
+    size = zip_path.stat().st_size
+    if size > HARVEST_MAX_ZIP_BYTES:
+        zip_path.unlink(missing_ok=True)
+        raise StateBundleError(
+            f"state bundle is {size} bytes — over the 45MB send "
+            f"cap; a state bundle is whole or refused, never sliced")
+    family["zip_bytes"] = size
+    family["zip_name"] = zip_path.name
+    return zip_path, family
+
+
+@command("/statebundle",
+         "verified journal + guard/deterministic state as one bundle ZIP")
+def _statebundle(ctx: CommandContext, args: list[str]) -> CommandResult:
+    try:
+        zip_path, manifest = build_state_bundle(ctx)
+    except StateBundleError as exc:
+        return CommandResult(text=f"state bundle refused: {exc}")
+    except Exception as exc:
+        return CommandResult(
+            text=f"state bundle failed: {type(exc).__name__}: {exc}")
+    det = (f", deterministic {manifest['deterministic_frames']} frames"
+           if manifest.get("deterministic_frames") is not None else "")
+    caption = (f"🗄️ state bundle — journal "
+               f"{manifest['journal_records']} records "
+               f"(integrity verified{det}), "
+               f"{len(manifest['files'])} files, "
+               f"{manifest['zip_bytes'] // 1024}KB")
+    return CommandResult(document=zip_path, caption=caption)
 
 
 # ------------------------------------------------------------------ engine /

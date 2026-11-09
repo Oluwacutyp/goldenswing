@@ -286,6 +286,51 @@ def render_messages(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
     return parts or [""]
 
 
+def split_text(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
+    """Split PLAIN text into ``<= limit`` chunks on line boundaries.
+
+    The plain-text sibling of :func:`render_messages`: surfaces
+    that must deliver text verbatim (no HTML rendering — the
+    backtest export summary above all) split here, so this module
+    is the ONE splitting authority for Telegram-bound output.
+    Lossless: ``"".join(split_text(text, limit)) == text``.  A
+    single line longer than ``limit`` is hard-split into
+    limit-sized pieces — otherwise one long line would produce one
+    over-limit chunk.
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+
+    def _flush():
+        nonlocal current, size
+        if current:
+            chunks.append("".join(current))
+            current, size = [], 0
+
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:
+            room = limit - size
+            if room <= 0:
+                _flush()
+                room = limit
+            take = line[:room]
+            current.append(take)
+            size += len(take)
+            line = line[room:]
+            if size >= limit:
+                _flush()
+        if line:
+            if size + len(line) > limit:
+                _flush()
+            current.append(line)
+            size += len(line)
+    _flush()
+    return chunks
+
+
 def render_html(text: str) -> str:
     """Render to ONE HTML message; raises ValueError when the
     rendered text cannot fit one message (callers that need the

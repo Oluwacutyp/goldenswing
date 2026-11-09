@@ -33,7 +33,8 @@ from ..feed.tick_log import export_tick_history
 from ..feed.mt5 import MT5Feed
 from ..alerts import commands as _alerts_commands
 from ..alerts.commands import (CommandContext, CommandResult,
-                               CommandRouter, build_zip_bundle,
+                               CommandRouter, StateBundleError,
+                               build_state_bundle, build_zip_bundle,
                                fmt_code, fmt_feed_line,
                                fmt_next_keyboard, fmt_none, fmt_pnl,
                                fmt_progress, fmt_r, fmt_section,
@@ -1496,6 +1497,32 @@ def _mt5_harvest(ctx: CommandContext, args: list[str]) -> CommandResult:
     caption = (f"📦 MT5 harvest {scope} — {n_trades} trades{total_r}, "
                f"{len(files)} files, {manifest['zip_bytes'] // 1024}KB — "
                f"RESULTS.md inside has the full breakdown")
+    return CommandResult(
+        document=zip_path, caption=caption,
+        reply_markup=fmt_next_keyboard("/status", "/trades", "/report"))
+
+
+@mt5_command("/statebundle",
+             "verified MT5 journal + risk/deterministic state as one bundle ZIP")
+def _mt5_statebundle(ctx: CommandContext, args: list[str]) -> CommandResult:
+    # One implementation, two registries (alerts.commands owns the
+    # builder + the integrity verification); the MT5 surface differs
+    # only in the bundle's file prefix.
+    try:
+        zip_path, manifest = build_state_bundle(
+            ctx, zip_prefix="goldenswing-mt5-state")
+    except StateBundleError as exc:
+        return CommandResult(text=f"state bundle refused: {exc}")
+    except Exception as exc:
+        return CommandResult(
+            text=f"state bundle failed: {type(exc).__name__}: {exc}")
+    det = (f", deterministic {manifest['deterministic_frames']} frames"
+           if manifest.get("deterministic_frames") is not None else "")
+    caption = (f"🗄️ MT5 state bundle — journal "
+               f"{manifest['journal_records']} records "
+               f"(integrity verified{det}), "
+               f"{len(manifest['files'])} files, "
+               f"{manifest['zip_bytes'] // 1024}KB")
     return CommandResult(
         document=zip_path, caption=caption,
         reply_markup=fmt_next_keyboard("/status", "/trades", "/report"))
