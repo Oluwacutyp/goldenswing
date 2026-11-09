@@ -48,6 +48,7 @@ from .tiles import MUTED as _MUTED  # noqa: E402
 from .tiles import TEXT as _TEXT  # noqa: E402
 from .tiles import UP as _UP  # noqa: E402
 from .tiles import drawdown_bar  # noqa: E402
+from .tiles import target_bar as _target_bar  # noqa: E402
 from .tiles import tile as _tile  # noqa: E402
 from .tiles import tile_label as _label  # noqa: E402
 from .tiles import unavailable as _unavailable  # noqa: E402
@@ -71,6 +72,17 @@ def render_desk_card(stats: dict) -> bytes:
     only draws.  Keys: day, pnl, r_net, trades, wins, losses,
     win_rate, open_positions, equity, balance, currency,
     drawdown_pct, drawdown_limit, halted, halt_reason.
+
+    Optional month-target keys (reporting.monthly_target_progress,
+    present only when the owner has set the display-only
+    ``monthly_target`` live-config key): monthly_target,
+    month_pnl, month_pct, month_label.  When monthly_target is
+    absent/None the strip is not drawn and every other coordinate
+    is the card's original layout — an unset target renders
+    byte-identical to the card that shipped before targets
+    existed.  The target never recolours: the strip follows the
+    drawdown bar's neutral grammar (the one accent stays the
+    P&L sign).
     """
     day = str(stats.get("day") or "")
     pnl = float(stats.get("pnl") or 0.0)
@@ -87,6 +99,33 @@ def render_desk_card(stats: dict) -> bytes:
     limit = float(stats.get("drawdown_limit") or 0.15)
     halted = bool(stats.get("halted"))
     halt_reason = str(stats.get("halt_reason") or "")
+    target = stats.get("monthly_target")
+    has_target = target is not None
+    month_pnl = stats.get("month_pnl")
+    month_pct = stats.get("month_pct")
+    month_label = str(stats.get("month_label") or "")
+
+    # Vertical rhythm: with the target strip showing, the middle
+    # row steps up to make room for it; without one, every
+    # coordinate below is the card's original layout (the
+    # byte-identical unset render above).
+    pnl_y = 0.335 if has_target else 0.27
+    pnl_h = 0.48 if has_target else 0.545
+    pnl_num_y = 0.575 if has_target else 0.545
+    pnl_sub_y = 0.41 if has_target else 0.345
+    wr_y = 0.585 if has_target else 0.555
+    wr_h = 0.23 if has_target else 0.26
+    wr_val_y = 0.725 if has_target else 0.715
+    wr_sub_y = 0.63 if has_target else 0.615
+    wr_unavail_y = 0.70 if has_target else 0.685
+    row_y = 0.335 if has_target else 0.27
+    row_h = 0.23 if has_target else 0.26
+    row_lab_y = 0.53 if has_target else 0.495
+    tr_val_y = 0.45 if has_target else 0.415
+    tr_sub_y = 0.375 if has_target else 0.315
+    eq_val_y = 0.455 if has_target else 0.42
+    eq_sub_y = 0.385 if has_target else 0.325
+    eq_unavail_y = 0.45 if has_target else 0.40
 
     fig = plt.figure(figsize=_FIGSIZE, dpi=_DPI)
     fig.patch.set_facecolor(_BG)
@@ -112,11 +151,11 @@ def render_desk_card(stats: dict) -> bytes:
                 color=_DOWN, ha="center", va="top")
 
     # ---------------------------------------------------------- P&L tile
-    _tile(ax, 0.02, 0.27, 0.56, 0.545)
+    _tile(ax, 0.02, pnl_y, 0.56, pnl_h)
     _label(ax, 0.045, 0.78, "NET P&L — CLOSED TRADES")
     accent = _UP if pnl > 0 else (_DOWN if pnl < 0 else _MUTED)
     pnl_s = f"{pnl:+,.2f}"
-    ax.text(0.30, 0.545, pnl_s, fontsize=44, fontweight="bold",
+    ax.text(0.30, pnl_num_y, pnl_s, fontsize=44, fontweight="bold",
             family=_MONO, color=accent, ha="center", va="center")
     if trades:
         sub = f"{r_net:+.2f}R · {trades} closed · {wins}W / {losses}L"
@@ -124,27 +163,27 @@ def render_desk_card(stats: dict) -> bytes:
         sub = "no closed trades — nothing realized"
     if currency:
         sub = currency + " · " + sub
-    ax.text(0.30, 0.345, sub, fontsize=11.5, color=_TEXT,
+    ax.text(0.30, pnl_sub_y, sub, fontsize=11.5, color=_TEXT,
             ha="center", va="center")
 
     # ---------------------------------------------------------- win rate
-    _tile(ax, 0.60, 0.555, 0.38, 0.26)
+    _tile(ax, 0.60, wr_y, 0.38, wr_h)
     _label(ax, 0.625, 0.78, "WIN RATE")
     if win_rate is None:
-        _unavailable(ax, 0.79, 0.685, "no closed trades this day")
+        _unavailable(ax, 0.79, wr_unavail_y, "no closed trades this day")
     else:
         wr_s = f"{float(win_rate):.0f}%"
-        ax.text(0.79, 0.715, wr_s, fontsize=30, fontweight="bold",
+        ax.text(0.79, wr_val_y, wr_s, fontsize=30, fontweight="bold",
                 family=_MONO, color=_TEXT, ha="center", va="center")
         sub = f"{wins}W / {losses}L of {trades} closed"
-        ax.text(0.79, 0.615, sub, fontsize=10.5, color=_MUTED,
+        ax.text(0.79, wr_sub_y, sub, fontsize=10.5, color=_MUTED,
                 ha="center", va="center")
 
     # ------------------------------------------------------------ trades
-    _tile(ax, 0.60, 0.27, 0.145, 0.26)
-    _label(ax, 0.617, 0.495, "TRADES")
+    _tile(ax, 0.60, row_y, 0.145, row_h)
+    _label(ax, 0.617, row_lab_y, "TRADES")
     n_s = str(trades)
-    ax.text(0.6725, 0.415, n_s, fontsize=26, fontweight="bold",
+    ax.text(0.6725, tr_val_y, n_s, fontsize=26, fontweight="bold",
             family=_MONO, color=_TEXT, ha="center", va="center")
     if trades:
         sub = "closed"
@@ -152,25 +191,50 @@ def render_desk_card(stats: dict) -> bytes:
             sub = sub + f" · {int(open_positions)} open"
     else:
         sub = "nothing closed"
-    ax.text(0.6725, 0.315, sub, fontsize=10, color=_MUTED,
+    ax.text(0.6725, tr_sub_y, sub, fontsize=10, color=_MUTED,
             ha="center", va="center")
 
     # ------------------------------------------------------------ equity
-    _tile(ax, 0.765, 0.27, 0.215, 0.26)
-    _label(ax, 0.782, 0.495, "EQUITY")
+    _tile(ax, 0.765, row_y, 0.215, row_h)
+    _label(ax, 0.782, row_lab_y, "EQUITY")
     if equity is None:
-        _unavailable(ax, 0.8725, 0.40, "account read n/a",
+        _unavailable(ax, 0.8725, eq_unavail_y, "account read n/a",
                      value_size=20)
     else:
         eq_s = f"{float(equity):,.2f}"
-        ax.text(0.8725, 0.42, eq_s, fontsize=17, fontweight="bold",
+        ax.text(0.8725, eq_val_y, eq_s, fontsize=17, fontweight="bold",
                 family=_MONO, color=_TEXT, ha="center", va="center")
         if balance is not None:
             bal = f"bal {float(balance):,.2f}"
             if currency:
                 bal = bal + " " + currency
-            ax.text(0.8725, 0.325, bal, fontsize=9.5, color=_MUTED,
+            ax.text(0.8725, eq_sub_y, bal, fontsize=9.5, color=_MUTED,
                     ha="center", va="center")
+
+    # --------------------------------------- month target (owner-set)
+    if has_target:
+        _tile(ax, 0.02, 0.245, 0.96, 0.07)
+        lab = "MONTH TARGET"
+        if month_label:
+            lab = lab + " — " + month_label.upper()
+        ax.text(0.045, 0.28, lab, fontsize=10.5, fontweight="bold",
+                color=_MUTED, ha="left", va="center")
+        if month_pnl is None or month_pct is None:
+            ax.text(0.72, 0.28, "— month-to-date P&L unavailable",
+                    fontsize=10.5, color=_MUTED, ha="center",
+                    va="center")
+        else:
+            _target_bar(ax, x0=0.315, x1=0.60, y=0.262, h=0.022,
+                        pct=float(month_pct), tick_label="")
+            pct_s = f"{float(month_pct):+.0f}%"
+            ax.text(0.635, 0.28, pct_s, fontsize=13, fontweight="bold",
+                    family=_MONO, color=_TEXT, ha="left", va="center")
+            amt = (f"{float(month_pnl):+,.2f} of "
+                   f"{float(target):,.2f}")
+            if currency:
+                amt = amt + " " + currency
+            ax.text(0.955, 0.28, amt, fontsize=10.5, family=_MONO,
+                    color=_MUTED, ha="right", va="center")
 
     # ------------------------------------------- drawdown vs daily halt
     _tile(ax, 0.02, 0.075, 0.96, 0.155)

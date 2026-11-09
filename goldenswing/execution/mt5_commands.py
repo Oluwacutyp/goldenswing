@@ -379,9 +379,13 @@ def _config_text(ctx: CommandContext) -> str:
     if ctrl is None:
         return ("live config unavailable (no live runner attached).\n"
                 "Safe keys: max_layers, manipulation_filter, "
-                "pending_expiry_bars, playbook.<name>.")
+                "pending_expiry_bars, monthly_target, "
+                "playbook.<name>.")
     cfg = ctrl.get_live_config()
     _k = cfg.get('risk_pct')
+    _mt = cfg.get('monthly_target')
+    _mt_s = (f"{float(_mt):,.2f}" if _mt is not None
+             else "off (no target line)")
     lines = [fmt_section("⚙️", "MT5 LIVE CONFIG (safe keys only):"), "",
              f"`sizing` = "
              f"{fmt_code('dynamic: lots = max(broker min, floor((k x equity x C x S) / (stop_ticks x tick_value))); k = ' + (str(_k) if _k is not None else '?') + ' (proposed coefficient, not a gate); C = 1.0 (confidence definition pending)')} ",
@@ -390,6 +394,8 @@ def _config_text(ctx: CommandContext) -> str:
              f"{fmt_code('on' if cfg.get('manipulation_filter') else 'off')}",
              f"`pending_expiry_bars` = "
              f"{fmt_code(cfg.get('pending_expiry_bars'))}",
+             f"`monthly_target` = {fmt_code(_mt_s)} "
+             f"(display-only: desk / recap progress line)",
              f"`paused` = {fmt_code('yes' if cfg.get('paused') else 'no')}",
              "", fmt_section("🎯", "Playbooks:")]
     for name, enabled in (cfg.get("playbooks") or {}).items():
@@ -987,6 +993,7 @@ def _mt5_set(ctx: CommandContext, args: list[str]) -> CommandResult:
             text="usage: /set <key> <value>\n"
                  "safe keys: max_layers (0–3), "
                  "manipulation_filter (on/off), pending_expiry_bars (1–24), "
+                 "monthly_target (amount or off — display-only), "
                  "playbook.<name> (on/off).  Sizing is dynamic-only "
                  "(risk rule) — there is no lots key.  Pause is not "
                  "a /set key.")
@@ -1153,6 +1160,17 @@ def _desk_caption(stats: dict) -> str:
         parts.append("equity " + eq_s)
     if stats.get("halted"):
         parts.append("⛔ HALTED")
+    target = stats.get("monthly_target")
+    month_pnl = stats.get("month_pnl")
+    month_pct = stats.get("month_pct")
+    if target is not None and month_pnl is not None \
+            and month_pct is not None:
+        tgt_s = (f"🎯 month {float(month_pnl):+,.2f} of "
+                 f"{float(target):,.2f} "
+                 f"({float(month_pct):+.0f}%)")
+        if currency:
+            tgt_s = tgt_s + " " + currency
+        parts.append(tgt_s)
     return " · ".join(parts)
 
 
@@ -1161,7 +1179,8 @@ def _desk_caption(stats: dict) -> str:
                       "drawdown) to save / post")
 def _mt5_desk(ctx: CommandContext, args: list[str]) -> CommandResult:
     from ..charts.desk import render_desk_card
-    from ..execution.reporting import daily_recap_image_stats
+    from ..execution.reporting import (daily_recap_image_stats,
+                                       monthly_target_progress)
     if args:
         return CommandResult(text="usage: /desk")
     if ctx.journal is None:
@@ -1191,6 +1210,24 @@ def _mt5_desk(ctx: CommandContext, args: list[str]) -> CommandResult:
     stats = daily_recap_image_stats(
         ctx.journal, today, vitals=vitals,
         open_count=len(ctx.live_positions))
+    # Owner's monthly target (display-only live config): when
+    # set, the card gains the month-progress strip — same
+    # numbers the recap renders (one stats source).  Guarded
+    # like vitals: an old runner without the key, or a failed
+    # read, simply renders the card without the strip.
+    _target = None
+    cfg_fn = getattr(ctrl0, "get_live_config", None)
+    if callable(cfg_fn):
+        try:
+            _target = (cfg_fn() or {}).get("monthly_target")
+        except Exception:
+            _target = None
+    if _target is not None:
+        try:
+            stats.update(monthly_target_progress(
+                ctx.journal, today, target=float(_target)))
+        except Exception:
+            pass
     try:
         png = render_desk_card(stats)
     except Exception as exc:

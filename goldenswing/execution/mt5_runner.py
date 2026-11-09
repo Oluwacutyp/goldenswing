@@ -214,7 +214,8 @@ from .signal_log import log_signal
 from .mt5_commands import (mt5_back_keyboard, mt5_confirm_keyboard,
                            mt5_control_keyboard, mt5_nav_keyboard,
                            mt5_router, parse_mt5_callback)
-from .mt5_config import LiveConfigStore, unknown_disabled_names
+from .mt5_config import (LiveConfigStore, dropped_monthly_target,
+                         unknown_disabled_names)
 from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 MANAGEMENT_HORIZONS as
                                 _MANAGEMENT_HORIZONS,
@@ -815,6 +816,11 @@ class MT5RunnerConfig:
     manipulation_filter: bool = True   # liquidity-test entry filter
     disabled_playbooks: tuple = ()      # playbook names switched off
     paused: bool = False                # pause new signals, not management
+    # Owner's monthly P&L target — DISPLAY-ONLY: the desk card
+    # and the daily recap render month-to-date progress toward
+    # it when set (None = unset, no line drawn).  No order, halt,
+    # or sizing path ever reads this field.
+    monthly_target: float | None = None
     # Margin checks (owner's-bot floor): every order must clear the
     # broker-computed margin + a buffer, and a Golden Swing base
     # order / any layer must leave the post-order free margin at or
@@ -1964,6 +1970,11 @@ class MT5Runner:
                         "mt5: persisted config dropped unknown "
                         "disabled_playbooks entries (not real "
                         f"playbooks): {', '.join(_dropped)}")
+                if dropped_monthly_target(_raw_cfg):
+                    self.journal.log_note(
+                        "mt5: persisted config dropped an invalid "
+                        "monthly_target (not a positive number) — "
+                        "the target line reads unset")
             except Exception:
                 pass
         # Common evidence is attached to the signal logger so every existing
@@ -8421,8 +8432,12 @@ class MT5Runner:
             from .reporting import (build_daily_recap,
                                     build_weekly_recap)
             from datetime import timedelta as _td
-            self._send_alert(build_daily_recap(self.journal, prev),
-                             chart_png=self._daily_recap_png(prev))
+            self._send_alert(
+                build_daily_recap(
+                    self.journal, prev,
+                    monthly_target=getattr(
+                        self.cfg, "monthly_target", None)),
+                chart_png=self._daily_recap_png(prev))
             if day.weekday() == 0:  # Monday: the week just ended
                 self._send_alert(build_weekly_recap(
                     self.journal, prev - _td(days=6)))
@@ -8452,6 +8467,7 @@ class MT5Runner:
         try:
             from ..charts.recap import render_daily_recap
             from .reporting import (daily_recap_image_stats,
+                                    monthly_target_progress,
                                     open_positions)
             vitals = None
             try:
@@ -8482,6 +8498,23 @@ class MT5Runner:
             stats = daily_recap_image_stats(
                 self.journal, day, vitals=vitals,
                 open_count=open_count)
+            _target = getattr(self.cfg, "monthly_target", None)
+            if _target is not None:
+                # Display-only month progress, same numbers as
+                # the text recap's target line (one stats source).
+                # A merge failure degrades to the no-target image
+                # rather than costing the recap its photo.
+                try:
+                    stats.update(monthly_target_progress(
+                        self.journal, day, target=_target))
+                except Exception:
+                    try:
+                        self.journal.log_note(
+                            "mt5: rollover recap month-target "
+                            "merge failed — image renders without "
+                            "the target line")
+                    except Exception:
+                        pass
             return render_daily_recap(stats)
         except Exception as exc:
             try:
@@ -17771,6 +17804,9 @@ class MT5Runner:
             self.cfg.manipulation_filter = bool(value)
         elif field == "pending_expiry_bars":
             self.cfg.pending_expiry_bars = int(value)
+        elif field == "monthly_target":
+            self.cfg.monthly_target = (
+                None if value is None else float(value))
         elif field == "playbook":
             name = change.get("name")
             disabled = set(self.cfg.disabled_playbooks or ())

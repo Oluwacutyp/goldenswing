@@ -281,14 +281,70 @@ def render_recap_markdown(trades: list[dict], *, title: str,
     return "\n".join(lines)
 
 
-def build_daily_recap(journal: TradeJournal, day) -> str:
-    """Recap for one UTC calendar day (``day``: a ``date``)."""
+#: English month abbreviations for display labels — a pinned
+#: table, never the process locale (renders must not drift with
+#: the host's language settings).
+_MONTH_ABBR = ("", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def monthly_target_progress(journal: TradeJournal, day, *,
+                            target: float) -> dict:
+    """Month-to-date realized P&L vs the owner's monthly target.
+
+    The window is the UTC calendar month containing ``day``,
+    from its first instant through the end of ``day`` — computed
+    with the SAME ``recap_trades`` + ``_stats`` machinery the
+    daily recap renders, so the desk card, the recap image and
+    the recap text can never disagree about the month's number.
+
+    ``month_pct`` is signed and UNCLAMPED: a month past target
+    reads over 100, a losing month reads negative — a progress
+    bar clamps its fill to the track, the number never lies.
+    The target is display-only (the owner's ``monthly_target``
+    live-config key); nothing here gates anything.
+    """
+    start = datetime(day.year, day.month, 1, tzinfo=timezone.utc)
+    end = datetime(day.year, day.month, day.day,
+                   tzinfo=timezone.utc) + timedelta(days=1)
+    trades = recap_trades(journal, since=start, until=end)
+    stats = _stats(trades)
+    pnl = float(stats.get("total_pnl") or 0.0)
+    tgt = float(target)
+    return {
+        "monthly_target": tgt,
+        "month_pnl": pnl,
+        "month_trades": int(stats.get("trades", 0)),
+        "month_pct": (100.0 * pnl / tgt) if tgt > 0 else None,
+        "month_label": f"{_MONTH_ABBR[day.month]} {day.year}",
+    }
+
+
+def build_daily_recap(journal: TradeJournal, day, *,
+                      monthly_target: float | None = None) -> str:
+    """Recap for one UTC calendar day (``day``: a ``date``).
+
+    With ``monthly_target`` set (the owner's display-only live
+    config), one line is appended: the month-to-date progress
+    toward it, from :func:`monthly_target_progress` — the same
+    numbers the day's desk / recap images draw.  Unset (the
+    default) the text is exactly what it has always been."""
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
     trades = recap_trades(journal, since=start, until=end)
-    return render_recap_markdown(
+    text = render_recap_markdown(
         trades, title=f"daily — {day.isoformat()}",
         window_label=f"{start.date().isoformat()} (UTC calendar day)")
+    if monthly_target is None:
+        return text
+    prog = monthly_target_progress(journal, day, target=monthly_target)
+    pct = prog["month_pct"]
+    pct_s = f"{pct:+.0f}%" if pct is not None else "n/a"
+    line = (f"Month target ({prog['month_label']}): "
+            f"{prog['month_pnl']:+,.2f} of "
+            f"{prog['monthly_target']:,.2f} — {pct_s} · "
+            f"{prog['month_trades']} closed trades this month")
+    return text + line + "\n"
 
 
 def build_weekly_recap(journal: TradeJournal, week_start) -> str:

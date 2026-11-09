@@ -80,3 +80,30 @@ def drawdown_bar(ax, *, x0: float, x1: float, y: float, h: float,
             color=DOWN, linewidth=1.6)
     ax.text(x1, y + h + 0.028, "HALT", fontsize=8.5,
             fontweight="bold", color=DOWN, ha="center", va="bottom")
+
+
+def target_bar(ax, *, x0: float, x1: float, y: float, h: float,
+               pct: float, tick_label: str = "TARGET") -> None:
+    """The month-target progress bar: grey track, grey fill up to
+    the TARGET tick standing at ``x1`` — the drawdown bar's
+    grammar, in neutral ink.  Red inside these cards means the
+    halt and only the halt, and the image's one accent is already
+    spent on the P&L sign, so a target bar never colours.
+
+    ``pct`` is the signed, unclamped progress percent; only the
+    FILL fraction clamps to the track (a bar cannot exceed its
+    own length, and a negative month fills nothing) — the number
+    beside the bar carries the truth, overshoot included.
+    """
+    frac = max(0.0, min(1.0, pct / 100.0))
+    ax.add_patch(Rectangle((x0, y), x1 - x0, h,
+                           facecolor=EDGE, edgecolor="none"))
+    if frac > 0:
+        ax.add_patch(Rectangle((x0, y), (x1 - x0) * frac, h,
+                               facecolor=BAR_IDLE, edgecolor="none"))
+    ax.plot([x1, x1], [y - 0.010, y + h + 0.010],
+            color=MUTED, linewidth=1.6)
+    if tick_label:
+        ax.text(x1, y + h + 0.024, tick_label, fontsize=8,
+                fontweight="bold", color=MUTED, ha="center",
+                va="bottom")

@@ -11,7 +11,14 @@ File format (all keys optional; missing keys fall back to defaults)::
     {"max_layers": 0-3,
      "manipulation_filter": true | false,
      "pending_expiry_bars": 1-24,
+     "monthly_target": <positive number> | null,
      "disabled_playbooks": ["<name>", ...], "paused": true | false}
+
+``monthly_target`` is DISPLAY-ONLY: the owner's monthly P&L
+target, rendered as a progress line on the desk card and the
+daily recap when set.  It gates nothing — no order, halt, or
+sizing path ever reads it.  Null / missing = unset: the target
+line is absent from the renders, never drawn as zero.
 
 Sizing is NOT a key: owner ruling 2026-10-23 revoked the fixed_lots
 override — position size comes only from the dynamic risk rule
@@ -27,6 +34,7 @@ back to defaults rather than refusing to start.
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -64,14 +72,27 @@ PENDING_EXPIRY_MAX = 24
 
 #: Keys ``/set`` accepts (``playbook.<name>`` handled separately).
 SAFE_SCALAR_KEYS = ("max_layers", "manipulation_filter",
-                    "pending_expiry_bars")
+                    "pending_expiry_bars", "monthly_target")
 
 
 def defaults() -> dict:
     """Default live config (sizing is dynamic-only — no key)."""
     return {"max_layers": 3,
             "manipulation_filter": True, "pending_expiry_bars": 4,
+            "monthly_target": None,
             "disabled_playbooks": [], "paused": False}
+
+
+def _clean_monthly_target(value) -> float | None:
+    """A stored monthly target survives only as a positive finite
+    number; anything else (text, zero, negative, NaN/inf, a bool)
+    is not a target — the key reads unset."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    val = float(value)
+    if not math.isfinite(val) or val <= 0:
+        return None
+    return val
 
 
 def _clean(values: dict) -> dict:
@@ -91,6 +112,8 @@ def _clean(values: dict) -> dict:
             out[key] = val
     if isinstance(values.get("manipulation_filter"), bool):
         out["manipulation_filter"] = values["manipulation_filter"]
+    out["monthly_target"] = _clean_monthly_target(
+        values.get("monthly_target"))
     if isinstance(values.get("paused"), bool):
         out["paused"] = values["paused"]
     disabled = values.get("disabled_playbooks")
@@ -113,6 +136,22 @@ def unknown_disabled_names(values) -> list[str]:
         return []
     return sorted({str(n) for n in disabled
                    if str(n) not in ALL_PLAYBOOK_NAMES})
+
+
+def dropped_monthly_target(values) -> bool:
+    """True when a stored ``monthly_target`` is present but NOT a
+    valid target — :func:`_clean` will read it as unset.  Dropping
+    is correct (a corrupt value must not crash a render or invent
+    a number), but like a vanished kill-switch entry it must never
+    be silent: the runner journals this at startup.  An absent key
+    or an explicit null is a legitimately unset target, not a
+    drop."""
+    if not isinstance(values, dict) or "monthly_target" not in values:
+        return False
+    raw = values.get("monthly_target")
+    if raw is None:
+        return False
+    return _clean_monthly_target(raw) is None
 
 
 def _parse_bool(raw: str) -> bool | None:
@@ -151,7 +190,8 @@ def parse_set(key: str, raw_value: str) -> tuple[dict | None, str | None]:
     if key not in SAFE_SCALAR_KEYS:
         return None, (f"{key!r} is not a safe /set key.  Safe keys: "
                       f"max_layers, manipulation_filter, "
-                      f"pending_expiry_bars, playbook.<name>.")
+                      f"pending_expiry_bars, monthly_target, "
+                      f"playbook.<name>.")
     if key == "max_layers":
         try:
             val = int(raw_value)
@@ -175,6 +215,18 @@ def parse_set(key: str, raw_value: str) -> tuple[dict | None, str | None]:
             return None, (f"pending_expiry_bars out of range "
                           f"({PENDING_EXPIRY_MIN}–{PENDING_EXPIRY_MAX}).")
         return {"field": "pending_expiry_bars", "value": val}, None
+    if key == "monthly_target":
+        if raw_value.strip().lower() in ("off", "none", "clear"):
+            return {"field": "monthly_target", "value": None}, None
+        try:
+            val = float(raw_value)
+        except ValueError:
+            return None, ("monthly_target takes a positive amount "
+                          "(e.g. 500) or off.")
+        if not math.isfinite(val) or val <= 0:
+            return None, ("monthly_target takes a positive amount "
+                          "(e.g. 500) or off.")
+        return {"field": "monthly_target", "value": val}, None
     return None, f"{key!r} is not a safe /set key."  # unreachable
 
 
@@ -183,6 +235,11 @@ def describe_change(change: dict) -> str:
     if change.get("field") == "playbook":
         return (f"playbook.{change['name']} = "
                 f"{'on' if change['value'] else 'off'}")
+    if change.get("field") == "monthly_target":
+        if change.get("value") is None:
+            return "monthly_target = off (target line hidden)"
+        val = float(change["value"])
+        return f"monthly_target = {val:,.2f}"
     return f"{change.get('field')} = {change.get('value')}"
 
 
@@ -222,6 +279,7 @@ class LiveConfigStore:
         cfg.layer_max_layers = values["max_layers"]
         cfg.manipulation_filter = values["manipulation_filter"]
         cfg.pending_expiry_bars = values["pending_expiry_bars"]
+        cfg.monthly_target = values["monthly_target"]
         cfg.disabled_playbooks = tuple(values["disabled_playbooks"])
         cfg.paused = values["paused"]
 
@@ -240,6 +298,7 @@ class LiveConfigStore:
                 cfg, "manipulation_filter", True),
             "pending_expiry_bars": getattr(
                 cfg, "pending_expiry_bars", 4),
+            "monthly_target": getattr(cfg, "monthly_target", None),
             "disabled_playbooks": sorted(
                 n for n in disabled if n in ALL_PLAYBOOK_NAMES),
             "paused": bool(getattr(cfg, "paused", False)),
