@@ -86,6 +86,8 @@ from ..live.atr_regime import (atr_regime as _atr_regime,
                                baseline_atr as _baseline_atr,
                                scaled_thresholds as _scaled_thresholds)
 from ..live.dxy import DXYTracker, dxy_bonus as _dxy_bonus
+from ..live.vol_expansion import (
+    FORMATION_TFS as FORMATION_TFS_VOL)
 from ..live import relationships as _relationships
 from ..live.data_health import check_data_health as _check_data_health
 from ..live import day_context as _day_context
@@ -198,6 +200,7 @@ from .mt5_config import LiveConfigStore, unknown_disabled_names
 from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
                                 ROSTER_SPECS, ROSTER_SPECS_H1,
+                                VOL_SPECS,
                                 decay_exempt as _decay_exempt,
                                 management_horizon_for as
                                 _management_horizon_for,
@@ -332,6 +335,20 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     "range_qm": "shadow_declared",
     "range_mean_reversion": "shadow_declared",
     "range_compression_breakout": "shadow_declared",
+    # VOLATILITY-EXPANSION FAMILY (MarketSituation Pass 7a,
+    # SPEC §6.2): the two vol playbooks' scheduled scan route
+    # (playbook_registry.ROUTE_VOLATILITY_EXPANSION) declared
+    # shadow per playbook — route name == playbook name, the
+    # §G precedent (the journal's shadow records are keyed by
+    # playbook and the promotion evaluation
+    # (execution/vol_promotion.py) reads per-playbook
+    # history).  The scans hold no order authority in any
+    # mode; the family is not on the trigger path at all.
+    # Declaring the routes also closes the latent hazard the
+    # §G comment names: an undeclared route name must never
+    # be one seam call away from governing.
+    "vol_expansion_escape": "shadow_declared",
+    "vol_failed_expansion": "shadow_declared",
 }
 
 #: The playbook name a route's judgment records journal under
@@ -345,6 +362,8 @@ JUDGMENT_ROUTE_PLAYBOOK: dict[str, str] = {
     "range_qm": "range_qm",
     "range_mean_reversion": "range_mean_reversion",
     "range_compression_breakout": "range_compression_breakout",
+    "vol_expansion_escape": "vol_expansion_escape",
+    "vol_failed_expansion": "vol_failed_expansion",
 }
 
 #: The §G range playbooks whose scheduled scans journal
@@ -353,6 +372,14 @@ JUDGMENT_ROUTE_PLAYBOOK: dict[str, str] = {
 #: is pinned to this set by test).
 RANGE_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in RANGE_SPECS)
+
+#: The Pass 7a volatility-expansion playbooks whose
+#: scheduled scans journal route-stamped shadow verdicts
+#: (derived from the registry's VOL_SPECS — one truth;
+#: vol_promotion.VOL_JUDGMENT_ROUTES is pinned to this set
+#: by test).
+VOL_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
+    spec.name for spec in VOL_SPECS)
 
 
 @dataclass
@@ -1041,6 +1068,17 @@ def management_block_for(pb_name: str, sig=None) -> dict:
     context_tf = (
         spec.native_tf if spec is not None
         else "M5" if name == "hot_scalp" else "")
+    # Pass 7a: a signal whose context declares its own
+    # management clock (the volatility-expansion family:
+    # the formation clock varies per instance, and the
+    # position is managed on the clock its thesis formed
+    # on — Pass 6's own-clock rule) — the declaration wins
+    # over the registry's native clock.  No other family's
+    # signals carry the key; their blocks are byte-identical.
+    _declared_tf = (getattr(sig, "live_context", None)
+                    or {}).get("management_context_timeframe")
+    if isinstance(_declared_tf, str) and _declared_tf:
+        context_tf = _declared_tf
     block = {
         "management_horizon": _management_horizon_for(name),
         "management_policy_id": policy_id,
@@ -1978,6 +2016,20 @@ class MT5Runner:
         except Exception:  # noqa: BLE001
             return None
 
+    def _current_situation(self) -> dict | None:
+        """The latest situation snapshot dict (Pass 7a: the
+        volatility-expansion scans thread it into their
+        playbooks — the family's corroboration reads the
+        situation engine's TFStates).  None when no snapshot
+        exists yet; never raises."""
+        keeper = getattr(self, "_situation_keeper", None)
+        if not keeper:
+            return None
+        try:
+            return keeper.latest()
+        except Exception:  # noqa: BLE001
+            return None
+
     # ------------------------------------------------ BOOK (Pass 2)
     # Scenario book (execution/scenario_book.py): the tracked
     # setups' second home — many concurrent scenarios with their
@@ -2352,6 +2404,16 @@ class MT5Runner:
                 "management_tf": native_tf}
             if rspec is not None and rspec.clocks:
                 clocks.update(dict(rspec.clocks))
+            # Pass 7a: the signal's own declared clocks win
+            # (the same per-instance declaration the
+            # lifecycle bridge honors in _clocks_for_setup).
+            _declared_clocks = (
+                getattr(sig, "live_context", None)
+                or {}).get("scenario_clocks")
+            if isinstance(_declared_clocks, dict):
+                clocks.update({
+                    k: v for k, v in _declared_clocks.items()
+                    if k in clocks})
             records = book.propose_scenario(
                 key, ts=ts, family=name,
                 route=getattr(spec, "route", None),
@@ -3904,6 +3966,14 @@ class MT5Runner:
             window={"from_offset": from_offset,
                     "to_offset": new_offset,
                     "records": len(records)})
+        # Pass 7a volatility-expansion promotion evaluation:
+        # the same window, the same cadence, the same state
+        # file — no new scheduler (§G host precedent).
+        self._vol_promotion_phase(
+            records, bar_key, damaged_lines=damaged,
+            window={"from_offset": from_offset,
+                    "to_offset": new_offset,
+                    "records": len(records)})
         # Pass 4 measured priors: the same window, the same
         # cadence, the same state file — no new scheduler.
         self._priors_phase(
@@ -3958,6 +4028,46 @@ class MT5Runner:
 
         sub = self._range_promotion_state()
         record = _range_promotion.cycle(
+            state=sub, records=records,
+            now=pd.Timestamp(bar_key),
+            damaged_lines=damaged_lines, window=window,
+            run_id=self._run_id, bar=bar_key)
+        if record is not None:
+            self.journal.append(record)
+
+    # ---- Pass 7a vol-expansion promotion evaluation --------
+    # The verdict machinery is execution/vol_promotion.py
+    # (the §G evaluator, re-parameterised for the family);
+    # this is only its host, in the exact range-promotion
+    # arrangement.  Findings feed back nowhere — the family's
+    # verdicts recommend; promotion stays the owner's
+    # separate decision.
+    def _vol_promotion_state(self) -> dict:
+        from . import vol_promotion as _vol_promotion
+
+        st = self._audit_state()
+        sub = st.get("vol_promotion")
+        if not isinstance(sub, dict):
+            sub = _vol_promotion.new_state()
+            st["vol_promotion"] = sub
+        else:
+            for key, value in _vol_promotion.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _vol_promotion_phase(self, records, bar_key, *,
+                             damaged_lines: int = 0,
+                             window: dict | None = None) -> None:
+        """One Pass 7a promotion-evaluation cycle over the
+        self-audit's journal window.  Called from inside
+        _self_audit_phase (inside the S3 cycle's guarded
+        body): a failure here is logged by that guard like
+        any audit failure and never reaches a decision
+        path."""
+        from . import vol_promotion as _vol_promotion
+
+        sub = self._vol_promotion_state()
+        record = _vol_promotion.cycle(
             state=sub, records=records,
             now=pd.Timestamp(bar_key),
             damaged_lines=damaged_lines, window=window,
@@ -6430,6 +6540,10 @@ class MT5Runner:
                                source="warmup_scan")
         self._run_range_family("h1_refinement", stats,
                                source="warmup_scan")
+        # Pass 7a: the volatility-expansion family's warmup
+        # pass — every formation clock once, observation only.
+        self._run_vol_expansion_family(
+            FORMATION_TFS_VOL, stats, source="warmup_scan")
         pump = TickPump(feed, interval=self.cfg.tick_interval)
         try:
             # on_idle: command polling MUST NOT depend on new ticks.
@@ -7835,6 +7949,21 @@ class MT5Runner:
         except Exception as exc:  # noqa: BLE001 — status must not die
             return f"range promotion: unavailable ({exc})"
 
+    def vol_promotion_line(self) -> str:
+        """One /status Vol Promotion block (Pass 7a
+        evaluation): per volatility-expansion route, the
+        promotion verdict over its own route-stamped shadow
+        history in plain words — the §G block's shape.  A
+        promotion_ready line is a recommendation; promotion
+        itself is the owner's separate decision."""
+        try:
+            from . import vol_promotion as _vol_promotion
+
+            return "\n".join(_vol_promotion.render_lines(
+                self._vol_promotion_state()))
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"vol promotion: unavailable ({exc})"
+
     def judgment_authority_line(self) -> str:
         """One /status Judgment Authority block (Pass 5):
         every route's effective authority state AND its
@@ -8290,6 +8419,14 @@ class MT5Runner:
         if "H4" in appended:
             self._run_range_family("h4_generation", stats,
                                    source="live_close")
+        # Pass 7a: the volatility-expansion family evaluates
+        # on EACH formation clock's own close (H4/H1/M15) —
+        # shadow scans: journal + book, never orders.
+        _vol_tfs = [tf for tf in appended
+                    if tf in FORMATION_TFS_VOL]
+        if _vol_tfs:
+            self._run_vol_expansion_family(
+                _vol_tfs, stats, source="live_close")
         # Phase 3: entry-TF closes — the Close Rule FIRST (a bar
         # closing beyond the invalidation level kills the setup
         # instantly, before any confirmation on the same close),
@@ -20713,6 +20850,16 @@ class MT5Runner:
                 pb.set_h4_frame(
                     self._stack.frames.get("H4")
                     if self._stack is not None else None)
+            # Pass 7a threading (the set_h4_frame idiom,
+            # additive): a playbook that reads the shared
+            # market situation gets the current snapshot,
+            # and one whose formation clock is the scan's
+            # own clock gets told which clock this scan is.
+            # No pre-7a playbook defines either setter.
+            if hasattr(pb, "set_situation"):
+                pb.set_situation(self._current_situation())
+            if hasattr(pb, "set_formation_tf"):
+                pb.set_formation_tf(intended_tf)
             sigs = pb.live_signal([], t, frame) or []
             fresh = [s for s in sigs
                      if int(getattr(s, "index", -1)) == t]
@@ -20974,7 +21121,9 @@ class MT5Runner:
             # the §G shadow history identifiable as THIS route's
             # (and countable in the manifest's route table).
             # Non-range and non-shadow scans pass no route, as
-            # before.
+            # before.  Pass 7a: the volatility-expansion
+            # family's shadow scans stamp identically (their
+            # history is vol_promotion's dataset).
             self._emit_eval(
                 **base, outcome="candidate_emitted",
                 reason_code=_disp_code, reason=_disp_why,
@@ -20982,7 +21131,8 @@ class MT5Runner:
                 decision=decision, evidence=_rec_evidence,
                 judgment_route=(
                     name if shadow
-                    and name in RANGE_JUDGMENT_ROUTE_NAMES
+                    and (name in RANGE_JUDGMENT_ROUTE_NAMES
+                         or name in VOL_JUDGMENT_ROUTE_NAMES)
                     else None))
             if _handoff:
                 # The judgment cycle inside this record's own
@@ -21114,6 +21264,139 @@ class MT5Runner:
                 self.journal.log_note(
                     f"mt5: range {stage} eval failed for "
                     f"{spec.name}: {exc}")
+
+    # --------------------------------------- vol-expansion (Pass 7a)
+
+    def _vol_arm_seen(self, key) -> bool:
+        """In-memory dedupe for the family's arm journal
+        (the Pass 7a design's standing remainder: a restart
+        can re-journal one arm transition once — the arm
+        record carries the coil's own timestamps, so the
+        duplicate is identifiable downstream)."""
+        seen = getattr(self, "_vol_arm_journaled", None)
+        if seen is None:
+            seen = set()
+            self._vol_arm_journaled = seen
+        if key in seen:
+            return True
+        seen.add(key)
+        return False
+
+    def _journal_vol_arm(self, tf: str, frame) -> None:
+        """Journal the family's DETECTION transitions for
+        this formation clock's scan: a new corroborated coil
+        arming (phase "coil") and a trigger firing out of
+        it (phase "triggered") — one record per transition,
+        stamped with the situation id, so Pass 9's self-
+        eval can count the family's arming history, not
+        only its signals.  The read is the escape playbook's
+        own pending_state (runner-threaded situation +
+        formation clock, exactly like its detection scans);
+        uncorroborated states are not arms — the scans'
+        situation-cited no_setup/abstention records carry
+        those."""
+        spec = _spec_for("vol_expansion_escape")
+        if spec is None or frame is None:
+            return
+        try:
+            pb = spec.playbook_class()
+            pb.set_situation(self._current_situation())
+            pb.set_formation_tf(tf)
+            pending = pb.pending_state(frame)
+        except Exception as exc:  # noqa: BLE001
+            self.journal.log_note(
+                f"mt5: vol arm read failed for {tf}: {exc}")
+            return
+        if not pending or not pending.get("corroborated"):
+            return
+        coil = pending.get("coil") or {}
+        if pending["phase"] == "coil":
+            key = ("vol_arm", tf, "coil",
+                   coil.get("start_ts"))
+        else:
+            key = ("vol_arm", tf, "triggered",
+                   (pending.get("trigger") or {}).get("bar_ts"),
+                   pending.get("direction"))
+        if self._vol_arm_seen(key):
+            return
+        self.journal.append({
+            "type": "vol_expansion_arm",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": getattr(self, "_run_id", None),
+            "family": "volatility_expansion",
+            "hypothesis": "expansion_escape",
+            "tf": tf,
+            "phase": pending["phase"],
+            "direction": pending.get("direction"),
+            "coil": coil,
+            "trigger": pending.get("trigger"),
+            "corroboration": pending.get("corroboration"),
+            "situation_id": (
+                (pending.get("corroboration") or {})
+                .get("situation_id")
+                or self._current_situation_id()),
+        })
+
+    def _run_vol_expansion_family(self, tfs, stats=None, *,
+                                  source: str) -> None:
+        """The volatility-expansion family on its scheduled
+        route (MarketSituation Pass 7a, SPEC §6.2): for each
+        formation clock that closed (or all of them at
+        warmup), journal the arm read, then evaluate both
+        playbooks on that clock via the funnel-evaluation
+        seam — shadow: the scans journal evaluations (with
+        route-stamped judgment verdicts), register shadow
+        setups on live closes, and propose scenarios to the
+        book; they NEVER order (no order path exists for
+        this partition).  D1/HTF relationships are recorded
+        as CONTEXT evidence only — D1 never vetoes (§G
+        precedent; SPEC §6.2 handles expansion-against-HTF
+        as ordinary evidence, no special branch).
+
+        Failure containment mirrors the range family's: one
+        playbook's failure logs a note and the family scans
+        on."""
+        setup = self._live_setup or {}
+        day_ctx = getattr(self, "_day_ctx", None)
+        ctx_evidence = {
+            "family": "volatility_expansion",
+            "d1_bias_context": setup.get("bias_d1"),
+            "d1_role": "context only — recorded, never consulted "
+                       "as permission (D1 never vetoes)",
+            # SPEC §6.2 names the day's fuel gauge among the
+            # family's situation inputs: the runner's day
+            # context carries it, and it rides on the family's
+            # records as CONTEXT (the gauge de-rates, it never
+            # blocks — day_context's own doctrine).
+            "adr_state_context": getattr(
+                day_ctx, "adr_state", None),
+            "adr_role": "context only — the day's fuel gauge, "
+                        "recorded with the family's evaluations, "
+                        "never consulted as permission",
+        }
+        for tf in tfs:
+            if tf not in FORMATION_TFS_VOL:
+                continue
+            frame = (self._stack.frames.get(tf)
+                     if self._stack is not None else None)
+            try:
+                self._journal_vol_arm(tf, frame)
+            except Exception as exc:  # noqa: BLE001
+                self.journal.log_note(
+                    f"mt5: vol arm journal failed for "
+                    f"{tf}: {exc}")
+            for spec in VOL_SPECS:
+                try:
+                    self._sweep_eval_one(
+                        spec, frame,
+                        clock=f"vol_expansion_{tf.lower()}",
+                        intended_tf=tf, actual_tf=tf,
+                        source=source, shadow=True,
+                        extra_evidence=ctx_evidence)
+                except Exception as exc:
+                    self.journal.log_note(
+                        f"mt5: vol expansion eval failed for "
+                        f"{spec.name} on {tf}: {exc}")
 
     # ------------------------------------------------- alerts + charts
     def _studies_for_chart(self, h1, entry: float, atr: float,

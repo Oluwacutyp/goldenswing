@@ -551,6 +551,17 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("📐", "Range Promotion"))
             lines.append(range_promotion())
             lines.append("")
+    # Pass 7a vol-expansion promotion evaluation: the same
+    # arrangement for the volatility-expansion routes —
+    # from the runner's vol_promotion_line.  Guarded — old
+    # runners lack it.
+    if ctrl is not None:
+        vol_promotion = getattr(ctrl, "vol_promotion_line",
+                                None)
+        if callable(vol_promotion):
+            lines.append(fmt_section("🌀", "Vol Promotion"))
+            lines.append(vol_promotion())
+            lines.append("")
     # Judgment authority (Pass 5): every route's effective
     # state + its source (declared / config / verdict /
     # demoted) and the two binding routes' standing verdicts

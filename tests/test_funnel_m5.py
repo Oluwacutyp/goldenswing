@@ -43,7 +43,7 @@ from goldenswing.execution.funnel import summarize_evaluations
 from goldenswing.execution.mt5_config import (
     LiveConfigStore, parse_set, unknown_disabled_names)
 from goldenswing.execution.playbook_registry import (
-    NATIVE_SPECS, PLAYBOOK_NAMES, ROSTER_SPECS)
+    NATIVE_SPECS, PLAYBOOK_NAMES, ROSTER_SPECS, VOL_SPECS)
 
 from test_p3_trader import (
     _FakeQMD1, _FakeScore, _StubEngine, _StubPB, _drive_one,
@@ -454,16 +454,20 @@ def test_funnel_completeness_reconciles(tmp_path, monkeypatch):
 # ------------------------------------------------------ (e) registry
 
 def test_registry_consistency_and_killability(tmp_path):
-    assert len(PLAYBOOK_NAMES) == 18
+    # Pass 7a grew the registry to 20: the partition is
+    # roster ∪ native ∪ vol (the vol family is scheduled-
+    # shadow only, deliberately outside the trigger path).
+    assert len(PLAYBOOK_NAMES) == 20
     assert {s.name for s in ROSTER_SPECS} | {
-        s.name for s in NATIVE_SPECS} == set(PLAYBOOK_NAMES)
+        s.name for s in NATIVE_SPECS} | {
+        s.name for s in VOL_SPECS} == set(PLAYBOOK_NAMES)
     # Every advertised control maps to a real playbook.
     for name in PLAYBOOK_NAMES:
         change, err = parse_set(f"playbook.{name}", "off")
         assert err is None
         assert change == {"field": "playbook", "name": name,
                           "value": False}
-    # Persistence round-trip: all 18 kill entries survive; an
+    # Persistence round-trip: all 20 kill entries survive; an
     # unknown name is dropped by the cleaner and REPORTED by the
     # detector the runner journals at startup.
     store = LiveConfigStore(tmp_path / "live.json")

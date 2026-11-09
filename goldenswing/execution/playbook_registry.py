@@ -39,7 +39,9 @@ from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
                          RangeSweepReclaimPlaybook,
                          RetracementTrapPlaybook,
                          SweepReversalPlaybook, TrendlineRetestPlaybook,
-                         TurtleSoupPlaybook, VReversalPlaybook)
+                         TurtleSoupPlaybook, VReversalPlaybook,
+                         VolExpansionEscapePlaybook,
+                         VolFailedExpansionPlaybook)
 
 #: Route: evaluated inside the H1-clocked signal path (the roster).
 ROUTE_H1_ROSTER = "h1_roster"
@@ -57,6 +59,20 @@ ROUTE_NATIVE = "native"
 #: §G.2: no silent live-decision changes).  Promotion of the §G
 #: route itself is a separate owner decision.
 ROUTE_RANGE_H4_H1 = "range_h4_h1"
+#: Route (MarketSituation Pass 7a, SPEC §6.2): the volatility-
+#: expansion family's SCHEDULED evaluation contract — scans on
+#: each formation clock's close (H4 / H1 / M15), reading the
+#: MarketSituation's multi-TF volatility state.  The route is
+#: SHADOW (it journals evaluations, arm records and analytical
+#: candidates, proposes scenarios to the book, and holds NO
+#: order authority in any mode).  Unlike the range family,
+#: these playbooks are NOT members of the trigger-path roster:
+#: they have no legacy order authority to preserve, so they
+#: stay out of ROSTER_SPECS entirely and the trigger path
+#: never evaluates them.  Promotion is the family's own
+#: evaluation (execution/vol_promotion.py) plus the owner's
+#: separate decision — the SPEC §6 common contract.
+ROUTE_VOLATILITY_EXPANSION = "volatility_expansion"
 
 
 @dataclass(frozen=True)
@@ -196,6 +212,22 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
                  shadow_evaluation=True, entry_thesis="market"),
     PlaybookSpec("narrative", NarrativePlaybook, "H1",
                  ROUTE_H1_ROSTER),
+    # Volatility-expansion family (MarketSituation Pass 7a,
+    # SPEC §6.2): vol-state-defined on any of its formation
+    # clocks (H4/H1/M15 — the scan threads the clock per
+    # evaluation; native_tf is the family's home clock for
+    # bare/research use).  Scheduled shadow route only;
+    # entry thesis is market (the premise is the accepted
+    # escape / the rejection itself — a resting limit
+    # contradicts it).  Horizon intraday (SPEC §6.2).
+    PlaybookSpec("vol_expansion_escape", VolExpansionEscapePlaybook,
+                 "H1", ROUTE_VOLATILITY_EXPANSION,
+                 shadow_evaluation=True, entry_thesis="market",
+                 chart_studies=("bollinger",)),
+    PlaybookSpec("vol_failed_expansion", VolFailedExpansionPlaybook,
+                 "H1", ROUTE_VOLATILITY_EXPANSION,
+                 shadow_evaluation=True, entry_thesis="market",
+                 chart_studies=("bollinger",)),
     # Native-clock routes: evaluated by dedicated runner paths on
     # their own frames (M5 closes / D1 closes).  They are NOT in
     # the H1 roster — feeding them H1 bars was the qm_m5 defect.
@@ -225,8 +257,11 @@ RANGE_SPECS: tuple[PlaybookSpec, ...] = tuple(
 #: roster PLUS the range family (whose scheduled §G evaluation
 #: contract above is additional, shadow, and separate).  This is
 #: the set ``_get_playbooks`` builds, in registry order.  (Named
-#: ROSTER_SPECS for continuity with the Phase 1 invariant:
-#: ROSTER_SPECS ∪ NATIVE_SPECS == the full registry.)
+#: ROSTER_SPECS for continuity with the Phase 1 invariant —
+#: extended at Pass 7a: ROSTER_SPECS ∪ NATIVE_SPECS ∪
+#: VOL_SPECS == the full registry, VOL_SPECS being the one
+#: partition that is scheduled-shadow only and therefore
+#: deliberately NOT in this trigger-path set.)
 ROSTER_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route in (ROUTE_H1_ROSTER, ROUTE_RANGE_H4_H1))
@@ -234,6 +269,15 @@ ROSTER_SPECS: tuple[PlaybookSpec, ...] = tuple(
 #: The native-clock route specs.
 NATIVE_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY if s.route == ROUTE_NATIVE)
+
+#: The volatility-expansion family specs (Pass 7a): the
+#: scheduled-shadow partition.  The registry partition is
+#: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS == the full
+#: registry (the Phase 1 invariant, extended by the one
+#: route class that is neither trigger-path nor native).
+VOL_SPECS: tuple[PlaybookSpec, ...] = tuple(
+    s for s in PLAYBOOK_REGISTRY
+    if s.route == ROUTE_VOLATILITY_EXPANSION)
 
 #: SCORE-FLOOR AUTHORITY, per route (Phase 2, P0-2).  Two scores
 #: exist and were conflated in Phase 1 records: the SLEEVE BASE
@@ -255,6 +299,11 @@ FLOOR_AUTHORITY: dict[str, str] = {
         "shadow evaluation route: no floor, no order authority. "
         "When the legacy trigger path fires for a range "
         "playbook, the ROUTE_H1_ROSTER floor authority applies",
+    ROUTE_VOLATILITY_EXPANSION:
+        "shadow evaluation route (Pass 7a): no floor, no order "
+        "authority in any mode — the family is not on the "
+        "trigger path; its candidates are journaled, judged "
+        "in shadow and proposed to the scenario book only",
     ROUTE_NATIVE + ":qm_m5":
         "NO score floor (judgment route): the weighed Asymmetry "
         "evidence decides; the sleeve base score (60.0) is a "

@@ -240,6 +240,53 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                      "grading, never orders",
         "notes": "D1 bias is context only (§G).",
     },
+    "vol_expansion_escape": {
+        "route": "volatility_expansion (Pass 7a scheduled)",
+        "detector": "the MarketSituation's TFStates + the "
+                    "formation TF's closed bars: a Bollinger "
+                    "squeeze run (>= 5 bars) with ATR "
+                    "contraction (atr_regime method) defines "
+                    "the coil on H4/H1/M15; corroboration = "
+                    "another TF's contracting state in the "
+                    "situation; displacement close beyond "
+                    "the coil, entry at the ACCEPTANCE close "
+                    "(a following bar whose whole range holds "
+                    "beyond the coil)",
+        "authority": "NONE — Pass 7a shadow: scheduled scans "
+                     "journal evaluations + arm records and "
+                     "propose book scenarios; never orders. "
+                     "Promotion is the family's own "
+                     "evaluation (execution/vol_promotion.py) "
+                     "plus the owner's separate decision",
+        "notes": "Distinct from range_compression_breakout: "
+                 "that playbook trades a RangeDetector range "
+                 "OBJECT on H4 in the D1-flat range regime, "
+                 "entering on the breakout close; this family "
+                 "reads no range object and no regime verdict "
+                 "— the coil is the volatility state's own "
+                 "geometry on the squeeze's clock, and the "
+                 "entry is the acceptance close, never the "
+                 "breakout print.",
+    },
+    "vol_failed_expansion": {
+        "route": "volatility_expansion (Pass 7a scheduled)",
+        "detector": "same coil + trigger as "
+                    "vol_expansion_escape; the resolution is "
+                    "a close back INSIDE the coil before any "
+                    "acceptance (within 3 formation bars of "
+                    "the trigger) — the escape rejected. "
+                    "Fade to the coil mid, then the opposite "
+                    "edge; stop beyond the escape's excursion "
+                    "extreme",
+        "authority": "NONE — Pass 7a shadow, as "
+                     "vol_expansion_escape",
+        "notes": "The family's second hypothesis shares the "
+                 "escape's coil/trigger measurement by "
+                 "construction (one state machine, two "
+                 "resolutions) — it is not a separate "
+                 "detector and cannot double-fire with the "
+                 "escape on the same sequence.",
+    },
     "qm_m5": {
         "route": "native M5",
         "detector": "M5 closed bars only (feeding it H1 bars "

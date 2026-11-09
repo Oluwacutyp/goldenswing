@@ -25,7 +25,7 @@ from test_step17_revalidation import _runner, _sig
 
 # ---------------------------------------------------------- declarations
 def test_every_playbook_declares_a_valid_horizon():
-    assert len(PLAYBOOK_REGISTRY) == 18
+    assert len(PLAYBOOK_REGISTRY) == 20  # +2 Pass 7a vol family
     for spec in PLAYBOOK_REGISTRY:
         assert spec.management_horizon in MANAGEMENT_HORIZONS, \
             spec.name

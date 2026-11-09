@@ -44,7 +44,12 @@ def test_full_roster_executes_and_is_live():
         "inversion", "killzone_open", "judas_swing",
         "turtle_soup", "v_reversal", "retracement_trap", "order_block",
         "range_sweep_reclaim", "range_qm", "range_mean_reversion",
-        "range_compression_breakout", "narrative", "qm_m5", "qm_d1")
+        "range_compression_breakout", "narrative",
+        # Pass 7a: the volatility-expansion family joins the
+        # registry (scheduled shadow route — its playbooks are
+        # live=False by design; see tests/test_vol_expansion.py).
+        "vol_expansion_escape", "vol_failed_expansion",
+        "qm_m5", "qm_d1")
     for cls in (SweepReversalPlaybook, FVGMidlinePlaybook,
                 TrendlineRetestPlaybook, FVGLimitPlaybook,
                 InversionPlaybook, KillzoneOpenPlaybook,

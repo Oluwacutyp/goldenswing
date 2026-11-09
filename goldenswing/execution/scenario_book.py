@@ -492,6 +492,18 @@ class ScenarioBook:
         }
         if spec is not None and spec.clocks:
             clocks.update(dict(spec.clocks))
+        # Pass 7a: a setup whose SIGNAL declares its own
+        # scenario clocks (the volatility-expansion family:
+        # the formation clock varies per instance, so the
+        # detector states the instance's clocks on its
+        # context) — the instance's declaration wins over
+        # the route defaults.  No other family's signals
+        # carry the key; their clocks are untouched.
+        declared = (setup.live_context or {}).get(
+            "scenario_clocks")
+        if isinstance(declared, dict):
+            clocks.update({k: v for k, v in declared.items()
+                           if k in clocks})
         return clocks
 
     def propose_from_setup(self, setup: TrackedSetup, *, ts,

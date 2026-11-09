@@ -306,17 +306,24 @@ def _full_stack_runner(tmp_path):
     return runner, {"H1": h1, "D1": d1, "M5": m5}
 
 
-def test_all_18_evaluate_on_their_clocks_without_trigger(tmp_path):
+def test_all_20_evaluate_on_their_clocks_without_trigger(tmp_path):
     """No _run_signal_path call anywhere in this test: every
     registered playbook still journals an evaluation on its
-    agreed clock."""
-    from goldenswing.execution.playbook_registry import PLAYBOOK_NAMES
+    agreed clock.  (Was all-18; Pass 7a adds the vol family,
+    whose clocks include H4/M15 frames this fixture stack
+    doesn't carry — those scans land as honest not_eligible
+    evaluation records, which is exactly the manifest contract:
+    evaluated and accountable, never silently absent.)"""
+    from goldenswing.execution.playbook_registry import (
+        PLAYBOOK_NAMES, VOL_SPECS)
     runner, frames = _full_stack_runner(tmp_path)
     runner._run_qm_m5(frames["M5"], {}, source="live_close")
     runner._run_qm_d1(frames["D1"], {}, source="live_close")
     runner._run_roster_close_evals({}, source="live_close")
     runner._run_range_family("h4_generation", {}, source="live_close")
     runner._run_range_family("h1_refinement", {}, source="live_close")
+    runner._run_vol_expansion_family(
+        ("H4", "H1", "M15"), {}, source="live_close")
     summary = summarize_evaluations(runner.journal.records(),
                                     PLAYBOOK_NAMES)
     assert summary["not_called"] == []
@@ -327,6 +334,11 @@ def test_all_18_evaluate_on_their_clocks_without_trigger(tmp_path):
         clocks = by[spec.name]["by_clock"]
         assert clocks.get("h4_generation") == 1, spec.name
         assert clocks.get("h1_refinement") == 1, spec.name
+    for spec in VOL_SPECS:
+        clocks = by[spec.name]["by_clock"]
+        assert clocks.get("vol_expansion_h4") == 1, spec.name
+        assert clocks.get("vol_expansion_h1") == 1, spec.name
+        assert clocks.get("vol_expansion_m15") == 1, spec.name
     assert by["qm_m5"]["by_clock"] == {"m5_close": 1}
     assert by["qm_d1"]["by_clock"] == {"d1_close": 1}
     assert summary["frame_mismatches"] == 0
