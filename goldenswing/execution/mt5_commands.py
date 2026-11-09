@@ -1174,18 +1174,16 @@ def _desk_caption(stats: dict) -> str:
     return " · ".join(parts)
 
 
-@mt5_command("/desk", "today's desk image — the public bento card "
-                      "(net P&L, win rate, trades, equity, day "
-                      "drawdown) to save / post")
-def _mt5_desk(ctx: CommandContext, args: list[str]) -> CommandResult:
-    from ..charts.desk import render_desk_card
+def _desk_day_stats(ctx: CommandContext):
+    """The /desk card's stats for today — the ONE assembly both
+    /desk and /deskdraft draw from, so the bundle's card can never
+    disagree with the delivered card.  Returns (stats, today) or
+    (None, today) when no journal is attached."""
     from ..execution.reporting import (daily_recap_image_stats,
                                        monthly_target_progress)
-    if args:
-        return CommandResult(text="usage: /desk")
-    if ctx.journal is None:
-        return CommandResult(text="no journal attached.")
     today = datetime.now(timezone.utc).date()
+    if ctx.journal is None:
+        return None, today
     vitals = None
     ctrl0 = _control(ctx)
     vitals_fn = getattr(ctrl0, "account_vitals", None)
@@ -1228,6 +1226,19 @@ def _mt5_desk(ctx: CommandContext, args: list[str]) -> CommandResult:
                 ctx.journal, today, target=float(_target)))
         except Exception:
             pass
+    return stats, today
+
+
+@mt5_command("/desk", "today's desk image — the public bento card "
+                      "(net P&L, win rate, trades, equity, day "
+                      "drawdown) to save / post")
+def _mt5_desk(ctx: CommandContext, args: list[str]) -> CommandResult:
+    from ..charts.desk import render_desk_card
+    if args:
+        return CommandResult(text="usage: /desk")
+    stats, _today = _desk_day_stats(ctx)
+    if stats is None:
+        return CommandResult(text="no journal attached.")
     try:
         png = render_desk_card(stats)
     except Exception as exc:
@@ -1235,7 +1246,47 @@ def _mt5_desk(ctx: CommandContext, args: list[str]) -> CommandResult:
             text=f"desk image build failed: {type(exc).__name__}: {exc}")
     return CommandResult(
         photo=png, caption=_desk_caption(stats),
-        reply_markup=fmt_next_keyboard("/status", "/report", "/recap"))
+        reply_markup=fmt_next_keyboard("/status", "/report", "/recap",
+                                       "/deskdraft"))
+
+
+@mt5_command("/deskdraft", "today's desk card as a bundle for Devon"
+                           " — lands as a draft in her review queue")
+def _mt5_deskdraft(ctx: CommandContext,
+                   args: list[str]) -> CommandResult:
+    # The /desk delivery's outward step (WS3-P7): the same card,
+    # packed as a nomorals-bundle (alerts/desk_bundle.py) the
+    # owner hands to Devon, where it becomes ONE review draft
+    # with the PNG attached.  GS sends a file and nothing else —
+    # no queue client, no network call, no social code here.
+    from ..alerts.desk_bundle import build_desk_bundle
+    from ..charts.desk import render_desk_card
+    if args:
+        return CommandResult(text="usage: /deskdraft")
+    stats, today = _desk_day_stats(ctx)
+    if stats is None:
+        return CommandResult(text="no journal attached.")
+    try:
+        png = render_desk_card(stats)
+    except Exception as exc:
+        return CommandResult(
+            text=f"desk image build failed: {type(exc).__name__}: {exc}")
+    caption = _desk_caption(stats)
+    out_dir = Path(ctx.reports_dir) if ctx.reports_dir else Path.cwd()
+    try:
+        zip_path, family = build_desk_bundle(
+            out_dir=out_dir, day=today.isoformat(), png=png,
+            caption=caption, stats=stats)
+    except Exception as exc:
+        return CommandResult(
+            text=f"desk bundle failed: {type(exc).__name__}: {exc}")
+    return CommandResult(
+        document=zip_path,
+        caption=(f"📝 desk draft bundle — {family['day']}: hand"
+                 " this file to Devon and it lands as a draft in"
+                 " her review queue, card attached"
+                 f" ({family['zip_bytes'] // 1024}KB)"),
+        reply_markup=fmt_next_keyboard("/desk", "/status", "/report"))
 
 
 @mt5_command("/ticks", "export the last N days of MT5 tick history as CSV (default 1, max 7)")
