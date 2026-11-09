@@ -107,6 +107,55 @@ def test_legacy_peak_era_halt_clears_at_first_roll(tmp_path):
     assert g.state["halt_reason"] == ""
 
 
+def test_legacy_peak_era_halt_voided_at_load_same_day(tmp_path):
+    # The owner's live 2026-11-09 screenshot, exact figures: he
+    # pulled the daily-drawdown build mid-day, so the state file's
+    # day was ALREADY today — no roll fires, and the roll-clear
+    # alone left the peak-era halt latched next to a 0.0% daily
+    # drawdown.  The halt's basis is dead under the current rules,
+    # so the load itself voids it.
+    state = {
+        "day": "2026-11-09", "day_start_balance": 67.24,
+        "day_realized": 0.0,
+        "week": "2026-W46", "week_start_balance": 67.24,
+        "week_realized": 0.0,
+        "peak_balance": 85.35, "consecutive_losses": 0,
+        "halted": True,
+        "halt_reason": "max drawdown hit (21.2% from peak 85.35 "
+                       ">= 15%)",
+        "trades_today": 0,
+    }
+    (tmp_path / "risk.json").write_text(json.dumps(state))
+    g = _guards(tmp_path, today=DAY1)
+    assert not g.halted
+    assert g.state["halt_reason"] == ""
+    assert g.state["halt_causes"] == []
+    assert g.legacy_halt_voided == \
+        "max drawdown hit (21.2% from peak 85.35 >= 15%)"
+    # The peak still stands for display; trading is unblocked
+    # (a risk-sized check passes — the halt latch no longer
+    # refuses it).
+    assert g.state["peak_balance"] == 85.35
+    assert _check(g, balance=67.24, new_risk_money=1.0).allowed
+    # The void is persisted: a fresh instance on the same file
+    # sees the cleared state and reports nothing left to void.
+    g2 = _guards(tmp_path, today=DAY1)
+    assert not g2.halted and g2.legacy_halt_voided is None
+
+
+def test_caused_halt_survives_same_day_reload(tmp_path):
+    # A halt latched by the CURRENT code always carries causes —
+    # the load void must never touch it (it clears at its day
+    # roll, or by human reset when the streak cause is present).
+    g1 = _guards(tmp_path, today=DAY1)
+    g1.note_balance(10_000.0)
+    g1.record_outcome(-1_600.0, 8_400.0)
+    assert g1.halted and g1.state["halt_causes"] == ["drawdown"]
+    g2 = _guards(tmp_path, today=DAY1)
+    assert g2.halted and g2.legacy_halt_voided is None
+    assert "daily drawdown hit" in g2.state["halt_reason"]
+
+
 def test_consecutive_loss_halt_is_not_cleared_by_day_roll(tmp_path):
     g1 = _guards(tmp_path, today=DAY1, max_consecutive_losses=3)
     for _ in range(3):

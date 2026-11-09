@@ -206,6 +206,12 @@ class LiveRunner:
         self.journal = TradeJournal(self.cfg.journal_path)
         self.guards = RiskGuards(self.cfg.risk_state_path, self.cfg.risk,
                                  kill_switch_path=self.cfg.kill_switch_path)
+        if self.guards.legacy_halt_voided:
+            self.journal.log_note(
+                "risk guards: legacy peak-era halt voided at load "
+                f"(was: {self.guards.legacy_halt_voided}) — the "
+                "drawdown halt is daily now (owner correction "
+                "2026-11-09)")
         # Injection point for the Exness loop: an ExnessPaperExecutor
         # (margin + stop-out model) instead of the default OANDA-model
         # PaperExecutor. Default path unchanged.

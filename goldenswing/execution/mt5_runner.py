@@ -1622,6 +1622,12 @@ class MT5Runner:
             self.cfg.risk_state_path,
             RiskConfig(max_total_risk_pct=0.0),
             kill_switch_path=self.cfg.kill_switch_path)
+        if self.guards.legacy_halt_voided:
+            self.journal.log_note(
+                "risk guards: legacy peak-era halt voided at load "
+                f"(was: {self.guards.legacy_halt_voided}) — the "
+                "drawdown halt is daily now (owner correction "
+                "2026-11-09)")
         self.tick_manager = tick_manager or TickManager(
             tick=TickConfig(
                 scalp_cap_minutes=float(self.cfg.scalp_cap_minutes),

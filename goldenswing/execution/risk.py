@@ -211,8 +211,10 @@ class RiskGuards:
                                  if kill_switch_path else None)
         self._today_fn = today_fn or (lambda: datetime.now(timezone.utc).date())
         self.load_error: str | None = None
+        self.legacy_halt_voided: str | None = None
         self._state = self._load()
         self._roll_periods()
+        self._void_legacy_halt()
 
     # ---------------------------------------------------------- state io
     def _fresh_state(self) -> dict:
@@ -230,9 +232,10 @@ class RiskGuards:
             # only when every latched cause is day-bound (drawdown);
             # a halt carrying "consecutive_losses" keeps the old
             # latch-until-human-reset semantics.  State files written
-            # before this field existed load with [] — treated as
-            # no non-drawdown cause on record, so a legacy (peak-era)
-            # drawdown halt also clears at its first day roll.
+            # before this field existed load with [] — and a halted
+            # state with no causes on record can only be a peak-era
+            # halt, voided at load by _void_legacy_halt (the roll
+            # alone misses a file whose day is already today).
             "halt_causes": [],
             "trades_today": 0,
         }
@@ -280,6 +283,29 @@ class RiskGuards:
                                week_start_balance=None, week_realized=0.0)
             changed = True
         if changed:
+            self._save()
+
+    def _void_legacy_halt(self) -> None:
+        """Void a peak-era halt at load, whatever day the file
+        carries.  Every halt the CURRENT code latches records its
+        causes (record_outcome / record_partial always set a
+        non-empty halt_causes), so a persisted halted state with an
+        EMPTY cause list can only predate cause tracking — its
+        basis was the all-time peak, retired by the owner's
+        2026-11-09 correction.  The day-roll clear cannot reach it
+        when the state file's day is already today (the runner was
+        live under the old code this morning), which is the exact
+        EC2 case: /health showed a 0.0% daily drawdown next to a
+        latched "21.2% from peak" halt.  A halt WITH causes is
+        untouched here: a drawdown halt clears at its own day
+        roll, a consecutive-losses halt waits for a human.  The
+        voided reason is kept on ``legacy_halt_voided`` so the
+        runners can journal the clearance."""
+        if self._state["halted"] and \
+                not (self._state.get("halt_causes") or []):
+            self.legacy_halt_voided = self._state.get("halt_reason") or ""
+            self._state.update(halted=False, halt_reason="",
+                               halt_causes=[])
             self._save()
 
     # ------------------------------------------------------------- views
