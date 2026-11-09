@@ -4261,6 +4261,18 @@ class MT5Runner:
             window={"from_offset": from_offset,
                     "to_offset": new_offset,
                     "records": len(records)})
+        # Pass 9: the three consumers of everything the
+        # earlier passes journaled — the whole-book
+        # comparison over the family states JUST folded by
+        # the phases above, the coverage-gap standing
+        # account, and the book-vs-S1 paired grading.  Same
+        # window, same cadence, same state file.  Evaluation
+        # and reporting only: nothing here moves authority.
+        self._pass9_phase(
+            records, bar_key, damaged_lines=damaged,
+            window={"from_offset": from_offset,
+                    "to_offset": new_offset,
+                    "records": len(records)})
 
     # ---- §G range promotion evaluation ----------------------
     # The verdict machinery is execution/range_promotion.py;
@@ -4602,6 +4614,129 @@ class MT5Runner:
                 "filled_identities", {}))
         for violation in violations:
             self._apply_route_violation(violation, bar_key)
+
+    # ---- Pass 9: self-evaluation, coverage, grading ---------
+    # The machinery is execution/book_evaluation.py,
+    # execution/coverage_report.py and
+    # execution/book_grading.py; this is only their host
+    # (standing blocks inside the S3 state file, fed the
+    # audit's journal windows, journaled on change, rendered
+    # on /status).  Findings feed back nowhere — this pass
+    # grants, demotes and changes NO authority.
+    def _book_evaluation_state(self) -> dict:
+        from . import book_evaluation as _book_evaluation
+
+        st = self._audit_state()
+        sub = st.get("book_evaluation")
+        if not isinstance(sub, dict):
+            sub = _book_evaluation.new_state()
+            st["book_evaluation"] = sub
+        else:
+            for key, value in \
+                    _book_evaluation.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _coverage_report_state(self) -> dict:
+        from . import coverage_report as _coverage_report
+
+        st = self._audit_state()
+        sub = st.get("coverage_report")
+        if not isinstance(sub, dict):
+            sub = _coverage_report.new_state()
+            st["coverage_report"] = sub
+        else:
+            for key, value in \
+                    _coverage_report.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _book_grading_state(self) -> dict:
+        from . import book_grading as _book_grading
+
+        st = self._audit_state()
+        sub = st.get("book_grading")
+        if not isinstance(sub, dict):
+            sub = _book_grading.new_state()
+            st["book_grading"] = sub
+        else:
+            for key, value in _book_grading.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _pass9_phase(self, records, bar_key, *,
+                     damaged_lines: int = 0,
+                     window: dict | None = None) -> None:
+        """One Pass-9 cycle over the self-audit's journal
+        window: the whole-book comparison (consuming the
+        family promotion states folded moments earlier in
+        this same audit cycle), the coverage standing
+        account (adjudicated against the latest situation
+        and the book's live scenarios), and the book-vs-S1
+        paired grading (fed the book's persisted closed
+        scenarios, deduped by the module).  Called from
+        inside _self_audit_phase (itself inside the S3
+        cycle's guarded body): a failure here is logged by
+        that guard like any audit failure and never reaches
+        a decision path."""
+        from . import book_evaluation as _book_evaluation
+        from . import book_grading as _book_grading
+        from . import coverage_report as _coverage_report
+
+        family_states = {
+            "range_promotion": self._range_promotion_state(),
+            "vol_promotion": self._vol_promotion_state(),
+            "trend_promotion":
+                self._trend_promotion_state(),
+            "auction_promotion":
+                self._auction_promotion_state(),
+            "reversion_promotion":
+                self._reversion_promotion_state(),
+            "session_promotion":
+                self._session_promotion_state(),
+            "route_promotion":
+                self._route_promotion_state(),
+        }
+        record = _book_evaluation.cycle(
+            state=self._book_evaluation_state(),
+            records=records, family_states=family_states,
+            now=pd.Timestamp(bar_key),
+            damaged_lines=damaged_lines, window=window,
+            run_id=self._run_id, bar=bar_key)
+        if record is not None:
+            self.journal.append(record)
+
+        try:
+            situation = self._current_situation()
+        except Exception:  # noqa: BLE001 — the coverage
+            # account degrades to "no situation read" rather
+            # than taking the audit cycle down with it
+            situation = None
+        try:
+            book = self._scenario_book_get()
+        except Exception:  # noqa: BLE001 — same reasoning:
+            # grading/coverage carry without the book
+            book = None
+        live = book.live() if book is not None else None
+        closed = list(book.closed) \
+            if book is not None else None
+        record = _coverage_report.cycle(
+            state=self._coverage_report_state(),
+            records=records,
+            now=pd.Timestamp(bar_key),
+            situation=situation, live=live,
+            damaged_lines=damaged_lines, window=window,
+            run_id=self._run_id, bar=bar_key)
+        if record is not None:
+            self.journal.append(record)
+        record = _book_grading.cycle(
+            state=self._book_grading_state(),
+            records=records, closed_scenarios=closed,
+            now=pd.Timestamp(bar_key),
+            damaged_lines=damaged_lines, window=window,
+            run_id=self._run_id, bar=bar_key)
+        if record is not None:
+            self.journal.append(record)
 
     def _apply_route_verdict(self, route: str, row: dict,
                              bar_key, promo_state: dict
@@ -8467,6 +8602,51 @@ class MT5Runner:
                 self._session_promotion_state()))
         except Exception as exc:  # noqa: BLE001 — status must not die
             return f"session promotion: unavailable ({exc})"
+
+    def book_evaluation_line(self) -> str:
+        """One /status Book Evaluation block (Pass 9): every
+        family's shadow history graded on the one shared
+        promotion instrument, side by side with the
+        governing routes' measured history — the comparison
+        table of execution/book_evaluation.py, consumed
+        from the family evaluations it does not re-run.  A
+        promotion_ready line is a recommendation; promotion
+        itself is the owner's separate decision."""
+        try:
+            from . import book_evaluation as _book_evaluation
+
+            return "\n".join(_book_evaluation.render_lines(
+                self._book_evaluation_state()))
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"book evaluation: unavailable ({exc})"
+
+    def coverage_report_line(self) -> str:
+        """One /status Coverage block (Pass 9): the standing
+        account of covered situation configurations and open
+        coverage gaps — each gap with its age and its
+        classification read from the situation's own state
+        (deliberate stand-aside vs an unwatched hole)."""
+        try:
+            from . import coverage_report as _coverage_report
+
+            return "\n".join(_coverage_report.render_lines(
+                self._coverage_report_state()))
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"coverage: unavailable ({exc})"
+
+    def book_grading_line(self) -> str:
+        """One /status Book Grading block (Pass 9): every
+        closed scenario's outcome paired to the situation
+        snapshot it was formed under — thesis survival per
+        family and per situation cell, degenerate and
+        unpaired scenarios counted, never dropped."""
+        try:
+            from . import book_grading as _book_grading
+
+            return "\n".join(_book_grading.render_lines(
+                self._book_grading_state()))
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"book grading: unavailable ({exc})"
 
     def judgment_authority_line(self) -> str:
         """One /status Judgment Authority block (Pass 5):

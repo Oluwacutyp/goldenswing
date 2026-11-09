@@ -609,6 +609,40 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("🌅", "Session Range Promotion"))
             lines.append(session_promotion())
             lines.append("")
+    # Pass 9 self-evaluation: the whole-book comparison
+    # table (every family + the governing routes on the one
+    # shared instrument), beside it.  Guarded — old runners
+    # lack it.
+    if ctrl is not None:
+        book_evaluation = getattr(ctrl,
+                                  "book_evaluation_line",
+                                  None)
+        if callable(book_evaluation):
+            lines.append(fmt_section("📊", "Book Evaluation"))
+            lines.append(book_evaluation())
+            lines.append("")
+    # Pass 9 coverage: the standing account of covered
+    # configurations and open coverage gaps with their
+    # classifications — from the runner's
+    # coverage_report_line.  Guarded — old runners lack it.
+    if ctrl is not None:
+        coverage_report = getattr(ctrl,
+                                  "coverage_report_line",
+                                  None)
+        if callable(coverage_report):
+            lines.append(fmt_section("🧭", "Coverage"))
+            lines.append(coverage_report())
+            lines.append("")
+    # Pass 9 book-vs-S1 grading: thesis survival per family
+    # and per situation cell — from the runner's
+    # book_grading_line.  Guarded — old runners lack it.
+    if ctrl is not None:
+        book_grading = getattr(ctrl, "book_grading_line",
+                               None)
+        if callable(book_grading):
+            lines.append(fmt_section("📜", "Book Grading"))
+            lines.append(book_grading())
+            lines.append("")
     # Judgment authority (Pass 5): every route's effective
     # state + its source (declared / config / verdict /
     # demoted) and the two binding routes' standing verdicts
