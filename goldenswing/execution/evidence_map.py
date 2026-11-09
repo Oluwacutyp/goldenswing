@@ -444,6 +444,84 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                  "printed, so the read never trades a "
                  "half-formed node.",
     },
+    "mean_reversion_extension_fade": {
+        "route": "mean_reversion (Pass 7d scheduled)",
+        "detector": "two clocks, causally sliced: the "
+                    "formation TF's (H1) closed bars + the "
+                    "trigger TF's (M15 / M5) closed bars.  "
+                    "The extension is a formation close "
+                    ">= 2 ATR beyond the ANCHORED developing "
+                    "value edge (the developing state at "
+                    "the last inside close — live/"
+                    "developing_value.py, the §6.3 "
+                    "extension; tick-volume basis, named "
+                    "on every record); the stall is >= 2 "
+                    "formation bars without close progress "
+                    "past the extreme, the trend core's "
+                    "momentum read off 'sustained', and "
+                    "the live developing state NOT "
+                    "migrated toward price since the "
+                    "extreme bar; the entry is the trigger "
+                    "clock's first minor-swing (n=2) break "
+                    "in the fade's direction after the "
+                    "stall confirms.  The REGIME GATE "
+                    "refuses the fade when the formation "
+                    "TF reads clean_trend / breakout "
+                    "(named post-exhaustion states "
+                    "excepted) — refusals journal as arm "
+                    "records",
+        "authority": "NONE — Pass 7d shadow: scheduled scans "
+                     "journal evaluations + arm records and "
+                     "propose book scenarios; never orders. "
+                     "Promotion is the family's own "
+                     "evaluation (execution/"
+                     "reversion_promotion.py) plus the "
+                     "owner's separate decision",
+        "notes": "Distinct from auction_value_rejection "
+                 "and range_mean_reversion: 7c trades the "
+                 "auction's answer to a probe AT the value "
+                 "edge; the range playbook fades a range "
+                 "edge re-entry toward a range mid.  This "
+                 "hypothesis trades the FAR side — an "
+                 "extension multiples of ATR beyond value "
+                 "that is exhausting — with value's own "
+                 "staged targets (POC, then the opposite "
+                 "edge).  A formation close beyond the "
+                 "extreme after the stall is 7c's "
+                 "acceptance fact arriving and it KILLS "
+                 "this family's thesis: the families "
+                 "never fight over the same ground.",
+    },
+    "mean_reversion_failed_continuation": {
+        "route": "mean_reversion (Pass 7d scheduled)",
+        "detector": "the extension episode's own "
+                    "structural death: the defended swing "
+                    "(the most recent confirmed counter-"
+                    "swing, n=3, known at the extreme bar) "
+                    "broken by a formation close after the "
+                    "extreme, while price was extended "
+                    ">= 2 ATR beyond anchored value.  "
+                    "Entry at the first trigger close "
+                    "after the break, while price is still "
+                    "on the extension side of the POC; "
+                    "targets the POC, then the opposite "
+                    "edge; stop beyond the extension "
+                    "extreme",
+        "authority": "NONE — Pass 7d shadow, as "
+                     "mean_reversion_extension_fade",
+        "notes": "SPEC §6.4 registers trend_exhaustion's "
+                 "mirror in THIS family (not §6.1's) so "
+                 "the bookkeeping lives in one place: "
+                 "the trend family journals the death as "
+                 "an arm fact; this hypothesis is the "
+                 "trade on that death when it happens at "
+                 "extension.  It is temporally disjoint "
+                 "from the extension fade by construction "
+                 "(the fade's turn hunt ends where the "
+                 "break begins) and exists only after the "
+                 "break close — it never fades a standing "
+                 "trend.",
+    },
     "qm_m5": {
         "route": "native M5",
         "detector": "M5 closed bars only (feeding it H1 bars "

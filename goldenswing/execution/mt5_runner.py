@@ -96,6 +96,10 @@ from ..live.auction_value import (
     FORMATION_TFS as FORMATION_TFS_AUCTION,
     FORMATION_TF_UP as FORMATION_TF_UP_AUCTION,
     TRIGGER_TF_DOWN as TRIGGER_TF_DOWN_AUCTION)
+from ..live.mean_reversion import (
+    FORMATION_TFS as FORMATION_TFS_REVERSION,
+    FORMATION_TF_UP as FORMATION_TF_UP_REVERSION,
+    TRIGGER_TFS as TRIGGER_TFS_REVERSION)
 from ..live import developing_value as _developing_value
 from ..live import relationships as _relationships
 from ..live.data_health import check_data_health as _check_data_health
@@ -211,6 +215,7 @@ from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 _MANAGEMENT_HORIZONS,
                                 AUCTION_SPECS,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
+                                REVERSION_SPECS,
                                 ROSTER_SPECS, ROSTER_SPECS_H1,
                                 TREND_SPECS, VOL_SPECS,
                                 decay_exempt as _decay_exempt,
@@ -392,6 +397,20 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     "auction_value_acceptance": "shadow_declared",
     "auction_value_rejection": "shadow_declared",
     "auction_lvn_traversal": "shadow_declared",
+    # MEAN REVERSION FAMILY (MarketSituation Pass 7d,
+    # SPEC §6.4): the two reversion playbooks' scheduled
+    # scan route (playbook_registry.ROUTE_MEAN_REVERSION)
+    # declared shadow per playbook — route name == playbook
+    # name, the §G precedent (the journal's shadow records
+    # are keyed by playbook and the promotion evaluation
+    # (execution/reversion_promotion.py) reads per-playbook
+    # history).  The scans hold no order authority in any
+    # mode; the family is not on the trigger path at all.
+    # Declaring the routes also closes the latent hazard
+    # the §G comment names: an undeclared route name must
+    # never be one seam call away from governing.
+    "mean_reversion_extension_fade": "shadow_declared",
+    "mean_reversion_failed_continuation": "shadow_declared",
 }
 
 #: The playbook name a route's judgment records journal under
@@ -412,6 +431,10 @@ JUDGMENT_ROUTE_PLAYBOOK: dict[str, str] = {
     "auction_value_acceptance": "auction_value_acceptance",
     "auction_value_rejection": "auction_value_rejection",
     "auction_lvn_traversal": "auction_lvn_traversal",
+    "mean_reversion_extension_fade":
+        "mean_reversion_extension_fade",
+    "mean_reversion_failed_continuation":
+        "mean_reversion_failed_continuation",
 }
 
 #: The §G range playbooks whose scheduled scans journal
@@ -444,6 +467,14 @@ TREND_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
 #: this set by test).
 AUCTION_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in AUCTION_SPECS)
+
+#: The Pass 7d mean reversion playbooks whose scheduled
+#: scans journal route-stamped shadow verdicts (derived
+#: from the registry's REVERSION_SPECS — one truth;
+#: reversion_promotion.REVERSION_JUDGMENT_ROUTES is pinned
+#: to this set by test).
+REVERSION_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
+    spec.name for spec in REVERSION_SPECS)
 
 
 @dataclass
@@ -2825,6 +2856,27 @@ class MT5Runner:
                             "migration": _dev["migration"],
                             "hvns": _dev["hvns"],
                             "lvns": _dev["lvns"]}
+                        # Pass 7d (SPEC §6.4): the
+                        # extension read this family
+                        # motivates — the signed distance
+                        # of price from the DEVELOPING POC
+                        # in H1 ATR units (positive =
+                        # above value), computed from the
+                        # same state the families read, so
+                        # the situation's number and the
+                        # family's can never disagree.
+                        # Carried as a measurement only
+                        # (like magnet_room_r): no consumer
+                        # gates on the situation's copy —
+                        # the family's detector measures
+                        # its episodes causally from bars.
+                        _atr_h1 = _atr14(h1)
+                        if price is not None and _atr_h1 \
+                                and _atr_h1 > 0:
+                            location["extension_atr"] = float(
+                                (float(price)
+                                 - float(_dev["poc"]))
+                                / _atr_h1)
                 except Exception:  # noqa: BLE001 — block-local
                     pass
             store = self._get_zone_store()
@@ -4118,6 +4170,14 @@ class MT5Runner:
             window={"from_offset": from_offset,
                     "to_offset": new_offset,
                     "records": len(records)})
+        # Pass 7d mean reversion promotion evaluation:
+        # the same window, the same cadence, the same state
+        # file — no new scheduler (the 7a host arrangement).
+        self._reversion_promotion_phase(
+            records, bar_key, damaged_lines=damaged,
+            window={"from_offset": from_offset,
+                    "to_offset": new_offset,
+                    "records": len(records)})
         # Pass 4 measured priors: the same window, the same
         # cadence, the same state file — no new scheduler.
         self._priors_phase(
@@ -4290,6 +4350,45 @@ class MT5Runner:
 
         sub = self._auction_promotion_state()
         record = _auction_promotion.cycle(
+            state=sub, records=records,
+            now=pd.Timestamp(bar_key),
+            damaged_lines=damaged_lines, window=window,
+            run_id=self._run_id, bar=bar_key)
+        if record is not None:
+            self.journal.append(record)
+
+    # ---- Mean reversion promotion evaluation (Pass 7d) ----
+    # The measurement machinery is execution/
+    # reversion_promotion.py; this is only its host (the
+    # vol-promotion arrangement: a standing block inside
+    # the S3 state file, fed the audit's journal windows,
+    # journaled on change).  Findings feed back nowhere.
+    def _reversion_promotion_state(self) -> dict:
+        from . import reversion_promotion as _reversion_promotion
+
+        st = self._audit_state()
+        sub = st.get("reversion_promotion")
+        if not isinstance(sub, dict):
+            sub = _reversion_promotion.new_state()
+            st["reversion_promotion"] = sub
+        else:
+            for key, value in _reversion_promotion.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _reversion_promotion_phase(self, records, bar_key, *,
+                                   damaged_lines: int = 0,
+                                   window: dict | None = None) -> None:
+        """One Pass 7d promotion-evaluation cycle over the
+        self-audit's journal window.  Called from inside
+        _self_audit_phase (inside the S3 cycle's guarded
+        body): a failure here is logged by that guard like
+        any audit failure and never reaches a decision
+        path."""
+        from . import reversion_promotion as _reversion_promotion
+
+        sub = self._reversion_promotion_state()
+        record = _reversion_promotion.cycle(
             state=sub, records=records,
             now=pd.Timestamp(bar_key),
             damaged_lines=damaged_lines, window=window,
@@ -6776,6 +6875,12 @@ class MT5Runner:
         # on the M15 trigger clock), observation only.
         self._run_auction_value_family(
             FORMATION_TFS_AUCTION, stats, source="warmup_scan")
+        # Pass 7d: the mean reversion family's warmup
+        # pass — its trigger clocks once (its scans run
+        # on the M15 / M5 trigger clocks), observation
+        # only.
+        self._run_mean_reversion_family(
+            TRIGGER_TFS_REVERSION, stats, source="warmup_scan")
         pump = TickPump(feed, interval=self.cfg.tick_interval)
         try:
             # on_idle: command polling MUST NOT depend on new ticks.
@@ -8226,6 +8331,21 @@ class MT5Runner:
         except Exception as exc:  # noqa: BLE001 — status must not die
             return f"auction promotion: unavailable ({exc})"
 
+    def reversion_promotion_line(self) -> str:
+        """One /status Mean Reversion Promotion block (Pass
+        7d evaluation): per mean reversion route, the
+        promotion verdict over its own route-stamped shadow
+        history in plain words — the §G block's shape.  A
+        promotion_ready line is a recommendation; promotion
+        itself is the owner's separate decision."""
+        try:
+            from . import reversion_promotion as _reversion_promotion
+
+            return "\n".join(_reversion_promotion.render_lines(
+                self._reversion_promotion_state()))
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"reversion promotion: unavailable ({exc})"
+
     def judgment_authority_line(self) -> str:
         """One /status Judgment Authority block (Pass 5):
         every route's effective authority state AND its
@@ -8711,6 +8831,17 @@ class MT5Runner:
         if _auction_formations:
             self._run_auction_value_family(
                 _auction_formations, stats, source="live_close")
+        # Pass 7d: the mean reversion family evaluates on
+        # each TRIGGER clock's close (M15 closes drive the
+        # intraday scans, M5 closes the scalp scans) —
+        # its entries are trigger-clock events; shadow
+        # scans: journal + book, never orders.
+        _reversion_triggers = [
+            tf for tf in TRIGGER_TFS_REVERSION
+            if tf in appended]
+        if _reversion_triggers:
+            self._run_mean_reversion_family(
+                _reversion_triggers, stats, source="live_close")
         # Phase 3: entry-TF closes — the Close Rule FIRST (a bar
         # closing beyond the invalidation level kills the setup
         # instantly, before any confirmation on the same close),
@@ -21156,9 +21287,18 @@ class MT5Runner:
             # its ladder is consulted second — the two
             # families' scan clocks never overlap (trend
             # scans run on H1/H4, auction scans on M15).
+            # Pass 7d: the mean reversion family threads
+            # identically (an M15 / M5 scan is an H1-formed
+            # reversion read); its ladder is consulted
+            # third — its M15 answer is the auction
+            # ladder's own H1, and M5 is its alone.  The
+            # family's set_formation_tf (above) records
+            # the scan clock as its TRIGGER clock, which
+            # is what intended_tf names on its scans.
             if hasattr(pb, "set_formation"):
                 _form_tf = FORMATION_TF_UP_TREND.get(
                     intended_tf) or FORMATION_TF_UP_AUCTION.get(
+                    intended_tf) or FORMATION_TF_UP_REVERSION.get(
                     intended_tf)
                 pb.set_formation(
                     self._stack.frames.get(_form_tf)
@@ -21432,6 +21572,9 @@ class MT5Runner:
             # history is trend_promotion's dataset).  Pass
             # 7c: the auction / value family's likewise
             # (their history is auction_promotion's dataset).
+            # Pass 7d: the mean reversion family's likewise
+            # (their history is reversion_promotion's
+            # dataset).
             self._emit_eval(
                 **base, outcome="candidate_emitted",
                 reason_code=_disp_code, reason=_disp_why,
@@ -21442,7 +21585,8 @@ class MT5Runner:
                     and (name in RANGE_JUDGMENT_ROUTE_NAMES
                          or name in VOL_JUDGMENT_ROUTE_NAMES
                          or name in TREND_JUDGMENT_ROUTE_NAMES
-                         or name in AUCTION_JUDGMENT_ROUTE_NAMES)
+                         or name in AUCTION_JUDGMENT_ROUTE_NAMES
+                         or name in REVERSION_JUDGMENT_ROUTE_NAMES)
                     else None))
             if _handoff:
                 # The judgment cycle inside this record's own
@@ -22006,6 +22150,178 @@ class MT5Runner:
                     self.journal.log_note(
                         f"mt5: auction value eval failed for "
                         f"{spec.name} on {formation_tf}: {exc}")
+
+    # --------------------------------------- mean reversion (Pass 7d)
+
+    def _reversion_arm_seen(self, key) -> bool:
+        """In-memory dedupe for the family's arm journal
+        (the Pass 7a design's standing remainder, inherited
+        through 7b and 7c: a restart can re-journal one arm
+        transition once — the arm record carries the
+        episode's own timestamps, so the duplicate is
+        identifiable downstream)."""
+        seen = getattr(self, "_reversion_arm_journaled", None)
+        if seen is None:
+            seen = set()
+            self._reversion_arm_journaled = seen
+        if key in seen:
+            return True
+        seen.add(key)
+        return False
+
+    def _journal_reversion_arm(self, trigger_frame) -> None:
+        """Journal the family's DETECTION transitions for
+        its formation clock (H1): a corroborated extension
+        arming (phase "extended"), its stall (phase
+        "stalled"), the continuation's structural death
+        (phase "broke"), a resolved episode's death
+        (phase "invalidated" — acceptance beyond the
+        extreme, a resumption, a re-acceptance; journaled
+        whether or not the wider state still corroborates,
+        because the death is a market fact Pass 9's
+        grading counts), and the REGIME GATE's refusal of
+        a stalled fade (phase "regime_refused" — the
+        family's honesty made a record: Pass 9 grades
+        what this family refused and why, not only what
+        it took).  One record per transition, stamped
+        with the situation id, carrying the developing-
+        value read WITH ITS BASIS NAMED (tick volume —
+        the profile is a tick-activity profile, never
+        dressed as traded volume) and the gate's verdict
+        block.  The read is the extension fade playbook's
+        own pending_state (runner-threaded situation +
+        formation frame, exactly like its detection
+        scans); the episode machine is shared by both
+        hypotheses, so one arm stream serves the family.
+        The arm read runs on the family's primary trigger
+        frame (M15 when the stack carries it) — arms are
+        formation-clock facts; the trigger frame only
+        sets the read's visibility bar."""
+        spec = _spec_for("mean_reversion_extension_fade")
+        if spec is None or trigger_frame is None:
+            return
+        formation_tf = FORMATION_TFS_REVERSION[0]
+        formation_frame = (
+            self._stack.frames.get(formation_tf)
+            if self._stack is not None else None)
+        if formation_frame is None:
+            return
+        try:
+            pb = spec.playbook_class()
+            pb.set_situation(self._current_situation())
+            pb.set_formation(formation_frame, formation_tf)
+            pending = pb.pending_state(trigger_frame)
+        except Exception as exc:  # noqa: BLE001
+            self.journal.log_note(
+                f"mt5: reversion arm read failed for "
+                f"{formation_tf}: {exc}")
+            return
+        if not pending:
+            return
+        if pending["phase"] in ("extended", "stalled",
+                                "broke") \
+                and not pending.get("corroborated"):
+            # Uncorroborated states are detections, not
+            # arms — the scans' situation-cited no_setup /
+            # abstention records carry those (the 7a rule).
+            # Invalidations and gate refusals journal
+            # regardless: both are facts Pass 9 counts.
+            return
+        key = ("reversion_arm", pending["identity"])
+        if self._reversion_arm_seen(key):
+            return
+        self.journal.append({
+            "type": "mean_reversion_arm",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": getattr(self, "_run_id", None),
+            "family": "mean_reversion",
+            "formation_tf": formation_tf,
+            "trigger_tf": pending.get("trigger_tf"),
+            "phase": pending["phase"],
+            "episode_phase": pending.get("episode_phase"),
+            "direction": pending.get("direction"),
+            "episode": pending.get("episode"),
+            "extension_atr": pending.get("extension_atr"),
+            "value": pending.get("value"),
+            "volume_basis": _developing_value.VOLUME_BASIS,
+            "regime_gate": pending.get("gate"),
+            "corroboration": pending.get("corroborated"),
+            "situation_id": (
+                pending.get("situation_id")
+                or self._current_situation_id()),
+        })
+
+    def _run_mean_reversion_family(self, trigger_tfs,
+                                   stats=None, *,
+                                   source: str) -> None:
+        """The mean reversion family on its scheduled
+        route (MarketSituation Pass 7d, SPEC §6.4):
+        journal the arm read once (arms are formation-
+        clock facts), then evaluate both playbooks on
+        each TRIGGER clock in ``trigger_tfs`` (M15 —
+        intraday instances; M5 — scalp instances) via
+        the funnel-evaluation seam — shadow: the scans
+        journal evaluations (with route-stamped judgment
+        verdicts), register shadow setups on live closes,
+        and propose scenarios to the book; they NEVER
+        order (no order path exists for this partition).
+        The scans run on the trigger clocks because the
+        family's entries ARE trigger-clock events (the
+        stall's structure turn, the break's first read).
+        The value evidence rides on every evaluation
+        record WITH ITS BASIS NAMED: the profile is
+        computed from MT5 tick volume — recorded as such,
+        never dressed as traded volume.  D1/HTF reads are
+        recorded as CONTEXT evidence only — D1 never
+        vetoes (§G precedent); the family's regime gate
+        reads the formation TF's situation state, stated
+        on every signal and arm record.
+
+        Failure containment mirrors the auction family's:
+        one playbook's failure logs a note and the family
+        scans on."""
+        setup = self._live_setup or {}
+        ctx_evidence = {
+            "family": "mean_reversion",
+            "d1_bias_context": setup.get("bias_d1"),
+            "d1_role": "context only — recorded, never consulted "
+                       "as permission (D1 never vetoes)",
+            "volume_basis": _developing_value.VOLUME_BASIS,
+            "volume_basis_role": "the developing value area "
+                                 "is a tick-volume profile "
+                                 "(MT5's volume column) — "
+                                 "named on the family's "
+                                 "records, never dressed "
+                                 "as traded volume",
+        }
+        frames = (self._stack.frames
+                  if self._stack is not None else {})
+        arm_frame = frames.get("M15")
+        if arm_frame is None:
+            arm_frame = frames.get("M5")
+        try:
+            self._journal_reversion_arm(arm_frame)
+        except Exception as exc:  # noqa: BLE001
+            self.journal.log_note(
+                f"mt5: reversion arm journal failed: {exc}")
+        for trigger_tf in trigger_tfs:
+            if trigger_tf not in TRIGGER_TFS_REVERSION:
+                continue
+            frame = frames.get(trigger_tf)
+            for spec in REVERSION_SPECS:
+                try:
+                    self._sweep_eval_one(
+                        spec, frame,
+                        clock=f"mean_reversion_"
+                              f"{trigger_tf.lower()}",
+                        intended_tf=trigger_tf,
+                        actual_tf=trigger_tf,
+                        source=source, shadow=True,
+                        extra_evidence=ctx_evidence)
+                except Exception as exc:
+                    self.journal.log_note(
+                        f"mt5: mean reversion eval failed for "
+                        f"{spec.name} on {trigger_tf}: {exc}")
 
     # ------------------------------------------------- alerts + charts
     def _studies_for_chart(self, h1, entry: float, atr: float,

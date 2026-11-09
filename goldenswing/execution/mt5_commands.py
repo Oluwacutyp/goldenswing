@@ -585,6 +585,18 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("🔨", "Auction Promotion"))
             lines.append(auction_promotion())
             lines.append("")
+    # Pass 7d mean reversion promotion evaluation: the
+    # same arrangement for the reversion routes — from
+    # the runner's reversion_promotion_line.  Guarded —
+    # old runners lack it.
+    if ctrl is not None:
+        reversion_promotion = getattr(ctrl,
+                                      "reversion_promotion_line",
+                                      None)
+        if callable(reversion_promotion):
+            lines.append(fmt_section("🧲", "Mean Reversion Promotion"))
+            lines.append(reversion_promotion())
+            lines.append("")
     # Judgment authority (Pass 5): every route's effective
     # state + its source (declared / config / verdict /
     # demoted) and the two binding routes' standing verdicts

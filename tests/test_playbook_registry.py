@@ -59,6 +59,10 @@ def test_full_roster_executes_and_is_live():
         # see tests/test_auction_value.py).
         "auction_value_acceptance", "auction_value_rejection",
         "auction_lvn_traversal",
+        # Pass 7d: the mean reversion family (same posture;
+        # see tests/test_mean_reversion.py).
+        "mean_reversion_extension_fade",
+        "mean_reversion_failed_continuation",
         "qm_m5", "qm_d1")
     for cls in (SweepReversalPlaybook, FVGMidlinePlaybook,
                 TrendlineRetestPlaybook, FVGLimitPlaybook,

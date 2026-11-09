@@ -40,6 +40,11 @@ from .auction_value import (
     AuctionValueAcceptancePlaybook,
     AuctionValueRejectionPlaybook,
 )
+from .mean_reversion import (
+    REVERSION_PLAYBOOKS,
+    MeanReversionExtensionFadePlaybook,
+    MeanReversionFailedContinuationPlaybook,
+)
 from .trend_momentum import (
     TREND_PLAYBOOKS,
     TrendImpulsePullbackPlaybook,
@@ -80,6 +85,9 @@ __all__ = [
     "AuctionValueAcceptancePlaybook",
     "AuctionValueRejectionPlaybook",
     "AuctionLVNTraversalPlaybook",
+    "REVERSION_PLAYBOOKS",
+    "MeanReversionExtensionFadePlaybook",
+    "MeanReversionFailedContinuationPlaybook",
     "VReversalPlaybook",
     "RetracementTrapPlaybook",
     "InversionPlaybook",

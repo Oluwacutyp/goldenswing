@@ -35,7 +35,10 @@ from ..playbooks import (AuctionLVNTraversalPlaybook,
                          AuctionValueRejectionPlaybook,
                          FVGLimitPlaybook, FVGMidlinePlaybook,
                          InversionPlaybook, JudasSwingPlaybook,
-                         KillzoneOpenPlaybook, NarrativePlaybook,
+                         KillzoneOpenPlaybook,
+                         MeanReversionExtensionFadePlaybook,
+                         MeanReversionFailedContinuationPlaybook,
+                         NarrativePlaybook,
                          OrderBlockPlaybook, QMD1Playbook, QMM5Playbook,
                          RangeCompressionBreakoutPlaybook,
                          RangeMeanReversionPlaybook, RangeQMPlaybook,
@@ -111,6 +114,24 @@ ROUTE_TREND_MOMENTUM = "trend_momentum"
 #: (execution/auction_promotion.py) plus the owner's
 #: separate decision — the SPEC §6 common contract.
 ROUTE_AUCTION_VALUE = "auction_value"
+#: Route (MarketSituation Pass 7d, SPEC §6.4): the mean
+#: reversion family's SCHEDULED evaluation contract —
+#: scans on each TRIGGER clock's close (M15 and M5, for
+#: the H1-formed extension episodes), reading the
+#: developing value state (live/developing_value.py —
+#: the §6.3 extension) and the trend core's momentum
+#: read on the H1 formation frame.  The route is SHADOW
+#: (it journals evaluations, arm records — including the
+#: regime gate's refusals — and analytical candidates,
+#: proposes scenarios to the book, and holds NO order
+#: authority in any mode).  Like the vol, trend and
+#: auction families, these playbooks are NOT members of
+#: the trigger-path roster: they have no legacy order
+#: authority to preserve, so they stay out of ROSTER_SPECS
+#: entirely.  Promotion is the family's own evaluation
+#: (execution/reversion_promotion.py) plus the owner's
+#: separate decision — the SPEC §6 common contract.
+ROUTE_MEAN_REVERSION = "mean_reversion"
 
 
 @dataclass(frozen=True)
@@ -317,6 +338,29 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
                  "H1", ROUTE_AUCTION_VALUE,
                  shadow_evaluation=True, entry_thesis="market",
                  chart_studies=("volume_profile",)),
+    # Mean reversion family (MarketSituation Pass 7d, SPEC
+    # §6.4): extension episodes defined on the formation
+    # clock (H1 — the developing value area's own clock;
+    # native_tf is the family's formation clock), entered
+    # on the trigger clocks one and two steps down (M15
+    # intraday / M5 scalp — the instance declares its
+    # horizon on its own signal, the additive declared-
+    # horizon read in management_block_for / the book, so
+    # its management resolves per instance).  Scheduled
+    # shadow route only; entry thesis is market (the
+    # premise is the stall's turn / the break's first
+    # read itself — a resting limit contradicts it).
+    # Horizon intraday by registry default (SPEC §6.4).
+    PlaybookSpec("mean_reversion_extension_fade",
+                 MeanReversionExtensionFadePlaybook,
+                 "H1", ROUTE_MEAN_REVERSION,
+                 shadow_evaluation=True, entry_thesis="market",
+                 chart_studies=("volume_profile",)),
+    PlaybookSpec("mean_reversion_failed_continuation",
+                 MeanReversionFailedContinuationPlaybook,
+                 "H1", ROUTE_MEAN_REVERSION,
+                 shadow_evaluation=True, entry_thesis="market",
+                 chart_studies=("volume_profile",)),
     # Native-clock routes: evaluated by dedicated runner paths on
     # their own frames (M5 closes / D1 closes).  They are NOT in
     # the H1 roster — feeding them H1 bars was the qm_m5 defect.
@@ -347,11 +391,12 @@ RANGE_SPECS: tuple[PlaybookSpec, ...] = tuple(
 #: contract above is additional, shadow, and separate).  This is
 #: the set ``_get_playbooks`` builds, in registry order.  (Named
 #: ROSTER_SPECS for continuity with the Phase 1 invariant —
-#: extended at Passes 7a, 7b and 7c: ROSTER_SPECS ∪
-#: NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ∪ AUCTION_SPECS ==
-#: the full registry, the VOL/TREND/AUCTION partitions being
-#: the ones that are scheduled-shadow only and therefore
-#: deliberately NOT in this trigger-path set.)
+#: extended at Passes 7a, 7b, 7c and 7d: ROSTER_SPECS ∪
+#: NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ∪ AUCTION_SPECS ∪
+#: REVERSION_SPECS == the full registry, the VOL/TREND/
+#: AUCTION/REVERSION partitions being the ones that are
+#: scheduled-shadow only and therefore deliberately NOT in
+#: this trigger-path set.)
 ROSTER_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route in (ROUTE_H1_ROSTER, ROUTE_RANGE_H4_H1))
@@ -373,7 +418,7 @@ VOL_SPECS: tuple[PlaybookSpec, ...] = tuple(
 #: scheduled-shadow partition.  The registry partition is
 #: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ==
 #: the full registry (extended at Pass 7c by AUCTION_SPECS
-#: below).
+#: and at Pass 7d by REVERSION_SPECS below).
 TREND_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route == ROUTE_TREND_MOMENTUM)
@@ -381,10 +426,19 @@ TREND_SPECS: tuple[PlaybookSpec, ...] = tuple(
 #: The auction / value family specs (Pass 7c): the third
 #: scheduled-shadow partition.  The registry partition is
 #: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ∪
-#: AUCTION_SPECS == the full registry.
+#: AUCTION_SPECS == the full registry (extended at Pass 7d
+#: by REVERSION_SPECS below).
 AUCTION_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route == ROUTE_AUCTION_VALUE)
+
+#: The mean reversion family specs (Pass 7d): the fourth
+#: scheduled-shadow partition.  The registry partition is
+#: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ∪
+#: AUCTION_SPECS ∪ REVERSION_SPECS == the full registry.
+REVERSION_SPECS: tuple[PlaybookSpec, ...] = tuple(
+    s for s in PLAYBOOK_REGISTRY
+    if s.route == ROUTE_MEAN_REVERSION)
 
 #: SCORE-FLOOR AUTHORITY, per route (Phase 2, P0-2).  Two scores
 #: exist and were conflated in Phase 1 records: the SLEEVE BASE
@@ -418,6 +472,11 @@ FLOOR_AUTHORITY: dict[str, str] = {
         "in shadow and proposed to the scenario book only",
     ROUTE_AUCTION_VALUE:
         "shadow evaluation route (Pass 7c): no floor, no order "
+        "authority in any mode — the family is not on the "
+        "trigger path; its candidates are journaled, judged "
+        "in shadow and proposed to the scenario book only",
+    ROUTE_MEAN_REVERSION:
+        "shadow evaluation route (Pass 7d): no floor, no order "
         "authority in any mode — the family is not on the "
         "trigger path; its candidates are journaled, judged "
         "in shadow and proposed to the scenario book only",
