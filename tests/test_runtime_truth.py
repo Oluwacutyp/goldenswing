@@ -345,10 +345,12 @@ def test_daily_and_weekly_caps_no_longer_exist_or_halt(tmp_path):
 def test_max_drawdown_is_the_account_level_halt(tmp_path):
     g = RiskGuards(tmp_path / "risk.json",
                    RiskConfig())   # max_drawdown_pct = 0.15
-    g.note_balance(1000.0)         # the peak the DD is measured from
+    g.note_balance(1000.0)         # the day's starting balance the
+                                   # DD is measured from (daily basis,
+                                   # owner correction 2026-11-09)
     g.record_outcome(pnl_money=-200.0, balance=800.0)
     assert g.halted
-    assert "max drawdown" in g.state["halt_reason"]
+    assert "daily drawdown" in g.state["halt_reason"]
     dec = g.check_new_trade(balance=800.0, open_risk_money=0.0,
                             new_risk_money=10.0, open_count=0)
     assert not dec.allowed

@@ -23549,10 +23549,12 @@ class MT5Runner:
         Sources are repo truth only: the feed's ``account_state()``
         (the same MT5 read the sizing/risk path uses) for balance /
         equity / margin, and the risk guards' persisted state for
-        the peak balance the 15% drawdown halt is measured from —
-        the arithmetic itself is
-        :func:`goldenswing.execution.risk.drawdown_snapshot`, the
-        guard's own formula.  Any source that cannot be read comes
+        the day's starting balance the 15% DAILY drawdown halt is
+        measured from (owner correction 2026-11-09) — the arithmetic
+        itself is :func:`goldenswing.execution.risk.drawdown_snapshot`,
+        the guard's own formula.  The all-time peak balance rides
+        along as display information only; it feeds no figure here
+        except its own line.  Any source that cannot be read comes
         back as an ``error`` string: the caller renders it honestly
         as unavailable, never as 0.00.
         """
@@ -23577,8 +23579,9 @@ class MT5Runner:
         except Exception:
             guards_state = {}
         peak = guards_state.get("peak_balance")
+        day_start = guards_state.get("day_start_balance")
         snap = drawdown_snapshot(
-            peak_balance=(float(peak) if peak else None),
+            day_start_balance=(float(day_start) if day_start else None),
             balance=balance, limit=limit)
         out.update({
             "ok": True, "error": "",
@@ -23588,6 +23591,8 @@ class MT5Runner:
             "free_margin": state.get("free_margin"),
             "currency": state.get("currency") or "",
             "peak_balance": (float(peak) if peak else None),
+            "day_start_balance": (float(day_start)
+                                  if day_start else None),
             "drawdown_pct": snap["drawdown_pct"],
             "distance_pct": snap["distance_pct"],
             "limit_pct": limit,

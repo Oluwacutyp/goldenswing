@@ -1324,8 +1324,13 @@ class LiveRunner:
         try:
             acct = mt5.account_state()
             balance = acct.balance
-            peak = gst.get("peak_balance") or balance
-            drawdown = max(0.0, (peak - balance) / peak) if peak else 0.0
+            # TODAY's drawdown, from the day's starting balance —
+            # the same daily basis the guard enforces (owner
+            # correction 2026-11-09).  The all-time peak is not
+            # used here anymore.
+            day_start = gst.get("day_start_balance") or balance
+            drawdown = max(0.0, (day_start - balance) / day_start) \
+                if day_start else 0.0
             open_pos = len(mt5.positions())
         except Exception:
             pass

@@ -53,7 +53,7 @@ def build_daily_summary(*, day: str | None = None,
     if balance is not None:
         lines.append(f"Balance: {balance:,.2f}")
     if drawdown_pct is not None:
-        lines.append(f"Drawdown from peak: {drawdown_pct:.1%}")
+        lines.append(f"Drawdown today: {drawdown_pct:.1%}")
     if halted:
         lines.append("")
         lines.append(f"⛔ RISK HALT ACTIVE — {halt_reason or 'no reason given'}")

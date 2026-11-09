@@ -20,12 +20,23 @@ exist in the config, the checks, or the latch.  Day/week realised
 P/L is still BOOKED (state + status facts), it just never halts
 or refuses anything.
 
+Owner correction 2026-11-09: the drawdown itself is a DAILY
+drawdown — measured from the CURRENT DAY's starting balance,
+never from the all-time peak.  A past day's loss must not halt
+today: a halt latched for a drawdown breach belongs to its day
+and clears automatically when the day rolls.  The all-time peak
+balance is still tracked, but as display information only — it
+feeds no guard decision.  (This supersedes the peak basis the
+2026-10-23 ruling was originally implemented with; the "sole
+account-level hard halt" part of that ruling stands.)
+
 Guard state is PERSISTED as JSON on disk (the ATS library uses MT5
 GlobalVariables for the same reason): a process or terminal restart
 can never reset a halt that was already latched.  Day/week periods
 roll over by calendar date (an injectable clock keeps the rollover
 testable), and a tripped halt LATCHES — it stays tripped, with its
-reason, until a human clears it via :meth:`RiskGuards.reset_halt`.
+reason, until a human clears it via :meth:`RiskGuards.reset_halt`
+— except a drawdown halt, which the day roll clears (above).
 """
 from __future__ import annotations
 
@@ -135,8 +146,12 @@ class RiskConfig:
     # used to live here (daily_loss_pct 0.03 / weekly_loss_pct
     # 0.05, with optional money overrides) are REMOVED — not
     # zeroed, gone: no config field, no room check, no latch.
-    max_drawdown_pct: float = 0.15     # from peak balance -> latched halt
-                                       # (1.5x in-sample max 10.38%)
+    max_drawdown_pct: float = 0.15     # DAILY drawdown: from the day's
+                                       # starting balance -> halt latched
+                                       # for that day only (owner
+                                       # correction 2026-11-09; was the
+                                       # all-time peak basis — 1.5x the
+                                       # in-sample max 10.38%)
     max_consecutive_losses: int = 6    # -> latched halt (3-runs hit 14x
                                        # in 2y; 6+ hit once — tail only)
     max_positions: int = 3
@@ -159,22 +174,24 @@ def _week_key(d: date) -> str:
     return f"{iso.year}-W{iso.week:02d}"
 
 
-def drawdown_snapshot(*, peak_balance: float | None, balance: float,
+def drawdown_snapshot(*, day_start_balance: float | None, balance: float,
                       limit: float) -> dict:
     """Pure drawdown arithmetic for display (the /health vitals).
 
     Mirrors :meth:`RiskGuards._drawdown_reason` EXACTLY — the same
-    peak-balance basis and the same breach rule (``dd >= limit``) —
-    so what /health shows is what the guard enforces.  Returns
-    ``{"drawdown_pct": float | None, "distance_pct": float | None,
-    "breached": bool}``; both percentages are None when no peak has
-    been recorded yet (nothing to measure from — the caller renders
-    that honestly rather than as 0.00).
+    DAILY basis (the current day's starting balance) and the same
+    breach rule (``dd >= limit``) — so what /health shows is what
+    the guard enforces.  Returns ``{"drawdown_pct": float | None,
+    "distance_pct": float | None, "breached": bool}``; both
+    percentages are None when no day start has been recorded yet
+    (nothing to measure from — the caller renders that honestly
+    rather than as 0.00).  The all-time peak never enters this
+    arithmetic; it is display information only.
     """
-    if not peak_balance or not limit:
+    if not day_start_balance or not limit:
         return {"drawdown_pct": None, "distance_pct": None,
                 "breached": False}
-    dd = (peak_balance - balance) / peak_balance
+    dd = (day_start_balance - balance) / day_start_balance
     return {"drawdown_pct": dd, "distance_pct": limit - dd,
             "breached": dd >= limit}
 
@@ -208,6 +225,15 @@ class RiskGuards:
             "peak_balance": None,
             "consecutive_losses": 0,
             "halted": False, "halt_reason": "",
+            # WHY the current halt latched: a subset of ["drawdown",
+            # "consecutive_losses"].  The day roll auto-clears a halt
+            # only when every latched cause is day-bound (drawdown);
+            # a halt carrying "consecutive_losses" keeps the old
+            # latch-until-human-reset semantics.  State files written
+            # before this field existed load with [] — treated as
+            # no non-drawdown cause on record, so a legacy (peak-era)
+            # drawdown halt also clears at its first day roll.
+            "halt_causes": [],
             "trades_today": 0,
         }
 
@@ -235,6 +261,19 @@ class RiskGuards:
         if self._state["day"] != _day_key(today):
             self._state.update(day=_day_key(today), day_start_balance=None,
                                day_realized=0.0, trades_today=0)
+            # A drawdown halt belongs to its day (owner correction
+            # 2026-11-09): the stored halt necessarily latched on a
+            # previous day (the roll runs before any of today's
+            # checks/outcomes), so when every latched cause is the
+            # day-bound drawdown, the new day starts unhalted —
+            # yesterday's loss never halts today.  A halt carrying
+            # "consecutive_losses" is NOT day-bound and keeps
+            # latching until a human resets it.
+            if self._state["halted"] and \
+                    "consecutive_losses" not in \
+                    (self._state.get("halt_causes") or []):
+                self._state.update(halted=False, halt_reason="",
+                                   halt_causes=[])
             changed = True
         if self._state["week"] != _week_key(today):
             self._state.update(week=_week_key(today),
@@ -258,8 +297,11 @@ class RiskGuards:
 
     # ------------------------------------------------------------ checks
     def note_balance(self, balance: float) -> None:
-        """Feed the current balance: anchors day/week starts and the
-        drawdown peak.  Called on every check and outcome."""
+        """Feed the current balance: anchors the day/week starts
+        (the day start is the drawdown basis) and keeps tracking
+        the all-time peak balance — the peak is DISPLAY information
+        only since the owner's 2026-11-09 correction; no guard
+        decision reads it.  Called on every check and outcome."""
         self._roll_periods()
         changed = False
         if self._state["day_start_balance"] is None and balance > 0:
@@ -309,23 +351,28 @@ class RiskGuards:
                        f"({self.cfg.max_total_risk_pct:.0%} of balance)")
         # Owner ruling 2026-10-23: NO daily/weekly loss-room check
         # exists here anymore — max drawdown (latched in
-        # record_outcome) is the sole account-level hard halt.
+        # record_outcome) is the sole account-level hard halt, and
+        # since the owner's 2026-11-09 correction that drawdown is
+        # the DAILY one (from the day's starting balance).
         return GuardDecision(True, "")
 
     # ---------------------------------------------------------- outcomes
     def _drawdown_reason(self, balance: float) -> str:
-        """Max-drawdown breach reason for the current balance, or
-        "".  Shared by record_outcome and record_partial: the halt
+        """Daily-drawdown breach reason for the current balance, or
+        "".  The basis is the CURRENT DAY's starting balance
+        (owner correction 2026-11-09) — never the all-time peak.
+        Shared by record_outcome and record_partial: the halt
         is an account-state fact, and a partial leg's money is
-        real money — a partial loss that breaches drawdown latches
-        the halt even though the position is still open."""
+        real money — a partial loss that breaches the daily
+        drawdown latches the halt even though the position is
+        still open."""
         st = self._state
-        peak = st["peak_balance"]
-        if peak and self.cfg.max_drawdown_pct:
-            dd = (peak - balance) / peak
+        start = st["day_start_balance"]
+        if start and self.cfg.max_drawdown_pct:
+            dd = (start - balance) / start
             if dd >= self.cfg.max_drawdown_pct:
-                return (f"max drawdown hit ({dd:.1%} from peak "
-                        f"{peak:.2f} >= {self.cfg.max_drawdown_pct:.0%})")
+                return (f"daily drawdown hit ({dd:.1%} from day start "
+                        f"{start:.2f} >= {self.cfg.max_drawdown_pct:.0%})")
         return ""
 
     def record_partial(self, pnl_money: float, balance: float) -> None:
@@ -344,12 +391,13 @@ class RiskGuards:
         if reason and not st["halted"]:
             st["halted"] = True
             st["halt_reason"] = reason
+            st["halt_causes"] = ["drawdown"]
         self._save()
 
     def record_outcome(self, pnl_money: float, balance: float) -> None:
         """Book one closed trade's realised P/L.  Trips (and latches)
-        the halt when max drawdown or the consecutive-loss limit is
-        breached."""
+        the halt when the daily drawdown or the consecutive-loss
+        limit is breached."""
         self.note_balance(balance)
         st = self._state
         st["day_realized"] += pnl_money
@@ -360,25 +408,33 @@ class RiskGuards:
         elif pnl_money > 0:
             st["consecutive_losses"] = 0
         reasons = []
+        causes = []
         # Owner ruling 2026-10-23: daily/weekly loss limits no
         # longer latch a halt — day/week realised P/L above is
-        # bookkeeping only.  Max drawdown is the sole account-level
-        # hard halt; the consecutive-loss halt (a streak fact, not
-        # a loss-room allowance) is unchanged.
+        # bookkeeping only.  The (daily, per the 2026-11-09
+        # correction) drawdown is the sole account-level hard halt;
+        # the consecutive-loss halt (a streak fact, not a loss-room
+        # allowance) is unchanged — and unlike the drawdown halt it
+        # is NOT cleared by the day roll, which is why the latched
+        # causes are recorded alongside the reason.
         reason = self._drawdown_reason(balance)
         if reason:
             reasons.append(reason)
+            causes.append("drawdown")
         if self.cfg.max_consecutive_losses and \
                 st["consecutive_losses"] >= self.cfg.max_consecutive_losses:
             reasons.append(f"{st['consecutive_losses']} consecutive losses "
                            f"(limit {self.cfg.max_consecutive_losses})")
+            causes.append("consecutive_losses")
         if reasons and not st["halted"]:
             st["halted"] = True
             st["halt_reason"] = "; ".join(reasons)
+            st["halt_causes"] = causes
         self._save()
 
     def reset_halt(self) -> None:
         """Human action: clear a latched halt (state stays on disk)."""
         self._state["halted"] = False
         self._state["halt_reason"] = ""
+        self._state["halt_causes"] = []
         self._save()

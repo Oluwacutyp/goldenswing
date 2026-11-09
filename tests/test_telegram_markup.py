@@ -260,7 +260,9 @@ def test_sender_part_failure_reports_not_delivered():
 # ------------------------------------------------- drawdown arithmetic
 
 def test_drawdown_snapshot_math():
-    snap = drawdown_snapshot(peak_balance=10_000.0, balance=9_250.0,
+    # Daily basis (owner correction 2026-11-09): the snapshot is
+    # measured from the DAY's starting balance, never the peak.
+    snap = drawdown_snapshot(day_start_balance=10_000.0, balance=9_250.0,
                              limit=0.15)
     assert snap["drawdown_pct"] == 0.075
     assert snap["distance_pct"] == 0.075
@@ -268,19 +270,19 @@ def test_drawdown_snapshot_math():
 
 
 def test_drawdown_snapshot_boundary_breaches_at_limit():
-    at = drawdown_snapshot(peak_balance=10_000.0, balance=8_500.0,
+    at = drawdown_snapshot(day_start_balance=10_000.0, balance=8_500.0,
                            limit=0.15)
     assert at["drawdown_pct"] == 0.15 and at["breached"] is True
-    over = drawdown_snapshot(peak_balance=10_000.0, balance=8_499.0,
+    over = drawdown_snapshot(day_start_balance=10_000.0, balance=8_499.0,
                              limit=0.15)
     assert over["breached"] is True
-    under = drawdown_snapshot(peak_balance=10_000.0, balance=8_501.0,
+    under = drawdown_snapshot(day_start_balance=10_000.0, balance=8_501.0,
                               limit=0.15)
     assert under["breached"] is False
 
 
-def test_drawdown_snapshot_no_peak_is_none_not_zero():
-    snap = drawdown_snapshot(peak_balance=None, balance=9_000.0,
+def test_drawdown_snapshot_no_day_start_is_none_not_zero():
+    snap = drawdown_snapshot(day_start_balance=None, balance=9_000.0,
                              limit=0.15)
     assert snap["drawdown_pct"] is None
     assert snap["distance_pct"] is None
@@ -299,14 +301,14 @@ class _FakeFeed:
         return self._state
 
 
-def _vitals(feed_state=None, *, peak=10_000.0, halted=False,
-            halt_reason="", exc=None):
+def _vitals(feed_state=None, *, peak=10_000.0, day_start=10_000.0,
+            halted=False, halt_reason="", exc=None):
     from goldenswing.execution.mt5_runner import MT5Runner
     fake = SimpleNamespace(
         feed=_FakeFeed(feed_state, exc),
         guards=SimpleNamespace(
-            state={"peak_balance": peak, "halted": halted,
-                   "halt_reason": halt_reason},
+            state={"peak_balance": peak, "day_start_balance": day_start,
+                   "halted": halted, "halt_reason": halt_reason},
             cfg=SimpleNamespace(max_drawdown_pct=0.15)))
     return MT5Runner.account_vitals(fake)
 
@@ -318,8 +320,25 @@ def test_account_vitals_populated():
     assert v["ok"] is True
     assert v["balance"] == 9_250.0 and v["equity"] == 9_310.5
     assert v["floating_pnl"] == 60.5
+    # Today's drawdown comes from the day start (10,000 -> 9,250);
+    # the all-time peak rides along as information only.
     assert v["drawdown_pct"] == 0.075 and v["distance_pct"] == 0.075
     assert v["breached"] is False
+    assert v["day_start_balance"] == 10_000.0
+    assert v["peak_balance"] == 10_000.0
+
+
+def test_account_vitals_peak_does_not_drive_drawdown():
+    # Balance is 21% under the all-time peak but only 2% under
+    # today's start: the daily figures must show 2%, not a breach.
+    v = _vitals({"balance": 9_800.0, "equity": 9_800.0,
+                 "margin": None, "free_margin": 9_800.0,
+                 "currency": "USD"},
+                peak=12_400.0, day_start=10_000.0)
+    assert v["ok"] is True
+    assert v["drawdown_pct"] == 0.02
+    assert v["breached"] is False
+    assert v["peak_balance"] == 12_400.0
 
 
 def test_account_vitals_feed_failure_is_honest():
@@ -355,13 +374,17 @@ def test_health_shows_vitals_above_the_fold():
         "ok": True, "error": "", "balance": 9_250.0,
         "equity": 9_310.5, "floating_pnl": 60.5, "margin": 120.0,
         "free_margin": 9_190.5, "currency": "USD",
-        "peak_balance": 10_000.0, "drawdown_pct": 0.075,
+        "peak_balance": 12_400.0, "day_start_balance": 10_000.0,
+        "drawdown_pct": 0.075,
         "distance_pct": 0.075, "limit_pct": 0.15, "breached": False,
         "halted": False, "halt_reason": ""}))
     assert "💰 Account Vitals" in text
     assert "`9,250.00`" in text and "`9,310.50`" in text
     assert "`+60.50`" in text and "open positions: 1" in text
     assert "`7.5%`" in text and "room to the 15% halt" in text
+    # Day start drives the drawdown; the peak still shows as info.
+    assert "day start: `10,000.00`" in text
+    assert "peak balance: `12,400.00`" in text
     # Above the fold: vitals precede the journal/positions sections.
     assert text.index("💰 Account Vitals") < \
         text.index("📈 Open Positions")
@@ -381,10 +404,13 @@ def test_health_vitals_halt_boundary_shows_halted():
         "ok": True, "error": "", "balance": 8_400.0,
         "equity": 8_400.0, "floating_pnl": 0.0, "margin": None,
         "free_margin": None, "currency": "USD",
-        "peak_balance": 10_000.0, "drawdown_pct": 0.16,
+        "peak_balance": 10_000.0, "day_start_balance": 10_000.0,
+        "drawdown_pct": 0.16,
         "distance_pct": -0.01, "limit_pct": 0.15, "breached": True,
-        "halted": True, "halt_reason": "max drawdown hit"}))
-    assert "⛔ HALTED" in text and "max drawdown hit" in text
+        "halted": True,
+        "halt_reason": "daily drawdown hit (16.0% from day start "
+                       "10000.00 >= 15%)"}))
+    assert "⛔ HALTED" in text and "daily drawdown hit" in text
 
 
 def test_health_without_account_read_shows_unavailable():

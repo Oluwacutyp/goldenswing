@@ -1417,9 +1417,12 @@ def _mt5_health(ctx: CommandContext, args: list[str]) -> CommandResult:
                            tick_age_s=_truth.get("tick_age_s"))]
     # Account vitals (owner directive 2026-11-09): the financial
     # vital signs ABOVE the fold, from the runner's account read —
-    # the same MT5 seam sizing/risk use — plus the guards' peak
-    # balance for drawdown vs the 15% sole halt.  An unavailable
-    # source renders as unavailable WITH the reason, never 0.00.
+    # the same MT5 seam sizing/risk use — plus the guards' day-start
+    # balance for TODAY's drawdown vs the 15% daily halt (owner
+    # correction 2026-11-09: the drawdown is daily, not from the
+    # peak).  The all-time peak balance still shows, as information
+    # only — it feeds no figure here.  An unavailable source renders
+    # as unavailable WITH the reason, never 0.00.
     lines += ["", fmt_section("💰", "Account Vitals")]
     ctrl0 = getattr(ctx, "mt5_control", None)
     vitals_fn = getattr(ctrl0, "account_vitals", None)
@@ -1454,13 +1457,17 @@ def _mt5_health(ctx: CommandContext, args: list[str]) -> CommandResult:
                     lvl_s = f"{level:,.0f}%"
                     margin_line += f" · margin level: {fmt_code(lvl_s)}"
                 lines.append(margin_line)
-            if v.get("drawdown_pct") is None:
-                lines.append("drawdown: no peak balance recorded yet "
-                             "— nothing to measure from")
-            else:
+            if v.get("day_start_balance") is not None:
+                ds_s = f"{v['day_start_balance']:,.2f}"
+                lines.append(f"day start: {fmt_code(ds_s)}")
+            if v.get("peak_balance") is not None:
                 pk_s = f"{v['peak_balance']:,.2f}"
-                dd_s = f"{v['drawdown_pct']:.1%}"
                 lines.append(f"peak balance: {fmt_code(pk_s)}")
+            if v.get("drawdown_pct") is None:
+                lines.append("drawdown: no day-start balance recorded "
+                             "yet — nothing to measure from")
+            else:
+                dd_s = f"{v['drawdown_pct']:.1%}"
                 if v.get("halted"):
                     lines.append(
                         f"drawdown: {fmt_code(dd_s)}"
