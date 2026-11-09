@@ -330,7 +330,7 @@ def test_range_h4_slice_is_causal_to_h1_close():
 
 def test_evidence_map_covers_registry_exactly():
     assert set(PLAYBOOK_EVIDENCE) == set(PLAYBOOK_NAMES)
-    assert len(PLAYBOOK_EVIDENCE) == 20  # +2 Pass 7a vol family
+    assert len(PLAYBOOK_EVIDENCE) == 22  # +2 Pass 7a vol family, +2 Pass 7b trend family
     for name, row in PLAYBOOK_EVIDENCE.items():
         assert row["route"], name
         assert row["authority"], name

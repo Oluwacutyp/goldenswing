@@ -88,6 +88,10 @@ from ..live.atr_regime import (atr_regime as _atr_regime,
 from ..live.dxy import DXYTracker, dxy_bonus as _dxy_bonus
 from ..live.vol_expansion import (
     FORMATION_TFS as FORMATION_TFS_VOL)
+from ..live.trend_momentum import (
+    FORMATION_TFS as FORMATION_TFS_TREND,
+    FORMATION_TF_UP as FORMATION_TF_UP_TREND,
+    TRIGGER_TF_DOWN as TRIGGER_TF_DOWN_TREND)
 from ..live import relationships as _relationships
 from ..live.data_health import check_data_health as _check_data_health
 from ..live import day_context as _day_context
@@ -198,14 +202,18 @@ from .mt5_commands import (mt5_back_keyboard, mt5_confirm_keyboard,
                            mt5_router, parse_mt5_callback)
 from .mt5_config import LiveConfigStore, unknown_disabled_names
 from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
+                                MANAGEMENT_HORIZONS as
+                                _MANAGEMENT_HORIZONS,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
                                 ROSTER_SPECS, ROSTER_SPECS_H1,
-                                VOL_SPECS,
+                                TREND_SPECS, VOL_SPECS,
                                 decay_exempt as _decay_exempt,
                                 management_horizon_for as
                                 _management_horizon_for,
                                 management_policy_for as
                                 _management_policy_for,
+                                management_policy_for_horizon as
+                                _management_policy_for_horizon,
                                 native_tf_of as _native_tf,
                                 policy_params_for as
                                 _policy_params_for,
@@ -349,6 +357,20 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     # be one seam call away from governing.
     "vol_expansion_escape": "shadow_declared",
     "vol_failed_expansion": "shadow_declared",
+    # TREND / MOMENTUM FAMILY (MarketSituation Pass 7b,
+    # SPEC §6.1): the two trend playbooks' scheduled scan
+    # route (playbook_registry.ROUTE_TREND_MOMENTUM) declared
+    # shadow per playbook — route name == playbook name, the
+    # §G precedent (the journal's shadow records are keyed
+    # by playbook and the promotion evaluation
+    # (execution/trend_promotion.py) reads per-playbook
+    # history).  The scans hold no order authority in any
+    # mode; the family is not on the trigger path at all.
+    # Declaring the routes also closes the latent hazard
+    # the §G comment names: an undeclared route name must
+    # never be one seam call away from governing.
+    "trend_impulse_pullback": "shadow_declared",
+    "trend_momentum_acceleration": "shadow_declared",
 }
 
 #: The playbook name a route's judgment records journal under
@@ -364,6 +386,8 @@ JUDGMENT_ROUTE_PLAYBOOK: dict[str, str] = {
     "range_compression_breakout": "range_compression_breakout",
     "vol_expansion_escape": "vol_expansion_escape",
     "vol_failed_expansion": "vol_failed_expansion",
+    "trend_impulse_pullback": "trend_impulse_pullback",
+    "trend_momentum_acceleration": "trend_momentum_acceleration",
 }
 
 #: The §G range playbooks whose scheduled scans journal
@@ -380,6 +404,14 @@ RANGE_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
 #: by test).
 VOL_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in VOL_SPECS)
+
+#: The Pass 7b trend / momentum playbooks whose scheduled
+#: scans journal route-stamped shadow verdicts (derived
+#: from the registry's TREND_SPECS — one truth;
+#: trend_promotion.TREND_JUDGMENT_ROUTES is pinned to this
+#: set by test).
+TREND_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
+    spec.name for spec in TREND_SPECS)
 
 
 @dataclass
@@ -1063,6 +1095,24 @@ def management_block_for(pb_name: str, sig=None) -> dict:
     name = str(pb_name or "")
     spec = _spec_for(name) if name else None
     policy_id, policy_version = _management_policy_for(name)
+    # Pass 7b: a signal whose context declares its own
+    # management HORIZON (the trend / momentum family: the
+    # horizon follows the instance's formation clock —
+    # intraday on H4, swing on D1, SPEC §6.1) resolves its
+    # policy through the registry's horizon rule itself
+    # (management_policy_for_horizon — the same rule, never
+    # a second table).  No pre-7b family's signals carry
+    # the key; their blocks are byte-identical.  qm_m5's
+    # fixed bracket is a name resolution and is never
+    # horizon-overridden (its signals carry no such key,
+    # and the guard below keeps it that way by name).
+    _declared_horizon = (getattr(sig, "live_context", None)
+                         or {}).get("management_horizon")
+    if name != "qm_m5" and _declared_horizon \
+            in _MANAGEMENT_HORIZONS:
+        policy_id, policy_version = \
+            _management_policy_for_horizon(
+                str(_declared_horizon))
     targets = list(getattr(sig, "targets", None) or [])
     inval = getattr(sig, "invalidation", None)
     context_tf = (
@@ -1080,7 +1130,11 @@ def management_block_for(pb_name: str, sig=None) -> dict:
     if isinstance(_declared_tf, str) and _declared_tf:
         context_tf = _declared_tf
     block = {
-        "management_horizon": _management_horizon_for(name),
+        "management_horizon": (
+            str(_declared_horizon)
+            if name != "qm_m5" and _declared_horizon
+            in _MANAGEMENT_HORIZONS
+            else _management_horizon_for(name)),
         "management_policy_id": policy_id,
         "management_policy_version": int(policy_version),
         "management_context_timeframe": context_tf,
@@ -2414,12 +2468,22 @@ class MT5Runner:
                 clocks.update({
                     k: v for k, v in _declared_clocks.items()
                     if k in clocks})
+            # Pass 7b: the signal's declared horizon wins,
+            # as in the lifecycle bridge (a D1-formed trend
+            # instance is a swing scenario even as residue).
+            _declared_horizon = (
+                getattr(sig, "live_context", None)
+                or {}).get("management_horizon")
             records = book.propose_scenario(
                 key, ts=ts, family=name,
                 route=getattr(spec, "route", None),
                 direction=int(sig.direction),
-                horizon=(rspec.management_horizon
-                         if rspec is not None else "intraday"),
+                horizon=(
+                    str(_declared_horizon)
+                    if _declared_horizon in _MANAGEMENT_HORIZONS
+                    else (rspec.management_horizon
+                          if rspec is not None
+                          else "intraday")),
                 clocks=clocks,
                 geometry={
                     "entry": float(sig.entry_ref),
@@ -3974,6 +4038,14 @@ class MT5Runner:
             window={"from_offset": from_offset,
                     "to_offset": new_offset,
                     "records": len(records)})
+        # Pass 7b trend / momentum promotion evaluation:
+        # the same window, the same cadence, the same state
+        # file — no new scheduler (the 7a host arrangement).
+        self._trend_promotion_phase(
+            records, bar_key, damaged_lines=damaged,
+            window={"from_offset": from_offset,
+                    "to_offset": new_offset,
+                    "records": len(records)})
         # Pass 4 measured priors: the same window, the same
         # cadence, the same state file — no new scheduler.
         self._priors_phase(
@@ -4068,6 +4140,45 @@ class MT5Runner:
 
         sub = self._vol_promotion_state()
         record = _vol_promotion.cycle(
+            state=sub, records=records,
+            now=pd.Timestamp(bar_key),
+            damaged_lines=damaged_lines, window=window,
+            run_id=self._run_id, bar=bar_key)
+        if record is not None:
+            self.journal.append(record)
+
+    # ---- Trend / momentum promotion evaluation (Pass 7b) -----
+    # The measurement machinery is execution/
+    # trend_promotion.py; this is only its host (the
+    # vol-promotion arrangement: a standing block inside the
+    # S3 state file, fed the audit's journal windows,
+    # journaled on change).  Findings feed back nowhere.
+    def _trend_promotion_state(self) -> dict:
+        from . import trend_promotion as _trend_promotion
+
+        st = self._audit_state()
+        sub = st.get("trend_promotion")
+        if not isinstance(sub, dict):
+            sub = _trend_promotion.new_state()
+            st["trend_promotion"] = sub
+        else:
+            for key, value in _trend_promotion.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _trend_promotion_phase(self, records, bar_key, *,
+                               damaged_lines: int = 0,
+                               window: dict | None = None) -> None:
+        """One Pass 7b promotion-evaluation cycle over the
+        self-audit's journal window.  Called from inside
+        _self_audit_phase (inside the S3 cycle's guarded
+        body): a failure here is logged by that guard like
+        any audit failure and never reaches a decision
+        path."""
+        from . import trend_promotion as _trend_promotion
+
+        sub = self._trend_promotion_state()
+        record = _trend_promotion.cycle(
             state=sub, records=records,
             now=pd.Timestamp(bar_key),
             damaged_lines=damaged_lines, window=window,
@@ -6544,6 +6655,11 @@ class MT5Runner:
         # pass — every formation clock once, observation only.
         self._run_vol_expansion_family(
             FORMATION_TFS_VOL, stats, source="warmup_scan")
+        # Pass 7b: the trend / momentum family's warmup
+        # pass — every formation clock once (its scans run
+        # on the trigger clocks), observation only.
+        self._run_trend_momentum_family(
+            FORMATION_TFS_TREND, stats, source="warmup_scan")
         pump = TickPump(feed, interval=self.cfg.tick_interval)
         try:
             # on_idle: command polling MUST NOT depend on new ticks.
@@ -7964,6 +8080,21 @@ class MT5Runner:
         except Exception as exc:  # noqa: BLE001 — status must not die
             return f"vol promotion: unavailable ({exc})"
 
+    def trend_promotion_line(self) -> str:
+        """One /status Trend Promotion block (Pass 7b
+        evaluation): per trend / momentum route, the
+        promotion verdict over its own route-stamped shadow
+        history in plain words — the §G block's shape.  A
+        promotion_ready line is a recommendation; promotion
+        itself is the owner's separate decision."""
+        try:
+            from . import trend_promotion as _trend_promotion
+
+            return "\n".join(_trend_promotion.render_lines(
+                self._trend_promotion_state()))
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"trend promotion: unavailable ({exc})"
+
     def judgment_authority_line(self) -> str:
         """One /status Judgment Authority block (Pass 5):
         every route's effective authority state AND its
@@ -8427,6 +8558,17 @@ class MT5Runner:
         if _vol_tfs:
             self._run_vol_expansion_family(
                 _vol_tfs, stats, source="live_close")
+        # Pass 7b: the trend / momentum family evaluates on
+        # each TRIGGER clock's close (H1 closes drive the
+        # H4-formed scans, H4 closes the D1-formed ones) —
+        # its entries are trigger-clock events; shadow
+        # scans: journal + book, never orders.
+        _trend_formations = [
+            tf for tf in FORMATION_TFS_TREND
+            if TRIGGER_TF_DOWN_TREND[tf] in appended]
+        if _trend_formations:
+            self._run_trend_momentum_family(
+                _trend_formations, stats, source="live_close")
         # Phase 3: entry-TF closes — the Close Rule FIRST (a bar
         # closing beyond the invalidation level kills the setup
         # instantly, before any confirmation on the same close),
@@ -20860,6 +21002,20 @@ class MT5Runner:
                 pb.set_situation(self._current_situation())
             if hasattr(pb, "set_formation_tf"):
                 pb.set_formation_tf(intended_tf)
+            # Pass 7b threading (the same idiom, additive):
+            # a playbook whose FORMATION clock sits above
+            # its scan clock (the trend / momentum family —
+            # the scan runs on the trigger clock, entries
+            # fire when the LTF turn closes) gets the
+            # formation clock's frame + name.  No pre-7b
+            # playbook defines the setter.
+            if hasattr(pb, "set_formation"):
+                _form_tf = FORMATION_TF_UP_TREND.get(
+                    intended_tf)
+                pb.set_formation(
+                    self._stack.frames.get(_form_tf)
+                    if (self._stack is not None and _form_tf)
+                    else None, _form_tf)
             sigs = pb.live_signal([], t, frame) or []
             fresh = [s for s in sigs
                      if int(getattr(s, "index", -1)) == t]
@@ -21123,7 +21279,9 @@ class MT5Runner:
             # Non-range and non-shadow scans pass no route, as
             # before.  Pass 7a: the volatility-expansion
             # family's shadow scans stamp identically (their
-            # history is vol_promotion's dataset).
+            # history is vol_promotion's dataset).  Pass 7b:
+            # the trend / momentum family's likewise (their
+            # history is trend_promotion's dataset).
             self._emit_eval(
                 **base, outcome="candidate_emitted",
                 reason_code=_disp_code, reason=_disp_why,
@@ -21132,7 +21290,8 @@ class MT5Runner:
                 judgment_route=(
                     name if shadow
                     and (name in RANGE_JUDGMENT_ROUTE_NAMES
-                         or name in VOL_JUDGMENT_ROUTE_NAMES)
+                         or name in VOL_JUDGMENT_ROUTE_NAMES
+                         or name in TREND_JUDGMENT_ROUTE_NAMES)
                     else None))
             if _handoff:
                 # The judgment cycle inside this record's own
@@ -21397,6 +21556,148 @@ class MT5Runner:
                     self.journal.log_note(
                         f"mt5: vol expansion eval failed for "
                         f"{spec.name} on {tf}: {exc}")
+
+    # --------------------------------------- trend / momentum (Pass 7b)
+
+    def _trend_arm_seen(self, key) -> bool:
+        """In-memory dedupe for the family's arm journal
+        (the Pass 7a design's standing remainder, inherited:
+        a restart can re-journal one arm transition once —
+        the arm record carries the sequence's own
+        timestamps, so the duplicate is identifiable
+        downstream)."""
+        seen = getattr(self, "_trend_arm_journaled", None)
+        if seen is None:
+            seen = set()
+            self._trend_arm_journaled = seen
+        if key in seen:
+            return True
+        seen.add(key)
+        return False
+
+    def _journal_trend_arm(self, formation_tf: str,
+                           trigger_frame) -> None:
+        """Journal the family's DETECTION transitions for
+        this formation clock: a corroborated impulse
+        arming (phase "impulse"), a pullback arming
+        (phase "pullback"), and a sequence's structural
+        death (phase "invalidated" — a formation close
+        beyond the impulse origin; journaled whether or
+        not the wider state still corroborates, because
+        the death is a structure fact Pass 9's grading
+        counts, not a hypothesis).  One record per
+        transition, stamped with the situation id.  The
+        read is the pullback playbook's own pending_state
+        (runner-threaded situation + formation frame,
+        exactly like its detection scans)."""
+        spec = _spec_for("trend_impulse_pullback")
+        if spec is None or trigger_frame is None:
+            return
+        formation_frame = (
+            self._stack.frames.get(formation_tf)
+            if self._stack is not None else None)
+        if formation_frame is None:
+            return
+        try:
+            pb = spec.playbook_class()
+            pb.set_situation(self._current_situation())
+            pb.set_formation(formation_frame, formation_tf)
+            pending = pb.pending_state(trigger_frame)
+        except Exception as exc:  # noqa: BLE001
+            self.journal.log_note(
+                f"mt5: trend arm read failed for "
+                f"{formation_tf}: {exc}")
+            return
+        if not pending:
+            return
+        if pending["phase"] in ("impulse", "pullback") \
+                and not pending.get("corroborated"):
+            # Uncorroborated states are detections, not
+            # arms — the scans' situation-cited no_setup /
+            # abstention records carry those (the 7a rule).
+            return
+        key = ("trend_arm", pending["identity"])
+        if self._trend_arm_seen(key):
+            return
+        self.journal.append({
+            "type": "trend_momentum_arm",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": getattr(self, "_run_id", None),
+            "family": "trend_momentum",
+            "hypothesis": "impulse_pullback",
+            "formation_tf": formation_tf,
+            "trigger_tf": pending.get("trigger_tf"),
+            "phase": pending["phase"],
+            "direction": pending.get("direction"),
+            "impulse": pending.get("impulse"),
+            "pullback": pending.get("pullback"),
+            "break_ts": pending.get("break_ts"),
+            "corroboration": pending.get("corroboration"),
+            "situation_id": (
+                (pending.get("corroboration") or {})
+                .get("situation_id")
+                or self._current_situation_id()),
+        })
+
+    def _run_trend_momentum_family(self, formation_tfs,
+                                   stats=None, *,
+                                   source: str) -> None:
+        """The trend / momentum family on its scheduled
+        route (MarketSituation Pass 7b, SPEC §6.1): for
+        each formation clock (H4 intraday / D1 swing),
+        journal the arm read, then evaluate both playbooks
+        on the TRIGGER clock (one step down) via the
+        funnel-evaluation seam — shadow: the scans journal
+        evaluations (with route-stamped judgment verdicts),
+        register shadow setups on live closes, and propose
+        scenarios to the book; they NEVER order (no order
+        path exists for this partition).  The scans run on
+        the trigger clock because the family's entries ARE
+        trigger-clock events (the pullback's LTF turn, the
+        acceleration's first read of a fresh formation
+        close) — evaluating on the formation close would
+        enter up to a formation bar late.  D1/HTF
+        relationships are recorded as CONTEXT evidence
+        only — D1 never vetoes (§G precedent); the family's
+        own trend-state read (the situation's pair kinds)
+        is its definition, stated on every signal.
+
+        Failure containment mirrors the vol family's: one
+        playbook's failure logs a note and the family
+        scans on."""
+        setup = self._live_setup or {}
+        ctx_evidence = {
+            "family": "trend_momentum",
+            "d1_bias_context": setup.get("bias_d1"),
+            "d1_role": "context only — recorded, never consulted "
+                       "as permission (D1 never vetoes)",
+        }
+        for formation_tf in formation_tfs:
+            if formation_tf not in FORMATION_TFS_TREND:
+                continue
+            trigger_tf = TRIGGER_TF_DOWN_TREND[formation_tf]
+            frame = (self._stack.frames.get(trigger_tf)
+                     if self._stack is not None else None)
+            try:
+                self._journal_trend_arm(formation_tf, frame)
+            except Exception as exc:  # noqa: BLE001
+                self.journal.log_note(
+                    f"mt5: trend arm journal failed for "
+                    f"{formation_tf}: {exc}")
+            for spec in TREND_SPECS:
+                try:
+                    self._sweep_eval_one(
+                        spec, frame,
+                        clock=f"trend_momentum_"
+                              f"{formation_tf.lower()}",
+                        intended_tf=trigger_tf,
+                        actual_tf=trigger_tf,
+                        source=source, shadow=True,
+                        extra_evidence=ctx_evidence)
+                except Exception as exc:
+                    self.journal.log_note(
+                        f"mt5: trend momentum eval failed for "
+                        f"{spec.name} on {formation_tf}: {exc}")
 
     # ------------------------------------------------- alerts + charts
     def _studies_for_chart(self, h1, entry: float, atr: float,

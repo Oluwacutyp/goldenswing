@@ -58,7 +58,7 @@ from .judgment_thesis import (
     DEFAULT_RECOVER_BAND,
     DEFAULT_WEAKEN_DROP,
 )
-from .playbook_registry import spec_for
+from .playbook_registry import MANAGEMENT_HORIZONS, spec_for
 from .setup_lifecycle import (
     STAGE_ARMED,
     STAGE_DETECTED,
@@ -527,14 +527,27 @@ class ScenarioBook:
             return []
         spec = spec_for(setup.playbook)
         self._seq += 1
+        # Pass 7b: a setup whose SIGNAL declares its own
+        # horizon (the trend / momentum family: the horizon
+        # follows the instance's formation clock — swing on
+        # D1, intraday on H4) — the instance's declaration
+        # wins over the registry default, the same rule the
+        # scenario_clocks read below applies.  No other
+        # family's setups carry the key; their horizons are
+        # untouched.
+        _declared_horizon = (setup.live_context or {}).get(
+            "management_horizon")
         scenario = {
             "scenario_id": setup.setup_id,
             "family": setup.playbook,
             "route": setup.route,
             "authority": authority,
             "direction": int(setup.direction),
-            "horizon": (spec.management_horizon
-                        if spec is not None else "intraday"),
+            "horizon": (
+                str(_declared_horizon)
+                if _declared_horizon in MANAGEMENT_HORIZONS
+                else (spec.management_horizon
+                      if spec is not None else "intraday")),
             "clocks": self._clocks_for_setup(setup),
             "state": "proposed",
             "close_reason": None,

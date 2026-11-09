@@ -38,7 +38,10 @@ from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
                          RangeMeanReversionPlaybook, RangeQMPlaybook,
                          RangeSweepReclaimPlaybook,
                          RetracementTrapPlaybook,
-                         SweepReversalPlaybook, TrendlineRetestPlaybook,
+                         SweepReversalPlaybook,
+                         TrendImpulsePullbackPlaybook,
+                         TrendMomentumAccelerationPlaybook,
+                         TrendlineRetestPlaybook,
                          TurtleSoupPlaybook, VReversalPlaybook,
                          VolExpansionEscapePlaybook,
                          VolFailedExpansionPlaybook)
@@ -73,6 +76,21 @@ ROUTE_RANGE_H4_H1 = "range_h4_h1"
 #: evaluation (execution/vol_promotion.py) plus the owner's
 #: separate decision — the SPEC §6 common contract.
 ROUTE_VOLATILITY_EXPANSION = "volatility_expansion"
+#: Route (MarketSituation Pass 7b, SPEC §6.1): the trend /
+#: momentum family's SCHEDULED evaluation contract — scans
+#: on each TRIGGER clock's close (H1 for H4-formed trends,
+#: H4 for D1-formed), reading the MarketSituation's per-TF
+#: states and relationship kinds.  The route is SHADOW (it
+#: journals evaluations, arm records and analytical
+#: candidates, proposes scenarios to the book, and holds
+#: NO order authority in any mode).  Like the vol family,
+#: these playbooks are NOT members of the trigger-path
+#: roster: they have no legacy order authority to preserve,
+#: so they stay out of ROSTER_SPECS entirely.  Promotion
+#: is the family's own evaluation
+#: (execution/trend_promotion.py) plus the owner's separate
+#: decision — the SPEC §6 common contract.
+ROUTE_TREND_MOMENTUM = "trend_momentum"
 
 
 @dataclass(frozen=True)
@@ -228,6 +246,30 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
                  "H1", ROUTE_VOLATILITY_EXPANSION,
                  shadow_evaluation=True, entry_thesis="market",
                  chart_studies=("bollinger",)),
+    # Trend / momentum family (MarketSituation Pass 7b,
+    # SPEC §6.1): the trend STATE defined on its formation
+    # clocks (H4 intraday / D1 swing — the scan threads the
+    # clock per evaluation; native_tf is the family's
+    # intraday home clock), entered on the trigger clock
+    # one step down.  Scheduled shadow route only; entry
+    # thesis is market (the premise is the trigger turn /
+    # the acceleration break itself — a resting limit
+    # contradicts it).  The registry horizon is the §6.1
+    # default (intraday); a D1-formed instance declares
+    # "swing" on its own signal (the additive declared-
+    # horizon read in management_block_for / the book), so
+    # its management resolves to the swing policy.
+    # chart_studies is empty by declaration: the family
+    # reads structure and velocity, never an indicator
+    # overlay — phase by structure, never an EMA read.
+    PlaybookSpec("trend_impulse_pullback",
+                 TrendImpulsePullbackPlaybook,
+                 "H4", ROUTE_TREND_MOMENTUM,
+                 shadow_evaluation=True, entry_thesis="market"),
+    PlaybookSpec("trend_momentum_acceleration",
+                 TrendMomentumAccelerationPlaybook,
+                 "H4", ROUTE_TREND_MOMENTUM,
+                 shadow_evaluation=True, entry_thesis="market"),
     # Native-clock routes: evaluated by dedicated runner paths on
     # their own frames (M5 closes / D1 closes).  They are NOT in
     # the H1 roster — feeding them H1 bars was the qm_m5 defect.
@@ -258,10 +300,11 @@ RANGE_SPECS: tuple[PlaybookSpec, ...] = tuple(
 #: contract above is additional, shadow, and separate).  This is
 #: the set ``_get_playbooks`` builds, in registry order.  (Named
 #: ROSTER_SPECS for continuity with the Phase 1 invariant —
-#: extended at Pass 7a: ROSTER_SPECS ∪ NATIVE_SPECS ∪
-#: VOL_SPECS == the full registry, VOL_SPECS being the one
-#: partition that is scheduled-shadow only and therefore
-#: deliberately NOT in this trigger-path set.)
+#: extended at Pass 7a and again at Pass 7b: ROSTER_SPECS ∪
+#: NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS == the full registry,
+#: the VOL/TREND partitions being the ones that are scheduled-
+#: shadow only and therefore deliberately NOT in this
+#: trigger-path set.)
 ROSTER_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route in (ROUTE_H1_ROSTER, ROUTE_RANGE_H4_H1))
@@ -278,6 +321,14 @@ NATIVE_SPECS: tuple[PlaybookSpec, ...] = tuple(
 VOL_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route == ROUTE_VOLATILITY_EXPANSION)
+
+#: The trend / momentum family specs (Pass 7b): the second
+#: scheduled-shadow partition.  The registry partition is
+#: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ==
+#: the full registry.
+TREND_SPECS: tuple[PlaybookSpec, ...] = tuple(
+    s for s in PLAYBOOK_REGISTRY
+    if s.route == ROUTE_TREND_MOMENTUM)
 
 #: SCORE-FLOOR AUTHORITY, per route (Phase 2, P0-2).  Two scores
 #: exist and were conflated in Phase 1 records: the SLEEVE BASE
@@ -301,6 +352,11 @@ FLOOR_AUTHORITY: dict[str, str] = {
         "playbook, the ROUTE_H1_ROSTER floor authority applies",
     ROUTE_VOLATILITY_EXPANSION:
         "shadow evaluation route (Pass 7a): no floor, no order "
+        "authority in any mode — the family is not on the "
+        "trigger path; its candidates are journaled, judged "
+        "in shadow and proposed to the scenario book only",
+    ROUTE_TREND_MOMENTUM:
+        "shadow evaluation route (Pass 7b): no floor, no order "
         "authority in any mode — the family is not on the "
         "trigger path; its candidates are journaled, judged "
         "in shadow and proposed to the scenario book only",
@@ -434,6 +490,25 @@ def policy_params_for(policy_id: str) -> dict:
     return dict(params) if params is not None else {}
 
 
+def management_policy_for_horizon(horizon: str) -> tuple[str, int]:
+    """The Pass 6 horizon resolution itself (policy_id,
+    version) for a DECLARED horizon — the rule
+    management_policy_for applies to a playbook's registry
+    horizon, factored out so an instance that declares its
+    own horizon (Pass 7b: a D1-formed trend scenario
+    declares "swing" on its signal) resolves through the
+    SAME rule, never a second table.  qm_m5's fixed bracket
+    is a NAME resolution, not a horizon one — it does not
+    live here and no horizon input can reach it."""
+    if horizon == "scalp":
+        return ("standard_scalp_v1",
+                MANAGEMENT_POLICIES["standard_scalp_v1"])
+    if horizon == "swing":
+        return ("standard_swing_v1",
+                MANAGEMENT_POLICIES["standard_swing_v1"])
+    return "standard_v1", MANAGEMENT_POLICIES["standard_v1"]
+
+
 def management_policy_for(name: str) -> tuple[str, int]:
     """Resolve a playbook's management policy (policy_id,
     version).  Step 18 resolved only qm_m5's fixed bracket;
@@ -446,14 +521,8 @@ def management_policy_for(name: str) -> tuple[str, int]:
     how an intraday position is managed)."""
     if str(name) == "qm_m5":
         return "fixed_bracket_v1", MANAGEMENT_POLICIES["fixed_bracket_v1"]
-    horizon = management_horizon_for(name)
-    if horizon == "scalp":
-        return ("standard_scalp_v1",
-                MANAGEMENT_POLICIES["standard_scalp_v1"])
-    if horizon == "swing":
-        return ("standard_swing_v1",
-                MANAGEMENT_POLICIES["standard_swing_v1"])
-    return "standard_v1", MANAGEMENT_POLICIES["standard_v1"]
+    return management_policy_for_horizon(
+        management_horizon_for(name))
 
 
 def management_horizon_for(name: str) -> str:

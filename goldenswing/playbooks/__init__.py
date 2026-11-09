@@ -34,6 +34,11 @@ from .sweep_reversal import SweepReversalPlaybook
 from .trendline_retest import TrendlineRetestPlaybook
 from .turtle_soup import TurtleSoupPlaybook
 from .v_reversal import VReversalPlaybook
+from .trend_momentum import (
+    TREND_PLAYBOOKS,
+    TrendImpulsePullbackPlaybook,
+    TrendMomentumAccelerationPlaybook,
+)
 from .vol_expansion import (
     VOL_PLAYBOOKS,
     VolExpansionEscapePlaybook,
@@ -62,6 +67,9 @@ __all__ = [
     "VOL_PLAYBOOKS",
     "VolExpansionEscapePlaybook",
     "VolFailedExpansionPlaybook",
+    "TREND_PLAYBOOKS",
+    "TrendImpulsePullbackPlaybook",
+    "TrendMomentumAccelerationPlaybook",
     "VReversalPlaybook",
     "RetracementTrapPlaybook",
     "InversionPlaybook",

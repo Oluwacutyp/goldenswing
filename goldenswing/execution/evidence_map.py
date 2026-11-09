@@ -287,6 +287,74 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                  "detector and cannot double-fire with the "
                  "escape on the same sequence.",
     },
+    "trend_impulse_pullback": {
+        "route": "trend_momentum (Pass 7b scheduled)",
+        "detector": "two clocks, causally sliced: the "
+                    "formation TF's (H4 / D1) closed bars + "
+                    "the trigger TF's (H1 / H4) closed bars "
+                    "+ the MarketSituation snapshot.  The "
+                    "trend STATE is read from the situation "
+                    "(formation TF's canonical bias + bedrock "
+                    "structure phase + the formation->trigger "
+                    "relationship kind); the sequence is "
+                    "measured on the formation bars "
+                    "(confirmed-swing impulse break with "
+                    "momentum sustained at the extreme; "
+                    "pullback retracing 0.15-0.85 of the leg "
+                    "with no formation close beyond the "
+                    "impulse origin; counter-momentum never "
+                    "sustained; formation momentum never "
+                    "absorbed at the turn); the entry is the "
+                    "pullback's minor-structure turn on the "
+                    "trigger clock",
+        "authority": "NONE — Pass 7b shadow: scheduled scans "
+                     "journal evaluations + arm records and "
+                     "propose book scenarios; never orders. "
+                     "Promotion is the family's own "
+                     "evaluation (execution/trend_promotion.py) "
+                     "plus the owner's separate decision",
+        "notes": "Distinct from trendline_retest / fvg_*: "
+                 "those are level-return patterns (price "
+                 "returns to a drawn level / gap).  This "
+                 "family reads no level — its trigger is "
+                 "the momentum state transition (the "
+                 "pullback's structure turn) and its "
+                 "invalidation is the trend's structural "
+                 "death point (a formation close beyond the "
+                 "defended swing / the impulse origin), not "
+                 "a level's far edge.  Phase is read from "
+                 "structure (confirmed swings), never an "
+                 "EMA.",
+    },
+    "trend_momentum_acceleration": {
+        "route": "trend_momentum (Pass 7b scheduled)",
+        "detector": "the formation TF's closed bars + the "
+                    "MarketSituation snapshot: the trend "
+                    "state must already exist (formation TF "
+                    "trend-phased, canonical bias in the "
+                    "trade's direction, formation->trigger "
+                    "pair ALIGNED — live participation), "
+                    "formation momentum sustained, velocity "
+                    "(ATR-normalised close velocity) rising "
+                    "and >= the 80th percentile of its own "
+                    "trailing-100 distribution, and a fresh "
+                    "acceptance — a close beyond the last "
+                    "confirmed formation swing within the "
+                    "last two formation bars, every close "
+                    "since holding beyond it",
+        "authority": "NONE — Pass 7b shadow, as "
+                     "trend_impulse_pullback",
+        "notes": "Continuation, not breakout: a break of a "
+                 "swing in a non-trend state, or without "
+                 "the velocity percentile, is not this "
+                 "family's signal (it is the vol family's "
+                 "ground when it escapes a coil, or "
+                 "nobody's).  The hypothesis shares the "
+                 "family's trend-state read with "
+                 "trend_impulse_pullback by construction "
+                 "— one state, two entries (pullback / "
+                 "continuation).",
+    },
     "qm_m5": {
         "route": "native M5",
         "detector": "M5 closed bars only (feeding it H1 bars "

@@ -562,6 +562,17 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("🌀", "Vol Promotion"))
             lines.append(vol_promotion())
             lines.append("")
+    # Pass 7b trend / momentum promotion evaluation: the
+    # same arrangement for the trend routes — from the
+    # runner's trend_promotion_line.  Guarded — old runners
+    # lack it.
+    if ctrl is not None:
+        trend_promotion = getattr(ctrl, "trend_promotion_line",
+                                  None)
+        if callable(trend_promotion):
+            lines.append(fmt_section("📈", "Trend Promotion"))
+            lines.append(trend_promotion())
+            lines.append("")
     # Judgment authority (Pass 5): every route's effective
     # state + its source (declared / config / verdict /
     # demoted) and the two binding routes' standing verdicts
