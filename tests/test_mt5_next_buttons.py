@@ -8,7 +8,11 @@ Text formatting is untouched by construction: the conversion only
 deletes the trailing Next line and attaches a keyboard; bodies,
 section headers, code spans, emoji, and progress bars survive
 byte-identical, and the send/edit path is the same one the nav
-buttons already used.
+buttons already used.  (Markup standard, 2026-11-09: a result too
+long for one Telegram message — the full /status above all — can
+no longer be edited in place; it is delivered as fresh split
+messages with the same keyboard, and the pins below assert that
+shape for refresh.)
 
 Scope boundary, pinned: the legacy OANDA/paper command set in
 ``alerts.commands`` keeps its text CTAs (dead paper path — the
@@ -59,7 +63,8 @@ from goldenswing.execution.mt5_commands import (
     mt5_nav_with_next,
 )
 from test_mt5_nav_buttons import _Journal, _record
-from test_mt5_telegram_control import OWNER, _callback, _runner, FakeApi
+from test_mt5_telegram_control import (
+    OWNER, FakeSender, _callback, _runner, FakeApi)
 from test_telegram_formatting import _journal, _mt5_ctx, _mt5_text
 
 
@@ -452,12 +457,18 @@ def test_cmd_routing_rerenders_in_place(tmp_path, monkeypatch):
 def test_refresh_and_config_keep_merged_keyboards(tmp_path, monkeypatch):
     monkeypatch.setenv("GS_TELEGRAM_CHAT_ID", OWNER)
     runner = _runner(tmp_path)
+    sender = FakeSender()
+    runner.senders = [sender]
     api = FakeApi([])
     runner._tg_api = api
     runner._handle_callback_query(_callback("mt5:refresh"), {})
-    edits = _edits(api)
-    assert edits
-    markup = json.dumps(json.loads(edits[0]["reply_markup"]))
+    # Markup standard (2026-11-09): the full status is too long to
+    # edit into the tapped message, so refresh delivers it as fresh
+    # split messages — its merged next-action keyboard rides the
+    # send, intact.
+    assert not _edits(api)
+    assert sender.texts and "MT5 ENGINE STATUS" in sender.texts[0]
+    markup = json.dumps(sender.markups[-1])
     assert "mt5:cmd:/trades" in markup
     assert "mt5:cmd:/playbooks" in markup
     assert "mt5:cmd:/health" in markup

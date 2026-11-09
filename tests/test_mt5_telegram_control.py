@@ -623,14 +623,21 @@ def test_cancel_pending_button_cancels_only_on_confirm(tmp_path):
     assert runner._pending_orders == {}
 
 
-def test_refresh_button_edits_message_with_fresh_status(tmp_path):
+def test_refresh_button_delivers_fresh_status(tmp_path):
+    # Markup standard (2026-11-09): the full status renders to
+    # several Telegram messages — too long to edit into the tapped
+    # message — so refresh delivers it as fresh (split, lossless)
+    # messages through the send path instead of a doomed
+    # over-limit edit that Telegram would reject wholesale.
     runner = _runner(tmp_path)
     runner.senders = [FakeSender()]
     api = FakeApi([_callback("mt5:refresh")])
     _poll_with(runner, api)
-    edits = [p for m, p in api.calls if m == "editMessageText"]
-    assert edits and "MT5 ENGINE STATUS" in edits[0]["text"]
-    assert "reply_markup" in edits[0]
+    sender = runner.senders[0]
+    assert sender.texts and "MT5 ENGINE STATUS" in sender.texts[0]
+    assert len(sender.texts[0]) > 4096     # the FULL status, uncut
+    assert sender.markups[-1]              # keyboard rides the reply
+    assert not [p for m, p in api.calls if m == "editMessageText"]
     assert any(m == "answerCallbackQuery" for m, _ in api.calls)
 
 
@@ -644,7 +651,9 @@ def test_poller_routes_callback_query_updates(tmp_path, monkeypatch):
     runner._tg_offset = 0
     runner._last_poll = 0.0
     runner._poll_telegram_commands()
-    assert any(m == "editMessageText" for m, _ in api.calls)
+    # The refresh result is delivered (via the split-send path —
+    # it is too long to edit in place; see the markup standard).
+    assert runner.senders[0].texts
     assert any(m == "answerCallbackQuery" for m, _ in api.calls)
 
 

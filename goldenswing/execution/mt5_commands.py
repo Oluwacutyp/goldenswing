@@ -1415,6 +1415,63 @@ def _mt5_health(ctx: CommandContext, args: list[str]) -> CommandResult:
                            market_open=_truth.get("market_open"),
                            tick_state=_truth.get("tick_state"),
                            tick_age_s=_truth.get("tick_age_s"))]
+    # Account vitals (owner directive 2026-11-09): the financial
+    # vital signs ABOVE the fold, from the runner's account read —
+    # the same MT5 seam sizing/risk use — plus the guards' peak
+    # balance for drawdown vs the 15% sole halt.  An unavailable
+    # source renders as unavailable WITH the reason, never 0.00.
+    lines += ["", fmt_section("💰", "Account Vitals")]
+    ctrl0 = getattr(ctx, "mt5_control", None)
+    vitals_fn = getattr(ctrl0, "account_vitals", None)
+    if not callable(vitals_fn):
+        lines.append("⚠️ account vitals unavailable — this runner "
+                     "has no account read (old build)")
+    else:
+        try:
+            v = vitals_fn()
+        except Exception as exc:  # noqa: BLE001 — render, never crash
+            v = {"ok": False, "error": f"account read failed: {exc}"}
+        if not v.get("ok"):
+            lines.append("⚠️ account vitals unavailable — "
+                         f"{v.get('error') or 'account read failed'}")
+        else:
+            cur = v.get("currency") or ""
+            lines.append(f"balance: {fmt_code(f'{v['balance']:,.2f}')}"
+                         f"{' ' + cur if cur else ''}")
+            lines.append(f"equity: {fmt_code(f'{v['equity']:,.2f}')}"
+                         f"{' ' + cur if cur else ''}")
+            lines.append(
+                f"floating P&L: {fmt_code(f'{v['floating_pnl']:+,.2f}')}"
+                f" · open positions: {len(ctx.live_positions)}")
+            if v.get("free_margin") is not None:
+                margin_line = (f"free margin: "
+                               f"{fmt_code(f'{float(v['free_margin']):,.2f}')}")
+                if v.get("margin"):
+                    level = v["equity"] / float(v["margin"]) * 100.0
+                    margin_line += (f" · margin level: "
+                                    f"{fmt_code(f'{level:,.0f}%')}")
+                lines.append(margin_line)
+            if v.get("drawdown_pct") is None:
+                lines.append("drawdown: no peak balance recorded yet "
+                             "— nothing to measure from")
+            else:
+                lines.append(
+                    f"peak balance: "
+                    f"{fmt_code(f'{v['peak_balance']:,.2f}')}")
+                if v.get("halted"):
+                    lines.append(
+                        f"drawdown: {fmt_code(f'{v['drawdown_pct']:.1%}')}"
+                        f" — ⛔ HALTED"
+                        f"{': ' + v['halt_reason'] if v.get('halt_reason') else ''}")
+                elif v.get("breached"):
+                    lines.append(
+                        f"drawdown: {fmt_code(f'{v['drawdown_pct']:.1%}')}"
+                        f" — ⛔ at/over the {v['limit_pct']:.0%} halt")
+                else:
+                    lines.append(
+                        f"drawdown: {fmt_code(f'{v['drawdown_pct']:.1%}')}"
+                        f" — {fmt_code(f'{v['distance_pct']:.1%}')} of "
+                        f"room to the {v['limit_pct']:.0%} halt")
     if ctx.journal is not None:
         records, bad, error = read_journal_records(ctx)
         lines += ["", fmt_section("📓", "Journal")]

@@ -265,26 +265,43 @@ class TelegramSender:
     # ------------------------------------------------------------- API
     def send_text(self, text: str, *, silent: bool = False,
                   reply_markup: dict | None = None) -> SendResult:
-        """A plain text message (position updates, summaries, errors).
+        """A text message (position updates, summaries, errors).
 
         ``silent`` maps to Telegram's ``disable_notification`` — the
         phone doesn't buzz for routine chatter, only for things that
         need a human.
+
+        Long text is NEVER truncated: it renders through the house
+        markup standard (:mod:`goldenswing.alerts.markup` — HTML
+        parse_mode, bold section headers, expandable detail quotes)
+        and splits losslessly at section boundaries into as many
+        messages as it needs.  The reply markup rides the LAST part,
+        under the complete message.  ``delivered`` only when every
+        part was accepted.
         """
+        from .markup import render_messages
         if self.mode == "outbox":
             return SendResult(
                 "telegram", False, "outbox",
                 "no GS_TELEGRAM_BOT_TOKEN/GS_TELEGRAM_CHAT_ID — "
                 "text not queued (outbox is for chart alerts)")
-        if len(text) > _MESSAGE_LIMIT:
-            text = text[:_MESSAGE_LIMIT - 1] + "…"
-        payload: dict = {"chat_id": self.chat_id, "text": text,
-                         "disable_notification": silent}
-        if reply_markup is not None:
-            payload["reply_markup"] = json.dumps(reply_markup)
-        ok, detail = self._post_with_retry(
-            _API_MESSAGE.format(token=self.bot_token), payload)
-        return SendResult("telegram", ok, "live", detail)
+        parts = render_messages(text)
+        for idx, part in enumerate(parts):
+            payload: dict = {"chat_id": self.chat_id, "text": part,
+                             "parse_mode": "HTML",
+                             "disable_notification": silent}
+            if reply_markup is not None and idx == len(parts) - 1:
+                payload["reply_markup"] = json.dumps(reply_markup)
+            ok, detail = self._post_with_retry(
+                _API_MESSAGE.format(token=self.bot_token), payload)
+            if not ok:
+                return SendResult(
+                    "telegram", False, "live",
+                    f"part {idx + 1}/{len(parts)} failed: {detail}")
+        if len(parts) > 1:
+            return SendResult("telegram", True, "live",
+                              f"sent ({len(parts)} parts)")
+        return SendResult("telegram", True, "live", detail)
 
     def send_document(self, path: str | Path, *,
                       caption: str | None = None,
@@ -311,11 +328,13 @@ class TelegramSender:
                 "telegram", False, "live",
                 f"{p.name} is {size_mb:.1f}MB — over Telegram's "
                 f"{_DOCUMENT_LIMIT_MB}MB bot document limit")
+        from .markup import caption_parts
+        cap_html, cap_overflow = caption_parts(caption or "")
         data: dict = {"chat_id": self.chat_id,
                       "disable_notification": True}
-        if caption:
-            data["caption"] = caption[:_CAPTION_LIMIT - 1] + "…" \
-                if len(caption) > _CAPTION_LIMIT else caption
+        if cap_html:
+            data["caption"] = cap_html
+            data["parse_mode"] = "HTML"
         if reply_markup is not None:
             data["reply_markup"] = json.dumps(reply_markup)
         with p.open("rb") as fh:
@@ -324,6 +343,20 @@ class TelegramSender:
             _API_DOCUMENT.format(token=self.bot_token), data,
             files={"document": (p.name, content,
                                 "application/octet-stream")})
+        if ok and cap_overflow:
+            # The caption did not fit the caption limit: the file
+            # went bare and the FULL text follows as messages —
+            # captions are never sliced.
+            text_res = self.send_text(cap_overflow)
+            if not text_res.delivered:
+                return SendResult(
+                    "telegram", False, "live",
+                    f"sendDocument {p.name}: {detail}; caption text "
+                    f"follow-up failed: {text_res.detail}")
+            return SendResult(
+                "telegram", True, "live",
+                f"sendDocument {p.name}: {detail}; caption delivered "
+                f"as follow-up text")
         return SendResult("telegram", ok, "live",
                           f"sendDocument {p.name}: {detail}")
 
@@ -340,17 +373,26 @@ class TelegramSender:
                 "telegram", False, "outbox",
                 "no GS_TELEGRAM_BOT_TOKEN/GS_TELEGRAM_CHAT_ID — "
                 "photo not queued (outbox is for chart alerts)")
-        cap = caption or ""
-        if len(cap) > _CAPTION_LIMIT:
-            cap = cap[:_CAPTION_LIMIT - 1] + "…"
+        from .markup import caption_parts
+        cap_html, cap_overflow = caption_parts(caption or "")
+        data: dict = {"chat_id": self.chat_id, "caption": cap_html}
+        if cap_html:
+            data["parse_mode"] = "HTML"
         ok, detail = self._post_with_retry(
             _API_PHOTO.format(token=self.bot_token),
-            data={"chat_id": self.chat_id, "caption": cap},
+            data=data,
             files={"photo": (filename, png, "image/png")})
         if ok:
+            if cap_overflow:
+                text_res = self.send_text(cap_overflow)
+                return SendResult(
+                    "telegram", text_res.delivered, "live",
+                    f"sendPhoto {detail}; caption delivered as "
+                    f"follow-up text "
+                    f"({'sent' if text_res.delivered else 'failed'})")
             return SendResult("telegram", True, "live",
                               f"sendPhoto {detail}")
-        text_res = self.send_text(cap)
+        text_res = self.send_text(caption or "")
         return SendResult(
             "telegram", text_res.delivered, "live",
             f"photo failed ({detail}); text fallback "
@@ -364,20 +406,29 @@ class TelegramSender:
                 "telegram", False, "outbox",
                 "no GS_TELEGRAM_BOT_TOKEN/GS_TELEGRAM_CHAT_ID — wrote "
                 + ", ".join(p.name for p in paths))
-        caption = alert.text
-        if len(caption) > _CAPTION_LIMIT:
-            caption = caption[:_CAPTION_LIMIT - 1] + "…"
+        from .markup import caption_parts
+        cap_html, cap_overflow = caption_parts(alert.text)
+        data: dict = {"chat_id": self.chat_id, "caption": cap_html,
+                      "reply_markup": json.dumps(inline_keyboard(alert))}
+        if cap_html:
+            data["parse_mode"] = "HTML"
         ok, detail = self._post_with_retry(
             _API_PHOTO.format(token=self.bot_token),
-            data={"chat_id": self.chat_id, "caption": caption,
-                  "reply_markup": json.dumps(inline_keyboard(alert))},
+            data=data,
             files={"photo": (f"{alert.alert_id}.png", alert.chart_png,
                              "image/png")})
         if ok:
+            if cap_overflow:
+                text_res = self.send_text(cap_overflow)
+                return SendResult(
+                    "telegram", text_res.delivered, "live",
+                    f"sendPhoto {detail}; caption delivered as "
+                    f"follow-up text "
+                    f"({'sent' if text_res.delivered else 'failed'})")
             return SendResult("telegram", True, "live",
                               f"sendPhoto {detail}")
         # Photo refused — the thesis still matters more than the chart.
-        text_res = self.send_text(caption)
+        text_res = self.send_text(alert.text)
         return SendResult(
             "telegram", text_res.delivered, "live",
             f"photo failed ({detail}); text fallback "

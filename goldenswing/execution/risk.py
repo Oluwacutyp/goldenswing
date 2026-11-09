@@ -159,6 +159,26 @@ def _week_key(d: date) -> str:
     return f"{iso.year}-W{iso.week:02d}"
 
 
+def drawdown_snapshot(*, peak_balance: float | None, balance: float,
+                      limit: float) -> dict:
+    """Pure drawdown arithmetic for display (the /health vitals).
+
+    Mirrors :meth:`RiskGuards._drawdown_reason` EXACTLY — the same
+    peak-balance basis and the same breach rule (``dd >= limit``) —
+    so what /health shows is what the guard enforces.  Returns
+    ``{"drawdown_pct": float | None, "distance_pct": float | None,
+    "breached": bool}``; both percentages are None when no peak has
+    been recorded yet (nothing to measure from — the caller renders
+    that honestly rather than as 0.00).
+    """
+    if not peak_balance or not limit:
+        return {"drawdown_pct": None, "distance_pct": None,
+                "breached": False}
+    dd = (peak_balance - balance) / peak_balance
+    return {"drawdown_pct": dd, "distance_pct": limit - dd,
+            "breached": dd >= limit}
+
+
 class RiskGuards:
     """Persisted, latching risk guards.  One instance owns one state
     file; constructing a second instance on the same file sees the

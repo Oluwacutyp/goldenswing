@@ -23543,6 +23543,94 @@ class MT5Runner:
             deliver=self._reply_command,
         )
 
+    def account_vitals(self) -> dict:
+        """The account's financial vital signs for /health.
+
+        Sources are repo truth only: the feed's ``account_state()``
+        (the same MT5 read the sizing/risk path uses) for balance /
+        equity / margin, and the risk guards' persisted state for
+        the peak balance the 15% drawdown halt is measured from —
+        the arithmetic itself is
+        :func:`goldenswing.execution.risk.drawdown_snapshot`, the
+        guard's own formula.  Any source that cannot be read comes
+        back as an ``error`` string: the caller renders it honestly
+        as unavailable, never as 0.00.
+        """
+        from .risk import drawdown_snapshot
+        out: dict = {"ok": False, "error": "account read unavailable"}
+        try:
+            state = self.feed.account_state()
+        except Exception as exc:
+            out["error"] = f"account read failed: {exc}"
+            return out
+        if not isinstance(state, dict) or state.get("balance") is None \
+                or state.get("equity") is None:
+            out["error"] = "account read returned no balance/equity"
+            return out
+        balance = float(state["balance"])
+        equity = float(state["equity"])
+        guards_state = {}
+        limit = 0.15
+        try:
+            guards_state = self.guards.state or {}
+            limit = float(self.guards.cfg.max_drawdown_pct)
+        except Exception:
+            guards_state = {}
+        peak = guards_state.get("peak_balance")
+        snap = drawdown_snapshot(
+            peak_balance=(float(peak) if peak else None),
+            balance=balance, limit=limit)
+        out.update({
+            "ok": True, "error": "",
+            "balance": balance, "equity": equity,
+            "floating_pnl": equity - balance,
+            "margin": state.get("margin"),
+            "free_margin": state.get("free_margin"),
+            "currency": state.get("currency") or "",
+            "peak_balance": (float(peak) if peak else None),
+            "drawdown_pct": snap["drawdown_pct"],
+            "distance_pct": snap["distance_pct"],
+            "limit_pct": limit,
+            "breached": snap["breached"],
+            "halted": bool(guards_state.get("halted")),
+            "halt_reason": guards_state.get("halt_reason") or "",
+        })
+        return out
+
+    def _edit_command_result(self, chat_id, message_id, result,
+                             fallback_markup=None) -> None:
+        """Edit a message with a command result, markup-aware.
+
+        A result that renders to ONE HTML part edits in place with
+        its keyboard (``fallback_markup`` when the result carries
+        none — the call sites' long-standing default), exactly as
+        before.  A result too long for one message cannot be edited
+        (Telegram edits are single-message too), so it falls back
+        to fresh split messages via :meth:`_reply_command` with the
+        same effective keyboard — the owner gets the whole report
+        instead of a silently failed edit.
+        """
+        from dataclasses import replace as _dc_replace
+
+        from ..alerts.markup import render_messages
+        markup = getattr(result, "reply_markup", None) or fallback_markup
+        parts = render_messages(result.text or "")
+        if len(parts) != 1:
+            if markup is not getattr(result, "reply_markup", None):
+                try:
+                    result = _dc_replace(result, reply_markup=markup)
+                except Exception:
+                    pass
+            self._reply_command(result)
+            return
+        payload: dict = {
+            "chat_id": chat_id, "message_id": message_id,
+            "text": parts[0], "parse_mode": "HTML",
+        }
+        if markup:
+            payload["reply_markup"] = json.dumps(markup)
+        self._tg_api("editMessageText", payload)
+
     def _reply_command(self, result) -> None:
         """Send one command result back (document or text).
 
@@ -23835,22 +23923,18 @@ class MT5Runner:
                 from .mt5_commands import _mt5_status
                 result = _mt5_status(self._command_context(), [])
                 if message_id is not None:
-                    self._tg_api("editMessageText", {
-                        "chat_id": chat_id, "message_id": message_id,
-                        "text": result.text or "",
-                        "reply_markup": _json.dumps(
-                            result.reply_markup or mt5_control_keyboard())})
+                    self._edit_command_result(
+                        chat_id, message_id, result,
+                        fallback_markup=mt5_control_keyboard())
                 _answer("refreshed")
                 return
             if action == "config":
                 from .mt5_commands import _mt5_config
                 result = _mt5_config(self._command_context(), [])
                 if message_id is not None:
-                    self._tg_api("editMessageText", {
-                        "chat_id": chat_id, "message_id": message_id,
-                        "text": result.text or "",
-                        "reply_markup": _json.dumps(
-                            result.reply_markup or mt5_control_keyboard())})
+                    self._edit_command_result(
+                        chat_id, message_id, result,
+                        fallback_markup=mt5_control_keyboard())
                 _answer("config")
                 return
             if action in ("assess_all", "health", "forecast_train"):
@@ -23871,11 +23955,9 @@ class MT5Runner:
                 if result.document is not None:
                     self._reply_command(result)
                 elif message_id is not None:
-                    self._tg_api("editMessageText", {
-                        "chat_id": chat_id, "message_id": message_id,
-                        "text": result.text or "",
-                        "reply_markup": _json.dumps(
-                            result.reply_markup or mt5_nav_keyboard())})
+                    self._edit_command_result(
+                        chat_id, message_id, result,
+                        fallback_markup=mt5_nav_keyboard())
                 _answer(action.replace("_", " "))
                 return
             if action == "cmd":
@@ -23903,11 +23985,9 @@ class MT5Runner:
                 if result.document is not None:
                     self._reply_command(result)
                 elif message_id is not None:
-                    self._tg_api("editMessageText", {
-                        "chat_id": chat_id, "message_id": message_id,
-                        "text": result.text or "",
-                        "reply_markup": _json.dumps(
-                            result.reply_markup or mt5_back_keyboard())})
+                    self._edit_command_result(
+                        chat_id, message_id, result,
+                        fallback_markup=mt5_back_keyboard())
                 _answer(parts[0].replace("_", " "))
                 return
             _answer("unknown button")
