@@ -53,6 +53,124 @@ def score_text(decision_score: float | None, *,
     return f"Score {v:.0f}"
 
 
+# ------------------------------------------------------------ chart clocks
+# SPEC §8.1: every chart role renders on the clock the SCENARIO
+# declares, never on a timeframe a renderer chose privately.
+# Role A renders on the management clock (the position's truth),
+# role B on the context clock (formation clock for scenario-born
+# setups), role C on the entry clock.  The resolver below is the
+# ONE place that decision is made; renderers take a ChartClocks
+# and draw what it says.  Route names are the registry's route
+# strings (execution.playbook_registry) — charts sits below
+# execution, so the runner passes them in as plain strings.
+_FAMILY_ROUTES = frozenset({
+    "volatility_expansion", "trend_momentum", "auction_value",
+    "mean_reversion", "session_range",
+})
+
+
+@dataclass(frozen=True)
+class ChartClocks:
+    """The resolved clocks one chart render must use (SPEC §8.1).
+
+    ``source`` records where the answer came from so a chart's
+    provenance is auditable: ``scenario_clocks`` (the scenario
+    declared them), ``route_default`` (the §8.1 table row for the
+    route), ``registry_native`` (the playbook registry's declared
+    native TF), ``standing_default`` (the runner's standing
+    fallback — stamped, never silent) or ``legacy_entry_clock``
+    (a direct renderer call that passed no clocks: the pre-Pass-10
+    frame choice, preserved for non-runner callers)."""
+
+    management_tf: str          # role A
+    context_tf: str             # role B
+    entry_tf: str               # role C
+    formation_tf: str = ""      # formation clock (role B's source)
+    source: str = "route_default"
+    context_hold: bool = False  # qm_d1: W1 unavailable → D1 hold
+
+    def as_dict(self) -> dict:
+        return {
+            "management_tf": self.management_tf,
+            "context_tf": self.context_tf,
+            "entry_tf": self.entry_tf,
+            "formation_tf": self.formation_tf,
+            "source": self.source,
+            "context_hold": bool(self.context_hold),
+        }
+
+
+def chart_clocks_for(*, playbook: str = "", route: str = "",
+                     horizon: str = "", entry_clock: str = "",
+                     clocks: dict | None = None,
+                     native_tf: str | None = None,
+                     available=None) -> ChartClocks:
+    """Resolve the SPEC §8.1 clocks for one chart.
+
+    Resolution order: the scenario's declared clocks win per role;
+    unfilled roles fall to the §8.1 route row; a family/native
+    playbook without declared clocks falls to the registry's
+    native TF; anything unknown falls to the standing default
+    (H1 management / H4 context / the recorded entry clock) with
+    the fallback stamped in ``source`` — never a silent guess."""
+    pb = (playbook or "").strip()
+    rt = (route or "").strip()
+    ec = (entry_clock or "").strip()
+    declared: dict = {}
+    if isinstance(clocks, dict):
+        declared = {k: str(v) for k, v in clocks.items() if v}
+
+    hold = False
+    if pb == "hot_scalp" or rt == "hot_scalp":
+        row = {"management_tf": "M15", "context_tf": "H1",
+               "entry_tf": "M1", "formation_tf": "H1"}
+        row_source = "route_default"
+    elif pb == "qm_m5":
+        row = {"management_tf": "M5", "context_tf": "H1",
+               "entry_tf": "M5", "formation_tf": "H4"}
+        row_source = "route_default"
+    elif pb == "qm_d1":
+        w1 = "W1" if (available is None or "W1" in available) \
+            else "D1"
+        hold = w1 == "D1"
+        row = {"management_tf": "D1", "context_tf": w1,
+               "entry_tf": "D1", "formation_tf": "D1"}
+        row_source = "route_default"
+    elif rt == "range_h4_h1":
+        row = {"management_tf": "H1", "context_tf": "D1",
+               "entry_tf": "H1", "formation_tf": "H4"}
+        row_source = "route_default"
+    elif rt == "h1_roster":
+        row = {"management_tf": "H1", "context_tf": "H4",
+               "entry_tf": ec or "M15", "formation_tf": "H4"}
+        row_source = "route_default"
+    elif rt == "native" or rt in _FAMILY_ROUTES:
+        base = native_tf or ec or "H1"
+        row = {"management_tf": base, "context_tf": base,
+               "entry_tf": ec or base, "formation_tf": base}
+        row_source = "registry_native"
+    else:
+        row = {"management_tf": "H1", "context_tf": "H4",
+               "entry_tf": ec or "M15", "formation_tf": "H4"}
+        row_source = "standing_default"
+
+    mgmt = declared.get("management_tf") or row["management_tf"]
+    formation = declared.get("formation_tf") or row["formation_tf"]
+    entry = declared.get("entry_tf") or row["entry_tf"] or ec \
+        or "M15"
+    # Role B is the formation clock whenever the scenario declared
+    # one; the route row's context otherwise (H4 zones for the
+    # roster, D1 for range, W1/D1-hold for qm_d1).
+    context = formation if declared.get("formation_tf") \
+        else row["context_tf"]
+    source = "scenario_clocks" if (
+        declared.get("management_tf") or declared.get("entry_tf")
+        or declared.get("formation_tf")) else row_source
+    return ChartClocks(
+        management_tf=mgmt, context_tf=context, entry_tf=entry,
+        formation_tf=formation, source=source, context_hold=hold)
+
+
 def effective_r(*, entry: float, broker_stop: float | None,
                 targets) -> float | None:
     """Reward/risk to the first target on the BROKER stop.
@@ -148,6 +266,113 @@ ROLE_TITLES = {
 MAX_ROLE_OVERLAYS = 4
 
 
+# ------------------------------------------------------------ study specs
+# SPEC §8.4: the studies a chart draws are DECLARED (per playbook /
+# family, via the registry's ``chart_studies``) and resolved
+# through this registry — study name → pane + the clock role it
+# draws on.  A study draws on ITS OWN clock, resolved through
+# ChartClocks: a volume profile belongs to the formation clock,
+# entry markers to the entry clock.  An undeclared study name
+# fails loudly here, at resolution time — never silently skipped
+# by a renderer.
+
+
+@dataclass(frozen=True)
+class StudySpec:
+    """One declared chart study (SPEC §8.4).
+
+    ``clock_tf`` is the resolved stamp (filled by
+    :func:`resolve_study_specs`); a bare declaration leaves it
+    empty and renderers fall back to the panel's own frame."""
+
+    kind: str        # "ema_pair" | "qm" | "bollinger" | "vwap" |
+                     # "volume_profile" | "atr_band" | "ao" | …
+    pane: str        # "price" | "sub"
+    params: dict = field(default_factory=dict)
+    label: str = ""
+    clock_tf: str = ""
+
+
+@dataclass(frozen=True)
+class StudyKind:
+    """The registry row for one study kind."""
+
+    kind: str
+    pane: str        # the pane the kind renders on
+    clock_role: str  # "entry" | "formation" | "context" |
+                     # "management" — resolved via ChartClocks
+    label: str       # display label
+
+
+STUDY_KINDS: dict = {
+    "ema_pair": StudyKind("ema_pair", "price", "entry",
+                          "EMA pair"),
+    "qm": StudyKind("qm", "price", "entry", "QM geometry"),
+    "bollinger": StudyKind("bollinger", "price", "formation",
+                           "Bollinger bands"),
+    "volume_profile": StudyKind("volume_profile", "price",
+                                "formation", "Volume profile"),
+    "atr_band": StudyKind("atr_band", "price", "entry",
+                          "ATR band"),
+    "vwap": StudyKind("vwap", "price", "entry", "VWAP"),
+    "ao": StudyKind("ao", "sub", "entry", "Awesome Oscillator"),
+}
+
+#: The study kinds the pre-Pass-10 ``overlays`` field could name;
+#: the EntryStudy sync derives overlays from studies (and back)
+#: through these so legacy constructions stay exact.
+_LEGACY_OVERLAY_KINDS = ("ema_pair", "qm")
+
+
+def study_kind(name: str) -> StudyKind:
+    """The registry row for a study name — ValueError when the
+    name was never declared (fail loudly, never skip silently)."""
+    row = STUDY_KINDS.get((name or "").strip())
+    if row is None:
+        raise ValueError(
+            f"undeclared chart study {name!r}: not in the "
+            f"StudySpec registry ({sorted(STUDY_KINDS)})")
+    return row
+
+
+def study_spec(name: str, *, params: dict | None = None,
+               label: str | None = None) -> StudySpec:
+    """A StudySpec for a declared study name (registry-stamped
+    pane + default label)."""
+    row = study_kind(name)
+    return StudySpec(kind=row.kind, pane=row.pane,
+                     params=dict(params or {}),
+                     label=label or row.label)
+
+
+def study_clock_tf(spec: StudySpec, clocks: ChartClocks) -> str:
+    """The timeframe a study draws on, from its registry clock
+    role resolved through the chart's clocks."""
+    role = study_kind(spec.kind).clock_role
+    if role == "formation":
+        return clocks.formation_tf or clocks.context_tf
+    if role == "context":
+        return clocks.context_tf
+    if role == "management":
+        return clocks.management_tf
+    return clocks.entry_tf
+
+
+def resolve_study_specs(declared, clocks: ChartClocks) -> tuple:
+    """Resolve declared study names/specs against the registry,
+    stamping each with the clock it draws on.  Accepts strings
+    (registry declarations) and StudySpec objects (per-signal
+    overrides from recorded evidence).  Undeclared names raise."""
+    from dataclasses import replace as _replace
+    out = []
+    for item in declared or ():
+        spec = item if isinstance(item, StudySpec) \
+            else study_spec(str(item))
+        out.append(_replace(
+            spec, clock_tf=study_clock_tf(spec, clocks)))
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class StopEvent:
     """One broker-confirmed stop modification, as journaled."""
@@ -238,6 +463,8 @@ class ContextStudy:
     trigger: str = ""
     bias_d1: int = 0
     bias_h4: int = 0
+    studies: tuple = ()        # StudySpec — declared studies drawn
+                               # on the context panel (SPEC §8.4)
 
     def overlay_families(self) -> tuple:
         fams = []
@@ -271,10 +498,32 @@ class EntryStudy:
     overlays: tuple = ()      # ("ema_pair",) and/or ("qm",)
     qm_pattern: dict | None = None
     reason_lines: tuple = ()  # recorded entry reason / reaction text
+    studies: tuple = ()       # StudySpec — the PRIMARY study
+                              # declaration (SPEC §8.4); overlays
+                              # are derived from it for back-compat
+
+    def __post_init__(self):
+        # Keep the two views of the study set in sync: a caller
+        # declaring studies gets the legacy overlay names derived;
+        # a legacy caller naming overlays gets registry-resolved
+        # specs.  Both given → both trusted as declared.
+        studies = tuple(self.studies or ())
+        overlays = tuple(self.overlays or ())
+        if studies and not overlays:
+            object.__setattr__(self, "overlays", tuple(
+                s.kind for s in studies
+                if s.kind in _LEGACY_OVERLAY_KINDS))
+        elif overlays and not studies:
+            object.__setattr__(self, "studies", tuple(
+                study_spec(k) for k in overlays))
 
     def overlay_families(self) -> tuple:
         fams = ["entry_zone"] if self.entry_zone else []
-        return tuple(fams) + tuple(self.overlays)
+        for kind in list(self.overlays) + [
+                s.kind for s in self.studies]:
+            if kind not in fams:
+                fams.append(kind)
+        return tuple(fams)
 
 
 def lifecycle_from_events(*, direction: int, entry_ref: float,

@@ -32,7 +32,7 @@ from .signal_model import (  # Step 7: one shared signal-view model
     score_text,
 )
 
-TF_ORDER = ("D1", "H4", "H1", "M30", "M15", "M5")
+TF_ORDER = ("M1", "D1", "H4", "H1", "M30", "M15", "M5")
 _BARS_CAP = 500
 
 

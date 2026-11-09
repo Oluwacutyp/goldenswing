@@ -1027,7 +1027,9 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                        fib_levels: list[tuple[float, float]] | None = None,
                        fib_range: tuple[float, float] | None = None,
                        ote_band: tuple[float, float] | None = None,
-                       qm_pattern: dict | None = None) -> list[bytes]:
+                       qm_pattern: dict | None = None,
+                       clocks=None,
+                       frames: dict | None = None) -> list[bytes]:
     """Render the MT5 multi-timeframe signal chart to PNG bytes.
 
     THREE PNGs, one per panel (H4 structure / H1 trigger /
@@ -1068,33 +1070,79 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
             f"unknown MT5 chart style {style!r}; expected one of "
             f"{_MT5_STYLES}")
     theme = _THEMES[style]
-    if h1 is None or len(h1) == 0:
+    if clocks is None and (h1 is None or len(h1) == 0):
         raise ValueError("render_mt5_signal needs a non-empty H1 frame")
     targets = list(targets or [])
     risk = (abs(entry - broker_stop) if broker_stop is not None
             else abs(entry - stop))
     shown_score = score_text(decision_score, fallback=score)
     clock = entry_clock or (verdict or {}).get("entry_clock") or "M15"
+    if clocks is not None:
+        clock = clocks.entry_tf
     bias_d1 = (verdict or {}).get("bias_d1", 0)
     bias_h4 = (verdict or {}).get("bias_h4", 0)
     trigger = (verdict or {}).get("trigger") or "?"
     arrow = "▲ LONG" if direction == 1 else "▼ SHORT" if direction == -1 \
         else "FLAT"
 
-    h1_role = panel_role("H1", playbook=playbook, entry_clock=clock)
-    h1_title = f"H1 — {h1_role}"
-    if trigger != "?":
-        h1_title += f": {trigger}"
-    panels = [
-        # (frame, window, title, zone band?, marker label, is H1 panel?)
-        (h4, h4_window,
-         f"H4 — structure · D1 bias {bias_d1:+d} · H4 bias {bias_h4:+d}",
-         True, None, False),
-        (h1, window, h1_title, False,
-         f"TRIGGER {trigger}" if trigger != "?" else None, True),
-        (entry_frame, entry_window, f"{clock} — entry", False, "ENTRY",
-         False),
-    ]
+    if clocks is not None:
+        # SPEC §8.1: the panels are the resolved role clocks —
+        # management / context / entry — drawn from the frame
+        # map.  The zone band rides the context panel; the fib
+        # study rides whichever panel IS H1 (the frame it was
+        # computed on), and is skipped when no panel is H1 —
+        # never drawn on a wrong frame.
+        global _LAST_CHART_PROVENANCE
+        all_frames = dict(frames or {})
+        if all_frames.get("H1") is None and h1 is not None:
+            all_frames["H1"] = h1
+        role_frames = [all_frames.get(clocks.management_tf),
+                       all_frames.get(clocks.context_tf),
+                       all_frames.get(clocks.entry_tf)]
+        if not any(f is not None and len(f) for f in role_frames):
+            raise ValueError(
+                "render_mt5_signal needs at least one non-empty "
+                "role frame")
+        _LAST_CHART_PROVENANCE = _chart_provenance(
+            clocks, None, None, style=f"signal-{style}")
+        panels = [
+            [role_frames[0], window,
+             f"{clocks.management_tf} — trade", False, None,
+             clocks.management_tf == "H1"],
+            [role_frames[1], h4_window,
+             f"{clocks.context_tf} — context · D1 bias {bias_d1:+d}"
+             f" · H4 bias {bias_h4:+d}", True, None,
+             clocks.context_tf == "H1"],
+            [role_frames[2], entry_window,
+             f"{clocks.entry_tf} — entry", False, "ENTRY",
+             clocks.entry_tf == "H1"],
+        ]
+        if trigger != "?":
+            for _p, _tf in zip(panels, (clocks.management_tf,
+                                        clocks.context_tf,
+                                        clocks.entry_tf)):
+                if _tf == "H1":
+                    _p[4] = f"TRIGGER {trigger}"
+                    break
+        panel_tfs = [clocks.management_tf, clocks.context_tf,
+                     clocks.entry_tf]
+    else:
+        h1_role = panel_role("H1", playbook=playbook,
+                             entry_clock=clock)
+        h1_title = f"H1 — {h1_role}"
+        if trigger != "?":
+            h1_title += f": {trigger}"
+        panels = [
+            # (frame, window, title, zone band?, marker, is H1?)
+            (h4, h4_window,
+             f"H4 — structure · D1 bias {bias_d1:+d} · "
+             f"H4 bias {bias_h4:+d}", True, None, False),
+            (h1, window, h1_title, False,
+             f"TRIGGER {trigger}" if trigger != "?" else None, True),
+            (entry_frame, entry_window, f"{clock} — entry", False,
+             "ENTRY", False),
+        ]
+        panel_tfs = ["H4", "H1", clock]
     verdict_box_done = False
     panel_pngs: list[bytes] = []
     for _pi, (frame, win, title, show_zone, marker, is_h1) \
@@ -1154,7 +1202,8 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                 ax.axhline(zbot, color="#b8860b", linewidth=0.9,
                            linestyle=(0, (4, 3)), zorder=2)
                 ax.text(x_lo + 0.4, ztop,
-                        f" H4 ZONE {zone.get('kind', '')} "
+                        f" {panel_tfs[_pi]} ZONE "
+                        f"{zone.get('kind', '')} "
                         f"{_fmt(zbot)}–{_fmt(ztop)}",
                         va="bottom", fontsize=8.5, color="#8a6d00",
                         fontweight="bold")
@@ -1346,6 +1395,138 @@ def _role_scaffold(title: str, header: str):
     return fig, ax, axv, theme
 
 
+def _role_scaffold_sub(title: str, header: str):
+    """Scaffold with ONE sub-pane under the price axis (SPEC
+    §8.4): used when a declared study lives on the sub pane."""
+    theme = _THEMES["classic"]
+    fig = plt.figure(figsize=_ROLE_FIGSIZE, dpi=_DPI)
+    fig.patch.set_facecolor(theme["bg"])
+    gs = fig.add_gridspec(3, 1, height_ratios=[3.6, 0.85, 0.75],
+                          hspace=0.05, left=0.045, right=0.965,
+                          top=0.80, bottom=0.09)
+    ax = fig.add_subplot(gs[0])
+    axsub = fig.add_subplot(gs[1], sharex=ax)
+    axv = fig.add_subplot(gs[2], sharex=ax)
+    for a in (ax, axsub, axv):
+        a.set_facecolor(theme["bg"])
+        a.tick_params(colors=theme["text"], labelsize=9)
+        for spine in a.spines.values():
+            spine.set_color(theme["grid"])
+        a.grid(True, color=theme["grid"], linewidth=0.5, alpha=0.7)
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
+    axsub.yaxis.tick_right()
+    axv.yaxis.tick_right()
+    axv.yaxis.set_label_position("right")
+    plt.setp(ax.get_xticklabels(), visible=False)
+    plt.setp(axsub.get_xticklabels(), visible=False)
+    fig.text(0.045, 0.955, header, fontsize=13.5, fontweight="bold",
+             color=theme["text"], ha="left", va="top")
+    fig.text(0.045, 0.905, title, fontsize=11.5,
+             color=theme["text"], ha="left", va="top")
+    return fig, ax, axsub, axv, theme
+
+
+def _draw_studies_mpl(ax, *, panel_frame, view, studies,
+                      study_frames, specs, legend, theme) -> list:
+    """Declared price-pane studies on their OWN clocks (§8.4).
+
+    Series studies are computed on the study's clock frame and
+    as-of aligned onto the panel view; level studies draw their
+    own frame's levels.  A study whose frame is missing is named
+    in the legend as unavailable — never drawn from the wrong
+    frame, never silently dropped.  Returns the sub-pane specs
+    for the caller to draw on the sub axis."""
+    from .studies import asof_align, study_levels, study_series
+    sub_specs: list = []
+    xs = np.arange(len(view), dtype=float)
+    colors = {"bollinger": "#2962ff", "atr_band": "#00838f",
+              "vwap": "#8e24aa"}
+    for spec in studies or ():
+        if spec.kind in ("ema_pair", "qm"):
+            continue  # dedicated paths in the role renderers
+        src_tf = spec.clock_tf or ""
+        src = None
+        if study_frames is not None and src_tf:
+            src = study_frames.get(src_tf)
+        if src is None and not src_tf:
+            src = panel_frame
+        if src is None or len(src) == 0:
+            legend.append(f"{spec.label} · {src_tf} — frame "
+                          f"unavailable, study not drawn")
+            continue
+        if spec.pane == "sub":
+            sub_specs.append((spec, src))
+            continue
+        if spec.kind == "volume_profile":
+            levels = study_levels(src, "volume_profile")
+            if not levels:
+                legend.append(f"{spec.label} · {src_tf} — no "
+                              f"value area yet")
+                continue
+            for name, price in levels.items():
+                ax.axhline(price, color="#7e57c2",
+                           linewidth=1.6 if name == "POC" else 1.0,
+                           linestyle="-" if name == "POC"
+                           else (0, (4, 3)), alpha=0.85, zorder=3)
+                specs.append((price, f"{name} {_fmt(price)}",
+                              "#7e57c2"))
+            if "POC" in levels:
+                legend.append(f"{spec.label} · {src_tf} · POC "
+                              f"{_fmt(levels['POC'])}")
+            else:
+                legend.append(f"{spec.label} · {src_tf}")
+            continue
+        comps = study_series(src, spec.kind, spec.params)
+        if not comps:
+            legend.append(f"{spec.label} · {src_tf} — not "
+                          f"computable on this frame")
+            continue
+        color = colors.get(spec.kind, "#5a6472")
+        last_seen = None
+        for comp_values in comps.values():
+            aligned = asof_align(src.index, comp_values,
+                                 view.index)
+            ax.plot(xs, aligned, color=color, linewidth=1.0,
+                    alpha=0.85, zorder=3)
+            finite = aligned[np.isfinite(aligned)]
+            if len(finite):
+                last_seen = float(finite[-1])
+        if last_seen is not None:
+            legend.append(f"{spec.label} · {src_tf} · "
+                          f"{_fmt(last_seen)}")
+    return sub_specs
+
+
+def _draw_sub_studies_mpl(axsub, *, view, sub_specs, theme) -> None:
+    """Sub-pane studies (AO): bars colored by direction of
+    travel, zero line through — the same read the HTML pane
+    renders (§8.4 parity)."""
+    from .studies import asof_align, study_series
+    xs = np.arange(len(view), dtype=float)
+    for spec, src in sub_specs:
+        comps = study_series(src, spec.kind, spec.params)
+        if not comps:
+            continue
+        values = asof_align(src.index, comps[spec.kind],
+                            view.index)
+        colors = []
+        prev = None
+        for v in values:
+            if not np.isfinite(v):
+                colors.append("#9aa3b2")
+            else:
+                colors.append(theme["up"] if prev is None
+                              or v >= prev else theme["down"])
+                prev = v
+        axsub.bar(xs, np.nan_to_num(values), width=0.64,
+                  color=colors, alpha=0.8)
+        axsub.axhline(0.0, color=theme["text"], linewidth=0.7,
+                      alpha=0.6)
+        axsub.set_ylabel(spec.kind.upper(), fontsize=8.5,
+                         color=theme["text"])
+
+
 def _role_volume(axv, view, xs, theme) -> bool:
     """Volume pane from the frame's own volume column.
 
@@ -1408,14 +1589,15 @@ def _role_unavailable(title: str, header: str, tf: str) -> bytes:
 
 def build_context_study(h1, *, entry: float, verdict,
                         nearby_zones) -> object | None:
-    """ContextStudy for role B, from the H1 frame's own state.
+    """ContextStudy for role B, from the CONTEXT frame's own state.
 
-    Featurizes the frame the alert already holds (the same
-    pipeline the runner's other studies use) and converts the
-    last state through signal_model — relevance caps and all.
-    None when the featurizer cannot read the frame: the role
-    then renders candles + trade references only, and says the
-    structure read is unavailable in its header."""
+    Featurizes the frame it is handed — since Pass 10 that is the
+    resolved context clock's frame (§8.2: the roster's context is
+    the H4 state, not an H1 slice) — and converts the last state
+    through signal_model, relevance caps and all.  None when the
+    featurizer cannot read the frame: the role then renders
+    candles + trade references only, and says the structure read
+    is unavailable in its header."""
     try:
         from ..features.engine import read_and_featurize
         states = read_and_featurize(h1, None)
@@ -1435,15 +1617,26 @@ def build_context_study(h1, *, entry: float, verdict,
 
 
 def build_entry_study(*, sig, verdict, qm_pattern=None,
-                      playbook: str = ""):
+                      playbook: str = "", declared_studies=(),
+                      clocks=None):
     """EntryStudy for role C, from the signal's recorded evidence.
 
     Overlays are declared from evidence, never from habit: the
     QM geometry when the caller passes this signal's confirmed
     pattern; the EMA pair when the recorded factors name it.
     Formation / touch timestamps pass through only when the
-    verdict actually carries them."""
-    from .signal_model import EntryStudy
+    verdict actually carries them.
+
+    Pass 10 (§8.4): the playbook/family's DECLARED studies (the
+    registry's ``chart_studies``) compose with the evidence
+    overlays into the EntryStudy's StudySpec set, each stamped
+    with the clock it draws on via the resolved ChartClocks.
+    An undeclared declared-name raises — a study that cannot
+    resolve is a loud chart failure, never a silent skip.  With
+    nothing declared this stays the default resolver, exactly
+    as before."""
+    from .signal_model import (EntryStudy, resolve_study_specs,
+                               study_spec)
     v = verdict or {}
     zone = v.get("zone") or {}
     zlo, zhi = (float(x) for x in (getattr(sig, "entry_zone", None)
@@ -1455,6 +1648,23 @@ def build_entry_study(*, sig, verdict, qm_pattern=None,
     evidence = " ".join(factors + [str(v.get("trigger") or "")])
     if "EMA" in evidence and "ema_pair" not in overlays:
         overlays.append("ema_pair")
+    studies: list = []
+    if declared_studies:
+        if clocks is not None:
+            studies.extend(resolve_study_specs(
+                declared_studies, clocks))
+        else:
+            studies.extend(study_spec(str(n))
+                           for n in declared_studies)
+    seen = {s.kind for s in studies}
+    for kind in overlays:
+        if kind in seen:
+            continue
+        seen.add(kind)
+        spec = study_spec(kind)
+        if clocks is not None:
+            spec = resolve_study_specs([spec], clocks)[0]
+        studies.append(spec)
     reasons: list[str] = []
     if v.get("trigger"):
         reasons.append(f"trigger: {v['trigger']}")
@@ -1476,7 +1686,8 @@ def build_entry_study(*, sig, verdict, qm_pattern=None,
         trigger_label=str(v.get("trigger") or ""),
         overlays=tuple(overlays),
         qm_pattern=qm_pattern,
-        reason_lines=tuple(reasons))
+        reason_lines=tuple(reasons),
+        studies=tuple(studies))
 
 
 def _hdr(instrument: str, playbook: str, score_line: str) -> str:
@@ -1484,10 +1695,13 @@ def _hdr(instrument: str, playbook: str, score_line: str) -> str:
 
 
 def _render_role_trade(frame, lc, *, instrument: str, tf_label: str,
-                       playbook: str, score_line: str) -> bytes:
+                       playbook: str, score_line: str,
+                       fresh: str = "") -> bytes:
     """Role A — the position's truth on its management timeframe."""
     header = _hdr(instrument, playbook, score_line)
     title = f"A · Trade — fill overview · {tf_label}"
+    if fresh:
+        title += f" · {fresh}"
     fig, ax, axv, theme = _role_scaffold(title, header)
     anchor = _ts_to_pos(frame.index, lc.fill_ts)
     if anchor is None:
@@ -1642,16 +1856,28 @@ def _render_role_trade(frame, lc, *, instrument: str, tf_label: str,
 
 def _render_role_context(h1, ctx, lc, *, instrument: str,
                          playbook: str, score_line: str,
-                         window: int = 120) -> bytes:
-    """Role B — H1 context: the structure behind the trade."""
+                         window: int = 120, tf_label: str = "H1",
+                         study_frames=None,
+                         fresh: str = "") -> bytes:
+    """Role B — context: the structure behind the trade, on the
+    resolved context clock (SPEC §8.1/§8.2)."""
     header = _hdr(instrument, playbook, score_line)
-    title = "B · H1 — context"
+    title = f"B · {tf_label} — context"
     if ctx is not None:
         title += (f" · D1 {ctx.bias_d1:+d} / H4 {ctx.bias_h4:+d}"
                   + (f" / {ctx.trigger}" if ctx.trigger else ""))
     else:
         title += " · structure read unavailable"
-    fig, ax, axv, theme = _role_scaffold(title, header)
+    if fresh:
+        title += f" · {fresh}"
+    studies = tuple(getattr(ctx, "studies", ()) or ()) \
+        if ctx is not None else ()
+    if any(s.pane == "sub" for s in studies):
+        fig, ax, axsub, axv, theme = _role_scaffold_sub(
+            title, header)
+    else:
+        fig, ax, axv, theme = _role_scaffold(title, header)
+        axsub = None
     view = h1.iloc[-window:]
     offset = len(h1) - len(view)
     xs = np.arange(len(view), dtype=float)
@@ -1674,7 +1900,8 @@ def _render_role_context(h1, ctx, lc, *, instrument: str,
                 edgecolor=col, linewidth=0.7, zorder=1))
             specs.append(label_spec(
                 0.5 * (z.top + z.bottom),
-                f" {z.kind} · H1 · {z.age_bars}b ", col, size=8.0))
+                f" {z.kind} · {tf_label} · {z.age_bars}b ", col,
+                size=8.0))
         for price, side, strength in ctx.pools:
             col = "#e08a00" if side == "above" else "#00838f"
             ax.axhline(price, color=col, linewidth=1.0,
@@ -1758,6 +1985,24 @@ def _render_role_context(h1, ctx, lc, *, instrument: str,
         specs.append(label_spec(t, f" T{rank} {_fmt(t)} (ref)",
                                 "#2e7d32", size=8.5))
 
+    if studies:
+        legend: list[str] = []
+        sub_specs = _draw_studies_mpl(
+            ax, panel_frame=h1, view=view, studies=studies,
+            study_frames=study_frames, specs=specs, legend=legend,
+            theme=theme)
+        if axsub is not None and sub_specs:
+            _draw_sub_studies_mpl(axsub, view=view,
+                                  sub_specs=sub_specs, theme=theme)
+        if legend:
+            ax.text(0.008, 0.02, "\n".join(legend),
+                    transform=ax.transAxes, va="bottom", ha="left",
+                    fontsize=8.4, family="monospace",
+                    color=theme["text"], zorder=8,
+                    bbox=dict(boxstyle="round,pad=0.4",
+                              facecolor=theme["bg"],
+                              edgecolor=theme["text"], alpha=0.88))
+
     l = view["low"].to_numpy(dtype=float)
     h = view["high"].to_numpy(dtype=float)
     lo_v, hi_v = float(np.nanmin(l)), float(np.nanmax(h))
@@ -1781,11 +2026,20 @@ def _ema(values: np.ndarray, span: int) -> np.ndarray:
 
 def _render_role_entry(frame, es, lc, *, instrument: str,
                        tf_label: str, playbook: str,
-                       score_line: str, window: int = 44) -> bytes:
+                       score_line: str, window: int = 44,
+                       study_frames=None, fresh: str = "") -> bytes:
     """Role C — the entry, up close, with only the used studies."""
     header = _hdr(instrument, playbook, score_line)
     title = f"C · {tf_label} — entry precision"
-    fig, ax, axv, theme = _role_scaffold(title, header)
+    if fresh:
+        title += f" · {fresh}"
+    studies = tuple(getattr(es, "studies", ()) or ())
+    if any(s.pane == "sub" for s in studies):
+        fig, ax, axsub, axv, theme = _role_scaffold_sub(
+            title, header)
+    else:
+        fig, ax, axv, theme = _role_scaffold(title, header)
+        axsub = None
     anchor = _ts_to_pos(frame.index, lc.fill_ts)
     if anchor is None:
         anchor = len(frame) - 1
@@ -1862,6 +2116,14 @@ def _render_role_entry(frame, es, lc, *, instrument: str,
     if "qm" in es.overlays and es.qm_pattern:
         specs += _mt5_qm_pattern(ax, x_hi, es.qm_pattern,
                                  view.index, theme)
+    if studies:
+        sub_specs = _draw_studies_mpl(
+            ax, panel_frame=frame, view=view, studies=studies,
+            study_frames=study_frames, specs=specs, legend=legend,
+            theme=theme)
+        if axsub is not None and sub_specs:
+            _draw_sub_studies_mpl(axsub, view=view,
+                                  sub_specs=sub_specs, theme=theme)
 
     ax.axhline(lc.entry_ref, color="#c99700", linewidth=1.8, zorder=4)
     specs.append(label_spec(lc.entry_ref,
@@ -1914,11 +2176,25 @@ def _render_role_entry(frame, es, lc, *, instrument: str,
     return _role_finish(fig, ax, x_hi, specs)
 
 
+def _fresh_str(tf: str, freshness) -> str:
+    """The §8.4 freshness stamp for one role (mpl titles)."""
+    if not freshness:
+        return ""
+    row = freshness.get(tf) or {}
+    bits = []
+    if row.get("last_bar"):
+        bits.append(f"last bar {row['last_bar']}")
+    if row.get("quality"):
+        bits.append(f"data {row['quality']}")
+    return " · ".join(bits)
+
+
 def _render_mt5_roles_mpl(*, frames: dict, lifecycle, context=None,
                           entry_study=None, instrument: str = "XAUUSD",
                           playbook: str = "", score_line: str = "",
                           entry_clock: str = "M15",
-                          roles=ROLE_ORDER) -> list[bytes]:
+                          roles=ROLE_ORDER, clocks=None,
+                          freshness: dict = None) -> list[bytes]:
     """The role trio, matplotlib rung: one PNG per role.
 
     ``frames`` maps timeframe -> OHLCV frame (the stack the alert
@@ -1927,43 +2203,59 @@ def _render_mt5_roles_mpl(*, frames: dict, lifecycle, context=None,
     renders the role without its study layer — candles and trade
     truth only, never an invented study). A missing frame renders
     its role as an explicit unavailable panel.
+
+    Frames are selected by the resolved ChartClocks (SPEC §8.1):
+    role A the management clock, role B the context clock, role C
+    the entry clock.  No clocks → the legacy derivation (A/C on
+    the entry clock, B on H1), preserved for direct callers; the
+    runner always passes resolved clocks.
     """
-    from .signal_model import EntryStudy
+    from .signal_model import ChartClocks, EntryStudy
+    eff = clocks or ChartClocks(
+        management_tf=entry_clock, context_tf="H1",
+        entry_tf=entry_clock, source="legacy_entry_clock")
     header = _hdr(instrument, playbook, score_line)
     out: list[bytes] = []
     for role in roles:
         if role == ROLE_TRADE:
-            frame = frames.get(entry_clock)
+            tf = eff.management_tf
+            frame = frames.get(tf)
             if frame is None or len(frame) == 0:
                 out.append(_role_unavailable(
-                    f"A · Trade — fill overview · {entry_clock}",
-                    header, entry_clock))
+                    f"A · Trade — fill overview · {tf}",
+                    header, tf))
             else:
                 out.append(_render_role_trade(
                     frame, lifecycle, instrument=instrument,
-                    tf_label=entry_clock, playbook=playbook,
-                    score_line=score_line))
+                    tf_label=tf, playbook=playbook,
+                    score_line=score_line,
+                    fresh=_fresh_str(tf, freshness)))
         elif role == ROLE_CONTEXT:
-            h1 = frames.get("H1")
-            if h1 is None or len(h1) == 0:
-                out.append(_role_unavailable(
-                    "B · H1 — context", header, "H1"))
-            else:
-                out.append(_render_role_context(
-                    h1, context, lifecycle, instrument=instrument,
-                    playbook=playbook, score_line=score_line))
-        elif role == ROLE_ENTRY:
-            frame = frames.get(entry_clock)
+            tf = eff.context_tf
+            frame = frames.get(tf)
             if frame is None or len(frame) == 0:
                 out.append(_role_unavailable(
-                    f"C · {entry_clock} — entry precision",
-                    header, entry_clock))
+                    f"B · {tf} — context", header, tf))
+            else:
+                out.append(_render_role_context(
+                    frame, context, lifecycle,
+                    instrument=instrument, playbook=playbook,
+                    score_line=score_line, tf_label=tf,
+                    study_frames=frames,
+                    fresh=_fresh_str(tf, freshness)))
+        elif role == ROLE_ENTRY:
+            tf = eff.entry_tf
+            frame = frames.get(tf)
+            if frame is None or len(frame) == 0:
+                out.append(_role_unavailable(
+                    f"C · {tf} — entry precision", header, tf))
             else:
                 out.append(_render_role_entry(
                     frame, entry_study or EntryStudy(),
                     lifecycle, instrument=instrument,
-                    tf_label=entry_clock, playbook=playbook,
-                    score_line=score_line))
+                    tf_label=tf, playbook=playbook,
+                    score_line=score_line, study_frames=frames,
+                    fresh=_fresh_str(tf, freshness)))
     return out
 
 
@@ -1974,6 +2266,13 @@ def _render_mt5_roles_mpl(*, frames: dict, lifecycle, context=None,
 #: Also stamped into every PNG's own metadata (tEXt "Renderer").
 _LAST_ROLE_RUNGS: list = []
 _LAST_TV_ERROR: str | None = None
+
+#: The chart provenance of the most recent roles/signal render
+#: (SPEC §8.4 + Pass 10): the resolved clocks, their source (any
+#: fallback is VISIBLE here), and every study drawn with the
+#: clock it drew on.  The runner journals this per chart so a
+#: fill alert's clocks are auditable after the fact.
+_LAST_CHART_PROVENANCE: dict | None = None
 
 
 def last_role_render_rungs() -> list:
@@ -1986,11 +2285,44 @@ def last_tv_error() -> str | None:
     return _LAST_TV_ERROR
 
 
+def last_chart_provenance() -> dict | None:
+    """Resolver output of the most recent chart render."""
+    return _LAST_CHART_PROVENANCE
+
+
+def _chart_provenance(clocks, context, entry_study, *,
+                      style: str) -> dict:
+    studies = []
+    for src in (context, entry_study):
+        for s in (getattr(src, "studies", ()) or ()):
+            studies.append({"kind": s.kind, "pane": s.pane,
+                            "clock_tf": s.clock_tf,
+                            "label": s.label})
+    return {"style": style, "clocks": clocks.as_dict(),
+            "studies": studies}
+
+
+def _provenance_stamps(prov: dict) -> dict:
+    """PNG tEXt stamps carrying the provenance on the artifact
+    itself (§8.4: freshness/provenance rendered from the model)."""
+    c = prov["clocks"]
+    clocks_line = (f"A={c['management_tf']} B={c['context_tf']} "
+                   f"C={c['entry_tf']} · {c['source']}")
+    if c.get("context_hold"):
+        clocks_line += " · context-hold"
+    studies = prov.get("studies") or []
+    studies_line = ",".join(
+        f"{s['kind']}@{s['clock_tf'] or 'panel'}" for s in studies)
+    return {"Chart-Clocks": clocks_line,
+            "Chart-Studies": studies_line or "none"}
+
+
 def render_mt5_roles(*, frames: dict, lifecycle, context=None,
                      entry_study=None, instrument: str = "XAUUSD",
                      playbook: str = "", score_line: str = "",
                      entry_clock: str = "M15",
-                     roles=ROLE_ORDER) -> list[bytes]:
+                     roles=ROLE_ORDER, clocks=None,
+                     freshness: dict = None) -> list[bytes]:
     """The role trio: one PNG per role, in ROLE_ORDER.
 
     Renderer ladder (implementation-ladder doctrine): the pages
@@ -2004,12 +2336,21 @@ def render_mt5_roles(*, frames: dict, lifecycle, context=None,
     The rung used is recorded per PNG (``last_role_render_rungs``
     + the PNG's own "Renderer" metadata stamp).
     """
-    global _LAST_ROLE_RUNGS, _LAST_TV_ERROR
+    global _LAST_ROLE_RUNGS, _LAST_TV_ERROR, _LAST_CHART_PROVENANCE
     from . import screenshot, tv_page
+    from .signal_model import ChartClocks
+    eff = clocks or ChartClocks(
+        management_tf=entry_clock, context_tf="H1",
+        entry_tf=entry_clock, source="legacy_entry_clock")
+    prov = _chart_provenance(eff, context, entry_study,
+                             style="roles")
+    _LAST_CHART_PROVENANCE = prov
+    stamps = _provenance_stamps(prov)
     kw = dict(frames=frames, lifecycle=lifecycle, context=context,
               entry_study=entry_study, instrument=instrument,
               playbook=playbook, score_line=score_line,
-              entry_clock=entry_clock, roles=roles)
+              entry_clock=entry_clock, roles=roles, clocks=clocks,
+              freshness=freshness)
     try:
         pages = tv_page.build_role_pages(**kw)
         pngs: list = []
@@ -2025,7 +2366,7 @@ def render_mt5_roles(*, frames: dict, lifecycle, context=None,
                 "Software": "GoldenSwing charts",
                 "Renderer": (f"lightweight-charts-"
                              f"{tv_page.LWC_VERSION}+{rung}"),
-                "Chart-Role": role}))
+                "Chart-Role": role, **stamps}))
         _LAST_ROLE_RUNGS = rungs
         _LAST_TV_ERROR = None
         return pngs
@@ -2034,6 +2375,6 @@ def render_mt5_roles(*, frames: dict, lifecycle, context=None,
         _LAST_ROLE_RUNGS = ["matplotlib"] * len(roles)
         return [screenshot.stamp_png_text(png, {
                     "Renderer": "matplotlib-fallback",
-                    "Chart-Role": role})
+                    "Chart-Role": role, **stamps})
                 for png, role in zip(_render_mt5_roles_mpl(**kw),
                                      roles)]

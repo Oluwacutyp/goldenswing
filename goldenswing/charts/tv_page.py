@@ -43,9 +43,11 @@ from .signal_model import (
     ROLE_ENTRY,
     ROLE_ORDER,
     ROLE_TRADE,
+    ChartClocks,
     admit_level_bounds,
     chart_targets,
 )
+from .studies import asof_align, study_levels, study_series
 
 LWC_VERSION = "5.0.8"
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -298,6 +300,22 @@ function build(el, cfg, opts){
     });
     s.setData(ls.points || []);
     out.aux.push(s);
+  });
+  (cfg.subSeries || []).forEach(function(ss, i){
+    if (i === 0){
+      const pane = chart.addPane();
+      pane.setHeight(110);
+    }
+    const def = ss.kind === 'histogram' ? LWC.HistogramSeries
+                                        : LWC.LineSeries;
+    const s = chart.addSeries(def, {
+      color: ss.color, lineWidth: ss.width || 2,
+      priceLineVisible: false, lastValueVisible: true,
+      crosshairMarkerVisible: false,
+    }, 1);
+    s.setData(ss.points || []);
+    out.sub = out.sub || [];
+    out.sub.push(s);
   });
   if ((cfg.bands && cfg.bands.length) ||
       (cfg.timeBands && cfg.timeBands.length)){
@@ -598,14 +616,131 @@ def _trade_cfg(frame, lc, *, tf_label: str) -> dict:
     }
 
 
+# ------------------------------------------------------------------ studies
+_STUDY_COLORS = {
+    ("bollinger", "mid"): "#5a6472",
+    ("bollinger", "upper"): "#2962ff",
+    ("bollinger", "lower"): "#2962ff",
+    ("atr_band", "upper"): "#00838f",
+    ("atr_band", "lower"): "#00838f",
+    ("vwap", "vwap"): "#8e24aa",
+}
+
+
+def _studies_cfg(studies, panel_frame, view, times, frames):
+    """Declared studies → (aux, lines, sub, ledger, extra_prices).
+
+    Each study is computed on ITS OWN clock's frame (its resolved
+    ``clock_tf``) and as-of aligned onto the panel — never
+    recomputed on the panel's clock.  A study whose own frame is
+    missing is NAMED in the ledger as unavailable, never silently
+    dropped and never drawn from the wrong frame.  ema_pair / qm
+    keep their dedicated paths in the role builders and are
+    skipped here."""
+    aux: list = []
+    lines: list = []
+    sub: list = []
+    ledger: list = []
+    extra: list = []
+    for spec in studies or ():
+        if spec.kind in ("ema_pair", "qm"):
+            continue
+        src_tf = spec.clock_tf or ""
+        src = None
+        if frames is not None and src_tf:
+            src = frames.get(src_tf)
+        if src is None and not src_tf:
+            src = panel_frame
+        if src is None or len(src) == 0:
+            ledger.append(f"{spec.label} · {src_tf} — frame "
+                          f"unavailable, study not drawn")
+            continue
+        if spec.kind == "volume_profile":
+            levels = study_levels(src, "volume_profile")
+            if not levels:
+                ledger.append(f"{spec.label} · {src_tf} — no "
+                              f"value area yet")
+                continue
+            for name, price in levels.items():
+                lines.append(_line(
+                    price, "#7e57c2",
+                    f"{name} {_fmt(price)} · VP {src_tf}",
+                    width=2 if name == "POC" else 1,
+                    style=_SOLID if name == "POC" else _DASHED))
+                extra.append(price)
+            ledger.append(f"VP POC {_fmt(levels['POC'])} · "
+                          f"{src_tf}" if "POC" in levels
+                          else f"Volume profile · {src_tf}")
+            continue
+        comps = study_series(src, spec.kind, spec.params)
+        if not comps:
+            ledger.append(f"{spec.label} · {src_tf} — not "
+                          f"computable on this frame")
+            continue
+        if spec.pane == "sub":
+            values = asof_align(src.index, comps[spec.kind],
+                                view.index)
+            pts = []
+            prev = None
+            for t, v in zip(times, values):
+                if v != v:  # NaN — the study has not started
+                    continue
+                pts.append({"time": t, "value": float(v),
+                            "color": "#26a69a" if prev is None
+                            or v >= prev else "#ef5350"})
+                prev = v
+            sub.append({"points": pts, "color": "#26a69a",
+                        "width": 2, "kind": "histogram"})
+            if prev is not None:
+                ledger.append(f"{spec.label} {_fmt(prev)} · "
+                              f"{src_tf}")
+            continue
+        last_seen = None
+        for comp_name, comp_values in comps.items():
+            aligned = asof_align(src.index, comp_values,
+                                 view.index)
+            pts = [{"time": t, "value": float(v)}
+                   for t, v in zip(times, aligned) if v == v]
+            if not pts:
+                continue
+            aux.append({"points": pts,
+                        "color": _STUDY_COLORS.get(
+                            (spec.kind, comp_name), "#5a6472"),
+                        "width": 1 if comp_name != "vwap" else 2,
+                        "stepped": False, "lastChip": True})
+            last_seen = pts[-1]["value"]
+        if last_seen is not None:
+            ledger.append(f"{spec.label} {_fmt(last_seen)} · "
+                          f"{src_tf}")
+    return aux, lines, sub, ledger, extra
+
+
+def _fresh_line(tf: str, freshness) -> str:
+    """The SPEC §8.4 freshness stamp for one role's header."""
+    if not freshness:
+        return ""
+    row = freshness.get(tf) or {}
+    bits = []
+    if row.get("last_bar"):
+        bits.append(f"last bar {row['last_bar']}")
+    if row.get("quality"):
+        bits.append(f"data {row['quality']}")
+    return " · ".join(bits)
+
+
 # ------------------------------------------------------------------ role B
-def _context_cfg(h1, ctx, lc, *, window: int = 120) -> dict:
+def _context_cfg(h1, ctx, lc, *, window: int = 120,
+                 tf_label: str = "H1", frames=None) -> dict:
     view = h1.iloc[-window:]
     offset = len(h1) - len(view)
     times = _view_times(view)
     lines: list = []
     bands: list = []
     markers: list = []
+    aux: list = []
+    sub: list = []
+    study_ledger: list = []
+    study_extra: list = []
     shown, _total = chart_targets(lc.targets, entry=lc.entry_ref,
                                   direction=lc.direction)
 
@@ -622,7 +757,8 @@ def _context_cfg(h1, ctx, lc, *, window: int = 120) -> dict:
                           "to": None, "fill": fill.format(alpha),
                           "stroke": None})
             lines.append(_line(0.5 * (z.top + z.bottom), col,
-                               f"{z.kind} · H1 · {z.age_bars}b",
+                               f"{z.kind} · {tf_label} · "
+                               f"{z.age_bars}b",
                                width=1, style=_DOTTED))
         for price, side, strength in ctx.pools:
             col = "#e08a00" if side == "above" else "#00838f"
@@ -679,8 +815,17 @@ def _context_cfg(h1, ctx, lc, *, window: int = 120) -> dict:
     for rank, t in shown:
         lines.append(_line(t, "#2e7d32", f"T{rank} {_fmt(t)} (ref)",
                            width=1, style=_DASHED))
+    if ctx is not None and getattr(ctx, "studies", ()):
+        s_aux, s_lines, s_sub, s_ledger, s_extra = _studies_cfg(
+            ctx.studies, h1, view, times, frames)
+        aux += s_aux
+        lines += s_lines
+        sub += s_sub
+        study_ledger += s_ledger
+        study_extra += s_extra
 
-    cand = [lc.entry_ref, lc.structural_stop] + [t for _r, t in shown]
+    cand = [lc.entry_ref, lc.structural_stop] + [t for _r, t in shown] \
+        + study_extra
     if ctx is not None:
         cand += [p for p, _s, _n in ctx.pools]
         cand += [p for p, _tf, _tier in ctx.htf_levels]
@@ -689,7 +834,7 @@ def _context_cfg(h1, ctx, lc, *, window: int = 120) -> dict:
     rng = _price_range(view, cand)
     inside, tags = _split_lines(lines, rng)
 
-    title = "B · H1 — context"
+    title = f"B · {tf_label} — context"
     if ctx is not None:
         title += (f" · D1 {ctx.bias_d1:+d} / H4 {ctx.bias_h4:+d}"
                   + (f" / {ctx.trigger}" if ctx.trigger else ""))
@@ -712,11 +857,12 @@ def _context_cfg(h1, ctx, lc, *, window: int = 120) -> dict:
                           + " — as recorded at the signal bar")
     return {
         "bars": _bars_json(view), "volume": _volume_json(view),
-        "lines": inside, "lineSeries": [], "bands": bands,
+        "lines": inside, "lineSeries": aux, "bands": bands,
         "timeBands": [], "markers": markers, "edgeTags": tags,
         "priceRange": [rng[0], rng[1]],
         "header": {"role": title, "arrow": ""},
-        "ledger": ledger,
+        "ledger": ledger + study_ledger,
+        "subSeries": sub,
     }
 
 
@@ -728,7 +874,7 @@ def _ema(values: np.ndarray, span: int) -> np.ndarray:
 
 
 def _entry_cfg(frame, es, lc, *, tf_label: str,
-               window: int = 44) -> dict:
+               window: int = 44, frames=None) -> dict:
     anchor = _ts_to_pos(frame.index, lc.fill_ts)
     if anchor is None:
         anchor = len(frame) - 1
@@ -827,7 +973,19 @@ def _entry_cfg(frame, es, lc, *, tf_label: str,
                            f"FILL {_fmt(lc.fill_price)}", width=2,
                            style=_DASHED))
 
-    cand = [lc.entry_ref, lc.structural_stop] + [t for _r, t in shown]
+    sub: list = []
+    if getattr(es, "studies", ()):
+        s_aux, s_lines, s_sub, s_ledger, s_extra = _studies_cfg(
+            es.studies, frame, view, times, frames)
+        aux += s_aux
+        lines += s_lines
+        sub += s_sub
+        ledger.extend(s_ledger)
+    else:
+        s_extra = []
+
+    cand = [lc.entry_ref, lc.structural_stop] + [t for _r, t in shown] \
+        + s_extra
     if lc.fill_price is not None:
         cand.append(lc.fill_price)
     if es.entry_zone:
@@ -843,6 +1001,7 @@ def _entry_cfg(frame, es, lc, *, tf_label: str,
         "header": {"role": f"C · {tf_label} — entry precision",
                    "arrow": ""},
         "ledger": ledger,
+        "subSeries": sub,
     }
 
 
@@ -897,6 +1056,9 @@ def role_page(cfg, *, instrument: str, playbook: str,
                 f"L <b>{_fmt(last['low'])}</b> · "
                 f"C <b style='color:{col}'>{_fmt(last['close'])}</b>")
     header = cfg.get("header") or {}
+    fresh = header.get("fresh")
+    if fresh:
+        ohlc = (ohlc + " · " if ohlc else "") + _html_escape(fresh)
     title_bits = " · ".join(
         x for x in (playbook, tf_label, score_line) if x)
     ledger_html = "".join(
@@ -949,53 +1111,71 @@ def build_role_pages(*, frames: dict, lifecycle, context=None,
                      entry_study=None, instrument: str = "XAUUSD",
                      playbook: str = "", score_line: str = "",
                      entry_clock: str = "M15",
-                     roles=ROLE_ORDER) -> list:
+                     roles=ROLE_ORDER, clocks: ChartClocks = None,
+                     freshness: dict = None) -> list:
     """The role trio as self-contained pages, in ROLE_ORDER.
 
     Same inputs and the same role split as the matplotlib
     ``render_mt5_roles`` — the screenshot rung and the fallback
     rung differ only in medium, never in what the trade was.
-    """
+
+    Frames come from the resolved ChartClocks (SPEC §8.1): role A
+    the management clock, role B the context clock, role C the
+    entry clock.  A caller passing no clocks gets the legacy
+    derivation (A/C on the entry clock, B on H1) — the runner
+    always passes resolved clocks."""
     from .signal_model import EntryStudy
+    eff = clocks or ChartClocks(
+        management_tf=entry_clock, context_tf="H1",
+        entry_tf=entry_clock, source="legacy_entry_clock")
     out: list = []
     for role in roles:
         if role == ROLE_TRADE:
-            frame = frames.get(entry_clock)
+            tf = eff.management_tf
+            frame = frames.get(tf)
             if frame is None or len(frame) == 0:
                 out.append(unavailable_page(
                     instrument=instrument, playbook=playbook,
                     score_line=score_line,
                     role_title=f"A · Trade — fill overview · "
-                               f"{entry_clock}", tf_label=entry_clock))
+                               f"{tf}", tf_label=tf))
             else:
+                cfg = _trade_cfg(frame, lifecycle, tf_label=tf)
+                cfg["header"]["fresh"] = _fresh_line(tf, freshness)
                 out.append(role_page(
-                    _trade_cfg(frame, lifecycle, tf_label=entry_clock),
-                    instrument=instrument, playbook=playbook,
-                    score_line=score_line, tf_label=entry_clock))
+                    cfg, instrument=instrument, playbook=playbook,
+                    score_line=score_line, tf_label=tf))
         elif role == ROLE_CONTEXT:
-            h1 = frames.get("H1")
-            if h1 is None or len(h1) == 0:
-                out.append(unavailable_page(
-                    instrument=instrument, playbook=playbook,
-                    score_line=score_line,
-                    role_title="B · H1 — context", tf_label="H1"))
-            else:
-                out.append(role_page(
-                    _context_cfg(h1, context, lifecycle),
-                    instrument=instrument, playbook=playbook,
-                    score_line=score_line, tf_label="H1"))
-        elif role == ROLE_ENTRY:
-            frame = frames.get(entry_clock)
+            tf = eff.context_tf
+            frame = frames.get(tf)
             if frame is None or len(frame) == 0:
                 out.append(unavailable_page(
                     instrument=instrument, playbook=playbook,
                     score_line=score_line,
-                    role_title=f"C · {entry_clock} — entry precision",
-                    tf_label=entry_clock))
+                    role_title=f"B · {tf} — context", tf_label=tf))
             else:
+                cfg = _context_cfg(frame, context, lifecycle,
+                                   tf_label=tf, frames=frames)
+                cfg["header"]["fresh"] = _fresh_line(tf, freshness)
                 out.append(role_page(
-                    _entry_cfg(frame, entry_study or EntryStudy(),
-                               lifecycle, tf_label=entry_clock),
+                    cfg, instrument=instrument, playbook=playbook,
+                    score_line=score_line, tf_label=tf))
+        elif role == ROLE_ENTRY:
+            tf = eff.entry_tf
+            frame = frames.get(tf)
+            if frame is None or len(frame) == 0:
+                out.append(unavailable_page(
                     instrument=instrument, playbook=playbook,
-                    score_line=score_line, tf_label=entry_clock))
+                    score_line=score_line,
+                    role_title=f"C · {tf} — entry precision",
+                    tf_label=tf))
+            else:
+                cfg = _entry_cfg(frame,
+                                 entry_study or EntryStudy(),
+                                 lifecycle, tf_label=tf,
+                                 frames=frames)
+                cfg["header"]["fresh"] = _fresh_line(tf, freshness)
+                out.append(role_page(
+                    cfg, instrument=instrument, playbook=playbook,
+                    score_line=score_line, tf_label=tf))
     return out

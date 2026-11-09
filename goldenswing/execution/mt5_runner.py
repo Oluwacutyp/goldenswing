@@ -71,10 +71,11 @@ from ..alerts.commands import CommandContext, is_owner_callback
 from ..alerts.model import send_failure_detail
 from ..backtest.data import REPO_ROOT
 from ..charts.engine import (build_context_study, build_entry_study,
+                             last_chart_provenance,
                              render_mt5_roles, render_mt5_signal,
                              zones_to_study_dicts)
-from ..charts.signal_model import (ROLE_TRADE, lifecycle_from_events,
-                                   score_text)
+from ..charts.signal_model import (ROLE_TRADE, chart_clocks_for,
+                                   lifecycle_from_events, score_text)
 from ..charts.signal_view import build_signal_view_html
 from ..charts.terminal_server import TerminalServer
 from ..confluence import ConfluenceEngine
@@ -8181,22 +8182,32 @@ class MT5Runner:
         # exactly as it was.
         _close_pngs = None
         try:
-            _clock = next((s.native_tf for s in PLAYBOOK_REGISTRY
-                           if s.name == pb), None)
-            _frame = (self._stack.frames.get(_clock)
-                      if getattr(self, "_stack", None) is not None
-                      and _clock else None)
-            if _frame is not None and len(_frame) > 0:
-                _lc = self._lifecycle_for_chart(
-                    ticket=ticket, pos=pos, exit_price=price,
-                    exit_reason=display, exit_ts=time.time())
-                _pngs = render_mt5_roles(
-                    frames={_clock: _frame}, lifecycle=_lc,
-                    instrument=self.cfg.symbol, playbook=pb,
-                    score_line="", entry_clock=_clock,
-                    roles=(ROLE_TRADE,))
-                if _pngs:
-                    _close_pngs = _pngs
+            if pb:
+                # Pass 10: the close chart resolves through the
+                # same ChartClocks resolver as every other
+                # surface (role A = the management clock).
+                _spec = _spec_for(pb)
+                _frames = self._chart_frames()
+                _clocks = chart_clocks_for(
+                    playbook=pb,
+                    route=_spec.route if _spec is not None else "",
+                    entry_clock="",
+                    native_tf=(_spec.native_tf
+                               if _spec is not None else None),
+                    available=set(_frames))
+                _frame = _frames.get(_clocks.management_tf)
+                if _frame is not None and len(_frame) > 0:
+                    _lc = self._lifecycle_for_chart(
+                        ticket=ticket, pos=pos, exit_price=price,
+                        exit_reason=display, exit_ts=time.time())
+                    _pngs = render_mt5_roles(
+                        frames=_frames, lifecycle=_lc,
+                        instrument=self.cfg.symbol, playbook=pb,
+                        score_line="",
+                        entry_clock=_clocks.entry_tf,
+                        clocks=_clocks, roles=(ROLE_TRADE,))
+                    if _pngs:
+                        _close_pngs = _pngs
         except Exception as exc:
             self.journal.log_note(
                 f"mt5: close chart failed for ticket {ticket}: {exc}")
@@ -22965,6 +22976,91 @@ class MT5Runner:
             exit_price=exit_price, exit_ts=exit_ts,
             exit_reason=exit_reason)
 
+    # ------------------------------------------------------- pass 10
+    _CHART_CLOCK_KEYS = ("formation_tf", "refinement_tf",
+                         "trigger_tf", "entry_tf", "management_tf")
+
+    def _chart_frames(self) -> dict:
+        """The frame map every chart surface renders from: the
+        stack's frames PLUS the Hot Scalp M1 aux frame merged
+        for charting only (SPEC §8.3 — the TimeframeStack itself
+        is untouched)."""
+        frames = dict(self._stack.frames or {}) if self._stack \
+            else {}
+        aux = getattr(self, "_hot_scalp_aux_frames", None) or {}
+        m1 = aux.get("M1") if isinstance(aux, dict) else None
+        if m1 is not None and len(m1) > 0:
+            frames["M1"] = m1
+        return frames
+
+    def _chart_clocks_for(self, sig, verdict, playbook: str,
+                          entry_clock: str, frames: dict):
+        """Resolve the SPEC §8.1 ChartClocks for one chart.
+
+        The declared set is what the SCENARIO declared — the
+        registry spec's ``clocks`` override plus the signal's
+        recorded ``scenario_clocks`` (the same assembly the
+        scenario book performs), with the management clock from
+        the signal's declared management block.  No declaration
+        → the resolver's route row / registry native TF /
+        standing default, stamped in the result's ``source``."""
+        spec = _spec_for(playbook) if playbook else None
+        declared: dict = {}
+        if spec is not None and spec.clocks:
+            declared.update(dict(spec.clocks))
+        sig_clocks = (getattr(sig, "live_context", None)
+                      or {}).get("scenario_clocks")
+        if isinstance(sig_clocks, dict):
+            declared.update({k: v for k, v in sig_clocks.items()
+                             if k in self._CHART_CLOCK_KEYS})
+        block = management_block_for(playbook, sig)
+        mgmt_tf = block.get("management_context_timeframe")
+        if mgmt_tf and declared:
+            declared["management_tf"] = mgmt_tf
+        return chart_clocks_for(
+            playbook=playbook,
+            route=(spec.route if spec is not None
+                   else "hot_scalp" if playbook == "hot_scalp"
+                   else ""),
+            horizon=str(block.get("management_horizon") or ""),
+            entry_clock=entry_clock, clocks=declared or None,
+            native_tf=spec.native_tf if spec is not None else None,
+            available=set(frames))
+
+    def _chart_freshness(self, frames: dict, clocks) -> dict:
+        """Per-TF freshness for chart headers (SPEC §8.4): each
+        role frame's last closed bar + the situation's
+        data_quality verdict when a situation read is available
+        (last-bar only otherwise — never an invented verdict)."""
+        quality = ""
+        keeper = getattr(self, "_situation_keeper", None)
+        snap = None
+        if keeper is not None:
+            try:
+                snap = keeper.latest()
+            except Exception:
+                snap = None
+        if isinstance(snap, dict):
+            dq = snap.get("data_quality")
+            if not isinstance(dq, dict):
+                dq = (snap.get("blocks") or {}).get("data_quality")
+            if not isinstance(dq, dict):
+                dq = (snap.get("situation") or {}).get(
+                    "data_quality")
+            if isinstance(dq, dict):
+                quality = str(dq.get("health") or "")
+        out: dict = {}
+        for tf in {clocks.management_tf, clocks.context_tf,
+                   clocks.entry_tf}:
+            frame = frames.get(tf)
+            last = ""
+            if frame is not None and len(frame) > 0:
+                ts = frame.index[-1]
+                last = (ts.strftime("%m-%d %H:%M")
+                        if hasattr(ts, "strftime") else str(ts))
+            out[tf] = {"last_bar": last, "quality": quality}
+        return out
+
     def _build_chart(self, sig, verdict: dict | None, *,
                      alert_id: str, playbook: str = "",
                      fill_price: float | None = None,
@@ -22991,12 +23087,18 @@ class MT5Runner:
         alert still goes out.
         """
         try:
-            frames = self._stack.frames if self._stack else {}
+            frames = self._chart_frames()
             h1 = frames.get("H1")
             if h1 is None or len(h1) == 0:
                 return None, None
             zone = (verdict or {}).get("zone")
             entry_clock = (verdict or {}).get("entry_clock") or "M15"
+            # Pass 10 (SPEC §8): every chart resolves its clocks
+            # through the ONE resolver — no surface keeps a
+            # private timeframe choice.
+            clocks = self._chart_clocks_for(
+                sig, verdict, playbook, entry_clock, frames)
+            freshness = self._chart_freshness(frames, clocks)
             entry = float(sig.entry_ref)
             atr = float(getattr(sig, "atr", 0.0) or 0.0)
             st = self._studies_for_chart(h1, entry, atr, zone)
@@ -23042,7 +23144,8 @@ class MT5Runner:
                     fib_levels=st["fib_levels"],
                     fib_range=st["fib_range"], ote_band=st["ote_band"],
                     qm_pattern=self._qm_pattern_for_chart(
-                        sig, verdict, playbook))
+                        sig, verdict, playbook),
+                    clocks=clocks, frames=frames)
                 _tags = ("h4", "h1", "entry")
             else:
                 # Alert default (2026-11-05): the role trio —
@@ -23051,20 +23154,29 @@ class MT5Runner:
                 _lc = self._lifecycle_for_chart(
                     sig, ticket=ticket, fill_price=fill_price,
                     broker_stop=broker_stop)
+                # §8.2: the context study is built from the
+                # CONTEXT clock's own state (the roster reads H4
+                # zones/structure, not an H1 slice).
                 _ctx = build_context_study(
-                    h1, entry=entry, verdict=verdict,
-                    nearby_zones=st["nearby"])
+                    frames.get(clocks.context_tf), entry=entry,
+                    verdict=verdict, nearby_zones=st["nearby"])
+                _spec = _spec_for(playbook) if playbook else None
                 _es = build_entry_study(
                     sig=sig, verdict=verdict,
                     qm_pattern=self._qm_pattern_for_chart(
                         sig, verdict, playbook),
-                    playbook=playbook)
+                    playbook=playbook,
+                    declared_studies=tuple(
+                        _spec.chart_studies or ())
+                    if _spec is not None else (),
+                    clocks=clocks)
                 panel_pngs = render_mt5_roles(
                     frames=frames, lifecycle=_lc, context=_ctx,
                     entry_study=_es, instrument=self.cfg.symbol,
                     playbook=playbook,
                     score_line=score_text(decision_score),
-                    entry_clock=entry_clock)
+                    entry_clock=entry_clock, clocks=clocks,
+                    freshness=freshness)
                 _tags = ("trade", "context", "entry")
             # Owner order 2026-10-31: the chart is THREE PNGs —
             # one file each, in panel order, next to the journal.
@@ -23074,6 +23186,17 @@ class MT5Runner:
                     f"{alert_id}{suffix}-{_tag}.png"
                 _p.write_bytes(_panel_png)
                 paths.append(_p)
+            # Pass 10 provenance: the resolver output rides the
+            # deterministic journal in the chart record's shape —
+            # which clocks the chart drew, which studies on which
+            # clocks, and the fallback source when one was used.
+            _prov = last_chart_provenance()
+            if _prov is not None:
+                self._det_journal("chart_rendered", {
+                    "alert_id": alert_id, "suffix": suffix,
+                    "playbook": playbook,
+                    "scenario_id": self._current_situation_id(),
+                    **_prov})
             return panel_pngs, paths
         except Exception as exc:
             self.journal.log_note(
@@ -23099,7 +23222,7 @@ class MT5Runner:
         (None, None) and logs a note.
         """
         try:
-            frames = self._stack.frames if self._stack else {}
+            frames = self._chart_frames()
             h1 = frames.get("H1")
             if h1 is None or len(h1) == 0:
                 return None, None
@@ -23139,10 +23262,9 @@ class MT5Runner:
 
         class _TerminalProvider:
             def frames(self, tf):
-                stack = runner._stack
-                if stack is None:
+                if runner._stack is None:
                     return None
-                return stack.frames.get(tf)
+                return runner._chart_frames().get(tf)
 
             def studies(self):
                 return runner._latest_studies

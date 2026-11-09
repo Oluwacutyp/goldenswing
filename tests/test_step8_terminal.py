@@ -147,7 +147,10 @@ def test_status_endpoint_carries_freshness(server):
     payload = json.loads(body)
     assert payload["market_open"] is True
     assert payload["instrument"] == "XAUUSD"
-    assert set(payload["tfs"]) == {"M5", "M15", "M30", "H1", "H4", "D1"}
+    # Pass 10 (SPEC §8.3): M1 joins the study — the status set
+    # carries it alongside the standing six.
+    assert set(payload["tfs"]) == {"M1", "M5", "M15", "M30", "H1",
+                                   "H4", "D1"}
     assert payload["tfs"]["H1"]["last_bar"] is not None
     assert payload["tfs"]["H4"]["last_bar"] is None
     assert payload["tfs"]["H4"]["stale"] is False

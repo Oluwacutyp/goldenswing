@@ -44,9 +44,9 @@ from urllib.parse import parse_qs, urlparse
 from ..reader import session_timeframes as sessions
 from .terminal import build_terminal_page
 
-TF_INTERVALS = {"M5": 300, "M15": 900, "M30": 1800,
+TF_INTERVALS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800,
                 "H1": 3600, "H4": 14400, "D1": 86400}
-TF_ORDER = ("M5", "M15", "M30", "H1", "H4", "D1")
+TF_ORDER = ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
 _BARS_CAP = 500
 
 
