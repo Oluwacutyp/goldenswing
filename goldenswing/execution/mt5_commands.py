@@ -1436,41 +1436,45 @@ def _mt5_health(ctx: CommandContext, args: list[str]) -> CommandResult:
                          f"{v.get('error') or 'account read failed'}")
         else:
             cur = v.get("currency") or ""
-            lines.append(f"balance: {fmt_code(f'{v['balance']:,.2f}')}"
+            bal_s = f"{v['balance']:,.2f}"
+            eq_s = f"{v['equity']:,.2f}"
+            fl_s = f"{v['floating_pnl']:+,.2f}"
+            lines.append(f"balance: {fmt_code(bal_s)}"
                          f"{' ' + cur if cur else ''}")
-            lines.append(f"equity: {fmt_code(f'{v['equity']:,.2f}')}"
+            lines.append(f"equity: {fmt_code(eq_s)}"
                          f"{' ' + cur if cur else ''}")
             lines.append(
-                f"floating P&L: {fmt_code(f'{v['floating_pnl']:+,.2f}')}"
+                f"floating P&L: {fmt_code(fl_s)}"
                 f" · open positions: {len(ctx.live_positions)}")
             if v.get("free_margin") is not None:
-                margin_line = (f"free margin: "
-                               f"{fmt_code(f'{float(v['free_margin']):,.2f}')}")
+                fm_s = f"{float(v['free_margin']):,.2f}"
+                margin_line = f"free margin: {fmt_code(fm_s)}"
                 if v.get("margin"):
                     level = v["equity"] / float(v["margin"]) * 100.0
-                    margin_line += (f" · margin level: "
-                                    f"{fmt_code(f'{level:,.0f}%')}")
+                    lvl_s = f"{level:,.0f}%"
+                    margin_line += f" · margin level: {fmt_code(lvl_s)}"
                 lines.append(margin_line)
             if v.get("drawdown_pct") is None:
                 lines.append("drawdown: no peak balance recorded yet "
                              "— nothing to measure from")
             else:
-                lines.append(
-                    f"peak balance: "
-                    f"{fmt_code(f'{v['peak_balance']:,.2f}')}")
+                pk_s = f"{v['peak_balance']:,.2f}"
+                dd_s = f"{v['drawdown_pct']:.1%}"
+                lines.append(f"peak balance: {fmt_code(pk_s)}")
                 if v.get("halted"):
                     lines.append(
-                        f"drawdown: {fmt_code(f'{v['drawdown_pct']:.1%}')}"
+                        f"drawdown: {fmt_code(dd_s)}"
                         f" — ⛔ HALTED"
                         f"{': ' + v['halt_reason'] if v.get('halt_reason') else ''}")
                 elif v.get("breached"):
                     lines.append(
-                        f"drawdown: {fmt_code(f'{v['drawdown_pct']:.1%}')}"
+                        f"drawdown: {fmt_code(dd_s)}"
                         f" — ⛔ at/over the {v['limit_pct']:.0%} halt")
                 else:
+                    dist_s = f"{v['distance_pct']:.1%}"
                     lines.append(
-                        f"drawdown: {fmt_code(f'{v['drawdown_pct']:.1%}')}"
-                        f" — {fmt_code(f'{v['distance_pct']:.1%}')} of "
+                        f"drawdown: {fmt_code(dd_s)}"
+                        f" — {fmt_code(dist_s)} of "
                         f"room to the {v['limit_pct']:.0%} halt")
     if ctx.journal is not None:
         records, bad, error = read_journal_records(ctx)

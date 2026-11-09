@@ -175,7 +175,7 @@ Hierarchical: {hier_trades} entries taken, {hier_skipped} signals never
 touched the zone (no trade — by design).
 
 ## Read
-{"TBD — fill after run."}
+{'TBD — fill after run.'}
 """
     OUT.write_text(md)
     print(md)
