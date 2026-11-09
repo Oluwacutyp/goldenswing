@@ -23699,7 +23699,7 @@ class MT5Runner:
         self._tg_api("editMessageText", payload)
 
     def _reply_command(self, result) -> None:
-        """Send one command result back (document or text).
+        """Send one command result back (photo, document or text).
 
         Never silent on failure: a send that REPORTS non-delivery
         (SendResult.delivered False — e.g. a document refused for
@@ -23708,19 +23708,23 @@ class MT5Runner:
         what could not be delivered, plus a journal note.  A result
         carrying BOTH text and a document sends the text first (an
         explanation riding with a fallback file, the oversize-/db
-        shape), then the document.
+        shape), then the document.  A photo result sends the photo
+        with its caption (the /desk shape).
         """
         if result is None:
             return
         for sender in self.senders:
             failure = None
             try:
-                if result.text is not None \
+                if result.photo is not None:
+                    failure = self._reply_result_photo(sender, result)
+                elif result.text is not None \
                         and result.document is not None:
                     failure = self._reply_result_text(sender, result)
-                if result.document is not None:
                     detail = self._reply_result_document(sender, result)
                     failure = failure or detail
+                elif result.document is not None:
+                    failure = self._reply_result_document(sender, result)
                 elif result.text is not None:
                     failure = self._reply_result_text(sender, result)
             except Exception as exc:
@@ -23728,6 +23732,31 @@ class MT5Runner:
             if failure:
                 self.journal.log_note(f"mt5: {failure}")
                 self._send_failure_notice(sender, failure)
+
+    def _reply_result_photo(self, sender, result) -> str | None:
+        """Send result.photo via one sender; failure detail or None.
+
+        The photo seam the recap alerts use (sender.send_photo):
+        TelegramSender's own contract falls a failed photo back to
+        the caption as text, and a sender with no photo verb gets
+        the caption as a plain message — what the photo carried
+        still arrives, never a silent drop.  A reported
+        non-delivery returns the detail so the caller adds the
+        ⚠️ notice + journal note, like the document branch.
+        """
+        caption = result.caption or ""
+        if not hasattr(sender, "send_photo"):
+            sender.send(caption or "(photo unavailable on this sender)")
+            return None
+        try:
+            res = sender.send_photo(
+                result.photo, caption=caption,
+                reply_markup=result.reply_markup)
+        except TypeError:
+            # Legacy sender without reply_markup support.
+            res = sender.send_photo(result.photo, caption=caption)
+        detail = send_failure_detail(res)
+        return f"photo not delivered: {detail}" if detail else None
 
     def _reply_result_text(self, sender, result) -> str | None:
         """Send result.text via one sender; failure detail or None."""

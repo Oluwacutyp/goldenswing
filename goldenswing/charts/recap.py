@@ -30,41 +30,20 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.patches import FancyBboxPatch, Rectangle  # noqa: E402
 
-#: The classic chart theme (charts/engine.py) + tile neutrals.
-_BG = "#ffffff"
-_TILE = "#f7f8fa"
-_EDGE = "#e6e8ee"
-_TEXT = "#131722"
-_MUTED = "#6e7686"
-_UP = "#26a69a"
-_DOWN = "#ef5350"
-_BAR_IDLE = "#9aa3b2"
+from .tiles import BG as _BG  # noqa: E402
+from .tiles import DOWN as _DOWN  # noqa: E402
+from .tiles import MONO as _MONO  # noqa: E402
+from .tiles import MUTED as _MUTED  # noqa: E402
+from .tiles import TEXT as _TEXT  # noqa: E402
+from .tiles import UP as _UP  # noqa: E402
+from .tiles import drawdown_bar  # noqa: E402
+from .tiles import tile as _tile  # noqa: E402
+from .tiles import tile_label as _label  # noqa: E402
+from .tiles import unavailable as _unavailable  # noqa: E402
 
 _FIGSIZE = (12, 7)           # at 100 dpi -> 1200x700 px
 _DPI = 100
-_MONO = "DejaVu Sans Mono"
-
-
-def _tile(ax, x: float, y: float, w: float, h: float) -> None:
-    ax.add_patch(FancyBboxPatch(
-        (x, y), w, h,
-        boxstyle="round,pad=0,rounding_size=0.012",
-        linewidth=1.0, edgecolor=_EDGE, facecolor=_TILE))
-
-
-def _label(ax, x: float, y: float, text: str) -> None:
-    ax.text(x, y, text, fontsize=11, fontweight="bold",
-            color=_MUTED, ha="left", va="top")
-
-
-def _unavailable(ax, cx: float, cy: float, reason: str, *,
-                 value_size: float = 26) -> None:
-    ax.text(cx, cy + 0.045, "—", fontsize=value_size, fontweight="bold",
-            family=_MONO, color=_MUTED, ha="center", va="center")
-    ax.text(cx, cy - 0.075, reason, fontsize=10.5,
-            color=_MUTED, ha="center", va="center")
 
 
 def render_daily_recap(stats: dict) -> bytes:
@@ -180,21 +159,9 @@ def render_daily_recap(stats: dict) -> bytes:
                 fontsize=11.5, color=_MUTED, ha="center", va="center")
     else:
         dd = float(drawdown)
-        frac = max(0.0, min(1.0, dd / limit)) if limit > 0 else 0.0
         breached = dd >= limit
-        bar_color = _DOWN if (breached or halted) else _BAR_IDLE
-        bx0, bx1, by, bh = 0.045, 0.70, 0.085, 0.045
-        ax.add_patch(Rectangle((bx0, by), bx1 - bx0, bh,
-                               facecolor=_EDGE, edgecolor="none"))
-        if frac > 0:
-            ax.add_patch(Rectangle((bx0, by), (bx1 - bx0) * frac, bh,
-                                   facecolor=bar_color,
-                                   edgecolor="none"))
-        ax.plot([bx1, bx1], [by - 0.012, by + bh + 0.012],
-                color=_DOWN, linewidth=1.6)
-        ax.text(bx1, by + bh + 0.028, "HALT", fontsize=8.5,
-                fontweight="bold", color=_DOWN, ha="center",
-                va="bottom")
+        drawdown_bar(ax, x0=0.045, x1=0.70, y=0.085, h=0.045,
+                     drawdown=dd, limit=limit, halted=halted)
         dd_s = f"{dd:.1%}"
         ax.text(0.845, 0.135, dd_s, fontsize=15, fontweight="bold",
                 family=_MONO, color=_TEXT, ha="center", va="center")

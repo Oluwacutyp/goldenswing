@@ -66,6 +66,7 @@ class CommandResult:
     """What the runner sends back for one command."""
     text: str | None = None
     document: str | Path | None = None   # sent via sendDocument
+    photo: bytes | None = None           # sent via sendPhoto (MT5 seam)
     caption: str | None = None
     reply_markup: dict | None = None     # inline keyboard, if any
 

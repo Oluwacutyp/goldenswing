@@ -1120,6 +1120,86 @@ def _mt5_recap(ctx: CommandContext, args: list[str]) -> CommandResult:
         reply_markup=fmt_next_keyboard("/status", "/trades", "/report"))
 
 
+def _desk_caption(stats: dict) -> str:
+    """The /desk photo's one-line day summary.
+
+    Built from the SAME stats dict the image draws, so the
+    caption can never disagree with the tiles.  A value the day
+    does not have loses its segment — never a zero-filled stand-in
+    (an unread equity is omitted, not printed as 0.00).
+    """
+    day = str(stats.get("day") or "")
+    pnl = float(stats.get("pnl") or 0.0)
+    currency = str(stats.get("currency") or "")
+    trades = int(stats.get("trades") or 0)
+    pnl_s = f"{pnl:+,.2f}"
+    if currency:
+        pnl_s = pnl_s + " " + currency
+    parts = [f"🖥️ Desk {day}: {pnl_s}"]
+    win_rate = stats.get("win_rate")
+    if win_rate is not None:
+        wr_s = f"{float(win_rate):.0f}%"
+        parts.append(wr_s + " win rate")
+    if trades:
+        parts.append(f"{trades} closed")
+    else:
+        parts.append("no closed trades yet")
+    equity = stats.get("equity")
+    if equity is not None:
+        eq_s = f"{float(equity):,.2f}"
+        if currency:
+            eq_s = eq_s + " " + currency
+        parts.append("equity " + eq_s)
+    if stats.get("halted"):
+        parts.append("⛔ HALTED")
+    return " · ".join(parts)
+
+
+@mt5_command("/desk", "today's desk image — the public bento card "
+                      "(net P&L, win rate, trades, equity, day "
+                      "drawdown) to save / post")
+def _mt5_desk(ctx: CommandContext, args: list[str]) -> CommandResult:
+    from ..charts.desk import render_desk_card
+    from ..execution.reporting import daily_recap_image_stats
+    if args:
+        return CommandResult(text="usage: /desk")
+    if ctx.journal is None:
+        return CommandResult(text="no journal attached.")
+    today = datetime.now(timezone.utc).date()
+    vitals = None
+    ctrl0 = _control(ctx)
+    vitals_fn = getattr(ctrl0, "account_vitals", None)
+    if callable(vitals_fn):
+        try:
+            vitals = vitals_fn()
+        except Exception:
+            vitals = None
+        if vitals and vitals.get("ok"):
+            # The drawdown anchor belongs to the guard's day (the
+            # rollover recap's rule): before today's first tick the
+            # guard still stands on yesterday, and its day-start
+            # balance must not dress up as today's drawdown.
+            gday = None
+            try:
+                gday = (ctrl0.guards.state or {}).get("day")
+            except Exception:
+                gday = None
+            if gday is not None and str(gday) != today.isoformat():
+                vitals = dict(vitals)
+                vitals["drawdown_pct"] = None
+    stats = daily_recap_image_stats(
+        ctx.journal, today, vitals=vitals,
+        open_count=len(ctx.live_positions))
+    try:
+        png = render_desk_card(stats)
+    except Exception as exc:
+        return CommandResult(
+            text=f"desk image build failed: {type(exc).__name__}: {exc}")
+    return CommandResult(
+        photo=png, caption=_desk_caption(stats),
+        reply_markup=fmt_next_keyboard("/status", "/report", "/recap"))
+
+
 @mt5_command("/ticks", "export the last N days of MT5 tick history as CSV (default 1, max 7)")
 def _mt5_ticks(ctx: CommandContext, args: list[str]) -> CommandResult:
     try:

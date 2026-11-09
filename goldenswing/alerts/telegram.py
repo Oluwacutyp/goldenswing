@@ -361,12 +361,15 @@ class TelegramSender:
                           f"sendDocument {p.name}: {detail}")
 
     def send_photo(self, png: bytes, caption: str | None = None, *,
-                   filename: str = "chart.png") -> SendResult:
+                   filename: str = "chart.png",
+                   reply_markup: dict | None = None) -> SendResult:
         """Send raw PNG bytes as a Telegram photo (MT5 signal/fill charts).
 
         Same retry/backoff contract as the other sends.  A photo that
         will not send falls back to the caption as a text message, so
         the thesis still arrives when the chart doesn't.
+        ``reply_markup`` rides the photo when given (the /desk card
+        carries its nav keyboard, like a document does).
         """
         if self.mode == "outbox":
             return SendResult(
@@ -378,6 +381,8 @@ class TelegramSender:
         data: dict = {"chat_id": self.chat_id, "caption": cap_html}
         if cap_html:
             data["parse_mode"] = "HTML"
+        if reply_markup is not None:
+            data["reply_markup"] = json.dumps(reply_markup)
         ok, detail = self._post_with_retry(
             _API_PHOTO.format(token=self.bot_token),
             data=data,
