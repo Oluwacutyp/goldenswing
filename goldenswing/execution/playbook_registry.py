@@ -30,7 +30,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..playbooks import (FVGLimitPlaybook, FVGMidlinePlaybook,
+from ..playbooks import (AuctionLVNTraversalPlaybook,
+                         AuctionValueAcceptancePlaybook,
+                         AuctionValueRejectionPlaybook,
+                         FVGLimitPlaybook, FVGMidlinePlaybook,
                          InversionPlaybook, JudasSwingPlaybook,
                          KillzoneOpenPlaybook, NarrativePlaybook,
                          OrderBlockPlaybook, QMD1Playbook, QMM5Playbook,
@@ -91,6 +94,23 @@ ROUTE_VOLATILITY_EXPANSION = "volatility_expansion"
 #: (execution/trend_promotion.py) plus the owner's separate
 #: decision — the SPEC §6 common contract.
 ROUTE_TREND_MOMENTUM = "trend_momentum"
+#: Route (MarketSituation Pass 7c, SPEC §6.3): the auction /
+#: value family's SCHEDULED evaluation contract — scans on
+#: each TRIGGER clock's close (M15, for the H1-formed
+#: developing value area), reading the developing value
+#: state (live/developing_value.py — the §6.3 extension
+#: the situation's location.value carries) on the H1
+#: formation frame.  The route is SHADOW (it journals
+#: evaluations, arm records and analytical candidates,
+#: proposes scenarios to the book, and holds NO order
+#: authority in any mode).  Like the vol and trend
+#: families, these playbooks are NOT members of the
+#: trigger-path roster: they have no legacy order
+#: authority to preserve, so they stay out of ROSTER_SPECS
+#: entirely.  Promotion is the family's own evaluation
+#: (execution/auction_promotion.py) plus the owner's
+#: separate decision — the SPEC §6 common contract.
+ROUTE_AUCTION_VALUE = "auction_value"
 
 
 @dataclass(frozen=True)
@@ -270,6 +290,33 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
                  TrendMomentumAccelerationPlaybook,
                  "H4", ROUTE_TREND_MOMENTUM,
                  shadow_evaluation=True, entry_thesis="market"),
+    # Auction / value family (MarketSituation Pass 7c, SPEC
+    # §6.3): the developing value area defined on its
+    # formation clock (H1 — the day's bars; native_tf is
+    # the family's formation clock), entered on the
+    # trigger clock one step down (M15).  Scheduled shadow
+    # route only; entry thesis is market (the premise is
+    # the auction's answer itself — acceptance's retest
+    # hold, rejection's first read, the traversal's
+    # crossing — a resting limit contradicts it).  Horizon
+    # intraday (SPEC §6.3): the registry default, declared
+    # here by the absence of an override — every instance
+    # is intraday because every sequence is day-bound.
+    PlaybookSpec("auction_value_acceptance",
+                 AuctionValueAcceptancePlaybook,
+                 "H1", ROUTE_AUCTION_VALUE,
+                 shadow_evaluation=True, entry_thesis="market",
+                 chart_studies=("volume_profile",)),
+    PlaybookSpec("auction_value_rejection",
+                 AuctionValueRejectionPlaybook,
+                 "H1", ROUTE_AUCTION_VALUE,
+                 shadow_evaluation=True, entry_thesis="market",
+                 chart_studies=("volume_profile",)),
+    PlaybookSpec("auction_lvn_traversal",
+                 AuctionLVNTraversalPlaybook,
+                 "H1", ROUTE_AUCTION_VALUE,
+                 shadow_evaluation=True, entry_thesis="market",
+                 chart_studies=("volume_profile",)),
     # Native-clock routes: evaluated by dedicated runner paths on
     # their own frames (M5 closes / D1 closes).  They are NOT in
     # the H1 roster — feeding them H1 bars was the qm_m5 defect.
@@ -300,11 +347,11 @@ RANGE_SPECS: tuple[PlaybookSpec, ...] = tuple(
 #: contract above is additional, shadow, and separate).  This is
 #: the set ``_get_playbooks`` builds, in registry order.  (Named
 #: ROSTER_SPECS for continuity with the Phase 1 invariant —
-#: extended at Pass 7a and again at Pass 7b: ROSTER_SPECS ∪
-#: NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS == the full registry,
-#: the VOL/TREND partitions being the ones that are scheduled-
-#: shadow only and therefore deliberately NOT in this
-#: trigger-path set.)
+#: extended at Passes 7a, 7b and 7c: ROSTER_SPECS ∪
+#: NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ∪ AUCTION_SPECS ==
+#: the full registry, the VOL/TREND/AUCTION partitions being
+#: the ones that are scheduled-shadow only and therefore
+#: deliberately NOT in this trigger-path set.)
 ROSTER_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route in (ROUTE_H1_ROSTER, ROUTE_RANGE_H4_H1))
@@ -325,10 +372,19 @@ VOL_SPECS: tuple[PlaybookSpec, ...] = tuple(
 #: The trend / momentum family specs (Pass 7b): the second
 #: scheduled-shadow partition.  The registry partition is
 #: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ==
-#: the full registry.
+#: the full registry (extended at Pass 7c by AUCTION_SPECS
+#: below).
 TREND_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route == ROUTE_TREND_MOMENTUM)
+
+#: The auction / value family specs (Pass 7c): the third
+#: scheduled-shadow partition.  The registry partition is
+#: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ∪
+#: AUCTION_SPECS == the full registry.
+AUCTION_SPECS: tuple[PlaybookSpec, ...] = tuple(
+    s for s in PLAYBOOK_REGISTRY
+    if s.route == ROUTE_AUCTION_VALUE)
 
 #: SCORE-FLOOR AUTHORITY, per route (Phase 2, P0-2).  Two scores
 #: exist and were conflated in Phase 1 records: the SLEEVE BASE
@@ -357,6 +413,11 @@ FLOOR_AUTHORITY: dict[str, str] = {
         "in shadow and proposed to the scenario book only",
     ROUTE_TREND_MOMENTUM:
         "shadow evaluation route (Pass 7b): no floor, no order "
+        "authority in any mode — the family is not on the "
+        "trigger path; its candidates are journaled, judged "
+        "in shadow and proposed to the scenario book only",
+    ROUTE_AUCTION_VALUE:
+        "shadow evaluation route (Pass 7c): no floor, no order "
         "authority in any mode — the family is not on the "
         "trigger path; its candidates are journaled, judged "
         "in shadow and proposed to the scenario book only",

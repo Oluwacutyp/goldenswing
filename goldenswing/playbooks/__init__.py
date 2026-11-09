@@ -34,6 +34,12 @@ from .sweep_reversal import SweepReversalPlaybook
 from .trendline_retest import TrendlineRetestPlaybook
 from .turtle_soup import TurtleSoupPlaybook
 from .v_reversal import VReversalPlaybook
+from .auction_value import (
+    AUCTION_PLAYBOOKS,
+    AuctionLVNTraversalPlaybook,
+    AuctionValueAcceptancePlaybook,
+    AuctionValueRejectionPlaybook,
+)
 from .trend_momentum import (
     TREND_PLAYBOOKS,
     TrendImpulsePullbackPlaybook,
@@ -70,6 +76,10 @@ __all__ = [
     "TREND_PLAYBOOKS",
     "TrendImpulsePullbackPlaybook",
     "TrendMomentumAccelerationPlaybook",
+    "AUCTION_PLAYBOOKS",
+    "AuctionValueAcceptancePlaybook",
+    "AuctionValueRejectionPlaybook",
+    "AuctionLVNTraversalPlaybook",
     "VReversalPlaybook",
     "RetracementTrapPlaybook",
     "InversionPlaybook",

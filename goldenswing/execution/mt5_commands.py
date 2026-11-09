@@ -573,6 +573,18 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("📈", "Trend Promotion"))
             lines.append(trend_promotion())
             lines.append("")
+    # Pass 7c auction / value promotion evaluation: the
+    # same arrangement for the auction routes — from the
+    # runner's auction_promotion_line.  Guarded — old
+    # runners lack it.
+    if ctrl is not None:
+        auction_promotion = getattr(ctrl,
+                                    "auction_promotion_line",
+                                    None)
+        if callable(auction_promotion):
+            lines.append(fmt_section("🔨", "Auction Promotion"))
+            lines.append(auction_promotion())
+            lines.append("")
     # Judgment authority (Pass 5): every route's effective
     # state + its source (declared / config / verdict /
     # demoted) and the two binding routes' standing verdicts

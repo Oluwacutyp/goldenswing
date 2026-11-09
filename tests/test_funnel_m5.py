@@ -43,8 +43,8 @@ from goldenswing.execution.funnel import summarize_evaluations
 from goldenswing.execution.mt5_config import (
     LiveConfigStore, parse_set, unknown_disabled_names)
 from goldenswing.execution.playbook_registry import (
-    NATIVE_SPECS, PLAYBOOK_NAMES, ROSTER_SPECS, TREND_SPECS,
-    VOL_SPECS)
+    AUCTION_SPECS, NATIVE_SPECS, PLAYBOOK_NAMES, ROSTER_SPECS,
+    TREND_SPECS, VOL_SPECS)
 
 from test_p3_trader import (
     _FakeQMD1, _FakeScore, _StubEngine, _StubPB, _drive_one,
@@ -456,13 +456,14 @@ def test_funnel_completeness_reconciles(tmp_path, monkeypatch):
 
 def test_registry_consistency_and_killability(tmp_path):
     # Pass 7a grew the registry to 20 and Pass 7b to 22:
-    # the partition is roster ∪ native ∪ vol ∪ trend (the
+    # the partition is roster ∪ native ∪ vol ∪ trend ∪ auction (the
     # scheduled-shadow families sit deliberately outside
     # the trigger path).
-    assert len(PLAYBOOK_NAMES) == 22  # +2 Pass 7a vol family, +2 Pass 7b trend family
+    assert len(PLAYBOOK_NAMES) == 25  # +2 Pass 7a vol family, +2 Pass 7b trend family, +3 Pass 7c auction family
     assert {s.name for s in ROSTER_SPECS} | {
         s.name for s in NATIVE_SPECS} | {
         s.name for s in TREND_SPECS} | {
+        s.name for s in AUCTION_SPECS} | {
         s.name for s in VOL_SPECS} == set(PLAYBOOK_NAMES)
     # Every advertised control maps to a real playbook.
     for name in PLAYBOOK_NAMES:

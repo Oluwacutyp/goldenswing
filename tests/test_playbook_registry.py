@@ -49,6 +49,16 @@ def test_full_roster_executes_and_is_live():
         # registry (scheduled shadow route — its playbooks are
         # live=False by design; see tests/test_vol_expansion.py).
         "vol_expansion_escape", "vol_failed_expansion",
+        # Pass 7b: the trend/momentum family (same posture;
+        # see tests/test_trend_momentum.py).  This pin was
+        # NOT updated by 7b — it failed on pristine bf02501
+        # with exactly the trend pair missing; 7c restores
+        # it while adding its own names.
+        "trend_impulse_pullback", "trend_momentum_acceleration",
+        # Pass 7c: the auction/value family (same posture;
+        # see tests/test_auction_value.py).
+        "auction_value_acceptance", "auction_value_rejection",
+        "auction_lvn_traversal",
         "qm_m5", "qm_d1")
     for cls in (SweepReversalPlaybook, FVGMidlinePlaybook,
                 TrendlineRetestPlaybook, FVGLimitPlaybook,

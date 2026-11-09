@@ -92,6 +92,11 @@ from ..live.trend_momentum import (
     FORMATION_TFS as FORMATION_TFS_TREND,
     FORMATION_TF_UP as FORMATION_TF_UP_TREND,
     TRIGGER_TF_DOWN as TRIGGER_TF_DOWN_TREND)
+from ..live.auction_value import (
+    FORMATION_TFS as FORMATION_TFS_AUCTION,
+    FORMATION_TF_UP as FORMATION_TF_UP_AUCTION,
+    TRIGGER_TF_DOWN as TRIGGER_TF_DOWN_AUCTION)
+from ..live import developing_value as _developing_value
 from ..live import relationships as _relationships
 from ..live.data_health import check_data_health as _check_data_health
 from ..live import day_context as _day_context
@@ -204,6 +209,7 @@ from .mt5_config import LiveConfigStore, unknown_disabled_names
 from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 MANAGEMENT_HORIZONS as
                                 _MANAGEMENT_HORIZONS,
+                                AUCTION_SPECS,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
                                 ROSTER_SPECS, ROSTER_SPECS_H1,
                                 TREND_SPECS, VOL_SPECS,
@@ -371,6 +377,21 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     # never be one seam call away from governing.
     "trend_impulse_pullback": "shadow_declared",
     "trend_momentum_acceleration": "shadow_declared",
+    # AUCTION / VALUE FAMILY (MarketSituation Pass 7c,
+    # SPEC §6.3): the three auction playbooks' scheduled
+    # scan route (playbook_registry.ROUTE_AUCTION_VALUE)
+    # declared shadow per playbook — route name == playbook
+    # name, the §G precedent (the journal's shadow records
+    # are keyed by playbook and the promotion evaluation
+    # (execution/auction_promotion.py) reads per-playbook
+    # history).  The scans hold no order authority in any
+    # mode; the family is not on the trigger path at all.
+    # Declaring the routes also closes the latent hazard
+    # the §G comment names: an undeclared route name must
+    # never be one seam call away from governing.
+    "auction_value_acceptance": "shadow_declared",
+    "auction_value_rejection": "shadow_declared",
+    "auction_lvn_traversal": "shadow_declared",
 }
 
 #: The playbook name a route's judgment records journal under
@@ -388,6 +409,9 @@ JUDGMENT_ROUTE_PLAYBOOK: dict[str, str] = {
     "vol_failed_expansion": "vol_failed_expansion",
     "trend_impulse_pullback": "trend_impulse_pullback",
     "trend_momentum_acceleration": "trend_momentum_acceleration",
+    "auction_value_acceptance": "auction_value_acceptance",
+    "auction_value_rejection": "auction_value_rejection",
+    "auction_lvn_traversal": "auction_lvn_traversal",
 }
 
 #: The §G range playbooks whose scheduled scans journal
@@ -412,6 +436,14 @@ VOL_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
 #: set by test).
 TREND_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in TREND_SPECS)
+
+#: The Pass 7c auction / value playbooks whose scheduled
+#: scans journal route-stamped shadow verdicts (derived
+#: from the registry's AUCTION_SPECS — one truth;
+#: auction_promotion.AUCTION_JUDGMENT_ROUTES is pinned to
+#: this set by test).
+AUCTION_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
+    spec.name for spec in AUCTION_SPECS)
 
 
 @dataclass
@@ -2763,6 +2795,38 @@ class MT5Runner:
                     location["value"] = {
                         "poc": vp.get("poc"), "vah": vp.get("vah"),
                         "val": vp.get("val"), "developing": True}
+            # Pass 7c (SPEC §6.3): the DEVELOPING value
+            # state rides the value block — the day's value
+            # area as it is building (migration vs the
+            # previous H1 bar, node structure), computed by
+            # the shared extension (live/developing_value)
+            # the auction/value family reads, so the
+            # situation and the family can never disagree
+            # on the same bars.  Its basis is named on the
+            # state itself: a tick-volume profile (MT5's
+            # volume column), never dressed as traded
+            # volume.  Guarded on its own: a value state
+            # that cannot be computed is simply absent.
+            if "value" in location and h1 is not None \
+                    and len(h1):
+                try:
+                    _dev = _developing_value.current_developing(
+                        h1)
+                    if _dev.get("status") == "ok":
+                        location["value"]["developing_state"] = {
+                            "poc": _dev["poc"],
+                            "vah": _dev["vah"],
+                            "val": _dev["val"],
+                            "day_key": _dev["day_key"],
+                            "bars": _dev["bars"],
+                            "bin_width": _dev["bin_width"],
+                            "volume_basis":
+                                _dev["volume_basis"],
+                            "migration": _dev["migration"],
+                            "hvns": _dev["hvns"],
+                            "lvns": _dev["lvns"]}
+                except Exception:  # noqa: BLE001 — block-local
+                    pass
             store = self._get_zone_store()
             active = store.active_zones() if store else []
             if price is not None:
@@ -4046,6 +4110,14 @@ class MT5Runner:
             window={"from_offset": from_offset,
                     "to_offset": new_offset,
                     "records": len(records)})
+        # Pass 7c auction / value promotion evaluation:
+        # the same window, the same cadence, the same state
+        # file — no new scheduler (the 7a host arrangement).
+        self._auction_promotion_phase(
+            records, bar_key, damaged_lines=damaged,
+            window={"from_offset": from_offset,
+                    "to_offset": new_offset,
+                    "records": len(records)})
         # Pass 4 measured priors: the same window, the same
         # cadence, the same state file — no new scheduler.
         self._priors_phase(
@@ -4179,6 +4251,45 @@ class MT5Runner:
 
         sub = self._trend_promotion_state()
         record = _trend_promotion.cycle(
+            state=sub, records=records,
+            now=pd.Timestamp(bar_key),
+            damaged_lines=damaged_lines, window=window,
+            run_id=self._run_id, bar=bar_key)
+        if record is not None:
+            self.journal.append(record)
+
+    # ---- Auction / value promotion evaluation (Pass 7c) ----
+    # The measurement machinery is execution/
+    # auction_promotion.py; this is only its host (the
+    # vol-promotion arrangement: a standing block inside
+    # the S3 state file, fed the audit's journal windows,
+    # journaled on change).  Findings feed back nowhere.
+    def _auction_promotion_state(self) -> dict:
+        from . import auction_promotion as _auction_promotion
+
+        st = self._audit_state()
+        sub = st.get("auction_promotion")
+        if not isinstance(sub, dict):
+            sub = _auction_promotion.new_state()
+            st["auction_promotion"] = sub
+        else:
+            for key, value in _auction_promotion.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _auction_promotion_phase(self, records, bar_key, *,
+                                 damaged_lines: int = 0,
+                                 window: dict | None = None) -> None:
+        """One Pass 7c promotion-evaluation cycle over the
+        self-audit's journal window.  Called from inside
+        _self_audit_phase (inside the S3 cycle's guarded
+        body): a failure here is logged by that guard like
+        any audit failure and never reaches a decision
+        path."""
+        from . import auction_promotion as _auction_promotion
+
+        sub = self._auction_promotion_state()
+        record = _auction_promotion.cycle(
             state=sub, records=records,
             now=pd.Timestamp(bar_key),
             damaged_lines=damaged_lines, window=window,
@@ -6660,6 +6771,11 @@ class MT5Runner:
         # on the trigger clocks), observation only.
         self._run_trend_momentum_family(
             FORMATION_TFS_TREND, stats, source="warmup_scan")
+        # Pass 7c: the auction / value family's warmup
+        # pass — its formation clock once (its scans run
+        # on the M15 trigger clock), observation only.
+        self._run_auction_value_family(
+            FORMATION_TFS_AUCTION, stats, source="warmup_scan")
         pump = TickPump(feed, interval=self.cfg.tick_interval)
         try:
             # on_idle: command polling MUST NOT depend on new ticks.
@@ -8095,6 +8211,21 @@ class MT5Runner:
         except Exception as exc:  # noqa: BLE001 — status must not die
             return f"trend promotion: unavailable ({exc})"
 
+    def auction_promotion_line(self) -> str:
+        """One /status Auction Promotion block (Pass 7c
+        evaluation): per auction / value route, the
+        promotion verdict over its own route-stamped shadow
+        history in plain words — the §G block's shape.  A
+        promotion_ready line is a recommendation; promotion
+        itself is the owner's separate decision."""
+        try:
+            from . import auction_promotion as _auction_promotion
+
+            return "\n".join(_auction_promotion.render_lines(
+                self._auction_promotion_state()))
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"auction promotion: unavailable ({exc})"
+
     def judgment_authority_line(self) -> str:
         """One /status Judgment Authority block (Pass 5):
         every route's effective authority state AND its
@@ -8569,6 +8700,17 @@ class MT5Runner:
         if _trend_formations:
             self._run_trend_momentum_family(
                 _trend_formations, stats, source="live_close")
+        # Pass 7c: the auction / value family evaluates on
+        # each TRIGGER clock's close (M15 closes drive the
+        # H1-formed scans) — its entries are trigger-clock
+        # events; shadow scans: journal + book, never
+        # orders.
+        _auction_formations = [
+            tf for tf in FORMATION_TFS_AUCTION
+            if TRIGGER_TF_DOWN_AUCTION[tf] in appended]
+        if _auction_formations:
+            self._run_auction_value_family(
+                _auction_formations, stats, source="live_close")
         # Phase 3: entry-TF closes — the Close Rule FIRST (a bar
         # closing beyond the invalidation level kills the setup
         # instantly, before any confirmation on the same close),
@@ -21008,9 +21150,15 @@ class MT5Runner:
             # the scan runs on the trigger clock, entries
             # fire when the LTF turn closes) gets the
             # formation clock's frame + name.  No pre-7b
-            # playbook defines the setter.
+            # playbook defines the setter.  Pass 7c: the
+            # auction / value family threads identically
+            # (an M15 scan is an H1-formed auction read);
+            # its ladder is consulted second — the two
+            # families' scan clocks never overlap (trend
+            # scans run on H1/H4, auction scans on M15).
             if hasattr(pb, "set_formation"):
                 _form_tf = FORMATION_TF_UP_TREND.get(
+                    intended_tf) or FORMATION_TF_UP_AUCTION.get(
                     intended_tf)
                 pb.set_formation(
                     self._stack.frames.get(_form_tf)
@@ -21281,7 +21429,9 @@ class MT5Runner:
             # family's shadow scans stamp identically (their
             # history is vol_promotion's dataset).  Pass 7b:
             # the trend / momentum family's likewise (their
-            # history is trend_promotion's dataset).
+            # history is trend_promotion's dataset).  Pass
+            # 7c: the auction / value family's likewise
+            # (their history is auction_promotion's dataset).
             self._emit_eval(
                 **base, outcome="candidate_emitted",
                 reason_code=_disp_code, reason=_disp_why,
@@ -21291,7 +21441,8 @@ class MT5Runner:
                     name if shadow
                     and (name in RANGE_JUDGMENT_ROUTE_NAMES
                          or name in VOL_JUDGMENT_ROUTE_NAMES
-                         or name in TREND_JUDGMENT_ROUTE_NAMES)
+                         or name in TREND_JUDGMENT_ROUTE_NAMES
+                         or name in AUCTION_JUDGMENT_ROUTE_NAMES)
                     else None))
             if _handoff:
                 # The judgment cycle inside this record's own
@@ -21697,6 +21848,163 @@ class MT5Runner:
                 except Exception as exc:
                     self.journal.log_note(
                         f"mt5: trend momentum eval failed for "
+                        f"{spec.name} on {formation_tf}: {exc}")
+
+    # --------------------------------------- auction / value (Pass 7c)
+
+    def _auction_arm_seen(self, key) -> bool:
+        """In-memory dedupe for the family's arm journal
+        (the Pass 7a design's standing remainder, inherited
+        through 7b: a restart can re-journal one arm
+        transition once — the arm record carries the
+        sequence's own timestamps, so the duplicate is
+        identifiable downstream)."""
+        seen = getattr(self, "_auction_arm_journaled", None)
+        if seen is None:
+            seen = set()
+            self._auction_arm_journaled = seen
+        if key in seen:
+            return True
+        seen.add(key)
+        return False
+
+    def _journal_auction_arm(self, formation_tf: str,
+                             trigger_frame) -> None:
+        """Journal the family's DETECTION transitions for
+        this formation clock: a corroborated probe arming
+        (phase "probing"), its resolutions (phases
+        "accepted" / "rejected"), and a resolved
+        sequence's structural death (phase "invalidated"
+        — an accepted re-pricing that did not hold, or a
+        rejection the auction later re-accepted;
+        journaled whether or not the wider state still
+        corroborates, because the death is an auction
+        fact Pass 9's grading counts, not a hypothesis).
+        One record per transition, stamped with the
+        situation id, carrying the developing-value read
+        WITH ITS BASIS NAMED (tick volume — the profile
+        is a tick-activity profile, never dressed as
+        traded volume).  The read is the acceptance
+        playbook's own pending_state (runner-threaded
+        situation + formation frame, exactly like its
+        detection scans); the sequence machine is shared
+        by all three hypotheses, so one arm stream serves
+        the family."""
+        spec = _spec_for("auction_value_acceptance")
+        if spec is None or trigger_frame is None:
+            return
+        formation_frame = (
+            self._stack.frames.get(formation_tf)
+            if self._stack is not None else None)
+        if formation_frame is None:
+            return
+        try:
+            pb = spec.playbook_class()
+            pb.set_situation(self._current_situation())
+            pb.set_formation(formation_frame, formation_tf)
+            pending = pb.pending_state(trigger_frame)
+        except Exception as exc:  # noqa: BLE001
+            self.journal.log_note(
+                f"mt5: auction arm read failed for "
+                f"{formation_tf}: {exc}")
+            return
+        if not pending:
+            return
+        if pending["phase"] in ("probing", "accepted",
+                                "rejected") \
+                and not pending.get("corroborated"):
+            # Uncorroborated states are detections, not
+            # arms — the scans' situation-cited no_setup /
+            # abstention records carry those (the 7a rule).
+            return
+        key = ("auction_arm", pending["identity"])
+        if self._auction_arm_seen(key):
+            return
+        self.journal.append({
+            "type": "auction_value_arm",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": getattr(self, "_run_id", None),
+            "family": "auction_value",
+            "formation_tf": formation_tf,
+            "trigger_tf": pending.get("trigger_tf"),
+            "phase": pending["phase"],
+            "direction": pending.get("direction"),
+            "probe": pending.get("probe"),
+            "resolution_ts": pending.get("resolution_ts"),
+            "death_ts": pending.get("death_ts"),
+            "value": pending.get("value"),
+            "volume_basis": _developing_value.VOLUME_BASIS,
+            "corroboration": pending.get("corroborated"),
+            "situation_id": (
+                pending.get("situation_id")
+                or self._current_situation_id()),
+        })
+
+    def _run_auction_value_family(self, formation_tfs,
+                                  stats=None, *,
+                                  source: str) -> None:
+        """The auction / value family on its scheduled
+        route (MarketSituation Pass 7c, SPEC §6.3): for
+        its formation clock (H1 — the developing value
+        area's own clock), journal the arm read, then
+        evaluate all three playbooks on the TRIGGER clock
+        (M15) via the funnel-evaluation seam — shadow: the
+        scans journal evaluations (with route-stamped
+        judgment verdicts), register shadow setups on live
+        closes, and propose scenarios to the book; they
+        NEVER order (no order path exists for this
+        partition).  The scans run on the trigger clock
+        because the family's entries ARE trigger-clock
+        events (the retest hold, the rejection's first
+        read, the LVN crossing).  The value evidence rides
+        on every evaluation record WITH ITS BASIS NAMED:
+        the profile is computed from MT5 tick volume —
+        recorded as such, never dressed as traded volume.
+        D1/HTF relationships are recorded as CONTEXT
+        evidence only — D1 never vetoes (§G precedent).
+
+        Failure containment mirrors the trend family's:
+        one playbook's failure logs a note and the family
+        scans on."""
+        setup = self._live_setup or {}
+        ctx_evidence = {
+            "family": "auction_value",
+            "d1_bias_context": setup.get("bias_d1"),
+            "d1_role": "context only — recorded, never consulted "
+                       "as permission (D1 never vetoes)",
+            "volume_basis": _developing_value.VOLUME_BASIS,
+            "volume_basis_role": "the developing value area "
+                                 "is a tick-volume profile "
+                                 "(MT5's volume column) — "
+                                 "named on the family's "
+                                 "records, never dressed "
+                                 "as traded volume",
+        }
+        for formation_tf in formation_tfs:
+            if formation_tf not in FORMATION_TFS_AUCTION:
+                continue
+            trigger_tf = TRIGGER_TF_DOWN_AUCTION[formation_tf]
+            frame = (self._stack.frames.get(trigger_tf)
+                     if self._stack is not None else None)
+            try:
+                self._journal_auction_arm(formation_tf, frame)
+            except Exception as exc:  # noqa: BLE001
+                self.journal.log_note(
+                    f"mt5: auction arm journal failed for "
+                    f"{formation_tf}: {exc}")
+            for spec in AUCTION_SPECS:
+                try:
+                    self._sweep_eval_one(
+                        spec, frame,
+                        clock=f"auction_value_"
+                              f"{formation_tf.lower()}",
+                        intended_tf=trigger_tf,
+                        actual_tf=trigger_tf,
+                        source=source, shadow=True,
+                        extra_evidence=ctx_evidence)
+                except Exception as exc:
+                    self.journal.log_note(
+                        f"mt5: auction value eval failed for "
                         f"{spec.name} on {formation_tf}: {exc}")
 
     # ------------------------------------------------- alerts + charts

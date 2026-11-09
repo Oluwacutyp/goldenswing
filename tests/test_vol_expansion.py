@@ -48,7 +48,8 @@ from goldenswing.execution.mt5_runner import (
     JUDGMENT_ROUTE_PLAYBOOK, management_block_for)
 from goldenswing.execution.playbook_registry import (
     FLOOR_AUTHORITY, NATIVE_SPECS, PLAYBOOK_REGISTRY, ROSTER_SPECS,
-    TREND_SPECS, VOL_SPECS, ROUTE_VOLATILITY_EXPANSION)
+    AUCTION_SPECS, TREND_SPECS, VOL_SPECS,
+    ROUTE_VOLATILITY_EXPANSION)
 from goldenswing.execution.scenario_book import ScenarioBook
 from goldenswing.execution.setup_lifecycle import TrackedSetup
 from goldenswing.live import vol_expansion as ve
@@ -417,6 +418,7 @@ def test_registry_partition_and_posture():
     assert {s.name for s in ROSTER_SPECS} | {
         s.name for s in VOL_SPECS} | {
         s.name for s in TREND_SPECS} | {
+        s.name for s in AUCTION_SPECS} | {
         s.name for s in NATIVE_SPECS} == {
         s.name for s in PLAYBOOK_REGISTRY}
     assert "no order authority" in FLOOR_AUTHORITY[

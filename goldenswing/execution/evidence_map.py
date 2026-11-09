@@ -355,6 +355,95 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                  "— one state, two entries (pullback / "
                  "continuation).",
     },
+    "auction_value_acceptance": {
+        "route": "auction_value (Pass 7c scheduled)",
+        "detector": "two clocks, causally sliced: the "
+                    "formation TF's (H1) closed bars + the "
+                    "trigger TF's (M15) closed bars.  Value "
+                    "is the DEVELOPING value area (the "
+                    "§6.3 extension, live/"
+                    "developing_value.py — the situation's "
+                    "own value layer; tick-volume basis, "
+                    "named on every record): a probe is a "
+                    "close beyond the pre-probe VAH/VAL "
+                    "after a close inside it; acceptance "
+                    "is >= 2 closes holding beyond the "
+                    "probed edge with the POC or the "
+                    "probed edge migrated toward the probe "
+                    "beyond the migration dead-band; the "
+                    "entry is the M15 retest that holds "
+                    "outside the probed edge (range back "
+                    "to the edge, close outside, no prior "
+                    "M15 close back inside)",
+        "authority": "NONE — Pass 7c shadow: scheduled scans "
+                     "journal evaluations + arm records and "
+                     "propose book scenarios; never orders. "
+                     "Promotion is the family's own "
+                     "evaluation (execution/auction_promotion.py) "
+                     "plus the owner's separate decision",
+        "notes": "Distinct from range_compression_breakout "
+                 "and the range family: no RangeDetector "
+                 "range object, no regime verdict — the "
+                 "levels are the developing value area's "
+                 "own and the trigger is the auction's "
+                 "answer (acceptance), read from closes + "
+                 "value migration, never a single wick. "
+                 "Acceptance and rejection share one "
+                 "sequence machine (the rejection row "
+                 "below) and cannot double-fire on the "
+                 "same probe.",
+    },
+    "auction_value_rejection": {
+        "route": "auction_value (Pass 7c scheduled)",
+        "detector": "the acceptance hypothesis's own "
+                    "probe sequence: the probe is REJECTED "
+                    "when a formation close returns inside "
+                    "the probed value before acceptance "
+                    "forms (a failed auction).  Entry at "
+                    "the first M15 close after the "
+                    "rejection close, while price is still "
+                    "inside the rejection bar's value; "
+                    "rotation targets the POC, then the "
+                    "opposite edge; stop beyond the probe "
+                    "extreme",
+        "authority": "NONE — Pass 7c shadow, as "
+                     "auction_value_acceptance",
+        "notes": "Distinct from range_mean_reversion: that "
+                 "playbook fades a range edge re-entry "
+                 "toward a range mid; this hypothesis is "
+                 "defined by the probe-and-answer sequence "
+                 "against MIGRATING developing value, and "
+                 "its targets are value's own (POC, far "
+                 "edge).  The classic rotation-completion "
+                 "rate (the '80% rule') is a stated "
+                 "hypothesis this family's shadow book "
+                 "validates — never an assumption in the "
+                 "detector (SPEC §6.3).",
+    },
+    "auction_lvn_traversal": {
+        "route": "auction_value (Pass 7c scheduled)",
+        "detector": "the developing profile's nodes "
+                    "(plateau-merged local extrema of the "
+                    "tick-volume histogram): an LVN is a "
+                    "local-minimum bin at or below the "
+                    "stated share of the POC bin, flanked "
+                    "by HVN shelves on both sides.  Entry "
+                    "on the M15 close that crosses INTO "
+                    "the node's span from outside it, read "
+                    "against the formation value state at "
+                    "the last closed H1 bar; target the "
+                    "far shelf; stop beyond the near shelf",
+        "authority": "NONE — Pass 7c shadow, as "
+                     "auction_value_acceptance",
+        "notes": "A close that jumps the whole span is "
+                 "the traversal already done — never "
+                 "chased; a close already inside the span "
+                 "is not a crossing.  The shelves are the "
+                 "developing day's own: an LVN exists "
+                 "only once both flanking HVNs have "
+                 "printed, so the read never trades a "
+                 "half-formed node.",
+    },
     "qm_m5": {
         "route": "native M5",
         "detector": "M5 closed bars only (feeding it H1 bars "
