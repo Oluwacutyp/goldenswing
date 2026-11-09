@@ -45,6 +45,13 @@ from .mean_reversion import (
     MeanReversionExtensionFadePlaybook,
     MeanReversionFailedContinuationPlaybook,
 )
+from .session_range import (
+    SESSION_PLAYBOOKS,
+    SessionAsiaSweepPlaybook,
+    SessionDriveReversalPlaybook,
+    SessionOpeningBreakoutPlaybook,
+    SessionOpeningFailurePlaybook,
+)
 from .trend_momentum import (
     TREND_PLAYBOOKS,
     TrendImpulsePullbackPlaybook,
@@ -88,6 +95,11 @@ __all__ = [
     "REVERSION_PLAYBOOKS",
     "MeanReversionExtensionFadePlaybook",
     "MeanReversionFailedContinuationPlaybook",
+    "SESSION_PLAYBOOKS",
+    "SessionOpeningBreakoutPlaybook",
+    "SessionOpeningFailurePlaybook",
+    "SessionDriveReversalPlaybook",
+    "SessionAsiaSweepPlaybook",
     "VReversalPlaybook",
     "RetracementTrapPlaybook",
     "InversionPlaybook",

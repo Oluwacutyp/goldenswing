@@ -313,9 +313,16 @@ def test_all_20_evaluate_on_their_clocks_without_trigger(tmp_path):
     whose clocks include H4/M15 frames this fixture stack
     doesn't carry — those scans land as honest not_eligible
     evaluation records, which is exactly the manifest contract:
-    evaluated and accountable, never silently absent.)"""
+    evaluated and accountable, never silently absent.  Passes
+    7b–7e add the trend / auction / reversion / session
+    families; their runners were NOT called here, so this
+    test failed on pristine afd8db3 with exactly those 7
+    names uncalled — Pass 7e restores the contract by
+    calling all four family runners, the same repair 7c
+    made to the EXECUTE pin.)"""
     from goldenswing.execution.playbook_registry import (
-        PLAYBOOK_NAMES, VOL_SPECS)
+        AUCTION_SPECS, PLAYBOOK_NAMES, REVERSION_SPECS,
+        SESSION_SPECS, TREND_SPECS, VOL_SPECS)
     runner, frames = _full_stack_runner(tmp_path)
     runner._run_qm_m5(frames["M5"], {}, source="live_close")
     runner._run_qm_d1(frames["D1"], {}, source="live_close")
@@ -324,6 +331,14 @@ def test_all_20_evaluate_on_their_clocks_without_trigger(tmp_path):
     runner._run_range_family("h1_refinement", {}, source="live_close")
     runner._run_vol_expansion_family(
         ("H4", "H1", "M15"), {}, source="live_close")
+    runner._run_trend_momentum_family(
+        ("D1", "H4"), {}, source="live_close")
+    runner._run_auction_value_family(
+        ("H1",), {}, source="live_close")
+    runner._run_mean_reversion_family(
+        ("M15", "M5"), {}, source="live_close")
+    runner._run_session_range_family(
+        ("H1",), {}, source="live_close")
     summary = summarize_evaluations(runner.journal.records(),
                                     PLAYBOOK_NAMES)
     assert summary["not_called"] == []
@@ -339,6 +354,20 @@ def test_all_20_evaluate_on_their_clocks_without_trigger(tmp_path):
         assert clocks.get("vol_expansion_h4") == 1, spec.name
         assert clocks.get("vol_expansion_h1") == 1, spec.name
         assert clocks.get("vol_expansion_m15") == 1, spec.name
+    for spec in TREND_SPECS:
+        clocks = by[spec.name]["by_clock"]
+        assert clocks.get("trend_momentum_d1") == 1, spec.name
+        assert clocks.get("trend_momentum_h4") == 1, spec.name
+    for spec in AUCTION_SPECS:
+        clocks = by[spec.name]["by_clock"]
+        assert clocks.get("auction_value_h1") == 1, spec.name
+    for spec in REVERSION_SPECS:
+        clocks = by[spec.name]["by_clock"]
+        assert clocks.get("mean_reversion_m15") == 1, spec.name
+        assert clocks.get("mean_reversion_m5") == 1, spec.name
+    for spec in SESSION_SPECS:
+        clocks = by[spec.name]["by_clock"]
+        assert clocks.get("session_range_h1") == 1, spec.name
     assert by["qm_m5"]["by_clock"] == {"m5_close": 1}
     assert by["qm_d1"]["by_clock"] == {"d1_close": 1}
     assert summary["frame_mismatches"] == 0

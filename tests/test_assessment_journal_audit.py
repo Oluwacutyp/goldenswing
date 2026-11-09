@@ -330,7 +330,7 @@ def test_range_h4_slice_is_causal_to_h1_close():
 
 def test_evidence_map_covers_registry_exactly():
     assert set(PLAYBOOK_EVIDENCE) == set(PLAYBOOK_NAMES)
-    assert len(PLAYBOOK_EVIDENCE) == 27  # +2 Pass 7a vol family, +2 Pass 7b trend family, +3 Pass 7c auction family, +2 Pass 7d mean reversion family
+    assert len(PLAYBOOK_EVIDENCE) == 31  # +2 Pass 7a vol family, +2 Pass 7b trend family, +3 Pass 7c auction family, +2 Pass 7d mean reversion family, +4 Pass 7e session family
     for name, row in PLAYBOOK_EVIDENCE.items():
         assert row["route"], name
         assert row["authority"], name

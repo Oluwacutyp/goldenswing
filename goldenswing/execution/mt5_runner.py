@@ -100,6 +100,10 @@ from ..live.mean_reversion import (
     FORMATION_TFS as FORMATION_TFS_REVERSION,
     FORMATION_TF_UP as FORMATION_TF_UP_REVERSION,
     TRIGGER_TFS as TRIGGER_TFS_REVERSION)
+from ..live.session_range import (
+    FORMATION_TFS as FORMATION_TFS_SESSION,
+    FORMATION_TF_UP as FORMATION_TF_UP_SESSION,
+    TRIGGER_TF_DOWN as TRIGGER_TF_DOWN_SESSION)
 from ..live import developing_value as _developing_value
 from ..live import relationships as _relationships
 from ..live.data_health import check_data_health as _check_data_health
@@ -217,6 +221,7 @@ from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
                                 REVERSION_SPECS,
                                 ROSTER_SPECS, ROSTER_SPECS_H1,
+                                SESSION_SPECS,
                                 TREND_SPECS, VOL_SPECS,
                                 decay_exempt as _decay_exempt,
                                 management_horizon_for as
@@ -411,6 +416,22 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     # never be one seam call away from governing.
     "mean_reversion_extension_fade": "shadow_declared",
     "mean_reversion_failed_continuation": "shadow_declared",
+    # SESSION / OPENING RANGE FAMILY (MarketSituation Pass
+    # 7e, SPEC §6.5): the four session playbooks' scheduled
+    # scan route (playbook_registry.ROUTE_SESSION_RANGE)
+    # declared shadow per playbook — route name == playbook
+    # name, the §G precedent (the journal's shadow records
+    # are keyed by playbook and the promotion evaluation
+    # (execution/session_promotion.py) reads per-playbook
+    # history).  The scans hold no order authority in any
+    # mode; the family is not on the trigger path at all.
+    # Declaring the routes also closes the latent hazard
+    # the §G comment names: an undeclared route name must
+    # never be one seam call away from governing.
+    "session_opening_breakout": "shadow_declared",
+    "session_opening_failure": "shadow_declared",
+    "session_drive_reversal": "shadow_declared",
+    "session_asia_sweep": "shadow_declared",
 }
 
 #: The playbook name a route's judgment records journal under
@@ -435,6 +456,10 @@ JUDGMENT_ROUTE_PLAYBOOK: dict[str, str] = {
         "mean_reversion_extension_fade",
     "mean_reversion_failed_continuation":
         "mean_reversion_failed_continuation",
+    "session_opening_breakout": "session_opening_breakout",
+    "session_opening_failure": "session_opening_failure",
+    "session_drive_reversal": "session_drive_reversal",
+    "session_asia_sweep": "session_asia_sweep",
 }
 
 #: The §G range playbooks whose scheduled scans journal
@@ -475,6 +500,14 @@ AUCTION_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
 #: to this set by test).
 REVERSION_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in REVERSION_SPECS)
+
+#: The Pass 7e session / opening range playbooks whose
+#: scheduled scans journal route-stamped shadow verdicts
+#: (derived from the registry's SESSION_SPECS — one truth;
+#: session_promotion.SESSION_JUDGMENT_ROUTES is pinned to
+#: this set by test).
+SESSION_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
+    spec.name for spec in SESSION_SPECS)
 
 
 @dataclass
@@ -2928,6 +2961,27 @@ class MT5Runner:
                            else None),
                 "overnight_high": (levels or {}).get("asia_high"),
                 "overnight_low": (levels or {}).get("asia_low")}
+            # Pass 7e (SPEC §6.5): the opening-range read
+            # this family motivates — the day's frozen
+            # Initial Balance as the situation's own
+            # measurement (high / low / mid, and its width
+            # in H1 ATR units), computed from the same day
+            # object the day_levels above read, so the
+            # situation's numbers and the family's can
+            # never disagree.  Carried as a measurement
+            # only (like extension_atr): the family's
+            # detector measures its sequences causally
+            # from bars; nothing gates on this copy.
+            if day is not None and day.ib_complete:
+                _atr_or = _atr14(h1) if h1 is not None else None
+                location["opening_range"] = {
+                    "high": float(day.ib_high),
+                    "low": float(day.ib_low),
+                    "mid": float((float(day.ib_high)
+                                  + float(day.ib_low)) / 2.0),
+                    "width_atr": (
+                        float(day.ib_width) / float(_atr_or)
+                        if _atr_or and _atr_or > 0 else None)}
             blocks["location"] = location
         except Exception:  # noqa: BLE001 — observation-only
             pass
@@ -4178,6 +4232,15 @@ class MT5Runner:
             window={"from_offset": from_offset,
                     "to_offset": new_offset,
                     "records": len(records)})
+        # Pass 7e session / opening range promotion
+        # evaluation: the same window, the same cadence,
+        # the same state file — no new scheduler (the 7a
+        # host arrangement).
+        self._session_promotion_phase(
+            records, bar_key, damaged_lines=damaged,
+            window={"from_offset": from_offset,
+                    "to_offset": new_offset,
+                    "records": len(records)})
         # Pass 4 measured priors: the same window, the same
         # cadence, the same state file — no new scheduler.
         self._priors_phase(
@@ -4389,6 +4452,45 @@ class MT5Runner:
 
         sub = self._reversion_promotion_state()
         record = _reversion_promotion.cycle(
+            state=sub, records=records,
+            now=pd.Timestamp(bar_key),
+            damaged_lines=damaged_lines, window=window,
+            run_id=self._run_id, bar=bar_key)
+        if record is not None:
+            self.journal.append(record)
+
+    # ---- Session range promotion evaluation (Pass 7e) ----
+    # The measurement machinery is execution/
+    # session_promotion.py; this is only its host (the
+    # vol-promotion arrangement: a standing block inside
+    # the S3 state file, fed the audit's journal windows,
+    # journaled on change).  Findings feed back nowhere.
+    def _session_promotion_state(self) -> dict:
+        from . import session_promotion as _session_promotion
+
+        st = self._audit_state()
+        sub = st.get("session_promotion")
+        if not isinstance(sub, dict):
+            sub = _session_promotion.new_state()
+            st["session_promotion"] = sub
+        else:
+            for key, value in _session_promotion.new_state().items():
+                sub.setdefault(key, value)
+        return sub
+
+    def _session_promotion_phase(self, records, bar_key, *,
+                                 damaged_lines: int = 0,
+                                 window: dict | None = None) -> None:
+        """One Pass 7e promotion-evaluation cycle over the
+        self-audit's journal window.  Called from inside
+        _self_audit_phase (inside the S3 cycle's guarded
+        body): a failure here is logged by that guard like
+        any audit failure and never reaches a decision
+        path."""
+        from . import session_promotion as _session_promotion
+
+        sub = self._session_promotion_state()
+        record = _session_promotion.cycle(
             state=sub, records=records,
             now=pd.Timestamp(bar_key),
             damaged_lines=damaged_lines, window=window,
@@ -6881,6 +6983,11 @@ class MT5Runner:
         # only.
         self._run_mean_reversion_family(
             TRIGGER_TFS_REVERSION, stats, source="warmup_scan")
+        # Pass 7e: the session / opening range family's
+        # warmup pass — its formation clock once (its scans
+        # run on the M15 trigger clock), observation only.
+        self._run_session_range_family(
+            FORMATION_TFS_SESSION, stats, source="warmup_scan")
         pump = TickPump(feed, interval=self.cfg.tick_interval)
         try:
             # on_idle: command polling MUST NOT depend on new ticks.
@@ -8346,6 +8453,21 @@ class MT5Runner:
         except Exception as exc:  # noqa: BLE001 — status must not die
             return f"reversion promotion: unavailable ({exc})"
 
+    def session_promotion_line(self) -> str:
+        """One /status Session Range Promotion block (Pass
+        7e evaluation): per session / opening range route,
+        the promotion verdict over its own route-stamped
+        shadow history in plain words — the §G block's
+        shape.  A promotion_ready line is a recommendation;
+        promotion itself is the owner's separate decision."""
+        try:
+            from . import session_promotion as _session_promotion
+
+            return "\n".join(_session_promotion.render_lines(
+                self._session_promotion_state()))
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"session promotion: unavailable ({exc})"
+
     def judgment_authority_line(self) -> str:
         """One /status Judgment Authority block (Pass 5):
         every route's effective authority state AND its
@@ -8842,6 +8964,17 @@ class MT5Runner:
         if _reversion_triggers:
             self._run_mean_reversion_family(
                 _reversion_triggers, stats, source="live_close")
+        # Pass 7e: the session / opening range family
+        # evaluates on each TRIGGER clock's close (M15
+        # closes drive the H1-formed scans) — its entries
+        # are trigger-clock events; shadow scans: journal
+        # + book, never orders.
+        _session_formations = [
+            tf for tf in FORMATION_TFS_SESSION
+            if TRIGGER_TF_DOWN_SESSION[tf] in appended]
+        if _session_formations:
+            self._run_session_range_family(
+                _session_formations, stats, source="live_close")
         # Phase 3: entry-TF closes — the Close Rule FIRST (a bar
         # closing beyond the invalidation level kills the setup
         # instantly, before any confirmation on the same close),
@@ -21295,10 +21428,18 @@ class MT5Runner:
             # family's set_formation_tf (above) records
             # the scan clock as its TRIGGER clock, which
             # is what intended_tf names on its scans.
+            # Pass 7e: the session / opening range family
+            # threads identically (an M15 scan is an
+            # H1-formed session read); its ladder is
+            # consulted fourth — its M15 answer is the
+            # same H1 the auction and reversion ladders
+            # name, so consultation order changes nothing
+            # the family reads.
             if hasattr(pb, "set_formation"):
                 _form_tf = FORMATION_TF_UP_TREND.get(
                     intended_tf) or FORMATION_TF_UP_AUCTION.get(
                     intended_tf) or FORMATION_TF_UP_REVERSION.get(
+                    intended_tf) or FORMATION_TF_UP_SESSION.get(
                     intended_tf)
                 pb.set_formation(
                     self._stack.frames.get(_form_tf)
@@ -21574,7 +21715,9 @@ class MT5Runner:
             # (their history is auction_promotion's dataset).
             # Pass 7d: the mean reversion family's likewise
             # (their history is reversion_promotion's
-            # dataset).
+            # dataset).  Pass 7e: the session / opening
+            # range family's likewise (their history is
+            # session_promotion's dataset).
             self._emit_eval(
                 **base, outcome="candidate_emitted",
                 reason_code=_disp_code, reason=_disp_why,
@@ -21586,7 +21729,8 @@ class MT5Runner:
                          or name in VOL_JUDGMENT_ROUTE_NAMES
                          or name in TREND_JUDGMENT_ROUTE_NAMES
                          or name in AUCTION_JUDGMENT_ROUTE_NAMES
-                         or name in REVERSION_JUDGMENT_ROUTE_NAMES)
+                         or name in REVERSION_JUDGMENT_ROUTE_NAMES
+                         or name in SESSION_JUDGMENT_ROUTE_NAMES)
                     else None))
             if _handoff:
                 # The judgment cycle inside this record's own
@@ -22322,6 +22466,179 @@ class MT5Runner:
                     self.journal.log_note(
                         f"mt5: mean reversion eval failed for "
                         f"{spec.name} on {trigger_tf}: {exc}")
+
+    # --------------------------------------- session range (Pass 7e)
+
+    def _session_arm_seen(self, key) -> bool:
+        """In-memory dedupe for the family's arm journal
+        (the Pass 7a design's standing remainder, inherited
+        through 7b, 7c and 7d: a restart can re-journal one
+        arm transition once — the arm record carries the
+        sequence's own timestamps, so the duplicate is
+        identifiable downstream)."""
+        seen = getattr(self, "_session_arm_journaled", None)
+        if seen is None:
+            seen = set()
+            self._session_arm_journaled = seen
+        if key in seen:
+            return True
+        seen.add(key)
+        return False
+
+    def _journal_session_arm(self, formation_tf: str,
+                             trigger_frame) -> None:
+        """Journal the family's DETECTION transitions for
+        this formation clock (H1): the day's frozen range
+        standing (phase "range_set"), a probe arming
+        (phase "probing"), its resolutions (phases
+        "accepted" / "failed" / "swept" /
+        "drive_rejected"), a resolved sequence's
+        structural death (phase "invalidated" — an
+        acceptance that did not hold, or a rejection the
+        session later re-accepted; journaled whether or
+        not the wider state still corroborates, because
+        the death is a session fact Pass 9's grading
+        counts), and the family's two standing
+        ABSTENTIONS (phase "no_range" — the day formed
+        no range, with its reason; phase "past_cutoff"
+        — the range stands but the day's entry window
+        closed with no resolution taken; both journaled
+        regardless of corroboration: they are the
+        family's refusals, and Pass 9 grades refusals).
+        One record per transition, stamped with the
+        situation id, carrying the day read (frozen
+        range, Asia range, drive premise) and the prior
+        value's basis NAMED where it rides (tick volume
+        — the profile is a tick-activity profile, never
+        dressed as traded volume).  The read is the
+        breakout playbook's own pending_state
+        (runner-threaded situation + formation frame,
+        exactly like its detection scans); the day
+        machine is shared by all four hypotheses, so
+        one arm stream serves the family."""
+        spec = _spec_for("session_opening_breakout")
+        if spec is None or trigger_frame is None:
+            return
+        formation_frame = (
+            self._stack.frames.get(formation_tf)
+            if self._stack is not None else None)
+        if formation_frame is None:
+            return
+        try:
+            pb = spec.playbook_class()
+            pb.set_situation(self._current_situation())
+            pb.set_formation(formation_frame, formation_tf)
+            pending = pb.pending_state(trigger_frame)
+        except Exception as exc:  # noqa: BLE001
+            self.journal.log_note(
+                f"mt5: session arm read failed for "
+                f"{formation_tf}: {exc}")
+            return
+        if not pending:
+            return
+        if pending["phase"] in ("range_set", "probing",
+                                "accepted", "failed",
+                                "swept", "drive_rejected") \
+                and not pending.get("corroborated"):
+            # Uncorroborated states are detections, not
+            # arms — the scans' situation-cited no_setup /
+            # abstention records carry those (the 7a rule).
+            # Invalidations and the standing abstentions
+            # journal regardless: all are facts Pass 9
+            # counts.
+            return
+        key = ("session_arm", pending["identity"])
+        if self._session_arm_seen(key):
+            return
+        self.journal.append({
+            "type": "session_range_arm",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": getattr(self, "_run_id", None),
+            "family": "session_range",
+            "formation_tf": formation_tf,
+            "trigger_tf": pending.get("trigger_tf"),
+            "phase": pending["phase"],
+            "seq_phase": pending.get("seq_phase"),
+            "seq_kind": pending.get("seq_kind"),
+            "direction": pending.get("direction"),
+            "day": pending.get("day"),
+            "sequence": pending.get("sequence"),
+            "volume_basis": _developing_value.VOLUME_BASIS,
+            "corroboration": pending.get("corroborated"),
+            "situation_id": (
+                pending.get("situation_id")
+                or self._current_situation_id()),
+        })
+
+    def _run_session_range_family(self, formation_tfs,
+                                  stats=None, *,
+                                  source: str) -> None:
+        """The session / opening range family on its
+        scheduled route (MarketSituation Pass 7e, SPEC
+        §6.5): for its formation clock (H1 — the day
+        object's own clock), journal the arm read, then
+        evaluate all four playbooks on the TRIGGER clock
+        (M15) via the funnel-evaluation seam — shadow:
+        the scans journal evaluations (with route-stamped
+        judgment verdicts), register shadow setups on
+        live closes, and propose scenarios to the book;
+        they NEVER order (no order path exists for this
+        partition).  The scans run on the trigger clock
+        because the family's entries ARE trigger-clock
+        events (the first read after a session fact
+        resolves).  The day's facts are the engine's own
+        session organs' — the frozen IB and Asia range
+        from live/day_context.py's day object, the
+        session partition from live/session_timeframes.py,
+        prior-day value from live/volume_profile.py WITH
+        ITS BASIS NAMED (tick volume — recorded as such,
+        never dressed as traded volume).  D1/HTF reads
+        are recorded as CONTEXT evidence only — D1 never
+        vetoes (§G precedent).
+
+        Failure containment mirrors the auction family's:
+        one playbook's failure logs a note and the family
+        scans on."""
+        setup = self._live_setup or {}
+        ctx_evidence = {
+            "family": "session_range",
+            "d1_bias_context": setup.get("bias_d1"),
+            "d1_role": "context only — recorded, never consulted "
+                       "as permission (D1 never vetoes)",
+            "volume_basis": _developing_value.VOLUME_BASIS,
+            "volume_basis_role": "the prior-day value area "
+                                 "is a tick-volume profile "
+                                 "(MT5's volume column) — "
+                                 "named on the family's "
+                                 "records, never dressed "
+                                 "as traded volume",
+        }
+        for formation_tf in formation_tfs:
+            if formation_tf not in FORMATION_TFS_SESSION:
+                continue
+            trigger_tf = TRIGGER_TF_DOWN_SESSION[formation_tf]
+            frame = (self._stack.frames.get(trigger_tf)
+                     if self._stack is not None else None)
+            try:
+                self._journal_session_arm(formation_tf, frame)
+            except Exception as exc:  # noqa: BLE001
+                self.journal.log_note(
+                    f"mt5: session arm journal failed for "
+                    f"{formation_tf}: {exc}")
+            for spec in SESSION_SPECS:
+                try:
+                    self._sweep_eval_one(
+                        spec, frame,
+                        clock=f"session_range_"
+                              f"{formation_tf.lower()}",
+                        intended_tf=trigger_tf,
+                        actual_tf=trigger_tf,
+                        source=source, shadow=True,
+                        extra_evidence=ctx_evidence)
+                except Exception as exc:  # noqa: BLE001
+                    self.journal.log_note(
+                        f"mt5: session range eval failed for "
+                        f"{spec.name} on {formation_tf}: {exc}")
 
     # ------------------------------------------------- alerts + charts
     def _studies_for_chart(self, h1, entry: float, atr: float,

@@ -85,6 +85,7 @@ from goldenswing.execution.playbook_registry import (
     REVERSION_SPECS,
     ROSTER_SPECS,
     ROUTE_MEAN_REVERSION,
+    SESSION_SPECS,
     TREND_SPECS,
     VOL_SPECS,
 )
@@ -607,9 +608,10 @@ def test_registry_partition_covers_reversion():
         s.name for s in VOL_SPECS} | {
         s.name for s in TREND_SPECS} | {
         s.name for s in AUCTION_SPECS} | {
-        s.name for s in REVERSION_SPECS} == {
+        s.name for s in REVERSION_SPECS} | {
+        s.name for s in SESSION_SPECS} == {
         s.name for s in PLAYBOOK_REGISTRY}
-    assert len(PLAYBOOK_REGISTRY) == 27
+    assert len(PLAYBOOK_REGISTRY) == 31
     assert "no order authority" in FLOOR_AUTHORITY[
         ROUTE_MEAN_REVERSION]
 

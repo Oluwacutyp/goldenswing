@@ -63,6 +63,10 @@ def test_full_roster_executes_and_is_live():
         # see tests/test_mean_reversion.py).
         "mean_reversion_extension_fade",
         "mean_reversion_failed_continuation",
+        # Pass 7e: the session / opening range family (same
+        # posture; see tests/test_session_range.py).
+        "session_opening_breakout", "session_opening_failure",
+        "session_drive_reversal", "session_asia_sweep",
         "qm_m5", "qm_d1")
     for cls in (SweepReversalPlaybook, FVGMidlinePlaybook,
                 TrendlineRetestPlaybook, FVGLimitPlaybook,
