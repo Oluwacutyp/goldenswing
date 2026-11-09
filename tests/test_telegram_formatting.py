@@ -167,10 +167,16 @@ def test_mt5_status_blocked_legs_and_counts(tmp_path):
 # ------------------------------------------------------------ other MT5
 
 def test_mt5_position_pending_none_markers(tmp_path):
-    assert "➖ (none)" in _mt5_text(_journal(tmp_path), tmp_path,
-                                   "/position")
-    assert "➖ (none)" in _mt5_text(_journal(tmp_path), tmp_path,
-                                   "/pending")
+    # Design absorption #6 supersedes the bare "(none)" marker:
+    # empty /position + /pending now answer with DESIGNED empty
+    # states (what the screen holds + what puts something here),
+    # still carrying the ➖ marker — never a bare "(none)".
+    pos = _mt5_text(_journal(tmp_path), tmp_path, "/position")
+    assert "➖ flat — no open positions" in pos
+    assert "➖ (none)" not in pos
+    pen = _mt5_text(_journal(tmp_path), tmp_path, "/pending")
+    assert "➖ nothing resting — no pending orders" in pen
+    assert "➖ (none)" not in pen
 
 
 def test_mt5_playbooks_rows_keep_contract(tmp_path):

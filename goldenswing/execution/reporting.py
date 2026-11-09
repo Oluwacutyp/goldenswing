@@ -304,6 +304,56 @@ def build_weekly_recap(journal: TradeJournal, week_start) -> str:
                      f"(UTC Mon–Sun week)")
 
 
+def daily_recap_image_stats(journal: TradeJournal, day, *,
+                            vitals: dict | None = None,
+                            open_count: int | None = None) -> dict:
+    """Tile data for the bento daily-recap image (charts/recap.py).
+
+    The journal numbers are the SAME stats the text recap renders
+    (``recap_trades`` + ``_stats`` over the same window), so the
+    image and the text can never disagree.  ``vitals`` is the
+    runner's ``account_vitals()`` dict (or None): when it is not
+    ``ok``, equity / balance / drawdown stay None and the image
+    renders those tiles unavailable — never 0.00 (the /health
+    vitals doctrine).  ``open_count`` is the live position count at
+    send time (None when no read was possible).  A win rate over
+    zero closed trades is undefined -> None, not 0%.
+    """
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    end = start + timedelta(days=1)
+    trades = recap_trades(journal, since=start, until=end)
+    stats = _stats(trades)
+    n = int(stats.get("trades", 0))
+    wins = sum(1 for t in trades if t["r_net"] > 0)
+    out: dict = {
+        "day": day.isoformat(),
+        "trades": n,
+        "wins": wins,
+        "losses": n - wins,
+        "pnl": float(stats.get("total_pnl") or 0.0),
+        "r_net": float(stats.get("total_r") or 0.0),
+        "win_rate": (float(stats["win_rate"]) if n else None),
+        "open_positions": open_count,
+        "equity": None,
+        "balance": None,
+        "currency": "",
+        "drawdown_pct": None,
+        "drawdown_limit": 0.15,
+        "halted": False,
+        "halt_reason": "",
+    }
+    if vitals and vitals.get("ok"):
+        out["equity"] = vitals.get("equity")
+        out["balance"] = vitals.get("balance")
+        out["currency"] = str(vitals.get("currency") or "")
+        out["drawdown_pct"] = vitals.get("drawdown_pct")
+        if vitals.get("limit_pct"):
+            out["drawdown_limit"] = float(vitals["limit_pct"])
+        out["halted"] = bool(vitals.get("halted"))
+        out["halt_reason"] = str(vitals.get("halt_reason") or "")
+    return out
+
+
 def recap_for_period(journal: TradeJournal, period: str) -> str:
     """Recap for the trailing window: ``daily`` = last 24h,
     ``weekly`` = last 7d (used by /recap)."""

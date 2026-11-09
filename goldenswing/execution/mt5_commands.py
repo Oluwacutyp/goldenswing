@@ -238,6 +238,48 @@ def _feed_truth(ctx: CommandContext) -> dict:
         return {}
 
 
+def _screen_state(ctx: CommandContext) -> tuple[str, str]:
+    """The bot-screen state grammar (design absorption #6): ONE
+    glyph + word for the engine's standing state, heading the
+    screens so /status reads at a glance.  Priority: HALTED >
+    PAUSED > MARKET CLOSED > STALE > LIVE.
+
+    Halt truth comes from the runner's account_vitals() — the
+    /health seam, guarded exactly as there: old runners lack it,
+    and a failed read claims neither halt nor all-clear (it simply
+    cannot add the halt state).  Paused is the live config's own
+    flag; closed / stale are the reconciled feed truth's own
+    words — fmt_feed_line renders the same states, so the header
+    and the feed line agree by construction."""
+    ctrl = _control(ctx)
+    if ctrl is not None:
+        vitals_fn = getattr(ctrl, "account_vitals", None)
+        if callable(vitals_fn):
+            try:
+                v = vitals_fn() or {}
+            except Exception:
+                v = {}
+            if v.get("ok") and v.get("halted"):
+                return "⛔", "HALTED"
+        cfg_fn = getattr(ctrl, "get_live_config", None)
+        cfg = None
+        if callable(cfg_fn):
+            try:
+                cfg = cfg_fn()
+            except Exception:
+                cfg = None
+        if cfg is not None and cfg.get("paused"):
+            return "⏸️", "PAUSED"
+    tick_state = _feed_truth(ctx).get("tick_state")
+    if tick_state == "closed_expected":
+        return "🌙", "MARKET CLOSED"
+    if tick_state in ("stale", "no_ticks"):
+        return "🟡", "STALE"
+    if not (ctx.feed_status or {}).get("ok"):
+        return "🟡", "STALE"
+    return "🟢", "LIVE"
+
+
 def _confirm_result(ctx: CommandContext, action: str, label: str,
                     arg=None) -> CommandResult:
     """Ask for confirmation before a mutating action (never acts here)."""
@@ -281,7 +323,13 @@ def _position_lines(ctx: CommandContext) -> list[str]:
     from ..execution.reporting import open_positions
     journal_opens = open_positions(ctx.journal) if ctx.journal else []
     if not journal_opens:
-        return [fmt_none()]
+        # Designed empty state (design absorption #6): what this
+        # screen holds, and what puts something here — never a
+        # bare "(none)".
+        return ["➖ flat — no open positions.  A position appears "
+                "here the moment a playbook setup fires and is "
+                "filled; resting orders live under ⏳ Pending "
+                "Orders."]
     for o in journal_opens:
         side = ("LONG 🟢" if (o.get("direction") or 0) > 0
                 else "SHORT 🔴")
@@ -302,7 +350,11 @@ def _pending_lines(ctx: CommandContext) -> list[str]:
     """Resting LIMIT / STOP orders the engine is responsible for."""
     pendings = list(getattr(ctx, "pending_orders", None) or [])
     if not pendings:
-        return [fmt_none()]
+        # Designed empty state (design absorption #6).
+        return ["➖ nothing resting — no pending orders.  A "
+                "limit/stop order appears here when a playbook "
+                "arms an entry away from price, carrying its "
+                "expiry H1 bar."]
     lines = []
     for p in pendings:
         side = ("LONG 🟢" if (p.get("direction") or 0) > 0
@@ -414,7 +466,9 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
     ctrl = _control(ctx)
     cfg = ctrl.get_live_config() if ctrl is not None else None
 
-    lines = [fmt_section("📊", "MT5 ENGINE STATUS"), ""]
+    _glyph, _word = _screen_state(ctx)
+    lines = [fmt_section("📊", "MT5 ENGINE STATUS")
+             + f" — {_glyph} {_word}", ""]
     # Feed — reconciled with the Health section below from ONE
     # source (Runtime Truth item 1): the runner's feed_truth()
     # carries market state + tick state, so this line can no
@@ -873,7 +927,15 @@ def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
 
 @mt5_command("/position", "open MT5 positions with layers")
 def _mt5_position(ctx: CommandContext, args: list[str]) -> CommandResult:
-    lines = [fmt_section("📈", "MT5 OPEN POSITIONS:"), ""]
+    live = list(getattr(ctx, "live_positions", None) or [])
+    if live:
+        state = f" — 🟢 {len(live)} open"
+    else:
+        from ..execution.reporting import open_positions
+        opens = open_positions(ctx.journal) if ctx.journal else []
+        state = (f" — 🟢 {len(opens)} open" if opens
+                 else " — ➖ flat")
+    lines = [fmt_section("📈", "MT5 OPEN POSITIONS:") + state, ""]
     lines += _position_lines(ctx)
     return CommandResult(text="\n".join(lines),
                          reply_markup=mt5_control_with_next("/status", "/pending", "/trades"))
@@ -881,7 +943,10 @@ def _mt5_position(ctx: CommandContext, args: list[str]) -> CommandResult:
 
 @mt5_command("/pending", "resting MT5 pending LIMIT / STOP orders")
 def _mt5_pending(ctx: CommandContext, args: list[str]) -> CommandResult:
-    lines = [fmt_section("⏳", "MT5 PENDING ORDERS:"), ""]
+    pendings = list(getattr(ctx, "pending_orders", None) or [])
+    state = (f" — ⏳ {len(pendings)} resting" if pendings
+             else " — ➖ none resting")
+    lines = [fmt_section("⏳", "MT5 PENDING ORDERS:") + state, ""]
     lines += _pending_lines(ctx)
     return CommandResult(text="\n".join(lines),
                          reply_markup=mt5_control_with_next("/status", "/position", "/cancel_pending"))
@@ -952,7 +1017,18 @@ def _mt5_trades(ctx: CommandContext, args: list[str]) -> CommandResult:
         return CommandResult(text="no journal attached.")
     trades = iter_paper_trades(ctx.journal)[-n:]
     if not trades:
-        return CommandResult(text="no closed MT5 trades yet.")
+        # Designed empty state (design absorption #6): the same
+        # header + next-step keyboard as the populated screen,
+        # saying what lands here and where the open ones live.
+        return CommandResult(
+            text="\n".join([
+                fmt_section("📊", "MT5 TRADES:"), "",
+                "➖ no closed MT5 trades yet — a trade lands here, "
+                "with its R multiple and exit reason, the moment a "
+                "position closes.  Open ones live under "
+                "📈 Positions."]),
+            reply_markup=fmt_next_keyboard("/status", "/report",
+                                           "/recap"))
     lines = [fmt_section("📊", f"last {len(trades)} MT5 trades:"), ""]
     for t in trades:
         side = "LONG 🟢" if t["direction"] > 0 else "SHORT 🔴"

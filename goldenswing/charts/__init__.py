@@ -6,5 +6,7 @@ liquidity pools, FVGs, order blocks, premium/discount, killzones, levels,
 entry/stop/targets — drawn on the chart in one of four styles.
 """
 from .engine import ForecastNote, STYLES, heikin_ashi, render, render_to_file
+from .recap import render_daily_recap
 
-__all__ = ["ForecastNote", "STYLES", "heikin_ashi", "render", "render_to_file"]
+__all__ = ["ForecastNote", "STYLES", "heikin_ashi", "render",
+           "render_daily_recap", "render_to_file"]

@@ -8415,13 +8415,75 @@ class MT5Runner:
             from .reporting import (build_daily_recap,
                                     build_weekly_recap)
             from datetime import timedelta as _td
-            self._send_alert(build_daily_recap(self.journal, prev))
+            self._send_alert(build_daily_recap(self.journal, prev),
+                             chart_png=self._daily_recap_png(prev))
             if day.weekday() == 0:  # Monday: the week just ended
                 self._send_alert(build_weekly_recap(
                     self.journal, prev - _td(days=6)))
         except Exception as exc:
             self.journal.log_note(
                 f"mt5: rollover recap failed: {exc}")
+
+    def _daily_recap_png(self, day) -> bytes | None:
+        """The bento recap image for the day that just ended
+        (design absorption #5) — companion to the daily text recap,
+        riding the same rollover trigger through _send_alert's
+        chart_png seam (a photo failure there falls back to the
+        text, so the recap can never be lost to the image).
+        Fully guarded: any failure returns None — the text recap
+        then sends exactly as it did before this image existed —
+        and leaves one journal note.
+
+        Tile data: journal stats identical to the text recap's
+        (reporting.daily_recap_image_stats); equity / drawdown
+        from account_vitals() — the /health seam.  The drawdown
+        figure is the guard's DAILY snapshot, so it is only used
+        while the guard's day is still the recap day: once the
+        guard has rolled to the new day, its day-start anchor
+        belongs to the new day and the tile honestly renders
+        unavailable rather than wearing the wrong day's number.
+        """
+        try:
+            from ..charts.recap import render_daily_recap
+            from .reporting import (daily_recap_image_stats,
+                                    open_positions)
+            vitals = None
+            try:
+                vitals = self.account_vitals()
+            except Exception:
+                vitals = None
+            if vitals and vitals.get("ok"):
+                gday = None
+                try:
+                    gday = (self.guards.state or {}).get("day")
+                except Exception:
+                    gday = None
+                if gday is not None and str(gday) != day.isoformat():
+                    vitals = dict(vitals)
+                    vitals["drawdown_pct"] = None
+            open_count = None
+            try:
+                if self.executor is not None:
+                    open_count = len(self.executor.positions(
+                        self.cfg.symbol))
+            except Exception:
+                open_count = None
+            if open_count is None:
+                try:
+                    open_count = len(open_positions(self.journal))
+                except Exception:
+                    open_count = None
+            stats = daily_recap_image_stats(
+                self.journal, day, vitals=vitals,
+                open_count=open_count)
+            return render_daily_recap(stats)
+        except Exception as exc:
+            try:
+                self.journal.log_note(
+                    f"mt5: rollover recap image failed: {exc}")
+            except Exception:
+                pass
+            return None
 
     # --------------------------------------------------------------- bars
     def _forecast_loop_lines(self) -> list[str]:
