@@ -550,6 +550,19 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("🔭", "Market Read"))
             lines.append(market_read())
             lines.append("")
+    # MarketSituation whole-market read (SPEC §9, Pass 1 demo
+    # proof: "/status shows the whole-market read (per-TF
+    # states + relationships)"): the situation snapshot's
+    # measured per-TF states, TF-pair relationships and §3.3
+    # blocks — beside the standing Market Read above, which is
+    # the older zone-book read and stays.  Guarded — old
+    # runners lack it.
+    if ctrl is not None:
+        situation = getattr(ctrl, "situation_line", None)
+        if callable(situation):
+            lines.append(fmt_section("🗺️", "Market Situation"))
+            lines.append(situation())
+            lines.append("")
     # Engine state
     lines.append(fmt_section("⚙️", "Engine"))
     if cfg is not None and cfg.get("paused"):

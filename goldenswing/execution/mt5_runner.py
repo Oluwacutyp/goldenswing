@@ -10948,6 +10948,34 @@ class MT5Runner:
             })
         return render_market_read(price=price, hold=hold, zones=zones)
 
+    def situation_line(self) -> str:
+        """Whole-market read for /status (see situation_read):
+        the latest MarketSituation snapshot — per-TF measured
+        states, TF-pair relationships and the §3.3 blocks,
+        rendered from the keeper's snapshot.  Observation-only
+        like everything situation: a disabled program says so
+        (a stale snapshot from an earlier enabled run is never
+        dressed as current), a missing snapshot renders as not
+        produced, and nothing here raises into the status."""
+        try:
+            from .situation_read import render_situation_read
+            if not getattr(self.cfg, "situation_enabled", True):
+                return ("market situation: disabled in config "
+                        "(situation_enabled off) — no snapshot "
+                        "is kept")
+            keeper = self._situation_keeper_get()
+            situation = None
+            if keeper is not None:
+                try:
+                    situation = keeper.latest()
+                except Exception:  # noqa: BLE001
+                    situation = None
+            if situation is None:
+                situation = self._current_situation()
+            return render_situation_read(situation)
+        except Exception as exc:  # noqa: BLE001 — status must not die
+            return f"market situation: unavailable ({exc})"
+
     def report_feed_status(self, feed_status: dict | None) -> None:
         """Log a feed failure on the SEPARATE FEED_ERROR channel.
 
