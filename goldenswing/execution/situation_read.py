@@ -22,6 +22,12 @@ carries.  Relative strength vs silver/DXY has no live feed
 in the runner — the situation carries it None, and this
 render says so in words.  It never prints a number the
 snapshot does not carry, and never 0 for an absent one.
+
+The per-TF lines also carry the TFState momentum + AMD-phase
+fields (SPEC §3.1, the §9 remainder): the measured velocity /
+band and the structural phase label, or — when the builder
+could not measure them — the builder's own reason in words,
+in the same absent-stays-absent form.
 """
 
 from __future__ import annotations
@@ -47,6 +53,55 @@ def _bias_word(bias) -> str:
     if bias < 0:
         return "bear"
     return "flat"
+
+
+def _momentum_segment(momentum) -> str:
+    """The TFState momentum read (SPEC §3.1): the measured
+    velocity + band when measured; unmeasured IN WORDS with
+    the builder's reason — never a fabricated 0.00."""
+    if not isinstance(momentum, dict):
+        return "momentum not produced"
+    velocity = momentum.get("velocity_atr")
+    if velocity is None:
+        reason = momentum.get("reason")
+        if reason:
+            return f"momentum unmeasured ({reason})"
+        return "momentum unmeasured"
+    seg = f"momentum {float(velocity):+.2f}"
+    if momentum.get("band"):
+        seg += f" {momentum['band']}"
+    if momentum.get("displacement"):
+        seg += f" · displacement {momentum['displacement']}"
+    if momentum.get("candle_character"):
+        seg += f" · candle {momentum['candle_character']}"
+    divergence = momentum.get("divergence")
+    if isinstance(divergence, dict) and divergence.get("active"):
+        seg += f" · divergence {divergence.get('family') or 'active'}"
+        direction_n = divergence.get("direction") or 0
+        if direction_n:
+            seg += " ↑" if direction_n > 0 else " ↓"
+    return seg
+
+
+def _phase_segment(phase) -> str:
+    """The TFState AMD phase (SPEC §3.1): the structural label
+    when measured; ``undetermined`` / unmeasured IN WORDS with
+    the builder's reason — never a defaulted label."""
+    if not isinstance(phase, dict):
+        return "phase not produced"
+    label = phase.get("label")
+    if label is None:
+        reason = phase.get("reason")
+        if reason:
+            return f"phase unmeasured ({reason})"
+        return "phase unmeasured"
+    seg = f"phase {label}"
+    direction_n = phase.get("direction") or 0
+    if direction_n:
+        seg += " ↑" if direction_n > 0 else " ↓"
+    if label == "undetermined" and phase.get("reason"):
+        seg += f" ({phase['reason']})"
+    return seg
 
 
 def _tf_line(tf: str, state: dict | None) -> str:
@@ -76,6 +131,8 @@ def _tf_line(tf: str, state: dict | None) -> str:
         if vol.get("atr_state"):
             seg += f" {vol['atr_state']}"
         parts.append(seg)
+    parts.append(_momentum_segment(state.get("momentum")))
+    parts.append(_phase_segment(state.get("phase")))
     event = state.get("last_structure_event")
     if isinstance(event, dict) and event.get("kind"):
         seg = f"last event {event['kind']}"

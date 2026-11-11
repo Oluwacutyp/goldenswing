@@ -80,6 +80,63 @@ Pass 1 completes the §3.1 schema and adds the A4 update layer:
 SHADOW discipline is unchanged: with the keeper disabled the
 record shapes are byte-identical to before Pass 0, and no
 decision record changes shape in any mode.
+
+Momentum + AMD phase (the §9 ship remainder — "momentum /
+AMD-phase TFState fields — build_tf_state carries no such
+keys"): every TFState now also carries the SPEC §3.1
+``momentum`` and ``phase`` fields, measured here from the
+frame's own bars with the desk's existing organs:
+
+- ``momentum.velocity_atr`` is the ATR-normalised close
+  velocity over ``VELOCITY_BARS`` bars — the construction
+  live/trend_momentum names as the situation schema's own
+  (close displacement per bar, in ATR, signed).  ``band``
+  bands that number: |v| < 0.05 ATR/bar is ``flat`` (over the
+  velocity window that is under the AMD exit buffer — noise,
+  not motion); |v| >= 0.25 ATR/bar is ``strong_*`` (sustained
+  over the window that pace is a displacement-scale move,
+  >= DISP_MIN_ATR).  ``displacement`` is the latest bar's
+  body-dominated close in the displacement doctrine's own
+  geometry (body >= DISP_BODY_WICK_MIN x wick, either
+  direction, else None).  ``candle_character`` is the latest
+  bar's named pattern from live/candle_taxonomy, or None.
+  ``divergence`` is the features/divergence RSI family read
+  at the last bar — ``{"active", "direction", "family"}``,
+  with a measured-inactive dict when the family ran and found
+  nothing live, and None when the frame is too short for the
+  family's pivots (that absence is the mean-reversion family's
+  SPEC §6.4 evidence input, previously always absent because
+  no builder produced the key).
+- ``phase`` is a STRUCTURAL AMD read (phase by structure,
+  never an EMA): the trailing AMD window's range geometry
+  against the TF's own ATR, in the bar-level AMD semantics of
+  the desk's own live/patterns.amd_phase and the sweep
+  definition of features/phases ("a liquidity sweep through
+  a base extreme that closes back inside is manipulation").
+  The features/phases state machine itself is NOT run here:
+  it consumes the full per-bar FeatureSet (sweeps, FVGs,
+  displacement series) that a pure frame builder does not
+  carry, so this read is defined from the measurements this
+  builder already makes, and says so.  Labels:
+  ``distribution`` — the last close has expanded beyond the
+  base segment's range extreme by the AMD exit buffer with
+  a displacement-scale move over the recent segment (the
+  expansion / delivery leg, including an ongoing trend);
+  ``manipulation`` — a recent bar swept beyond a range-bound
+  base's extreme and closed back inside, and price is still
+  inside (the false break / retrace shape); ``accumulation``
+  — price is still basing inside a range-bound trailing
+  window (the AMD machine's own base width / drift ceilings).
+  None of the three signatures measured -> ``undetermined``
+  WITH the measured facts as the reason; too few bars ->
+  the label stays None (absent) with the reason.  It is
+  never defaulted to accumulation.
+
+Both are state/reporting fields only: no consumer's decision
+path is changed by their presence (relationships read bias /
+structure_phase, Judgment reads the situation's other blocks,
+and the one playbook that reads ``momentum.divergence``
+records it as evidence context, exactly as it was built to).
 """
 from __future__ import annotations
 
@@ -90,14 +147,21 @@ import os
 from collections import deque
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
+from ..features.config import FeatureConfig as _FeatureConfig
+from ..features.divergence import detect_divergences as _detect_divergences
+from ..features.divergence import rsi_wilder as _rsi_wilder
 from . import multitf
 from . import relationships as _relationships
 from .atr_regime import atr_regime as _atr_regime
 from .atr_regime import atr_series as _atr_series
+from .candle_taxonomy import patterns_at as _candle_patterns_at
+from .displacement import DISP_BODY_WICK_MIN, DISP_MIN_ATR
 from .hierarchy import _pending_swings
 from .regime import ATR_CONTRACTING, SHORT_WINDOW, classify_regime
+from .trend_momentum import VELOCITY_BARS as _VELOCITY_BARS
 
 SITUATION_VERSION = 1
 
@@ -114,6 +178,37 @@ READINESS_READY = "ready"
 #: Bars a frame needs before the bedrock classifier's read counts
 #: as the full state (regime.py's own floor: SHORT_WINDOW + 5).
 MIN_BARS_READY = SHORT_WINDOW + 5
+
+#: The feature family's own default constants, sourced (never
+#: re-typed) from features/config.py: the divergence family's
+#: RSI period / pivot geometry / active age, and the AMD
+#: machine's range window, base width / drift ceilings, exit
+#: buffer and manipulation-episode memory.
+_FEATURE_DEFAULTS = _FeatureConfig()
+
+#: Momentum band edges, in ATR per bar of velocity_atr.  Below
+#: FLAT, the velocity window's total travel is under the AMD
+#: exit buffer (0.3 ATR) — noise, not motion.  At STRONG, the
+#: pace sustained over the velocity window is a
+#: displacement-scale move (>= DISP_MIN_ATR = 1.5 ATR).
+MOMENTUM_FLAT_ATR = 0.05
+MOMENTUM_STRONG_ATR = 0.25
+
+#: AMD phase measurement (see the module docstring): the
+#: trailing window and base ceilings are the AMD machine's
+#: own (features/config.py amd_*); the sweep must clear the
+#: base extreme by this much to count (live/patterns.amd_phase's
+#: sweep clearance), and the manipulation episode memory is
+#: the AMD machine's amd_manip_bars.
+AMD_WINDOW = int(_FEATURE_DEFAULTS.amd_range_bars)
+AMD_BASE_WIDTH_ATR = float(_FEATURE_DEFAULTS.amd_base_width_atr)
+AMD_BASE_DRIFT_ATR = float(_FEATURE_DEFAULTS.amd_base_drift_atr)
+AMD_EXIT_BUFFER_ATR = float(_FEATURE_DEFAULTS.amd_exit_buffer_atr)
+AMD_MANIP_BARS = int(_FEATURE_DEFAULTS.amd_manip_bars)
+AMD_SWEEP_BEYOND_ATR = 0.25
+#: Bars a frame needs before an AMD label is measured at all
+#: (live/patterns.amd_phase's own floor for its bar-level read).
+AMD_MIN_BARS = 30
 
 SNAPSHOT_KIND = "situation_snapshot"
 DELTA_KIND = "situation_delta"
@@ -188,6 +283,217 @@ def _swing_point(frame: pd.DataFrame, point) -> dict | None:
 
 
 # ------------------------------------------------------------------
+# momentum + AMD phase (SPEC §3.1 — the §9 remainder fields)
+# ------------------------------------------------------------------
+def _divergence_read(frame: pd.DataFrame, n: int) -> dict | None:
+    """The features/divergence RSI family at the frame's last
+    bar: ``{"active", "direction", "family"}`` for the newest
+    divergence whose confirmation is still within the family's
+    own active age, a measured-inactive dict when the family
+    ran and nothing is live, and None when the frame is too
+    short for two confirmed pivots (absent, never guessed)."""
+    cfg = _FEATURE_DEFAULTS
+    floor = (cfg.div_rsi_period + cfg.div_pivot_left
+             + cfg.div_pivot_right + cfg.div_min_sep)
+    if n < floor:
+        return None
+    try:
+        rsi = _rsi_wilder(
+            frame["close"].to_numpy(dtype=float), cfg.div_rsi_period)
+        found = _detect_divergences(
+            frame["high"].to_numpy(dtype=float),
+            frame["low"].to_numpy(dtype=float), rsi,
+            cfg.div_rsi_period, left=cfg.div_pivot_left,
+            right=cfg.div_pivot_right, min_sep=cfg.div_min_sep,
+            max_sep=cfg.div_max_sep, min_drsi=cfg.div_min_drsi)
+    except Exception:  # noqa: BLE001 — a malformed frame degrades
+        return None  # to absent, never a raise
+    live = [d for d in found
+            if 0 <= (n - 1) - d.confirmed_at <= cfg.div_max_age]
+    if not live:
+        return {"active": False, "direction": 0, "family": None}
+    newest = live[-1]  # detect_divergences sorts by confirmation
+    return {"active": True, "direction": int(newest.direction),
+            "family": str(newest.kind)}
+
+
+def _momentum_read(frame: pd.DataFrame, atr: float | None) -> dict:
+    """The per-TF momentum read (SPEC §3.1 ``momentum``) from
+    the frame's own bars.  Every subfield is a measurement or
+    None; ``reason`` names why the headline (velocity) is
+    absent when it is."""
+    read: dict = {"velocity_atr": None, "band": None,
+                  "displacement": None, "candle_character": None,
+                  "divergence": None, "reason": None}
+    n = len(frame)
+    if atr is None:
+        read["reason"] = ("no ATR measured (frame too short) — "
+                          "momentum unmeasured")
+        return read
+    try:
+        opens = frame["open"].to_numpy(dtype=float)
+        highs = frame["high"].to_numpy(dtype=float)
+        lows = frame["low"].to_numpy(dtype=float)
+        closes = frame["close"].to_numpy(dtype=float)
+    except Exception:  # noqa: BLE001
+        read["reason"] = "frame columns unreadable — momentum unmeasured"
+        return read
+    if n > _VELOCITY_BARS:
+        velocity = _finite(
+            (closes[-1] - closes[-1 - _VELOCITY_BARS])
+            / (_VELOCITY_BARS * atr))
+        read["velocity_atr"] = velocity
+        if velocity is not None:
+            mag = abs(velocity)
+            if mag < MOMENTUM_FLAT_ATR:
+                read["band"] = "flat"
+            elif velocity > 0:
+                read["band"] = ("strong_bull"
+                                if mag >= MOMENTUM_STRONG_ATR
+                                else "bull")
+            else:
+                read["band"] = ("strong_bear"
+                                if mag >= MOMENTUM_STRONG_ATR
+                                else "bear")
+    else:
+        read["reason"] = (
+            f"insufficient bars ({n}) for a velocity read over "
+            f"{_VELOCITY_BARS} bars")
+    # Displacement: the latest bar's body-dominated close
+    # (displacement doctrine geometry, either direction).
+    body = closes[-1] - opens[-1]
+    wick = ((highs[-1] - max(opens[-1], closes[-1]))
+            + (min(opens[-1], closes[-1]) - lows[-1]))
+    if body > 0 and body >= DISP_BODY_WICK_MIN * max(wick, 0.0):
+        read["displacement"] = "bull"
+    elif body < 0 and -body >= DISP_BODY_WICK_MIN * max(wick, 0.0):
+        read["displacement"] = "bear"
+    # Candle character: the latest bar's named pattern, if any.
+    try:
+        named = _candle_patterns_at(opens, highs, lows, closes,
+                                    float(atr), n - 1)
+    except Exception:  # noqa: BLE001
+        named = []
+    if named:
+        read["candle_character"] = str(named[0][0])
+    read["divergence"] = _divergence_read(frame, n)
+    return read
+
+
+def _amd_phase_read(frame: pd.DataFrame,
+                    atr: float | None) -> dict:
+    """The structural AMD phase (SPEC §3.1 ``phase``) — see the
+    module docstring for the definitions and their provenance.
+    ``label`` is None (absent) only when the frame cannot
+    support the read at all; a measured frame with no AMD
+    signature is ``undetermined`` with the facts as its reason,
+    never a defaulted label."""
+    read: dict = {"label": None, "direction": None,
+                  "range_high": None, "range_low": None,
+                  "reason": None}
+    n = len(frame)
+    if n < AMD_MIN_BARS:
+        read["reason"] = (
+            f"insufficient bars ({n}) for an AMD read "
+            f"(needs {AMD_MIN_BARS})")
+        return read
+    if atr is None:
+        read["reason"] = "no ATR measured — AMD phase unmeasured"
+        return read
+    try:
+        window = frame.tail(AMD_WINDOW)
+        highs = window["high"].to_numpy(dtype=float)
+        lows = window["low"].to_numpy(dtype=float)
+        closes = window["close"].to_numpy(dtype=float)
+    except Exception:  # noqa: BLE001
+        read["reason"] = "frame columns unreadable — AMD phase unmeasured"
+        return read
+    w = len(closes)
+    recent = min(AMD_MANIP_BARS, w // 3)
+    base_high = float(np.max(highs[:-recent]))
+    base_low = float(np.min(lows[:-recent]))
+    read["range_high"] = _finite(base_high)
+    read["range_low"] = _finite(base_low)
+    base_width_atr = (base_high - base_low) / atr
+    last_close = float(closes[-1])
+    recent_net_atr = float(closes[-1] - closes[-recent]) / atr
+    inside_base = base_low <= last_close <= base_high
+    # Distribution: expansion beyond the base range with a
+    # displacement-scale move over the recent segment.
+    if last_close > base_high + AMD_EXIT_BUFFER_ATR * atr \
+            and recent_net_atr >= DISP_MIN_ATR:
+        read.update({
+            "label": "distribution", "direction": 1,
+            "reason": (
+                f"expansion up: last close beyond the base range "
+                f"high {base_high:.1f} by "
+                f"{(last_close - base_high) / atr:.1f} ATR with a "
+                f"{recent_net_atr:.1f} ATR move over the last "
+                f"{recent} bars")})
+        return read
+    if last_close < base_low - AMD_EXIT_BUFFER_ATR * atr \
+            and recent_net_atr <= -DISP_MIN_ATR:
+        read.update({
+            "label": "distribution", "direction": -1,
+            "reason": (
+                f"expansion down: last close beyond the base "
+                f"range low {base_low:.1f} by "
+                f"{(base_low - last_close) / atr:.1f} ATR with a "
+                f"{recent_net_atr:.1f} ATR move over the last "
+                f"{recent} bars")})
+        return read
+    # Manipulation: a sweep through a range-bound base's extreme
+    # that closes back inside, price still inside (the false
+    # break — features/phases' manipulation definition).
+    if base_width_atr <= AMD_BASE_WIDTH_ATR and inside_base:
+        for i in range(w - recent, w):
+            if highs[i] >= base_high + AMD_SWEEP_BEYOND_ATR * atr \
+                    and closes[i] <= base_high:
+                read.update({
+                    "label": "manipulation", "direction": -1,
+                    "reason": (
+                        f"sweep above the base range high "
+                        f"{base_high:.1f} closed back inside "
+                        f"{w - 1 - i} bar(s) ago — manipulation "
+                        f"(upthrust shape)")})
+                return read
+            if lows[i] <= base_low - AMD_SWEEP_BEYOND_ATR * atr \
+                    and closes[i] >= base_low:
+                read.update({
+                    "label": "manipulation", "direction": 1,
+                    "reason": (
+                        f"sweep below the base range low "
+                        f"{base_low:.1f} closed back inside "
+                        f"{w - 1 - i} bar(s) ago — manipulation "
+                        f"(spring shape)")})
+                return read
+    # Accumulation: still basing inside a range-bound window
+    # (the AMD machine's base width / drift ceilings).
+    full_width_atr = float(np.max(highs) - np.min(lows)) / atr
+    full_drift_atr = abs(float(closes[-1] - closes[0])) / atr
+    if inside_base and full_width_atr <= AMD_BASE_WIDTH_ATR \
+            and full_drift_atr <= AMD_BASE_DRIFT_ATR:
+        read.update({
+            "label": "accumulation", "direction": 0,
+            "reason": (
+                f"range-bound base: trailing {w}-bar range "
+                f"{full_width_atr:.1f} ATR wide, net drift "
+                f"{full_drift_atr:.1f} ATR, price inside — "
+                f"accumulation")})
+        return read
+    read.update({
+        "label": "undetermined", "direction": None,
+        "reason": (
+            f"no AMD signature measured: base range "
+            f"{base_width_atr:.1f} ATR wide, trailing drift "
+            f"{full_drift_atr:.1f} ATR, last close "
+            f"{'inside' if inside_base else 'outside'} the base "
+            f"range — neither a range-bound base, a "
+            f"sweep-and-retrace, nor a displacement expansion")})
+    return read
+
+
+# ------------------------------------------------------------------
 # per-timeframe state (SPEC §3.2 — Pass 0 fields)
 # ------------------------------------------------------------------
 def build_tf_state(tf: str, frame: pd.DataFrame | None, *,
@@ -213,6 +519,13 @@ def build_tf_state(tf: str, frame: pd.DataFrame | None, *,
                    "pending_high": None, "pending_low": None},
         "volatility": {"atr": None, "atr_ratio": None,
                        "atr_state": None},
+        "momentum": {"velocity_atr": None, "band": None,
+                     "displacement": None, "candle_character": None,
+                     "divergence": None,
+                     "reason": "no bars — momentum unmeasured"},
+        "phase": {"label": None, "direction": None,
+                  "range_high": None, "range_low": None,
+                  "reason": "no bars — AMD phase unmeasured"},
         "freshness_s": None,
     }
     if frame is None or len(frame) == 0:
@@ -325,6 +638,13 @@ def build_tf_state(tf: str, frame: pd.DataFrame | None, *,
                     "contracting" if ratio < ATR_CONTRACTING
                     else str(verdict.get("regime") or "").lower()
                     or None)
+
+    # --- momentum + AMD phase (SPEC §3.1, §9 remainder) -------
+    # Both reads stand on the ATR measured above and the frame's
+    # own bars; each degrades to its absent form (label/velocity
+    # None + the reason in words) rather than raising.
+    state["momentum"] = _momentum_read(frame, atr)
+    state["phase"] = _amd_phase_read(frame, atr)
     return state
 
 
