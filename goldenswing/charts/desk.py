@@ -28,6 +28,21 @@ P&L with no closes IS a real zero and renders as +0.00 saying so.
 Determinism matches the chart engine: fixed figure size/DPI,
 the day string is data (not a wall clock), pinned PNG metadata —
 the same stats dict renders byte-identical output.
+
+Optional market ticker strip (the desk build's named remainder,
+closed when the runner gained the ``desk_ticker`` seam): when
+the stats dict carries a ``ticker`` dict — the symbol's last
+tick mid with its freshness class, the DXY's last closed H1
+close, the session — the card draws a one-line market strip
+above the drawdown tile and the middle tiles compress to make
+room, the month target strip's own pattern.  Without the dict
+the strip is not drawn and every coordinate is the card's
+original layout, byte-identical to the card that shipped
+before the strip existed.  The strip obeys the same honesty
+contract: a price the feed could not supply is a dash + its
+reason in words, and a price older than the engine's live
+class is NAMED stale / market-closed with its age — never
+dressed as live.
 """
 from __future__ import annotations
 
@@ -58,6 +73,74 @@ from .tiles import unavailable as _unavailable  # noqa: E402
 WORDMARK = "GOLDENSWING"
 STAMP = "Powered by Peacethefirst"
 
+#: Session words for the ticker strip — the engine's session
+#: vocabulary (live/regime.session_of) in the card's voice.
+_SESSION_WORDS = {
+    "asia": "Asia session",
+    "london": "London session",
+    "overlap": "London/NY overlap",
+    "ny": "New York session",
+    "offhours": "off-hours",
+}
+
+
+def _age_words(age) -> str:
+    """A tick age in words: seconds, then minutes, then hours."""
+    if age is None:
+        return "age unknown"
+    secs = float(age)
+    if secs < 90:
+        return f"{secs:.0f}s ago"
+    if secs < 5400:
+        return f"{secs / 60:.0f}m ago"
+    return f"{secs / 3600:.1f}h ago"
+
+
+def ticker_line(ticker: dict) -> str:
+    """The market ticker strip's one line, from the runner's
+    ``desk_ticker`` dict (see
+    :meth:`goldenswing.execution.mt5_runner.MT5Runner.desk_ticker`).
+
+    Segments: the symbol's last price with its freshness, the
+    DXY's last closed H1 close, the session — the day-log spec
+    for the strip (XAUUSD/DXY/session).  A value the runner
+    could not supply renders as a dash + its reason in words —
+    never a number standing in for an unread one; a price
+    outside the engine's live class is named with its state
+    and age, never presented bare as if live.  Pure text: the
+    card draws this line and the /desk caption carries it, so
+    the two can never disagree.
+    """
+    parts: list[str] = []
+    symbol = str(ticker.get("symbol") or "XAUUSD")
+    price = ticker.get("price")
+    state = str(ticker.get("tick_state") or "no_ticks")
+    age = ticker.get("tick_age_s")
+    if price is None:
+        reason = ("market closed — no tick yet"
+                  if state == "closed_expected" else "no tick yet")
+        parts.append(symbol + " — " + reason)
+    else:
+        seg = f"{symbol} {float(price):,.2f}"
+        if state == "stale":
+            seg = seg + f" (stale — last tick {_age_words(age)})"
+        elif state == "closed_expected":
+            seg = seg + (f" (market closed — last tick "
+                         f"{_age_words(age)})")
+        parts.append(seg)
+    dxy = ticker.get("dxy")
+    if dxy is not None:
+        parts.append(f"DXY {float(dxy):,.2f}")
+    else:
+        status = str(ticker.get("dxy_status") or "unavailable")
+        if status.startswith("fetch failed"):
+            status = "feed fetch failed"
+        parts.append("DXY — " + status)
+    label = _SESSION_WORDS.get(str(ticker.get("session") or ""))
+    if label:
+        parts.append(label)
+    return " · ".join(parts)
+
 _FIGSIZE = (12, 6.27)        # at 100 dpi -> 1200x627 px (LinkedIn)
 _DPI = 100
 
@@ -83,6 +166,16 @@ def render_desk_card(stats: dict) -> bytes:
     existed.  The target never recolours: the strip follows the
     drawdown bar's neutral grammar (the one accent stays the
     P&L sign).
+
+    Optional market ticker (the runner's ``desk_ticker`` dict,
+    merged by the /desk assembly when the runner carries the
+    seam): ``ticker`` with symbol, price, tick_state,
+    tick_age_s, dxy, dxy_status, session.  When absent the
+    ticker strip is not drawn and the layout is the card's
+    original (or target-only) geometry — byte-identical to the
+    card that shipped before the strip existed.  When present
+    the strip draws even with every market value unavailable:
+    a dead feed is named on the strip, never silently absent.
     """
     day = str(stats.get("day") or "")
     pnl = float(stats.get("pnl") or 0.0)
@@ -104,28 +197,44 @@ def render_desk_card(stats: dict) -> bytes:
     month_pnl = stats.get("month_pnl")
     month_pct = stats.get("month_pct")
     month_label = str(stats.get("month_label") or "")
+    ticker = stats.get("ticker")
+    has_ticker = isinstance(ticker, dict)
 
-    # Vertical rhythm: with the target strip showing, the middle
-    # row steps up to make room for it; without one, every
-    # coordinate below is the card's original layout (the
-    # byte-identical unset render above).
-    pnl_y = 0.335 if has_target else 0.27
-    pnl_h = 0.48 if has_target else 0.545
-    pnl_num_y = 0.575 if has_target else 0.545
-    pnl_sub_y = 0.41 if has_target else 0.345
-    wr_y = 0.585 if has_target else 0.555
-    wr_h = 0.23 if has_target else 0.26
-    wr_val_y = 0.725 if has_target else 0.715
-    wr_sub_y = 0.63 if has_target else 0.615
-    wr_unavail_y = 0.70 if has_target else 0.685
-    row_y = 0.335 if has_target else 0.27
-    row_h = 0.23 if has_target else 0.26
-    row_lab_y = 0.53 if has_target else 0.495
-    tr_val_y = 0.45 if has_target else 0.415
-    tr_sub_y = 0.375 if has_target else 0.315
-    eq_val_y = 0.455 if has_target else 0.42
-    eq_sub_y = 0.385 if has_target else 0.325
-    eq_unavail_y = 0.45 if has_target else 0.40
+    # Vertical rhythm: each optional strip (month target, market
+    # ticker) steps the middle rows up to make room for it; with
+    # no strip, every coordinate below is the card's original
+    # layout (the byte-identical unset render above).  `level`
+    # counts the strips present: 0 = original, 1 = one strip,
+    # 2 = both — levels 0/1 reproduce the shipped constants
+    # exactly.
+    level = (1 if has_target else 0) + (1 if has_ticker else 0)
+    pnl_y = (0.27, 0.335, 0.405)[level]
+    pnl_h = (0.545, 0.48, 0.41)[level]
+    pnl_num_y = (0.545, 0.575, 0.605)[level]
+    pnl_sub_y = (0.345, 0.41, 0.475)[level]
+    wr_y = (0.555, 0.585, 0.615)[level]
+    wr_h = (0.26, 0.23, 0.20)[level]
+    wr_val_y = (0.715, 0.725, 0.735)[level]
+    wr_sub_y = (0.615, 0.63, 0.645)[level]
+    wr_unavail_y = (0.685, 0.70, 0.715)[level]
+    row_y = pnl_y
+    row_h = (0.26, 0.23, 0.20)[level]
+    row_lab_y = (0.495, 0.53, 0.565)[level]
+    tr_val_y = (0.415, 0.45, 0.485)[level]
+    tr_sub_y = (0.315, 0.375, 0.435)[level]
+    eq_val_y = (0.42, 0.455, 0.49)[level]
+    eq_sub_y = (0.325, 0.385, 0.445)[level]
+    eq_unavail_y = (0.40, 0.45, 0.50)[level]
+
+    # Strip slots above the drawdown tile, bottom-up: the ticker
+    # takes the first slot; the target strip moves up one slot
+    # when the ticker is also present (its content shifts by the
+    # same step).  A lone strip sits in the slot the target strip
+    # shipped in.
+    ticker_tile_y = 0.245
+    ticker_tile_h = 0.065 if has_target else 0.07
+    ticker_cy = 0.278 if has_target else 0.28
+    target_dy = 0.085 if has_ticker else 0.0
 
     fig = plt.figure(figsize=_FIGSIZE, dpi=_DPI)
     fig.patch.set_facecolor(_BG)
@@ -213,28 +322,39 @@ def render_desk_card(stats: dict) -> bytes:
 
     # --------------------------------------- month target (owner-set)
     if has_target:
-        _tile(ax, 0.02, 0.245, 0.96, 0.07)
+        _tile(ax, 0.02, 0.245 + target_dy, 0.96,
+              0.065 if has_ticker else 0.07)
         lab = "MONTH TARGET"
         if month_label:
             lab = lab + " — " + month_label.upper()
-        ax.text(0.045, 0.28, lab, fontsize=10.5, fontweight="bold",
-                color=_MUTED, ha="left", va="center")
+        ax.text(0.045, 0.28 + target_dy, lab, fontsize=10.5,
+                fontweight="bold", color=_MUTED, ha="left",
+                va="center")
         if month_pnl is None or month_pct is None:
-            ax.text(0.72, 0.28, "— month-to-date P&L unavailable",
+            ax.text(0.72, 0.28 + target_dy,
+                    "— month-to-date P&L unavailable",
                     fontsize=10.5, color=_MUTED, ha="center",
                     va="center")
         else:
-            _target_bar(ax, x0=0.315, x1=0.60, y=0.262, h=0.022,
-                        pct=float(month_pct), tick_label="")
+            _target_bar(ax, x0=0.315, x1=0.60, y=0.262 + target_dy,
+                        h=0.022, pct=float(month_pct), tick_label="")
             pct_s = f"{float(month_pct):+.0f}%"
-            ax.text(0.635, 0.28, pct_s, fontsize=13, fontweight="bold",
-                    family=_MONO, color=_TEXT, ha="left", va="center")
+            ax.text(0.635, 0.28 + target_dy, pct_s, fontsize=13,
+                    fontweight="bold", family=_MONO, color=_TEXT,
+                    ha="left", va="center")
             amt = (f"{float(month_pnl):+,.2f} of "
                    f"{float(target):,.2f}")
             if currency:
                 amt = amt + " " + currency
-            ax.text(0.955, 0.28, amt, fontsize=10.5, family=_MONO,
-                    color=_MUTED, ha="right", va="center")
+            ax.text(0.955, 0.28 + target_dy, amt, fontsize=10.5,
+                    family=_MONO, color=_MUTED, ha="right",
+                    va="center")
+
+    # ------------------------------------- market ticker (runner-fed)
+    if has_ticker:
+        _tile(ax, 0.02, ticker_tile_y, 0.96, ticker_tile_h)
+        ax.text(0.5, ticker_cy, ticker_line(ticker), fontsize=11.5,
+                family=_MONO, color=_TEXT, ha="center", va="center")
 
     # ------------------------------------------- drawdown vs daily halt
     _tile(ax, 0.02, 0.075, 0.96, 0.155)

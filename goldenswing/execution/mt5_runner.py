@@ -9373,6 +9373,86 @@ class MT5Runner:
                 "tick_state": self._health.tick_state(),
                 "tick_age_s": self._health.tick_age_sec()}
 
+    def desk_ticker(self) -> dict:
+        """The desk card's market ticker strip fields (design #12
+        remainder — the strip the desk build left unbuilt for want
+        of a price seam in the stats dict).
+
+        XAUUSD is the runner's own last tick mid — the same tick
+        the market read prices from — with its freshness class
+        from the health monitor (the ONE vocabulary: live /
+        stale / closed_expected / no_ticks, plus the tick's age),
+        so the strip can never call a dead quote live.  DXY is
+        the last closed H1 close from the tracker frame the
+        correlation already fetched (no second fetch), with the
+        tracker's availability + status word.  The session is
+        read off the tick's own clock (live/regime.session_of),
+        falling back to the wall clock when no tick has arrived.
+
+        Every value the runner cannot honestly supply arrives
+        as None with its state word — the card renders those as
+        unavailable in words, never as numbers.  Display-only:
+        nothing here feeds a decision, a gate or an order.
+        """
+        from ..live.regime import session_of
+
+        tick = getattr(self, "_last_tick", None) or {}
+        price = tick.get("mid")
+        try:
+            price = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            price = None
+        tick_time = tick.get("time")
+        self._refresh_health_market()
+        health = getattr(self, "_health", None)
+        tick_state = (health.tick_state() if health is not None
+                      else "no_ticks")
+        tick_age = (health.tick_age_sec() if health is not None
+                    else None)
+        tracker = getattr(self, "_dxy", None)
+        dxy_state = getattr(tracker, "state", None)
+        dxy_available = bool(dxy_state is not None
+                             and dxy_state.available)
+        dxy_status = (str(dxy_state.status) if dxy_state is not None
+                      else "no DXY tracker")
+        dxy_close = None
+        dxy_time = None
+        frame = getattr(tracker, "frame", None)
+        if dxy_available and frame is not None and len(frame):
+            try:
+                dxy_close = float(frame["close"].iloc[-1])
+                dxy_time = frame.index[-1]
+            except Exception:
+                dxy_close = None
+                dxy_time = None
+        if dxy_available and dxy_close is None:
+            dxy_status = "no DXY close read"
+        session = (session_of(tick_time) if tick_time is not None
+                   else "unknown")
+        if session == "unknown":
+            session = session_of(datetime.now(timezone.utc))
+
+        def _stamp(value):
+            if value is None:
+                return None
+            iso = getattr(value, "isoformat", None)
+            return iso() if callable(iso) else str(value)
+
+        return {
+            "symbol": str(getattr(getattr(self, "cfg", None),
+                                  "symbol", "XAUUSD") or "XAUUSD"),
+            "price": price,
+            "tick_state": str(tick_state),
+            "tick_age_s": (float(tick_age)
+                           if tick_age is not None else None),
+            "tick_time": _stamp(tick_time),
+            "dxy": dxy_close,
+            "dxy_time": _stamp(dxy_time),
+            "dxy_available": dxy_available,
+            "dxy_status": dxy_status,
+            "session": str(session),
+        }
+
     def _journal_new_breaches(self) -> None:
         """Journal health breaches that were not breaching before —
         a stuck breach gets one note, not one per order."""

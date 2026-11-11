@@ -1184,6 +1184,16 @@ def _desk_caption(stats: dict) -> str:
         if currency:
             tgt_s = tgt_s + " " + currency
         parts.append(tgt_s)
+    ticker = stats.get("ticker")
+    if isinstance(ticker, dict):
+        # The strip's own line (charts/desk.ticker_line) rides
+        # the caption as one segment — same words as the card
+        # draws, so caption and image can never disagree; an
+        # unavailable market reads as its named state here too.
+        from ..charts.desk import ticker_line
+        line = ticker_line(ticker)
+        if line:
+            parts.append("📈 " + line)
     return " · ".join(parts)
 
 
@@ -1239,6 +1249,21 @@ def _desk_day_stats(ctx: CommandContext):
                 ctx.journal, today, target=float(_target)))
         except Exception:
             pass
+    # Market ticker strip (design #12 remainder): the runner's
+    # desk_ticker fields — the last tick mid + its freshness
+    # class, the DXY close, the session — merged under one
+    # "ticker" key, guarded like vitals: an old runner without
+    # the seam renders the card exactly as before (no strip);
+    # a runner whose feed is down still supplies the dict, and
+    # the strip names the state instead of inventing a price.
+    ticker_fn = getattr(ctrl0, "desk_ticker", None)
+    if callable(ticker_fn):
+        try:
+            ticker = ticker_fn()
+        except Exception:
+            ticker = None
+        if isinstance(ticker, dict) and ticker:
+            stats["ticker"] = ticker
     return stats, today
 
 
