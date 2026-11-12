@@ -217,11 +217,16 @@ def format_trade_status(snap: dict) -> str:
                  f"entry time {tr.get('entry_time', 'n/a')}, "
                  f"fill {tr.get('fill_status', 'n/a')}, "
                  f"style {style}")
+    # Sizing formula, rendered with its live inputs (owner ruling
+    # 2026-10-24): the authorized risk is k x equity x C, C held
+    # at 1.0 — no honest confidence field exists at order time.
+    _k = float(tr.get("risk_pct") or 0.0) / 100.0
+    _eq = float((s.get("margin") or {}).get("equity") or 0.0)
     lines.append(f"Size: lots {_v(tr.get('lots'))}, multiplier "
                  f"{_v(mgmt.get('size_mult') or plan.get('size_mult'))}x, "
                  f"reason {tr.get('size_reason', mgmt.get('confirm_kind', 'n/a'))}, "
-                 f"$ risk {_money(tr.get('risk_usd'))}, "
-                 f"risk {_v(tr.get('risk_pct'))}% equity")
+                 f"$ risk {_money(tr.get('risk_usd'))} "
+                 f"(k {_k} x ${_eq:.2f} equity x C 1.0)")
     # Min-lot floor: the min order is 0.01 lots; SL is
     # invalidation, never shrunk to fit a risk target.
     ml = s.get("min_lot") or {}

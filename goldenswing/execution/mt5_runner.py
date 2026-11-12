@@ -6640,6 +6640,15 @@ class MT5Runner:
                     # trades is a journal fact, never an implication.
                     "sizing_mode_effective": self._sizing_mode(),
                     "risk_pct": self.cfg.risk_pct,
+                    # The sizing formula, rendered with its live
+                    # coefficient (owner ruling 2026-10-24): lots =
+                    # max(0.01, floor((k*E*C)/(stop_ticks*tick_value)
+                    # /step)*step); C held at 1.0 — no honest
+                    # confidence field exists at order time.
+                    "sizing_formula": (
+                        "lots = max(0.01, floor((k*E*C)/"
+                        "(stop_ticks*tick_value)/step)*step), "
+                        f"k={float(self.cfg.risk_pct)}, C=1.0 (held)"),
                     "min_score": self.cfg.min_score,
                     "floor_authority": dict(_FLOOR_AUTHORITY),
                     # Judgment core: PROMOTED to the demo

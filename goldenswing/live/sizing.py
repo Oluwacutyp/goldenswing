@@ -14,6 +14,12 @@ broker minimum (0.01 lot on XAUUSDm); ``decline_below_min`` and
 ``cfg.risk_pct`` (default 0.01) remains only as a sizing
 coefficient inside the formula — never a gate.
 
+Confidence multiplier C is HELD at x1.0 (owner 2026-10-24):
+no honest confidence field exists at order time.  Proposed
+bands, NOT live — <60 -> x1.0, 60-79 -> x1.5, >=80 -> x2.0 —
+recorded here so they are activated by the owner's number
+only, never silently.
+
 Hard rules implemented here:
 - **Decimal everywhere.**  Every Decimal is constructed via
   ``Decimal(str(x))`` — ``Decimal(0.1)`` imports the float's binary

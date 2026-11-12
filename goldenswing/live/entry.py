@@ -561,6 +561,8 @@ def evaluate_entry(frame_m15, *, confirmation, displacement,
         if decision.get("lots") is not None:
             plan.lots = float(decision["lots"])
             plan.flags.append("min_lot_floor")
+        if decision.get("exceeds_halt_allowance"):
+            plan.flags.append("min_lot_exceeds_halt_allowance")
         for warn in decision.get("warnings", []):
             plan.flags.append(f"min_lot_warning: {warn}")
     plan.valid = True

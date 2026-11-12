@@ -1262,12 +1262,16 @@ class TestMinLotFloor:
         # 0.01 lots x $21.25 SL x $1/oz = $21.25 risk.
         assert min_lot_risk(21.25) == pytest.approx(21.25)
 
-    def test_skip_over_50pct_equity_non_fast_growth(self):
+    def test_over_50pct_equity_accepts_minimum_per_ruling(self):
+        # Owner ruling 2026-10-24: the 50% SKIP is REMOVED — the
+        # engine trades the broker minimum, never abandons.
         d = evaluate_min_lot(sl_distance=21.25, target_risk=10.0,
                              equity=12.0, mode="PERCENT")
-        assert d["decision"] == "skip"
-        assert "would blow account" in d["log"]
-        assert d["lots"] == 0.0
+        assert d["decision"] == "accept"
+        assert d["lots"] == pytest.approx(0.01)
+        assert d["exceeds_halt_allowance"] is True
+        assert "2026-10-24" in d["log"]
+        assert any("halt allowance" in w for w in d["warnings"])
 
     def test_accept_over_target_under_10pct_equity(self):
         d = evaluate_min_lot(sl_distance=21.25, target_risk=10.0,
@@ -1275,6 +1279,7 @@ class TestMinLotFloor:
         assert d["decision"] == "accept"
         assert d["lots"] == pytest.approx(0.01)
         assert d["min_risk_pct"] == pytest.approx(0.0425)
+        assert d["exceeds_halt_allowance"] is False
 
     def test_fixed_lots_12_accept_with_warning_guards(self):
         d = evaluate_min_lot(sl_distance=21.25, target_risk=10.0,
@@ -1305,14 +1310,19 @@ class TestMinLotFloor:
 
     def test_entry_never_shrinks_sl_or_fractional_lots(self):
         # Min-lot floor applies: SL stays at the invalidation
-        # level, lots never below 0.01.
+        # level, lots never below 0.01.  Owner ruling 2026-10-24:
+        # >50% equity no longer skips — the plan is valid at the
+        # broker minimum, flagged for exceeding the halt allowance.
         plan = evaluate_entry(
             _entry_frame(), confirmation=_conf(),
             displacement={"strength": "strong", "move_atr": 2.0},
             sweep={"wick": 4200.0}, direction=1, atr=ATR,
             risk_amount=10.0, equity=12.0, mode="PERCENT")
-        assert not plan.valid  # >50% equity, PERCENT -> skip
+        assert plan.valid
         assert plan.stop == pytest.approx(4197.5)  # SL unshrunk
+        assert plan.lots == pytest.approx(0.01)
+        assert plan.lots >= 0.01
+        assert "min_lot_exceeds_halt_allowance" in plan.flags
         plan2 = evaluate_entry(
             _entry_frame(), confirmation=_conf(),
             displacement={"strength": "strong", "move_atr": 2.0},
@@ -1333,6 +1343,7 @@ class TestMinLotFloor:
         assert "177% equity $12" in line
         assert "FIXED_LOTS" in line
         assert "margin shield ON" in line
+        assert "halt allowance" in line
 
 
 # ------------------------------------------------------------ /STATUS
