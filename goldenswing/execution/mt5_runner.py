@@ -3724,6 +3724,36 @@ class MT5Runner:
             table.append(row)
         return table
 
+    def _priors_verdict_summary(self) -> dict | None:
+        """The standing calibration verdict for the
+        judgment_authority record: whether the Core's priors
+        are proven (measured_wins), unproven
+        (insufficient_data) or held (fixed_holds), with the
+        holdout count and the bar, and the mode the verdicts
+        actually price under.  None when no calibration cycle
+        has journaled a verdict yet — the record then carries
+        no priors key at all (absent, never a guessed
+        verdict).  The abstention audit's surface: a reader
+        of the journal can tell, per H1 close, whether the
+        Core's expected value is earned or still stated."""
+        try:
+            sub = self._priors_state()
+            verdict = sub.get("last_verdict")
+            if not isinstance(verdict, dict) \
+                    or not verdict.get("verdict"):
+                return None
+            bar = verdict.get("bar") or {}
+            return {
+                "verdict": str(verdict.get("verdict")),
+                "holdout_n": int(verdict.get("holdout_n") or 0),
+                "min_holdout": int(bar.get("min_holdout") or 0),
+                "mode": str(getattr(
+                    self.cfg, "judgment_priors", "stated")
+                    or "stated"),
+            }
+        except Exception:  # noqa: BLE001 - annotation is evidence
+            return None
+
     def _priors_provider(self):  # type: ignore[no-untyped-def]
         """The live priors provider (Pass 4) over the standing
         calibration state, or None when the measurement layer
@@ -4931,13 +4961,17 @@ class MT5Runner:
         the manifest can never disagree about who may trade."""
         if "H1" not in (appended or []):
             return
-        self.journal.append({
+        record = {
             "type": "judgment_authority",
             "ts": (str(asof) if asof is not None
                    else str(self._evaluation_now())),
             "run_id": self._run_id,
             "mode": self._judgment_mode(),
-            "routes": self._judgment_route_table()})
+            "routes": self._judgment_route_table()}
+        priors = self._priors_verdict_summary()
+        if priors is not None:
+            record["priors"] = priors
+        self.journal.append(record)
 
     def _audit_feedback_for(self, playbook) -> dict | None:
         """Completion-05 feedback, journal-only: the standing

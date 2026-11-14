@@ -252,6 +252,38 @@ def test_authority_cycle_journals_once_per_h1_close(tmp_path):
         is False
 
 
+def test_authority_record_carries_the_priors_verdict(tmp_path):
+    """The abstention audit's surface: every
+    judgment_authority record carries the standing
+    calibration verdict — whether the Core's priors are
+    proven (measured_wins), unproven (insufficient_data) or
+    held (fixed_holds), with the holdout count and the bar.
+    A thin history reads insufficient_data (never a guessed
+    verdict); no verdict yet means no priors key at all."""
+    from test_judgment_calibration import _dataset
+    runner = _jc_runner(tmp_path)
+    # No calibration cycle yet: no priors key.
+    runner._authority_cycle(
+        ["H1", "M5"], "2026-11-06 01:00:00+00:00")
+    rows = _records(runner, "judgment_authority")
+    assert len(rows) == 1
+    assert "priors" not in rows[0]
+    # A thin history (10 pairs, 3 on the holdout): the
+    # verdict is insufficient_data, and the record carries it.
+    records = _dataset(10, outcome_r=1.0)
+    runner._priors_phase(records, "2026-11-06 02:00:00+00:00")
+    runner._authority_cycle(
+        ["H1", "M5"], "2026-11-06 02:00:00+00:00")
+    rows = _records(runner, "judgment_authority")
+    assert len(rows) == 2
+    priors = rows[1].get("priors")
+    assert priors is not None
+    assert priors["verdict"] == "insufficient_data"
+    assert priors["holdout_n"] < priors["min_holdout"]
+    assert priors["min_holdout"] == 20
+    assert priors["mode"] == "stated"
+
+
 def test_status_line_renders_the_same_table(tmp_path):
     runner = _jc_runner(tmp_path)
     line = runner.judgment_authority_line()
