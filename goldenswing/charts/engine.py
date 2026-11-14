@@ -1342,7 +1342,7 @@ def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
 # (_mt5_edge_labels) — whole-surface, no exceptions. The legacy
 # render_mt5_signal stays as the named study profiles
 # (classic / blueprint) for callers that ask for the full study.
-_ROLE_FIGSIZE = (16, 7.0)    # 1600x700 per role panel
+_ROLE_FIGSIZE = (12.42, 15.0)  # 1242x1500; match TV rung
 _ROLE_MARGIN = 12
 
 
@@ -1372,9 +1372,13 @@ def _role_scaffold(title: str, header: str):
     theme = _THEMES["classic"]
     fig = plt.figure(figsize=_ROLE_FIGSIZE, dpi=_DPI)
     fig.patch.set_facecolor(theme["bg"])
+    # Portrait fallback uses the same 1242x1500 canvas as the
+    # Lightweight Charts rung. Keep the header compact: the old
+    # landscape top=0.80 left a large empty band when rendered
+    # portrait and pushed useful candles below the phone fold.
     gs = fig.add_gridspec(2, 1, height_ratios=[4.4, 1.0], hspace=0.05,
-                          left=0.045, right=0.965, top=0.80,
-                          bottom=0.09)
+                          left=0.045, right=0.965, top=0.895,
+                          bottom=0.075)
     ax = fig.add_subplot(gs[0])
     axv = fig.add_subplot(gs[1], sharex=ax)
     for a in (ax, axv):
@@ -1388,9 +1392,9 @@ def _role_scaffold(title: str, header: str):
     axv.yaxis.tick_right()
     axv.yaxis.set_label_position("right")
     plt.setp(ax.get_xticklabels(), visible=False)
-    fig.text(0.045, 0.955, header, fontsize=13.5, fontweight="bold",
+    fig.text(0.045, 0.978, header, fontsize=15.0, fontweight="bold",
              color=theme["text"], ha="left", va="top")
-    fig.text(0.045, 0.905, title, fontsize=11.5,
+    fig.text(0.045, 0.948, title, fontsize=13.0,
              color=theme["text"], ha="left", va="top")
     return fig, ax, axv, theme
 
@@ -1401,9 +1405,10 @@ def _role_scaffold_sub(title: str, header: str):
     theme = _THEMES["classic"]
     fig = plt.figure(figsize=_ROLE_FIGSIZE, dpi=_DPI)
     fig.patch.set_facecolor(theme["bg"])
+    # Same portrait canvas and compact header as _role_scaffold.
     gs = fig.add_gridspec(3, 1, height_ratios=[3.6, 0.85, 0.75],
                           hspace=0.05, left=0.045, right=0.965,
-                          top=0.80, bottom=0.09)
+                          top=0.895, bottom=0.075)
     ax = fig.add_subplot(gs[0])
     axsub = fig.add_subplot(gs[1], sharex=ax)
     axv = fig.add_subplot(gs[2], sharex=ax)
@@ -1420,9 +1425,9 @@ def _role_scaffold_sub(title: str, header: str):
     axv.yaxis.set_label_position("right")
     plt.setp(ax.get_xticklabels(), visible=False)
     plt.setp(axsub.get_xticklabels(), visible=False)
-    fig.text(0.045, 0.955, header, fontsize=13.5, fontweight="bold",
+    fig.text(0.045, 0.978, header, fontsize=15.0, fontweight="bold",
              color=theme["text"], ha="left", va="top")
-    fig.text(0.045, 0.905, title, fontsize=11.5,
+    fig.text(0.045, 0.948, title, fontsize=13.0,
              color=theme["text"], ha="left", va="top")
     return fig, ax, axsub, axv, theme
 

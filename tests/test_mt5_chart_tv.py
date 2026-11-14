@@ -173,7 +173,7 @@ def test_find_browser_shape():
 
 
 # ------------------------------------------------------------ the rungs
-def test_fallback_rung_keeps_landscape_and_stamps_honestly(
+def test_fallback_rung_renders_portrait_and_stamps_honestly(
         monkeypatch):
     monkeypatch.setattr(screenshot, "screenshot_html",
                         lambda *a, **k: None)
@@ -182,7 +182,8 @@ def test_fallback_rung_keeps_landscape_and_stamps_honestly(
     assert engine.last_tv_error()
     for png in pngs:
         arr = plt.imread(io.BytesIO(png))
-        assert (arr.shape[1], arr.shape[0]) == (1600, 700)
+        assert (arr.shape[1], arr.shape[0]) == (tv_page.PAGE_W,
+                                                tv_page.PAGE_H)
         meta = screenshot.read_png_text(png)
         assert meta.get("Renderer") == "matplotlib-fallback"
 
@@ -230,3 +231,34 @@ def test_signal_view_consumes_the_shared_builder():
     assert payload["meta"]["target_ranks"] == [1, 2, 3, 24]
     # bars carry volume now (6th field) for the TV volume strip
     assert len(payload["tfs"]["M5"]["bars"][0]) == 6
+
+
+def test_signal_view_m1_rides_last_when_supplied():
+    """The Hot Scalp M1 aux frame reaches the signal view's
+    timeframe selector when real M1 bars exist (never resampled
+    or fabricated), and M1 sits LAST in the selector — the finest
+    clock is entry precision, not the lead tab."""
+    html = build_signal_view_html(
+        frames={"D1": _frame(30, "D", "2026-11-01"),
+                "H4": _frame(60, "4h", "2026-11-03"),
+                "H1": _frame(60, "h", "2026-11-03"),
+                "M15": _frame(60, "15min", "2026-11-05 08:00"),
+                "M5": _frame(60, "5min", "2026-11-05 08:00"),
+                "M1": _frame(60, "min", "2026-11-05 08:00")},
+        entry=4124.49, stop=4110.43,
+        targets=[4126.0 + 1.5 * i for i in range(12)],
+        direction=1, playbook="hot_scalp",
+        verdict={"entry_clock": "M1", "trigger": "sweep reclaim"},
+        zone={"top": 4135.883, "bottom": 4132.01, "kind": "FVG"},
+        nearby_zones=[], fib_levels=[], fib_range=None,
+        ote_band=None, fib_info=None, alert_id="MT5-hot_scalp-2009",
+        lifecycle=_lifecycle()[0])
+    start = html.index('<script id="signal-data" '
+                       'type="application/json">')
+    start = html.index(">", start) + 1
+    payload = json.loads(html[start:html.index("</script>", start)])
+    assert "M1" in payload["tfs"]
+    assert list(payload["tfs"]) == ["D1", "H4", "H1", "M15", "M5",
+                                    "M1"]
+    assert 'data-tf="M1"' in html
+    assert html.rindex('data-tf="M1"') > html.rindex('data-tf="M5"')

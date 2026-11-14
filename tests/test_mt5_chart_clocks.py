@@ -266,7 +266,9 @@ class TestDefectPins:
         assert len(pngs) == 3
         for png in pngs:
             img = mpimg.imread(io.BytesIO(png), format="png")
-            assert img.shape[1] == 1600
+            # Portrait canvas shared with the TV rung (1242x1500).
+            assert img.shape[1] == 1242
+            assert img.shape[0] == 1500
 
 
 # ------------------------------------------------------------ study parity

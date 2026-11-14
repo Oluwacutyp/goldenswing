@@ -275,15 +275,11 @@ def test_render_mt5_roles_is_three_real_pngs():
     for png in pngs:
         assert png[:8] == b"\x89PNG\r\n\x1a\n"
         arr = plt.imread(io.BytesIO(png))
-        # PIN MOVED (TV renderer pass): the canvas size now
-        # depends on the renderer rung — portrait 1242x1500 for
-        # the Lightweight Charts rung, the shipped 1600x700
-        # landscape for the matplotlib fallback. Both geometries
-        # are pinned deterministically in test_mt5_chart_tv.py
-        # (fallback forced / TV rung skip-gated); here the trio
-        # contract is rung-agnostic.
-        assert (arr.shape[1], arr.shape[0]) in ((1242, 1500),
-                                                (1600, 700))
+        # Both renderer rungs share the portrait phone geometry
+        # (1242x1500) so browser availability cannot change the
+        # Telegram chart layout — the matplotlib fallback renders
+        # the same canvas as the Lightweight Charts rung.
+        assert (arr.shape[1], arr.shape[0]) == (1242, 1500)
         assert float(arr.std()) > 0.01
 
 
