@@ -94,13 +94,14 @@ def test_cycle_journals_criteria_before_any_verdict():
                    now="2026-11-08 00:00:00+00:00",
                    bar="2026-11-08 00:00:00+00:00")
     types = [r["type"] for r in out]
-    assert types == [
-        rp.CRITERIA_RECORD_TYPE, rp.CRITERIA_RECORD_TYPE,
-        rp.EVALUATION_RECORD_TYPE]
-    criteria = out[:2]
+    n_routes = len(rp.PROMOTION_ROUTES)
+    assert types == (
+        [rp.CRITERIA_RECORD_TYPE] * n_routes
+        + [rp.EVALUATION_RECORD_TYPE])
+    criteria = out[:n_routes]
     assert {c["route"] for c in criteria} == set(
         rp.PROMOTION_ROUTES)
-    evaluation = out[2]
+    evaluation = out[n_routes]
     for route, row in evaluation["routes"].items():
         crit = next(c for c in criteria
                     if c["route"] == route)

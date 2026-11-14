@@ -193,6 +193,43 @@ def test_targets_as_prices_reads_every_shape():
         targets_as_prices(["tp1", 3925.0])
 
 
+def test_insane_geometry_is_refused_not_proposed(tmp_path):
+    """A scenario whose stop is on the wrong side of entry, or
+    whose targets sit behind entry, or which carries no target
+    at all, is REFUSED with a journaled reason — it never
+    reaches the book and can never reach an order."""
+    book = _book(tmp_path)
+    # Long with the stop ABOVE the entry (wrong side).
+    bad_stop = _setup("bad:stop", direction=1, entry=4000.0,
+                      stop=4010.0, targets=(4020.0,))
+    recs = book.propose_from_setup(bad_stop, ts=1)
+    assert recs and recs[0]["type"] == "scenario_refused"
+    assert "stop" in recs[0]["reason"]
+    assert "bad:stop" not in {s["scenario_id"]
+                              for s in book.live()}
+    # Long with every target BEHIND the entry.
+    bad_targets = _setup("bad:targets", direction=1,
+                         entry=4000.0, stop=3990.0,
+                         targets=(3980.0,))
+    recs = book.propose_from_setup(bad_targets, ts=1)
+    assert recs and recs[0]["type"] == "scenario_refused"
+    assert "target" in recs[0]["reason"]
+    assert "bad:targets" not in {s["scenario_id"]
+                                 for s in book.live()}
+    # No targets at all.
+    no_targets = _setup("bad:none", direction=1, entry=4000.0,
+                        stop=3990.0, targets=())
+    recs = book.propose_from_setup(no_targets, ts=1)
+    assert recs and recs[0]["type"] == "scenario_refused"
+    assert "bad:none" not in {s["scenario_id"]
+                              for s in book.live()}
+    # A sane setup still proposes.
+    good = _setup("good:1", direction=1, entry=4000.0,
+                  stop=3990.0, targets=(4020.0,))
+    book.propose_from_setup(good, ts=1)
+    assert "good:1" in {s["scenario_id"] for s in book.live()}
+
+
 # ------------------------------------------------------------------
 # A2.2 — different timeframes hold independent theses
 # ------------------------------------------------------------------

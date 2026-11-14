@@ -256,6 +256,52 @@ def targets_as_prices(targets) -> list[float]:
     return [float(targets)]
 
 
+def scenario_geometry_reason(*, entry, stop, targets,
+                             direction) -> str | None:
+    """None when a scenario's geometry is sane, else the reason.
+
+    Sane means: entry and stop are finite and different; the stop
+    sits on the correct side (long: stop below entry; short:
+    stop above entry); at least one target exists; every target
+    sits ahead of entry in the trade direction.  Targets are
+    read through targets_as_prices, so a Hot Scalp staged table
+    is judged on its prices, not its labels.  A scenario that
+    fails this never reaches the book and can never reach an
+    order — the promotion gate's per-scenario check.
+    """
+    import math
+
+    try:
+        entry_f = float(entry)
+        stop_f = float(stop)
+    except (TypeError, ValueError):
+        return "entry/stop are not numbers"
+    if not (math.isfinite(entry_f) and math.isfinite(stop_f)):
+        return "entry/stop are not finite"
+    if entry_f == stop_f:
+        return "stop equals entry (no risk distance)"
+    if int(direction) > 0 and not stop_f < entry_f:
+        return "stop is not below entry for a long"
+    if int(direction) < 0 and not stop_f > entry_f:
+        return "stop is not above entry for a short"
+    if int(direction) == 0:
+        return "direction is zero"
+    try:
+        prices = targets_as_prices(targets)
+    except (TypeError, ValueError):
+        return "targets are not prices"
+    if not prices:
+        return "no target"
+    for target in prices:
+        if not math.isfinite(target):
+            return "a target is not finite"
+        if int(direction) > 0 and not target > entry_f:
+            return "a target is not ahead of entry for a long"
+        if int(direction) < 0 and not target < entry_f:
+            return "a target is not ahead of entry for a short"
+    return None
+
+
 def _span(scenario: dict) -> tuple[float, float] | None:
     """The scenario's price span [lo, hi] over entry, stop and
     targets — the region its trade occupies.  Incomplete
@@ -624,6 +670,26 @@ class ScenarioBook:
             "created_ts": ts,
             "updated_ts": ts,
         }
+        _reason = scenario_geometry_reason(
+            entry=scenario["geometry"]["entry"],
+            stop=scenario["geometry"]["stop"],
+            targets=scenario["geometry"]["targets"],
+            direction=scenario["direction"])
+        if _reason is not None:
+            # The promotion gate's per-scenario check: an
+            # insane geometry is refused with a journaled
+            # reason — it never reaches the book and can never
+            # reach an order.
+            return [{
+                "type": "scenario_refused",
+                "ts": ts,
+                "scenario_id": setup.setup_id,
+                "family": setup.playbook,
+                "route": setup.route,
+                "reason": _reason,
+                "geometry": dict(scenario["geometry"]),
+                "note": ("insane geometry refused — never "
+                         "proposed, never orderable")}]
         self.scenarios[setup.setup_id] = scenario
         self._resolve_parent(scenario)
         records = [self._transition_record(
@@ -842,6 +908,24 @@ class ScenarioBook:
         }
         for key, value in (extras or {}).items():
             scenario[key] = copy.deepcopy(value)
+        _reason = scenario_geometry_reason(
+            entry=scenario["geometry"]["entry"],
+            stop=scenario["geometry"]["stop"],
+            targets=scenario["geometry"]["targets"],
+            direction=scenario["direction"])
+        if _reason is not None:
+            # Same gate as the lifecycle bridge: an insane
+            # geometry is refused with a journaled reason.
+            return [{
+                "type": "scenario_refused",
+                "ts": ts,
+                "scenario_id": scenario_id,
+                "family": family,
+                "route": route,
+                "reason": _reason,
+                "geometry": dict(scenario["geometry"]),
+                "note": ("insane geometry refused — never "
+                         "proposed, never orderable")}]
         self.scenarios[scenario_id] = scenario
         records = [self._transition_record(
             scenario, ts=ts, from_state=None, stage=stage,

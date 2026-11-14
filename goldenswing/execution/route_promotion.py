@@ -78,9 +78,40 @@ from .range_promotion import (HORIZON_H, MIN_PAIRED_PER_ARM,
 #: whose route-stamped shadow history is the route's dataset
 #: (the runner's JUDGMENT_ROUTE_PLAYBOOK carries the same
 #: pairs for its manifest counts; a test pins the two).
+#: Route name == playbook name for the per-playbook routes
+#: (the §G range family's pattern): each family member is
+#: evaluated on its OWN shadow history and promoted on its
+#: OWN verdict — a strong member never carries a weak one,
+#: and a weak one never holds a strong one back.
 PROMOTION_ROUTES: dict[str, str] = {
     "hot_scalp_promotion": "hot_scalp",
     "resting_limit": "arrival_zone",
+    # The 13 new-family members (owner promotion program
+    # 2026-11-14): the volatility-expansion, trend-momentum,
+    # auction-value, mean-reversion and session-range
+    # families.  Their routes are already declared shadow in
+    # the runner's JUDGMENT_ROUTE_STATES and carried in its
+    # JUDGMENT_ROUTE_PLAYBOOK; registering them here is what
+    # lets the binding evaluation actually judge them — a
+    # family with no paired outcomes reads insufficient_data
+    # (changes nothing), and only a route whose would-take
+    # median R and discrimination both pass earns
+    # promotion_ready.
+    "vol_expansion_escape": "vol_expansion_escape",
+    "vol_failed_expansion": "vol_failed_expansion",
+    "trend_impulse_pullback": "trend_impulse_pullback",
+    "trend_momentum_acceleration": "trend_momentum_acceleration",
+    "auction_value_acceptance": "auction_value_acceptance",
+    "auction_value_rejection": "auction_value_rejection",
+    "auction_lvn_traversal": "auction_lvn_traversal",
+    "mean_reversion_extension_fade":
+        "mean_reversion_extension_fade",
+    "mean_reversion_failed_continuation":
+        "mean_reversion_failed_continuation",
+    "session_opening_breakout": "session_opening_breakout",
+    "session_opening_failure": "session_opening_failure",
+    "session_drive_reversal": "session_drive_reversal",
+    "session_asia_sweep": "session_asia_sweep",
 }
 
 #: The shared evaluator's convention: playbook -> route.
