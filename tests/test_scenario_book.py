@@ -150,6 +150,49 @@ def test_a2_1_bullish_and_bearish_scenarios_coexist(tmp_path):
     assert summary["by_horizon"] == {"intraday": 2}
 
 
+def test_hot_scalp_staged_targets_table_proposes(tmp_path):
+    """A Hot Scalp setup carries its targets as a staged table
+    (tp1/tp2 prices plus the open runner marker), not a price
+    list — proposing it must read the PRICES, never crash on the
+    label keys (the 'tp1' string-to-float failure that silently
+    dropped Hot Scalp scenarios from the book)."""
+    book = _book(tmp_path)
+    setup = _setup("hot_scalp:1", playbook="hot_scalp",
+                   direction=1, entry=3892.265, stop=3878.344,
+                   targets=(3910.071,))
+    setup.targets = {"tp1": 3910.071, "tp2": 3925.0,
+                     "runner": "open"}
+    book.propose_from_setup(setup, ts=1)
+    live = {s["scenario_id"]: s for s in book.live()}
+    assert set(live) == {"hot_scalp:1"}
+    assert live["hot_scalp:1"]["geometry"]["targets"] == [
+        3910.071, 3925.0]
+
+
+def test_targets_as_prices_reads_every_shape():
+    from goldenswing.execution.scenario_book import (
+        targets_as_prices)
+    # The Hot Scalp staged table: prices in, markers out.
+    assert targets_as_prices(
+        {"tp1": 3910.071, "tp2": 3925.0, "runner": "open"}) == [
+            3910.071, 3925.0]
+    assert targets_as_prices(
+        {"tp1": 3910.071, "tp2": None, "runner": "open",
+         "planned_objective": 3940.0, "plan_kind": "ladder"}) == [
+            3910.071, 3940.0]
+    # A plain price list is unchanged.
+    assert targets_as_prices([3910.071, 3925.0]) == [
+        3910.071, 3925.0]
+    # None / empty / a single price.
+    assert targets_as_prices(None) == []
+    assert targets_as_prices([]) == []
+    assert targets_as_prices(3910.071) == [3910.071]
+    # A non-numeric element in a LIST is corrupt data and fails
+    # loudly, as before.
+    with pytest.raises(ValueError):
+        targets_as_prices(["tp1", 3925.0])
+
+
 # ------------------------------------------------------------------
 # A2.2 — different timeframes hold independent theses
 # ------------------------------------------------------------------

@@ -132,6 +132,7 @@ from ..forecast.mt5 import MT5Forecaster
 from ..live.urgency import urgency_score
 from ..live.volume_profile import volume_profile
 from ..live.hot_scalp import HotScalpConfig, HotScalpResearchEngine
+from .scenario_book import targets_as_prices as _targets_as_prices
 from ..live.multitf import atr14 as _atr14
 from ..live.evidence import (BASE_CATEGORY_WEIGHTS, EvidenceItem, score_evidence)
 from ..live.stacking import evaluate_layer_add as _evaluate_layer_add
@@ -2495,8 +2496,8 @@ class MT5Runner:
                     geometry={
                         "entry": float(sig.entry_ref),
                         "stop": float(sig.invalidation),
-                        "targets": [float(x) for x in
-                                    (sig.targets or [])],
+                        "targets": _targets_as_prices(
+                            getattr(sig, "targets", None)),
                         "zone_id": None},
                     invalidation_terms=[
                         f"close beyond invalidation "
@@ -2602,8 +2603,8 @@ class MT5Runner:
                 geometry={
                     "entry": float(sig.entry_ref),
                     "stop": float(sig.invalidation),
-                    "targets": [float(x) for x in
-                                (sig.targets or [])],
+                    "targets": _targets_as_prices(
+                        getattr(sig, "targets", None)),
                     "zone_id": None},
                 invalidation_terms=[
                     f"close beyond invalidation "
@@ -2703,11 +2704,9 @@ class MT5Runner:
                             "low": setup.get("zone_low"),
                             "high": setup.get("zone_high")}})
             elif name == "candidate_shadow":
-                targets = [float(x) for x in (
-                    event.get("targets") or (
-                        [event.get("target_reference")]
-                        if event.get("target_reference")
-                        is not None else []))]
+                targets = _targets_as_prices(
+                    event.get("targets")
+                    or event.get("target_reference"))
                 records += book.sync_scenario(
                     str(sid), ts=ts, to_state="triggered",
                     stage="candidate_shadow",
@@ -6098,7 +6097,7 @@ class MT5Runner:
             candidate={"direction": int(setup.direction),
                        "entry": float(setup.entry_ref),
                        "stop": float(setup.invalidation),
-                       "targets": [float(x) for x in setup.targets]},
+                       "targets": _targets_as_prices(setup.targets)},
             evidence=evidence,
             source="setup_lifecycle")
 
@@ -6132,7 +6131,7 @@ class MT5Runner:
                         if setup.entry_zone else (0.0, 0.0)),
             entry_ref=float(setup.entry_ref),
             invalidation=float(setup.invalidation),
-            targets=[float(x) for x in setup.targets],
+            targets=_targets_as_prices(setup.targets),
             atr=float(setup.atr),
             sweep_index=setup.sweep_index)
         if setup.live_context:
@@ -6207,7 +6206,7 @@ class MT5Runner:
                 or (0.0, 0.0))],
             entry_ref=float(sig.entry_ref),
             invalidation=float(sig.invalidation),
-            targets=[float(x) for x in (sig.targets or [])],
+            targets=_targets_as_prices(getattr(sig, "targets", None)),
             atr=float(getattr(sig, "atr", 0.0) or 0.0),
             sweep_index=getattr(sig, "sweep_index", None),
             live_context=clean_ctx,
@@ -6398,7 +6397,7 @@ class MT5Runner:
             "direction": int(sig.direction),
             "entry": float(sig.entry_ref),
             "stop": float(sig.invalidation),
-            "targets": [float(x) for x in (sig.targets or [])],
+            "targets": _targets_as_prices(getattr(sig, "targets", None)),
             "score": (asymmetry if asymmetry is not None
                       else sleeve_base),
             "asymmetry_score": asymmetry,
@@ -8016,7 +8015,7 @@ class MT5Runner:
             state = _mark_narrative_entered(
                 state, entry_price=float(fill_price),
                 stop=float(sig.invalidation),
-                targets=[float(x) for x in (sig.targets or [])])
+                targets=_targets_as_prices(getattr(sig, "targets", None)))
             plan = dict(getattr(state, "management", None) or {})
             if not plan:
                 return None, {}
@@ -13651,11 +13650,7 @@ class MT5Runner:
                               or 0.0)
             _hs_stop = float(candidate.get("structural_stop")
                              or 0.0)
-            _hs_targets = [float(x) for x in (
-                candidate.get("targets") or (
-                    [candidate.get("target_reference")]
-                    if candidate.get("target_reference") is not None
-                    else []))]
+            _hs_targets = _hot_scalp_order_targets(candidate)
             _hs_candidate: dict | None = {
                 "direction": _hs_dir,
                 "entry": _hs_entry,
@@ -14312,11 +14307,7 @@ class MT5Runner:
                        "entry_reference": entry_ref,
                        "stop": float(candidate.get("structural_stop")
                                      or 0.0),
-                       "targets": (_sig_targets
-                                   if candidate.get("planned_targets")
-                                   else candidate.get("targets")
-                                   or [candidate.get(
-                                       "target_reference")]),
+                       "targets": _sig_targets,
                        "management": sig.management},
         }
         if _hs_bundle is not None:
@@ -16600,7 +16591,7 @@ class MT5Runner:
                     bar_ts=h1.index[t] if t < len(h1) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
-                    targets=[float(x) for x in (sig.targets or [])],
+                    targets=_targets_as_prices(getattr(sig, "targets", None)),
                     factors=list(getattr(sig, "factors", []) or []),
                     hierarchy=hier_rec, score_breakdown=breakdown,
                     context=self._decision_context())
@@ -16623,7 +16614,7 @@ class MT5Runner:
                     bar_ts=h1.index[t] if t < len(h1) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
-                    targets=[float(x) for x in (sig.targets or [])],
+                    targets=_targets_as_prices(getattr(sig, "targets", None)),
                     factors=list(getattr(sig, "factors", []) or []),
                     hierarchy=hier_rec, score_breakdown=breakdown,
                     context=self._decision_context())
@@ -16664,7 +16655,7 @@ class MT5Runner:
                     bar_ts=h1.index[t] if t < len(h1) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
-                    targets=[float(x) for x in (sig.targets or [])],
+                    targets=_targets_as_prices(getattr(sig, "targets", None)),
                     factors=list(getattr(sig, "factors", []) or []),
                     hierarchy=hier_rec, score_breakdown=breakdown,
                     context=self._decision_context())
@@ -16727,8 +16718,8 @@ class MT5Runner:
                         bar_ts=h1.index[t] if t < len(h1) else None,
                         entry=float(sig.entry_ref),
                         stop=float(sig.invalidation),
-                        targets=[float(x) for x in
-                                 (sig.targets or [])],
+                        targets=_targets_as_prices(
+                            getattr(sig, "targets", None)),
                         factors=list(getattr(sig, "factors", [])
                                      or []),
                         hierarchy=hier_rec,
@@ -16862,7 +16853,7 @@ class MT5Runner:
                     bar_ts=h1.index[t] if t < len(h1) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
-                    targets=[float(x) for x in (sig.targets or [])],
+                    targets=_targets_as_prices(getattr(sig, "targets", None)),
                     factors=list(getattr(sig, "factors", []) or []),
                     hierarchy=hier_rec, score_breakdown=breakdown,
                     context=self._decision_context())
@@ -16895,7 +16886,7 @@ class MT5Runner:
                         bar_ts=h1.index[t] if t < len(h1) else None,
                         entry=float(sig.entry_ref),
                         stop=float(sig.invalidation),
-                        targets=[float(x) for x in (sig.targets or [])],
+                        targets=_targets_as_prices(getattr(sig, "targets", None)),
                         factors=list(getattr(sig, "factors", [])
                                      or []),
                         hierarchy=hier_rec, score_breakdown=breakdown,
@@ -16924,7 +16915,7 @@ class MT5Runner:
                     bar_ts=h1.index[t] if t < len(h1) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
-                    targets=[float(x) for x in (sig.targets or [])],
+                    targets=_targets_as_prices(getattr(sig, "targets", None)),
                     factors=list(getattr(sig, "factors", []) or []),
                     hierarchy=hier_rec, score_breakdown=breakdown,
                     context=self._decision_context())
@@ -16997,7 +16988,7 @@ class MT5Runner:
                 bar_ts=h1.index[t] if t < len(h1) else None,
                 entry=float(sig.entry_ref),
                 stop=float(sig.invalidation),
-                targets=[float(x) for x in (sig.targets or [])],
+                targets=_targets_as_prices(getattr(sig, "targets", None)),
                 factors=list(notes),
                 dxy_corr=(verdict or {}).get("dxy_corr"),
                 urgency=(verdict or {}).get("urgency"),
@@ -17074,7 +17065,7 @@ class MT5Runner:
                         bar_ts=h1.index[t] if t < len(h1) else None,
                         entry=float(sig.entry_ref),
                         stop=float(sig.invalidation),
-                        targets=[float(x) for x in (sig.targets or [])],
+                        targets=_targets_as_prices(getattr(sig, "targets", None)),
                         factors=list(notes),
                         context=self._decision_context())
                     _emit_sig(result="refused",
@@ -17138,8 +17129,8 @@ class MT5Runner:
                     bar_ts=h1.index[t] if t < len(h1) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
-                    targets=[float(x) for x in
-                             (sig.targets or [])],
+                    targets=_targets_as_prices(
+                        getattr(sig, "targets", None)),
                     factors=list(getattr(sig, "factors", [])
                                  or []),
                     hierarchy=hier_rec,
@@ -18875,7 +18866,7 @@ class MT5Runner:
                     score=float(sig.score), decision="gated",
                     reason=f"sizing_decline: {result.verdict}",
                     entry=float(sig.entry_ref), stop=float(stop0),
-                    targets=[float(x) for x in (sig.targets or [])],
+                    targets=_targets_as_prices(getattr(sig, "targets", None)),
                     score_breakdown=(score.breakdown()
                                      if score is not None else None),
                     trigger_source="arrival_score")
@@ -19004,9 +18995,9 @@ class MT5Runner:
         # P3: the A8 zone-anchored TP ladder (computed at signal
         # acceptance) replaces the playbook's raw targets when it
         # priced rungs — the opposing zone IS the target map.
-        _targets = [float(x) for x in (sig.targets or [])]
+        _targets = _targets_as_prices(getattr(sig, "targets", None))
         if signal_ctx is not None and signal_ctx.get("targets"):
-            _targets = [float(x) for x in signal_ctx["targets"]]
+            _targets = _targets_as_prices(signal_ctx["targets"])
             self.journal.log_note(
                 f"mt5: {pb.name} targets from the zone TP "
                 f"ladder: {[round(x, 2) for x in _targets]}")
@@ -19050,7 +19041,7 @@ class MT5Runner:
                 reason=reason,
                 entry=float(sig.entry_ref),
                 stop=float(sig.invalidation),
-                targets=[float(x) for x in (sig.targets or [])],
+                targets=_targets_as_prices(getattr(sig, "targets", None)),
                 factors=list(getattr(sig, "factors", []) or []),
                 dxy_corr=(verdict or {}).get("dxy_corr"),
                 urgency=(verdict or {}).get("urgency"))
@@ -20586,7 +20577,7 @@ class MT5Runner:
                         "not funded by the weighed evidence")},
         ]
         candidate = self._candidate_dict(sig, breakdown, provenance)
-        targets = [float(x) for x in (sig.targets or [])]
+        targets = _targets_as_prices(getattr(sig, "targets", None))
         factors = list(getattr(sig, "factors", []) or [])
 
         def _refuse(code: str, reason: str,
@@ -21292,7 +21283,7 @@ class MT5Runner:
             breakdown["clock_reason"] = self._last_clock.reason
         breakdown["posture"] = (self._posture.name
                                 if self._posture else "open")
-        targets = [float(x) for x in (sig.targets or [])]
+        targets = _targets_as_prices(getattr(sig, "targets", None))
         factors = list(getattr(sig, "factors", []) or [])
         bar_ts = d1_df.index[sig.index] \
             if sig.index < len(d1_df) else None
@@ -23351,7 +23342,7 @@ class MT5Runner:
                 panel_pngs = render_mt5_signal(
                     h1, zone=zone, entry=entry,
                     stop=float(sig.invalidation),
-                    targets=[float(x) for x in (sig.targets or [])],
+                    targets=_targets_as_prices(getattr(sig, "targets", None)),
                     direction=int(sig.direction), verdict=verdict,
                     playbook=playbook,
                     decision_score=decision_score,
@@ -23454,7 +23445,7 @@ class MT5Runner:
             html_str = build_signal_view_html(
                 frames=frames, entry=entry,
                 stop=float(sig.invalidation),
-                targets=[float(x) for x in (sig.targets or [])],
+                targets=_targets_as_prices(getattr(sig, "targets", None)),
                 direction=int(sig.direction), playbook=playbook,
                 decision_score=decision_score,
                 broker_stop=broker_stop,

@@ -224,6 +224,38 @@ class ScenarioBookConfig:
     recover_band: float = DEFAULT_RECOVER_BAND
 
 
+def targets_as_prices(targets) -> list[float]:
+    """Targets in any shape the producers emit, as a price list.
+
+    The Hot Scalp candidate carries its targets as a staged
+    TABLE (tp1/tp2 prices plus the open runner marker and, when
+    a continuation plan exists, the planned objective and its
+    kind) — iterating that dict yields the LABELS ('tp1', 'tp2',
+    'runner'), so a bare ``float(x)`` on it raises
+    ``could not convert string to float: 'tp1'`` and the scenario
+    never reaches the book.  A dict is read for its NUMERIC
+    values (prices) in insertion order, skipping the markers;
+    a list/tuple is coerced element-wise (a non-numeric element
+    there is corrupt data and raises, as before); a single
+    number becomes one target; None/empty becomes [].
+    """
+    if targets is None:
+        return []
+    if isinstance(targets, dict):
+        prices = []
+        for raw in targets.values():
+            if isinstance(raw, bool) or raw is None:
+                continue
+            try:
+                prices.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+        return prices
+    if isinstance(targets, (list, tuple)):
+        return [float(x) for x in targets]
+    return [float(targets)]
+
+
 def _span(scenario: dict) -> tuple[float, float] | None:
     """The scenario's price span [lo, hi] over entry, stop and
     targets — the region its trade occupies.  Incomplete
@@ -554,7 +586,7 @@ class ScenarioBook:
             "geometry": {
                 "entry": float(setup.entry_ref),
                 "stop": float(setup.invalidation),
-                "targets": [float(x) for x in setup.targets],
+                "targets": targets_as_prices(setup.targets),
                 "zone_id": None},
             "invalidation": {
                 "price": float(setup.invalidation),
