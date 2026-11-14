@@ -178,6 +178,44 @@ class TestStudyRegistry:
         assert specs["ao"].clock_tf == "M15"
         assert specs["ao"].pane == "sub"
 
+    def test_atr_measuring_families_declare_atr_band(self):
+        """Every playbook whose core measurement is ATR declares
+        the ATR band as its plotted study — the trend family
+        (ATR + velocity), the range family (ATR regime +
+        momentum) and the session family (ATR + session range)
+        all compute ATR on every evaluation, so the band is
+        their real measurement, not a decoration.  A playbook
+        that does not compute ATR declares nothing here — its
+        measurements are structure, drawn as overlays."""
+        atr_families = (
+            "trend_impulse_pullback",
+            "trend_momentum_acceleration",
+            "range_sweep_reclaim", "range_qm",
+            "range_mean_reversion",
+            "range_compression_breakout",
+            "session_opening_breakout",
+            "session_opening_failure",
+            "session_drive_reversal",
+            "session_asia_sweep")
+        for name in atr_families:
+            spec = spec_for(name)
+            assert spec is not None, f"{name} missing"
+            assert spec.chart_studies == ("atr_band",), (
+                f"{name} measures ATR but declares "
+                f"{spec.chart_studies}")
+        # The declared band resolves and draws on a real frame.
+        cc = chart_clocks_for(playbook="trend_momentum_"
+                              "acceleration")
+        resolved = resolve_study_specs(["atr_band"], cc)
+        assert resolved[0].kind == "atr_band"
+        assert resolved[0].clock_tf
+        from goldenswing.charts.studies import study_series
+        frame = _frame(60, "h", 0)
+        series = study_series(frame, "atr_band")
+        assert series is not None
+        assert set(series) == {"upper", "lower"}
+        assert len(series["upper"]) == len(frame)
+
     def test_entry_study_sync_both_directions(self):
         legacy = EntryStudy(overlays=("ema_pair", "qm"))
         assert {s.kind for s in legacy.studies} \
