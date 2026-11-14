@@ -472,3 +472,15 @@ def test_runner_measured_in_force_after_winning_windows(tmp_path):
         candidate=_CAND, decision=_DEC, evidence=_EV,
         intended_tf="M5", eval_now="2026-11-05 02:00:00")
     assert bundle["judgment"]["priors"]["source"] == "stated"
+
+
+def test_calibrated_is_the_default_priors_mode():
+    """E3, earned: the full live journal (2026-11-14, 108
+    calibration pairs, 30 on the locked holdout) returns
+    measured_wins — measured log-loss 1.3732 vs stated
+    1.3796 — so the Core prices the calibrated priors by
+    default. The fallback is automatic: no verdict or a loss,
+    and the stated constants price (pinned by the test
+    above). The config stays the owner's kill switch."""
+    from goldenswing.execution.mt5_runner import MT5RunnerConfig
+    assert MT5RunnerConfig().judgment_priors == "calibrated"

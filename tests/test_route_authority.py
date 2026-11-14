@@ -281,7 +281,11 @@ def test_authority_record_carries_the_priors_verdict(tmp_path):
     assert priors["verdict"] == "insufficient_data"
     assert priors["holdout_n"] < priors["min_holdout"]
     assert priors["min_holdout"] == 20
-    assert priors["mode"] == "stated"
+    # The default mode is calibrated since E3 was earned
+    # (2026-11-14, full live journal: measured_wins). A thin
+    # history still prices stated — the verdict, not the mode,
+    # is what gates the measured set.
+    assert priors["mode"] == "calibrated"
 
 
 def test_status_line_renders_the_same_table(tmp_path):

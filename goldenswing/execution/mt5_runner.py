@@ -645,15 +645,18 @@ class MT5RunnerConfig:
     # "calibrated" AND the calibration's locked-holdout verdict
     # (a judgment_priors_verdict record, recomputed on the S3
     # cycle from the reconciliation book) is a measured WIN.
-    # "stated" (default): the measured set is computed and
-    # journaled but never prices a verdict — every verdict
-    # still journals its priors trace (source/version/cell/n)
-    # under both settings.  "calibrated": the verdict of record
+    # "stated": the measured set is computed and journaled but
+    # never prices a verdict — every verdict still journals
+    # its priors trace (source/version/cell/n) under both
+    # settings.  "calibrated" (default, E3 earned 2026-11-14:
+    # the full live journal — 108 calibration pairs, 30 on the
+    # locked holdout — returns measured_wins, measured
+    # log-loss 1.3732 vs stated 1.3796): the verdict of record
     # rules — no verdict or a loss, and the stated constants
     # price, automatically.  The measurement is
     # execution/judgment_calibration.py; RESPONSE / OPPOSITION
     # / CHOP coefficients stay stated under the same rule.
-    judgment_priors: str = "stated"
+    judgment_priors: str = "calibrated"
     # PER-ROUTE authority overrides (completion-02): maps a
     # route name (JUDGMENT_ROUTE_STATES) to "governing" or
     # "shadow_declared".  This is THE explicit promotion step
