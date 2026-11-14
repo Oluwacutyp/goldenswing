@@ -187,7 +187,7 @@ class PreparedAuction:
             if self.n else np.zeros(0)
         wilder = pd.Series(tr).ewm(
             alpha=1.0 / 14, adjust=False, min_periods=14
-        ).mean().to_numpy(dtype=float) if self.n \
+        ).mean().to_numpy(dtype=float, copy=True) if self.n \
             else np.zeros(0)
         for j in range(min(13, self.n)):
             if not np.isfinite(wilder[j]):
