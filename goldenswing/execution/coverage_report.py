@@ -41,17 +41,25 @@ that was unwatched becomes deliberate the hour the feed
 dies); the current read is what the report states, with
 the episode's origin kept beside it.
 
-POSTURE: a gap is a REPORT, never an auto-build order.
-Findings feed back nowhere automatically — no family is
-spawned, no parameter moves, no decision reads this
-record (§G discipline).  The cycle host is the unified
-self-audit, in the standing arrangement (same windows,
-same cadence, same state file, own key).
+POSTURE: a gap gets a RESPONSE, never just a report.
+execution/gap_response.py answers every open unwatched gap:
+it names the missing behaviour, proposes a candidate detector
+for it, and evaluates that detector on chronological data; the
+outcome rides beside the gap in this record.  A deliberate gap
+(data halt / timeframe not ready / news blackout) gets no
+detector — the system stands aside there on purpose.  The
+response is evidence: no family is spawned, no parameter
+moves, no decision reads this record (§G discipline stands —
+the response feeds no decision automatically; promotion stays
+a separate, governed step).  The cycle host is the unified
+self-audit, in the standing arrangement (same windows, same
+cadence, same state file, own key).
 """
 from __future__ import annotations
 
 import copy
 
+from . import gap_response as _response
 from . import judgment_book as _jb
 from . import range_promotion as _eval
 
@@ -88,6 +96,7 @@ def new_state() -> dict:
         "last_snapshot": None,
         "last_journaled": None,
         "last_cycle_bar": None,
+        "responses": {},
     }
 
 
@@ -227,14 +236,22 @@ def cycle(*, state: dict, records: list[dict], now=None,
           live: list[dict] | None = None,
           damaged_lines: int = 0, window: dict | None = None,
           run_id: str | None = None,
-          bar: str | None = None) -> dict | None:
+          bar: str | None = None,
+          situations: list[dict] | None = None,
+          window_hours: float = _response.DEFAULT_WINDOW_HOURS
+          ) -> dict | None:
     """One coverage cycle (the self-audit's contract): fold
     new ``coverage_gap`` records into episodes, adjudicate
     open episodes against the latest situation + live book,
-    and return the report record when the standing account
-    changed — or None.  The FIRST cycle always journals.
-    A damaged window degrades the cycle (counted, nothing
-    folded)."""
+    answer every open gap (execution/gap_response.py: the
+    missing behaviour named, a candidate detector proposed,
+    the detector evaluated on chronological data when the
+    situation stream is supplied), and return the report
+    record when the standing account changed — or None.  The
+    FIRST cycle always journals.  A damaged window degrades
+    the cycle (counted, nothing folded).  Without a situation
+    stream the answers are proposals only (the evaluation
+    rides in when the stream is supplied)."""
     for key, value in new_state().items():
         state.setdefault(key, value)
     if damaged_lines:
@@ -313,6 +330,9 @@ def cycle(*, state: dict, records: list[dict], now=None,
 
     snap = _snapshot(state, situation=situation, live=live,
                      now_ts=now_ts)
+    snap["gap_responses"] = _response.cycle_responses(
+        state, open_gaps=snap.get("open_gaps") or [],
+        situations=situations, window_hours=window_hours)
     state["last_snapshot"] = snap
     state["last_cycle_bar"] = bar
     if snap == state.get("last_journaled"):
@@ -328,26 +348,36 @@ def cycle(*, state: dict, records: list[dict], now=None,
             "are covered and by whom, and every open "
             "coverage gap with its age and its "
             "classification read from the situation's own "
-            "state.  A gap is a report — this record builds "
-            "nothing, moves no parameter and feeds no "
-            "decision."),
+            "state — and every open gap's RESPONSE "
+            "(gap_response): the missing behaviour named, "
+            "a candidate detector proposed, the detector "
+            "evaluated on chronological data when the "
+            "situation stream was supplied.  The response "
+            "is evidence: it spawns no family, moves no "
+            "parameter and feeds no decision."),
     }
 
 
 def evaluate_records(records: list[dict], *,
                      situation: dict | None = None,
                      live: list[dict] | None = None,
-                     now=None) -> dict:
+                     now=None,
+                     situations: list[dict] | None = None,
+                     window_hours: float
+                     = _response.DEFAULT_WINDOW_HOURS) -> dict:
     """One-shot standing account over a complete record
     list: the same fold + adjudication the live cycle
-    performs, over a fresh state."""
+    performs, over a fresh state.  With ``situations`` (the
+    journal's situation stream) the open gaps are answered
+    with evaluated detectors, not proposals alone."""
     state = new_state()
     if now is None:
         stamps = [str(r.get("ts") or "") for r in records
                   if r.get("type") == "coverage_gap"]
         now = max(stamps) if stamps else None
     cycle(state=state, records=records, now=now,
-          situation=situation, live=live)
+          situation=situation, live=live,
+          situations=situations, window_hours=window_hours)
     return state["last_snapshot"]
 
 
@@ -406,4 +436,41 @@ def render_lines(state: dict) -> list[str]:
             f" · {age_txt}")
         lines.append(
             f"    {gap.get('classification_basis') or ''}")
+        response = (snap.get("gap_responses") or {}).get(
+            str(gap.get("config_key") or ""))
+        if response is not None:
+            lines.append(
+                f"    response: {_response_line(response)}")
     return lines
+
+
+def _response_line(response: dict) -> str:
+    """One gap's response in plain words."""
+    status = response.get("status")
+    if status == _response.STATUS_STANDING_ASIDE:
+        return response.get("reason") or "standing aside"
+    if status == _response.STATUS_UNTEMPLATED:
+        return response.get("reason") or "no detector yet"
+    detector = response.get("detector") or {}
+    key = detector.get("detector_key") or "detector"
+    if status == _response.STATUS_PROPOSED:
+        return (f"detector {key} proposed — evaluation "
+                "pending (no situation stream supplied)")
+    evaluation = response.get("evaluation") or {}
+    evaluated = int(evaluation.get("evaluated") or 0)
+    if not evaluated:
+        return (f"detector {key} — evaluated over "
+                f"{int(evaluation.get('episodes') or 0)} "
+                "episodes, none evaluable "
+                f"({int(evaluation.get('excluded_incomplete') or 0)} "
+                "incomplete, "
+                f"{int(evaluation.get('excluded_no_reference') or 0)} "
+                "no reference)")
+    hit_rate = evaluation.get("hit_rate")
+    return (f"detector {key}: "
+            f"{int(evaluation.get('hits') or 0)}/{evaluated} "
+            f"hit (rate {hit_rate:.2f}) · mean "
+            f"{evaluation.get('mean_favourable_atr')} ATR "
+            "favourable, "
+            f"{evaluation.get('mean_adverse_atr')} ATR adverse "
+            f"over {evaluated} episodes")
