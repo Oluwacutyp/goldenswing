@@ -14,6 +14,20 @@ measured swing points to the named session target (the prior
 session's low), marked as a projection, never a forecast.  Missing
 overlays are listed on the page, never invented.
 
+The default view is the analysis itself, not a charting tool
+(owner correction 2026-11-23): on load only the reference set
+renders — candles, named session levels, the Friday range band,
+the expected path.  The session levels and the path ARE the read
+(where price came from, where it is expected to go), not
+decoration and not one toggle among many.  Every other overlay
+stays available behind its toggle, and every control (the
+multi-timeframe strip, timeframe buttons, theme, date navigation,
+toggles) sits collapsed behind one "Chart controls" disclosure,
+so a person opening the page sees the analysis at a glance.
+Toggling an overlay re-fetches the frame with that overlay set;
+the server's default frames payload carries only the reference
+structure.
+
 Studies provenance, stated on the page: candles + session shading
 come from the live stack; nearby levels, zone band, Fib+OTE and
 premium/discount come from the LATEST SIGNAL's studies (served by
@@ -50,6 +64,9 @@ button.tf.on{background:var(--gold);color:#111;border-color:var(--gold)}
 #toggles{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
 #toggles label{display:flex;align-items:center;gap:6px;min-height:44px;padding:0 12px;border:1px solid var(--line);border-radius:8px;font-size:14px}
 #toggles input{width:18px;height:18px}
+#controls{margin-bottom:10px}
+#controls summary{cursor:pointer;color:var(--muted);font-size:13px;padding:4px 0}
+#controls summary:hover{color:var(--txt)}
 #mtf{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
 #mtf .chip{border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer;background:var(--panel)}
 #mtf .chip.on{border-color:var(--gold)}
@@ -57,7 +74,7 @@ button.tf.on{background:var(--gold);color:#111;border-color:var(--gold)}
 #navrow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
 #navrow input{padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--txt);font-size:14px}
 #wrap{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:8px}
-canvas{display:block;width:100%;height:520px;touch-action:none}
+canvas{display:block;width:100%;height:620px;touch-action:none}
 #readout{font-family:monospace;font-size:13px;color:var(--gold);min-height:18px;margin:6px 0}
 #foot{color:var(--muted);font-size:12px;margin-top:10px}
 </style></head><body data-theme="light">
@@ -65,12 +82,14 @@ canvas{display:block;width:100%;height:520px;touch-action:none}
 <div id="fresh">Connecting…</div>
 <div id="prov"></div>
 <div id="missing"></div>
+<details id="controls"><summary>Chart controls</summary>
 <div id="mtf"></div>
 <div id="tfs"><button class="tf" data-tf="M5">M5</button><button class="tf" data-tf="M15">M15</button><button class="tf" data-tf="M30">M30</button><button class="tf" data-tf="H1">H1</button><button class="tf" data-tf="H4">H4</button><button class="tf" data-tf="D1">D1</button></div>
 <div><button id="theme-btn">Dark theme</button></div>
-<div id="toggles"><label><input type="checkbox" id="ov-sess" checked> Sessions</label><label><input type="checkbox" id="ov-nearby" checked> Nearby levels</label><label><input type="checkbox" id="ov-fib" checked> Fib + OTE</label><label><input type="checkbox" id="ov-prem" checked> Premium/Discount</label><label><input type="checkbox" id="ov-zone" checked> Signal zone</label><label><input type="checkbox" id="ov-slevels" checked> Session levels</label><label><input type="checkbox" id="ov-srange" checked> Session range</label><label><input type="checkbox" id="ov-swings" checked> Swings</label><label><input type="checkbox" id="ov-breaks" checked> Breaks</label><label><input type="checkbox" id="ov-fvg" checked> FVGs</label><label><input type="checkbox" id="ov-liq" checked> Liquidity</label><label><input type="checkbox" id="ov-vol" checked> Vol expansion</label><label><input type="checkbox" id="ov-path" checked> Expected path</label></div>
+<div id="toggles"><label><input type="checkbox" id="ov-sess"> Sessions</label><label><input type="checkbox" id="ov-nearby"> Nearby levels</label><label><input type="checkbox" id="ov-fib"> Fib + OTE</label><label><input type="checkbox" id="ov-prem"> Premium/Discount</label><label><input type="checkbox" id="ov-zone"> Signal zone</label><label><input type="checkbox" id="ov-slevels" checked> Session levels</label><label><input type="checkbox" id="ov-srange" checked> Session range</label><label><input type="checkbox" id="ov-swings"> Swings</label><label><input type="checkbox" id="ov-breaks"> Breaks</label><label><input type="checkbox" id="ov-fvg"> FVGs</label><label><input type="checkbox" id="ov-liq"> Liquidity</label><label><input type="checkbox" id="ov-vol"> Vol expansion</label><label><input type="checkbox" id="ov-path" checked> Expected path</label></div>
 <div id="navrow"><input type="datetime-local" id="jump" step="3600"><button class="nav" id="jump-go">Go to date</button><button class="nav" id="jump-prev">◀ day</button><button class="nav" id="jump-next">day ▶</button><button class="nav" id="jump-latest">Latest</button><span id="hist"></span></div>
-<div id="wrap"><canvas id="cv" width="900" height="520"></canvas></div>
+</details>
+<div id="wrap"><canvas id="cv" width="900" height="620"></canvas></div>
 <div id="readout">Hover a candle for its values. Scroll to zoom, drag to pan, double-click to reset.</div>
 <div id="foot">Read-only view — it never trades. Orders stay on the engine / Telegram path. Polls every 30s; a stale feed is labeled stale, never shown as live. The expected path joins measured swings to the named session target — an annotation, not a forecast.</div>
 <script>
@@ -85,6 +104,8 @@ function setTheme(name){PAL=PALETTES[name];UP=PAL.UP;DN=PAL.DN;GOLD=PAL.GOLD;TXT
 let tf='H1',bars=[],sessions=[],studies=null,status=null,structure=null,mtf=null;
 let start=0,end=0,hover=-1,dragX=null,before=null,xDiv=1;
 function ov(id){return document.getElementById(id).checked}
+const OV_MAP={'ov-slevels':'session_levels','ov-srange':'session_range','ov-path':'expected_path','ov-swings':'swings','ov-breaks':'breaks','ov-fvg':'fvgs','ov-liq':'liquidity','ov-vol':'volatility'};
+function overlayParam(){return Object.keys(OV_MAP).filter(id=>ov(id)).map(id=>OV_MAP[id]).join(',');}
 function fmt(x){return x.toLocaleString(undefined,{minimumFractionDigits:1,maximumFractionDigits:1})}
 function resetWin(){const n=bars.length;end=n;start=Math.max(0,n-120)}
 function yRange(bs,lo,hi){let mn=Infinity,mx=-Infinity;
@@ -255,7 +276,7 @@ function showMtf(){const el=document.getElementById('mtf');if(!mtf)return;
     el.appendChild(chip);});}
 async function loadTF(t,keepWin){tf=t;
   document.querySelectorAll('button.tf').forEach(b=>b.classList.toggle('on',b.dataset.tf===t));
-  try{let url='/api/frames?tf='+t;
+  try{let url='/api/frames?tf='+t+'&overlays='+encodeURIComponent(overlayParam());
     if(before)url+='&before='+encodeURIComponent(before);
     const r=await fetch(url);
     if(!r.ok){document.getElementById('fresh').textContent='Engine returned '+r.status+' for '+t+'.';return;}
@@ -271,7 +292,7 @@ async function poll(){try{const r=await fetch('/api/status');
   loadTF(tf,true);}
 document.querySelectorAll('button.tf').forEach(b=>b.addEventListener('click',()=>loadTF(b.dataset.tf,false)));
 ['ov-sess','ov-nearby','ov-fib','ov-prem','ov-zone','ov-slevels','ov-srange','ov-swings','ov-breaks','ov-fvg','ov-liq','ov-vol','ov-path'].forEach(id=>
-  document.getElementById(id).addEventListener('change',draw));
+  document.getElementById(id).addEventListener('change',()=>loadTF(tf,true)));
 document.getElementById('theme-btn').addEventListener('click',()=>
   setTheme(document.body.dataset.theme==='dark'?'light':'dark'));
 function shiftDay(days){if(!before){const last=bars.length?bars[bars.length-1][0]:null;

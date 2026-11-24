@@ -5,6 +5,7 @@ its swings, break, sweeps and FVG are asserted exactly."""
 import http.client
 import io
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -325,6 +326,53 @@ def test_terminal_page_is_light_blue_black_with_workspace_toggles():
     assert "not a forecast" in page
 
 
+def _toggle_tag(page, toggle_id):
+    m = re.search(r'<input[^>]*id="%s"[^>]*>' % toggle_id, page)
+    assert m, toggle_id
+    return m.group(0)
+
+
+def test_terminal_page_clean_default_is_the_reference_set():
+    """The default view is the analysis, not a charting tool.
+
+    Owner correction 2026-11-23: the reference frame shows only
+    candles, named session levels, the Friday range band and the
+    expected path. Exactly those three toggles are checked on
+    load; every other overlay stays available (its checkbox is
+    still on the page) but OFF. All tool chrome — timeframe
+    strip, timeframe buttons, theme, date nav, toggles — sits
+    collapsed behind one "Chart controls" disclosure, so the
+    first thing a person sees is the read, not the tool.
+    """
+    page = build_terminal_page(instrument="XAUUSD")
+    for t in ("ov-slevels", "ov-srange", "ov-path"):
+        assert "checked" in _toggle_tag(page, t), t
+    for t in ("ov-sess", "ov-nearby", "ov-fib", "ov-prem",
+              "ov-zone", "ov-swings", "ov-breaks", "ov-fvg",
+              "ov-liq", "ov-vol"):
+        assert "checked" not in _toggle_tag(page, t), t
+    m = re.search(r'<details id="controls"[^>]*>', page)
+    assert m, "controls disclosure missing"
+    assert "open" not in m.group(0), "controls must start collapsed"
+    assert "Chart controls" in page
+    assert '<canvas id="cv"' in page
+
+
+def test_terminal_page_toggle_change_refetches_with_overlay_param():
+    """Toggling an overlay must bring its data back.
+
+    The server's default payload carries only the reference
+    structure, so a toggle-on cannot just redraw from a stale
+    payload — the change handler re-fetches the frame with the
+    checked overlay set (OV_MAP names each toggle's group).
+    """
+    page = build_terminal_page(instrument="XAUUSD")
+    assert "'ov-swings':'swings'" in page
+    assert "'ov-slevels':'session_levels'" in page
+    assert "overlays='+encodeURIComponent(overlayParam())" in page
+    assert "addEventListener('change',()=>loadTF(tf,true))" in page
+
+
 # ------------------------------------------------------- terminal server
 class _Provider:
     def __init__(self, frames):
@@ -376,8 +424,13 @@ def _get(url, path):
 
 
 def test_server_frames_carry_workspace_structure(server):
+    # The full measured structure rides on overlays=all. The
+    # DEFAULT payload is the clean reference set only (owner
+    # correction 2026-11-23: every overlay on at once was the
+    # clutter), so this test — whose intent is "the server carries
+    # the measured structure" — asks for all of it explicitly.
     srv, url = server
-    code, body = _get(url, "/api/frames?tf=H1")
+    code, body = _get(url, "/api/frames?tf=H1&overlays=all")
     assert code == 200
     d = json.loads(body)
     assert d["tf"] == "H1"
@@ -389,6 +442,57 @@ def test_server_frames_carry_workspace_structure(server):
     assert stt["expected_path"]["target_label"] == "Friday L"
     assert stt["swings"] and stt["fvgs"] is not None
     assert "volume" not in [m["what"] for m in stt["missing"]]
+
+
+def test_server_frames_default_payload_is_the_clean_reference_set(
+        server):
+    """The default frames payload carries only the reference set.
+
+    Owner correction 2026-11-23: the shipped page rendered every
+    overlay at once. With no `overlays` param the structure holds
+    the session levels, the Friday range band and the expected
+    path — and nothing else: no swings, no breaks, no sweeps, no
+    FVGs, no volatility run. The read (levels + path) is intact.
+    """
+    srv, url = server
+    code, body = _get(url, "/api/frames?tf=H1")
+    assert code == 200
+    stt = json.loads(body)["structure"]
+    assert [l["label_high"] for l in stt["session_levels"]] == \
+        ["Thursday H", "Friday H"]
+    assert stt["session_range"]["prior"]["label"] == "Friday range"
+    assert stt["expected_path"]["target_label"] == "Friday L"
+    assert stt["swings"] == []
+    assert stt["breaks"] == []
+    assert stt["liquidity"] == []
+    assert stt["fvgs"] == []
+    assert stt["volatility"] == {"regime": "unknown"}
+
+
+def test_server_frames_overlays_param_brings_groups_back(server):
+    """Toggling an overlay on must bring its data back (have-it-all).
+
+    Nothing was deleted: `overlays=all` carries the full measured
+    structure, a named list carries exactly those groups, and an
+    unknown name is a 400, not a silent ignore.
+    """
+    srv, url = server
+    code, body = _get(url, "/api/frames?tf=H1&overlays=swings")
+    assert code == 200
+    stt = json.loads(body)["structure"]
+    assert stt["swings"], "swings asked for must ride along"
+    assert stt["breaks"] == [] and stt["fvgs"] == []
+    assert stt["session_levels"] == [], "not asked for"
+    assert stt["expected_path"] is None
+    code, body = _get(url, "/api/frames?tf=H1&overlays=all")
+    assert code == 200
+    stt = json.loads(body)["structure"]
+    assert stt["swings"] and stt["fvgs"] is not None
+    assert stt["session_levels"] and stt["expected_path"] is not None
+    code, _ = _get(url, "/api/frames?tf=H1&overlays=bogus")
+    assert code == 400
+    code, _ = _get(url, "/api/frames?tf=H1&overlays=swings,bogus")
+    assert code == 400
 
 
 def test_server_frames_before_is_historical(server):
@@ -430,7 +534,10 @@ def test_server_frames_structure_coords_match_bars():
                          port=0, instrument="XAUUSD")
     url = srv.start()
     try:
-        code, body = _get(url, "/api/frames?tf=H1")
+        # overlays=all: this test pins bar coordinates of the FULL
+        # measured structure; the default payload is the clean
+        # reference set only (see the clean-default tests below).
+        code, body = _get(url, "/api/frames?tf=H1&overlays=all")
         assert code == 200
         d = json.loads(body)
         n = len(d["bars"])

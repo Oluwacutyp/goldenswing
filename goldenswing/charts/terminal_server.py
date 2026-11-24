@@ -18,6 +18,13 @@ Routes (GET only — read-only is enforced, not promised):
   named session levels, session range, volatility regime, the
   expected path to the session target) and a ``missing`` list for
   anything that could not be measured.
+  ``&overlays=`` selects which structure groups ride along:
+  comma-separated names, or ``all`` for the full measured
+  structure. With no ``overlays`` the payload carries only the
+  clean default — session levels, session range, expected path —
+  the owner's reference set (clean chart: candles, named levels,
+  Friday range band, one path to the target, nothing else).
+  Unknown names answer 400.
 - ``GET /api/mtf`` — each timeframe's measured state, from its own
   bars: trend from its own swings, volatility regime from its own
   ATR, range position from its own prior session range.
@@ -59,6 +66,40 @@ TF_INTERVALS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800,
                 "H1": 3600, "H4": 14400, "D1": 86400}
 TF_ORDER = ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
 _BARS_CAP = 500
+
+# The clean default (owner correction 2026-11-23): the reference
+# chart shows candles, named session levels, the Friday range band
+# and the expected path — nothing else. Every other group stays
+# measurable and available behind its toggle; the default payload
+# simply does not carry it until asked for.
+DEFAULT_OVERLAYS = ("session_levels", "session_range", "expected_path")
+ALL_OVERLAYS = ("session_levels", "session_range", "expected_path",
+                "swings", "breaks", "liquidity", "fvgs", "volatility")
+
+
+def filter_structure(structure: dict, overlays) -> dict:
+    """Return the structure payload carrying only `overlays` groups.
+
+    Unrequested list groups come back empty; the session range
+    reads ``{"prior": None, "current": None}``, the volatility
+    block reads ``{"regime": "unknown"}``, the expected path reads
+    None. ``as_of``, ``bars`` and ``missing`` are measurement
+    facts, never filtered — a group that could not be measured
+    still says so.
+    """
+    wanted = set(overlays)
+    out = dict(structure)
+    for key in ("swings", "breaks", "liquidity", "fvgs",
+                "session_levels"):
+        if key not in wanted:
+            out[key] = []
+    if "session_range" not in wanted:
+        out["session_range"] = {"prior": None, "current": None}
+    if "volatility" not in wanted:
+        out["volatility"] = {"regime": "unknown"}
+    if "expected_path" not in wanted:
+        out["expected_path"] = None
+    return out
 
 
 def bars_to_rows(frame) -> list:
@@ -180,6 +221,21 @@ def make_handler(provider, instrument: str):
                         self._send_json(
                             400, {"error": f"bad before {before_raw!r}"})
                         return
+                overlays_raw = (parse_qs(parsed.query).get("overlays")
+                                or [None])[0]
+                if overlays_raw is None:
+                    overlays = set(DEFAULT_OVERLAYS)
+                elif overlays_raw.strip().lower() == "all":
+                    overlays = set(ALL_OVERLAYS)
+                else:
+                    overlays = {o.strip() for o in
+                                overlays_raw.split(",") if o.strip()}
+                    unknown = overlays - set(ALL_OVERLAYS)
+                    if unknown:
+                        self._send_json(
+                            400, {"error": "unknown overlays "
+                                           f"{sorted(unknown)!r}"})
+                        return
                 try:
                     frame = provider.frames(tf)
                 except Exception as exc:
@@ -227,6 +283,7 @@ def make_handler(provider, instrument: str):
                                  "expected_path": None,
                                  "missing": [{"what": "structure",
                                               "reason": str(exc)}]}
+                structure = filter_structure(structure, overlays)
                 self._send_json(200, {
                     "tf": tf, "bars": bars_to_rows(frame),
                     "sessions": session_spans(frame),
