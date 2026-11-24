@@ -10,7 +10,17 @@ Routes (GET only — read-only is enforced, not promised):
 
 - ``GET /`` — the terminal page (``charts.terminal``).
 - ``GET /api/frames?tf=M5`` — capped bars + session spans + studies
-  as data for one timeframe.
+  as data for one timeframe. ``&before=ISO`` returns the bars up
+  to that time (historical navigation); the structure payload is
+  always measured on the returned bars, so a historical view shows
+  only what was knowable then. The payload also carries the
+  workspace structure (swings, breaks, liquidity sweeps, FVGs,
+  named session levels, session range, volatility regime, the
+  expected path to the session target) and a ``missing`` list for
+  anything that could not be measured.
+- ``GET /api/mtf`` — each timeframe's measured state, from its own
+  bars: trend from its own swings, volatility regime from its own
+  ATR, range position from its own prior session range.
 - ``GET /api/status`` — server time, market-open per the engine
   calendar, and per-timeframe last-bar age + stale flags.
 
@@ -42,6 +52,7 @@ from threading import Thread
 from urllib.parse import parse_qs, urlparse
 
 from ..reader import session_timeframes as sessions
+from .structure import measure_workspace, mtf_state
 from .terminal import build_terminal_page
 
 TF_INTERVALS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800,
@@ -51,13 +62,22 @@ _BARS_CAP = 500
 
 
 def bars_to_rows(frame) -> list:
-    """Frame -> [iso, open, high, low, close] rows, newest capped."""
+    """Frame -> [iso, open, high, low, close] rows, newest capped.
+
+    A sixth element (volume) rides along when the frame carries
+    a volume column; rows stay five elements otherwise.
+    """
+    vol_col = next((c for c in ("tick_volume", "volume",
+                                "real_volume") if c in frame), None)
     rows = []
     for ts, row in frame.iloc[-_BARS_CAP:].iterrows():
         try:
             iso = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-            rows.append([iso, float(row["open"]), float(row["high"]),
-                         float(row["low"]), float(row["close"])])
+            out = [iso, float(row["open"]), float(row["high"]),
+                   float(row["low"]), float(row["close"])]
+            if vol_col is not None:
+                out.append(float(row[vol_col]))
+            rows.append(out)
         except Exception:
             continue
     return rows
@@ -151,6 +171,15 @@ def make_handler(provider, instrument: str):
                 if tf not in TF_INTERVALS:
                     self._send_json(400, {"error": f"unknown tf {tf!r}"})
                     return
+                before_raw = (parse_qs(parsed.query).get("before")
+                              or [None])[0]
+                before = None
+                if before_raw is not None:
+                    before = _parse_iso(before_raw)
+                    if before is None:
+                        self._send_json(
+                            400, {"error": f"bad before {before_raw!r}"})
+                        return
                 try:
                     frame = provider.frames(tf)
                 except Exception as exc:
@@ -159,14 +188,70 @@ def make_handler(provider, instrument: str):
                 if frame is None or len(frame) == 0:
                     self._send_json(404, {"error": f"no bars for {tf}"})
                     return
+                if before is not None:
+                    try:
+                        frame = frame.loc[frame.index <= before]
+                    except Exception as exc:
+                        self._send_json(
+                            500, {"error": f"before slice: {exc}"})
+                        return
+                    if len(frame) == 0:
+                        self._send_json(
+                            404, {"error": f"no bars for {tf} "
+                                          f"before {before_raw}"})
+                        return
+                # One cap for every consumer: bars, session spans
+                # and the structure payload must share bar
+                # coordinates.  Measuring the structure on the
+                # provider's full frame while the page only receives
+                # the last 500 bars left every bar-indexed overlay
+                # (swings, breaks, sweeps, FVGs, vol run, expected
+                # path) outside the drawn window, so none of them
+                # ever rendered — the levels (price-based) were the
+                # only overlays that showed.
+                frame = frame.iloc[-_BARS_CAP:]
                 try:
                     studies = provider.studies()
                 except Exception:
                     studies = None
+                try:
+                    structure = measure_workspace(frame)
+                except Exception as exc:
+                    structure = {"as_of": None, "bars": len(frame),
+                                 "swings": [], "breaks": [],
+                                 "liquidity": [], "fvgs": [],
+                                 "session_levels": [],
+                                 "session_range": {"prior": None,
+                                                   "current": None},
+                                 "volatility": {"regime": "unknown"},
+                                 "expected_path": None,
+                                 "missing": [{"what": "structure",
+                                              "reason": str(exc)}]}
                 self._send_json(200, {
                     "tf": tf, "bars": bars_to_rows(frame),
                     "sessions": session_spans(frame),
-                    "studies": studies})
+                    "studies": studies, "structure": structure,
+                    "before": before_raw})
+                return
+            if path == "/api/mtf":
+                states = {}
+                for tf in TF_ORDER:
+                    try:
+                        frame = provider.frames(tf)
+                    except Exception as exc:
+                        states[tf] = {"tf": tf, "available": False,
+                                      "reason": f"provider: {exc}"}
+                        continue
+                    if frame is None or len(frame) == 0:
+                        states[tf] = {"tf": tf, "available": False,
+                                      "reason": "no bars"}
+                        continue
+                    try:
+                        states[tf] = mtf_state(frame, tf=tf)
+                    except Exception as exc:
+                        states[tf] = {"tf": tf, "available": False,
+                                      "reason": str(exc)}
+                self._send_json(200, {"tfs": states})
                 return
             if path == "/api/status":
                 try:

@@ -1007,6 +1007,98 @@ def _mt5_qm_pattern(ax, x_hi, pattern: dict, view_index,
     return specs
 
 
+#: Session levels' color family — the A-jay reference blue for
+#: session highs, muted grey for session lows; the range band is
+#: the same blue at low alpha.
+_SESSION_HIGH_COLOR = "#1a5fd7"
+_SESSION_LOW_COLOR = "#555555"
+_SESSION_BAND = "#2563eb"
+
+
+def _mt5_session_levels(ax, x_hi, levels, theme) -> list[dict]:
+    """Named session levels as horizontal lines (high blue dashed,
+    low grey dashed).  Labels come back as specs for the shared
+    post-draw de-collision pass, like every other level set."""
+    specs: list[dict] = []
+    for lvl in levels or []:
+        hi = float(lvl["high"])
+        lo = float(lvl["low"])
+        ax.axhline(hi, color=_SESSION_HIGH_COLOR, linewidth=0.9,
+                   linestyle=(0, (6, 3)), alpha=0.85, zorder=2)
+        specs.append({"value": hi,
+                      "text": f" {lvl['label_high']} {_fmt(hi)} ",
+                      "color": _SESSION_HIGH_COLOR, "bold": True,
+                      "size": 7.5})
+        ax.axhline(lo, color=_SESSION_LOW_COLOR, linewidth=0.9,
+                   linestyle=(0, (6, 3)), alpha=0.85, zorder=2)
+        specs.append({"value": lo,
+                      "text": f" {lvl['label_low']} {_fmt(lo)} ",
+                      "color": _SESSION_LOW_COLOR, "bold": False,
+                      "size": 7.5})
+    return specs
+
+
+def _mt5_session_range(ax, view_len, offset, band, theme
+                       ) -> list[dict]:
+    """The prior session's range as a blue band over its bars.
+
+    Bars outside the visible window are clamped, not invented:
+    a session wholly outside the window draws nothing.
+    """
+    specs: list[dict] = []
+    if not band:
+        return specs
+    x0 = max(band["start_bar"] - offset, 0) - 0.5
+    x1 = min(band["end_bar"] - offset, view_len - 1) + 0.5
+    if x1 <= x0:
+        return specs
+    ax.add_patch(Rectangle(
+        (x0, band["bottom"]), x1 - x0,
+        band["top"] - band["bottom"],
+        facecolor=_SESSION_BAND, alpha=0.18, edgecolor="none",
+        zorder=1))
+    specs.append({"value": float(band["top"]),
+                  "text": f" {band['label']} {_fmt(band['top'])} ",
+                  "color": _SESSION_HIGH_COLOR, "bold": True,
+                  "size": 7.5})
+    return specs
+
+
+def _mt5_expected_path(ax, view_len, offset, path, theme
+                       ) -> list[dict]:
+    """The expected path: a polyline through measured points to
+    the named session target, arrowed at the target with a $
+    marker.  The endpoint sits three bars past the last bar (the
+    role margin is twelve) and is a projection — the label says
+    so by naming the target level, never a price that will be.
+    """
+    specs: list[dict] = []
+    if not path:
+        return specs
+    xs: list[float] = []
+    ys: list[float] = []
+    for p in path["points"]:
+        if p["bar"] is not None:
+            xs.append(float(p["bar"] - offset))
+        else:
+            xs.append(float(view_len - 1 + 3))
+        ys.append(float(p["price"]))
+    if len(xs) < 2:
+        return specs
+    ax.plot(xs, ys, color="#111111", linewidth=1.6, zorder=4)
+    ax.annotate("", xy=(xs[-1], ys[-1]), xytext=(xs[-2], ys[-2]),
+                arrowprops=dict(arrowstyle="->", color="#111111",
+                                lw=1.6), zorder=4)
+    ax.text(xs[-1] + 0.3, ys[-1], "$", fontsize=11,
+            color="#2e7d32", fontweight="bold", ha="left",
+            va="center", zorder=6)
+    specs.append({"value": float(path["target_price"]),
+                  "text": f" {path['target_label']} "
+                          f"{_fmt(path['target_price'])} $ ",
+                  "color": "#111111", "bold": True, "size": 8.0})
+    return specs
+
+
 def render_mt5_signal(h1: pd.DataFrame, *, zone: dict | None,
                        entry: float, stop: float,
                        targets: list[float] | None = None,
@@ -1863,7 +1955,7 @@ def _render_role_context(h1, ctx, lc, *, instrument: str,
                          playbook: str, score_line: str,
                          window: int = 120, tf_label: str = "H1",
                          study_frames=None,
-                         fresh: str = "") -> bytes:
+                         fresh: str = "", workspace=None) -> bytes:
     """Role B — context: the structure behind the trade, on the
     resolved context clock (SPEC §8.1/§8.2)."""
     header = _hdr(instrument, playbook, score_line)
@@ -1970,6 +2062,21 @@ def _render_role_context(h1, ctx, lc, *, instrument: str,
                               facecolor="#7e57c2", edgecolor="none",
                               alpha=0.95), zorder=6)
 
+    # Workspace structure — measured on this panel's frame:
+    # named session levels, the prior session's range band, and
+    # the expected path to the session target.  Nothing here is
+    # drawn from a signal's study layer; the frame is the source.
+    if workspace is not None:
+        specs += _mt5_session_levels(
+            ax, x_hi, workspace.get("session_levels"), theme)
+        specs += _mt5_session_range(
+            ax, len(view), offset,
+            (workspace.get("session_range") or {}).get("prior"),
+            theme)
+        specs += _mt5_expected_path(
+            ax, len(view), offset, workspace.get("expected_path"),
+            theme)
+
     # Trade references — thin, muted, named as references.
     specs.append(label_spec(lc.entry_ref,
                             f" ENTRY {_fmt(lc.entry_ref)} (ref)",
@@ -2017,6 +2124,15 @@ def _render_role_context(h1, ctx, lc, *, instrument: str,
         cand += [p for p, _tf, _tier in ctx.htf_levels]
         for z in ctx.zones:
             cand += [z.top, z.bottom]
+    if workspace is not None:
+        for lvl in workspace.get("session_levels") or []:
+            cand += [lvl["high"], lvl["low"]]
+        band = (workspace.get("session_range") or {}).get("prior")
+        if band is not None:
+            cand += [band["top"], band["bottom"]]
+        path = workspace.get("expected_path")
+        if path is not None:
+            cand.append(path["target_price"])
     lo_v, hi_v = admit_level_bounds(lo_v, hi_v, cand, mult=1.6)
     pad = 0.07 * max(hi_v - lo_v, 1e-9)
     ax.set_ylim(lo_v - pad, hi_v + pad)
@@ -2199,7 +2315,8 @@ def _render_mt5_roles_mpl(*, frames: dict, lifecycle, context=None,
                           playbook: str = "", score_line: str = "",
                           entry_clock: str = "M15",
                           roles=ROLE_ORDER, clocks=None,
-                          freshness: dict = None) -> list[bytes]:
+                          freshness: dict = None,
+                          workspace=None) -> list[bytes]:
     """The role trio, matplotlib rung: one PNG per role.
 
     ``frames`` maps timeframe -> OHLCV frame (the stack the alert
@@ -2247,7 +2364,8 @@ def _render_mt5_roles_mpl(*, frames: dict, lifecycle, context=None,
                     instrument=instrument, playbook=playbook,
                     score_line=score_line, tf_label=tf,
                     study_frames=frames,
-                    fresh=_fresh_str(tf, freshness)))
+                    fresh=_fresh_str(tf, freshness),
+                    workspace=workspace))
         elif role == ROLE_ENTRY:
             tf = eff.entry_tf
             frame = frames.get(tf)
@@ -2327,7 +2445,8 @@ def render_mt5_roles(*, frames: dict, lifecycle, context=None,
                      playbook: str = "", score_line: str = "",
                      entry_clock: str = "M15",
                      roles=ROLE_ORDER, clocks=None,
-                     freshness: dict = None) -> list[bytes]:
+                     freshness: dict = None,
+                     workspace=None) -> list[bytes]:
     """The role trio: one PNG per role, in ROLE_ORDER.
 
     Renderer ladder (implementation-ladder doctrine): the pages
@@ -2340,6 +2459,11 @@ def render_mt5_roles(*, frames: dict, lifecycle, context=None,
     the pretty rung is missing, and the trio never mixes rungs.
     The rung used is recorded per PNG (``last_role_render_rungs``
     + the PNG's own "Renderer" metadata stamp).
+
+    ``workspace`` is the ``charts.structure`` measurement for the
+    context frame (or None: no workspace overlays).  It rides
+    both rungs, so the TV page and the matplotlib fallback draw
+    the same session levels, range band and expected path.
     """
     global _LAST_ROLE_RUNGS, _LAST_TV_ERROR, _LAST_CHART_PROVENANCE
     from . import screenshot, tv_page
@@ -2355,7 +2479,7 @@ def render_mt5_roles(*, frames: dict, lifecycle, context=None,
               entry_study=entry_study, instrument=instrument,
               playbook=playbook, score_line=score_line,
               entry_clock=entry_clock, roles=roles, clocks=clocks,
-              freshness=freshness)
+              freshness=freshness, workspace=workspace)
     try:
         pages = tv_page.build_role_pages(**kw)
         pngs: list = []

@@ -730,7 +730,8 @@ def _fresh_line(tf: str, freshness) -> str:
 
 # ------------------------------------------------------------------ role B
 def _context_cfg(h1, ctx, lc, *, window: int = 120,
-                 tf_label: str = "H1", frames=None) -> dict:
+                 tf_label: str = "H1", frames=None,
+                 workspace=None) -> dict:
     view = h1.iloc[-window:]
     offset = len(h1) - len(view)
     times = _view_times(view)
@@ -743,6 +744,53 @@ def _context_cfg(h1, ctx, lc, *, window: int = 120,
     study_extra: list = []
     shown, _total = chart_targets(lc.targets, entry=lc.entry_ref,
                                   direction=lc.direction)
+
+    if workspace is None:
+        try:
+            from .structure import measure_workspace
+            workspace = measure_workspace(h1)
+        except Exception:
+            workspace = None
+    if workspace is not None:
+        for lvl in workspace.get("session_levels") or []:
+            lines.append(_line(lvl["high"], "#1a5fd7",
+                               f"{lvl['label_high']} "
+                               f"{_fmt(lvl['high'])}", width=1,
+                               style=_DASHED))
+            lines.append(_line(lvl["low"], "#555555",
+                               f"{lvl['label_low']} "
+                               f"{_fmt(lvl['low'])}", width=1,
+                               style=_DASHED))
+        band = (workspace.get("session_range") or {}).get("prior")
+        if band is not None:
+            frm = (times[band["start_bar"] - offset]
+                   if 0 <= band["start_bar"] - offset < len(times)
+                   else None)
+            to = (times[band["end_bar"] - offset]
+                  if 0 <= band["end_bar"] - offset < len(times)
+                  else None)
+            bands.append({"top": float(band["top"]),
+                          "bottom": float(band["bottom"]),
+                          "from": frm, "to": to,
+                          "fill": "rgba(37,99,235,0.18)",
+                          "stroke": None})
+            lines.append(_line(0.5 * (band["top"] + band["bottom"]),
+                               "#1a5fd7",
+                               f"{band['label']} "
+                               f"{_fmt(band['bottom'])}–"
+                               f"{_fmt(band['top'])}", width=1,
+                               style=_DOTTED))
+        path = workspace.get("expected_path")
+        if path is not None:
+            pts = [{"time": p["ts"], "value": float(p["price"])}
+                   for p in path["points"]]
+            aux.append({"points": pts, "color": "#111111",
+                        "width": 2, "stepped": False,
+                        "lastChip": True})
+            study_ledger.append(
+                f"Path to {path['target_label']} "
+                f"{_fmt(path['target_price'])} — annotation, "
+                f"not a forecast")
 
     if ctx is not None:
         for z in ctx.zones:
@@ -831,6 +879,15 @@ def _context_cfg(h1, ctx, lc, *, window: int = 120,
         cand += [p for p, _tf, _tier in ctx.htf_levels]
         for z in ctx.zones:
             cand += [z.top, z.bottom]
+    if workspace is not None:
+        for lvl in workspace.get("session_levels") or []:
+            cand += [lvl["high"], lvl["low"]]
+        band = (workspace.get("session_range") or {}).get("prior")
+        if band is not None:
+            cand += [band["top"], band["bottom"]]
+        path = workspace.get("expected_path")
+        if path is not None:
+            cand.append(path["target_price"])
     rng = _price_range(view, cand)
     inside, tags = _split_lines(lines, rng)
 
@@ -855,6 +912,19 @@ def _context_cfg(h1, ctx, lc, *, window: int = 120,
         if bits:
             ledger.append(" · ".join(bits)
                           + " — as recorded at the signal bar")
+    if workspace is not None:
+        wbits = []
+        if workspace.get("session_levels"):
+            wbits.append(
+                f"{len(workspace['session_levels'])} session"
+                f"{'s' if len(workspace['session_levels']) != 1 else ''}"
+                " leveled")
+        if workspace.get("expected_path") is not None:
+            wbits.append("expected path to "
+                         f"{workspace['expected_path']['target_label']}")
+        if wbits:
+            ledger.append(" · ".join(wbits)
+                          + " — measured on this frame")
     return {
         "bars": _bars_json(view), "volume": _volume_json(view),
         "lines": inside, "lineSeries": aux, "bands": bands,
@@ -1112,7 +1182,8 @@ def build_role_pages(*, frames: dict, lifecycle, context=None,
                      playbook: str = "", score_line: str = "",
                      entry_clock: str = "M15",
                      roles=ROLE_ORDER, clocks: ChartClocks = None,
-                     freshness: dict = None) -> list:
+                     freshness: dict = None,
+                     workspace=None) -> list:
     """The role trio as self-contained pages, in ROLE_ORDER.
 
     Same inputs and the same role split as the matplotlib
@@ -1155,7 +1226,8 @@ def build_role_pages(*, frames: dict, lifecycle, context=None,
                     role_title=f"B · {tf} — context", tf_label=tf))
             else:
                 cfg = _context_cfg(frame, context, lifecycle,
-                                   tf_label=tf, frames=frames)
+                                   tf_label=tf, frames=frames,
+                                   workspace=workspace)
                 cfg["header"]["fresh"] = _fresh_line(tf, freshness)
                 out.append(role_page(
                     cfg, instrument=instrument, playbook=playbook,
