@@ -62,12 +62,18 @@ Nothing blends silently.
 **Cadence.**  Retraining triggers (``needs_retrain``): no
 artifact, an invalid artifact, ``RETRAIN_NEW_BARS`` new H1 bars
 since the artifact's training cutoff, or an artifact older than
-``RETRAIN_MAX_AGE_DAYS``.  The runner evaluates the trigger on
-its calibration cycle and trains in a background thread; the
-artifact swap is atomic (tmp + replace) and a failed train
-leaves the previous artifact live — the record always carries
-the artifact's trained-at stamp and training window, so a stale
-model never claims freshness.
+``RETRAIN_MAX_AGE_DAYS`` — plus a CALIBRATION trigger: when the
+live book says a horizon the artifact actually states for has
+enough resolutions and its ECE sits outside the graduation gate,
+the artifact is stale and retraining is due, once the artifact
+is past ``CALIBRATION_MIN_AGE_DAYS`` (the book is cumulative
+across artifacts, so without that floor the trigger would
+refire on the very next cycle after every retrain).  The runner
+evaluates the trigger on its calibration cycle and trains in a
+background thread; the artifact swap is atomic (tmp + replace)
+and a failed train leaves the previous artifact live — the
+record always carries the artifact's trained-at stamp and
+training window, so a stale model never claims freshness.
 
 Pure core + one service class; the runner owns cadence,
 journaling and the book's persistence calls.  No LLM anywhere,
@@ -106,6 +112,30 @@ GRAD_MAX_ECE = 0.10
 #: Retrain cadence (mirrors the ensemble's 500-bar trigger).
 RETRAIN_NEW_BARS = 500
 RETRAIN_MAX_AGE_DAYS = 21
+#: Calibration trigger floor: the live book is cumulative
+#: across artifacts, so a retrain cannot clear a drifted ECE by
+#: itself — the calibration cause fires only once the artifact
+#: is at least this old, or it would refire on the very next
+#: cycle after every retrain.  Bounded cost: at most one
+#: calibration retrain per floor period while a horizon stays
+#: outside the gate.
+CALIBRATION_MIN_AGE_DAYS = 3.0
+#: OOF fold design (horizon-aware).  The old design (initial
+#: max(200, n//2), step max(100, n//8)) left the long horizons
+#: with almost no out-of-fold rows on live-sized windows — on
+#: the live 733-row window h=360 got 7 OOF rows from a 6-row
+#: model, so its calibrator was None by construction and the
+#: horizon never stated, never resolved, never graduated.  The
+#: first fold now starts once the purge leaves a real training
+#: set (horizon + OOF_FIRST_TRAIN_MIN rows), and the folds tile
+#: the usable span in OOF_FOLD_BLOCKS blocks; a horizon whose
+#: usable span is empty at this window size gets no folds at
+#: all, and _horizon_entry records it uncalibrated with the
+#: reason instead of a silent never-state.
+OOF_FIRST_TRAIN_MIN = 100
+OOF_FIRST_FLOOR = 150
+OOF_FOLD_BLOCKS = 5
+OOF_MAX_FOLDS = 6
 #: Probability-book bins over stated probability.
 PROB_BINS = 10
 
@@ -210,23 +240,44 @@ def _slice_frames(frames: dict, through) -> dict:
     return out
 
 
+def _oof_fold_params(n: int, horizon: int) -> tuple[int, int]:
+    """(initial_train, step) for one horizon's OOF folds.
+
+    A fold starting at s trains on rows t < s - horizon (the
+    purge) and tests rows in [s, s+step) whose label is known
+    (t < n - horizon).  Both sets are non-empty only for
+    horizon + OOF_FIRST_TRAIN_MIN <= s < n - horizon; when that
+    interval is empty no honest OOF coverage exists at this
+    window size and the params still describe the empty
+    interval (make_folds then yields no folds, and the horizon
+    is recorded uncalibrated — never a silent never-state)."""
+    first = max(OOF_FIRST_FLOOR, horizon + OOF_FIRST_TRAIN_MIN)
+    last = n - horizon
+    if last <= first:
+        return first, max(100, OOF_FIRST_TRAIN_MIN)
+    step = max(100, (last - first) // OOF_FOLD_BLOCKS)
+    return first, step
+
+
 def _oof_probs(factory, Xv: np.ndarray, y: np.ndarray,
                known: np.ndarray, horizon: int,
                seed: int) -> np.ndarray:
     """Walk-forward out-of-fold class probabilities for one
     target: expanding chronological folds, house purge via
-    walkforward.make_folds.  Returns an (n_rows, n_classes)
-    array, NaN where a row was never out-of-fold predicted."""
+    walkforward.make_folds, horizon-aware fold placement (see
+    _oof_fold_params).  Returns an (n_rows, n_classes) array,
+    NaN where a row was never out-of-fold predicted."""
     from .walkforward import make_folds
 
     n = len(Xv)
     out = np.full((n, len(CLASSES)), np.nan)
     if factory == "binary":
         out = np.full((n, 2), np.nan)
+    initial_train, step = _oof_fold_params(n, horizon)
     folds = make_folds(n, known, horizon,
-                       initial_train=max(200, n // 2),
-                       step=max(100, n // 8))
-    for fold in folds[:6]:  # bounded: the calibration fit's tail
+                       initial_train=initial_train, step=step)
+    for fold in folds[:OOF_MAX_FOLDS]:  # bounded: the calibration
+        # fit's tail
         tr, te = fold.train_idx, fold.test_idx
         ytr = y[tr]
         if len(np.unique(ytr[~np.isnan(ytr)])) < 2:
@@ -320,6 +371,44 @@ def _horizon_entry(X: pd.DataFrame, Xv: np.ndarray,
         entry[f"{side}_calibrator"] = _fit_isotonic(
             oof_b[:, 1], yb)
 
+    # ── calibration standing, named, never silent ──
+    # A horizon whose OOF coverage cannot carry an isotonic fit
+    # states no probabilities (shadow or rendered), so it can
+    # never accrue live resolutions and never graduate.  That
+    # state used to be invisible — the calibrator was simply
+    # None.  It is now recorded with its OOF pair count and the
+    # reason, in the artifact and (via train_trained) in the
+    # summary, so the record and the status surface can name it.
+    dir_calibrated = all(
+        calibrators[name] is not None for name in CLASSES)
+    bar_calibrated = {
+        side: entry.get(f"{side}_calibrator") is not None
+        for side in ("up", "dn")}
+    if dir_calibrated:
+        cal_status, cal_reason = "calibrated", None
+    elif int(oof_rows.sum()) < MIN_OOF_PAIRS:
+        cal_status = "uncalibrated"
+        cal_reason = (
+            f"only {int(oof_rows.sum())} out-of-fold pairs "
+            f"(< {MIN_OOF_PAIRS}) on a {int(known.sum())}-row "
+            f"window: horizon {horizon} needs a longer training "
+            f"window for its {horizon}-bar purge")
+    else:
+        missing = [name for name in CLASSES
+                   if calibrators[name] is None]
+        cal_status = "uncalibrated"
+        cal_reason = (
+            f"{int(oof_rows.sum())} out-of-fold pairs but no "
+            f"isotonic fit for class {','.join(missing)} "
+            f"(single realized class in the out-of-fold rows)")
+    entry["calibration"] = {
+        "status": cal_status,
+        "reason": cal_reason,
+        "oof_n": int(oof_rows.sum()),
+        "dir_calibrated": dir_calibrated,
+        "barrier_calibrated": bar_calibrated,
+    }
+
     # ── quantiles of the forward return + excursion means ──
     entry["quantiles"] = {}
     for alpha in (_Q_LO, 0.5, _Q_HI):
@@ -392,6 +481,11 @@ def train_trained(frames: dict, out_path: str | Path, *,
     tmp_path = out_path.with_name(out_path.name + ".tmp")
     joblib.dump(artifact, tmp_path)
     os.replace(tmp_path, out_path)
+    uncalibrated = {
+        h: (entry.get("calibration") or {}).get("reason")
+        for h, entry in horizons.items()
+        if (entry.get("calibration") or {}).get("status")
+        == "uncalibrated"}
     return {
         "saved": str(out_path),
         "version": ARTIFACT_VERSION,
@@ -400,6 +494,10 @@ def train_trained(frames: dict, out_path: str | Path, *,
         "train_rows": artifact["train_rows"],
         "horizons": sorted(horizons),
         "skipped_horizons": skipped,
+        "calibration": {
+            h: (entry.get("calibration") or {}).get("status")
+            for h, entry in horizons.items()},
+        "uncalibrated_horizons": uncalibrated,
     }
 
 
@@ -429,19 +527,37 @@ def _validate_artifact(artifact) -> tuple[bool, str]:
 
 
 def retrain_accrual(artifact: dict | None, h1_index,
-                    now: datetime.datetime) -> dict:
+                    now: datetime.datetime,
+                    book: "ProbabilityBook | None" = None) -> dict:
     """The F2 retrain accrual as DATA (completion-04): how many
     new H1 bars have accrued against ``RETRAIN_NEW_BARS`` since
     the artifact's training cutoff, and how old the artifact is
     against ``RETRAIN_MAX_AGE_DAYS``.  ``needs_retrain`` is this
     computation's verdict; the status surface and the runtime
     manifest read the same numbers, so "how close is the next
-    retrain" is never a reason string someone has to parse."""
+    retrain" is never a reason string someone has to parse.
+
+    ``book`` (optional, the live probability book) adds the
+    CALIBRATION cause: a horizon the artifact actually states
+    for — all direction calibrators present — whose live book
+    carries at least ``GRAD_MIN_N`` resolutions at an ECE above
+    ``GRAD_MAX_ECE`` marks the artifact stale.  That is the
+    live failure of Nov 13–18: h72 graduated, then drifted to
+    ECE 0.127 while the bar (500) and age (21d) triggers still
+    slept.  Horizons the artifact cannot state for never count
+    here — retraining the same window cannot fix them, and a
+    stale book entry for one must not force retrains forever.
+    The calibration cause additionally requires the artifact to
+    be past ``CALIBRATION_MIN_AGE_DAYS``: the book is cumulative
+    across artifacts, so without that floor the cause would
+    refire on the very next cycle after every retrain."""
     acc: dict[str, Any] = {
         "new_bars": None, "threshold": RETRAIN_NEW_BARS,
         "age_days": None, "max_age_days": RETRAIN_MAX_AGE_DAYS,
         "trained_through": None, "due": True, "cause": None,
-        "reason": ""}
+        "reason": "", "calibration": {"horizons": {}, "due": False,
+                                      "cause": None, "reason": ""},
+    }
     if not artifact:
         acc.update(cause="no_artifact",
                    reason="no trained artifact")
@@ -463,12 +579,49 @@ def retrain_accrual(artifact: dict | None, h1_index,
         / 86400.0
     acc.update(new_bars=new_bars, age_days=round(age_days, 1),
                trained_through=str(artifact["trained_through"]))
+    # ── calibration evidence (reported always; verdict below) ──
+    cal = acc["calibration"]
+    if book is not None:
+        for key, entry in (artifact.get("horizons") or {}).items():
+            h = int(key)
+            cals = (entry or {}).get("dir_calibrators") or {}
+            if any(cals.get(name) is None for name in CLASSES):
+                continue
+            _ok, info = book.graduated(h)
+            n = int(info.get("n") or 0)
+            ece = info.get("ece")
+            outside = (n >= GRAD_MIN_N and ece is not None
+                       and ece > GRAD_MAX_ECE)
+            cal["horizons"][h] = {"n": n, "ece": ece,
+                                  "outside_gate": outside}
+            if outside:
+                cal["due"] = True
+        if cal["due"]:
+            worst = max(
+                (h for h, v in cal["horizons"].items()
+                 if v["outside_gate"]),
+                key=lambda h: cal["horizons"][h]["ece"])
+            w = cal["horizons"][worst]
+            cal["reason"] = (
+                f"live book horizon {worst}: n={w['n']} "
+                f"ECE {w['ece']} > {GRAD_MAX_ECE}")
     if new_bars >= RETRAIN_NEW_BARS:
         acc.update(due=True, cause="new_bars",
                    reason=f"{new_bars} new H1 bars since {through}")
     elif age_days >= RETRAIN_MAX_AGE_DAYS:
         acc.update(due=True, cause="age",
                    reason=f"artifact is {age_days:.0f} days old")
+    elif cal["due"] and age_days >= CALIBRATION_MIN_AGE_DAYS:
+        cal["cause"] = "calibration"
+        acc.update(due=True, cause="calibration",
+                   reason=(f"{cal['reason']} — artifact stale "
+                           f"({age_days:.1f} days old)"))
+    elif cal["due"]:
+        acc.update(due=False, cause=None,
+                   reason=(f"artifact current ({new_bars} new H1 "
+                           f"bars, {age_days:.1f} days old; "
+                           f"calibration drift noted: "
+                           f"{cal['reason']})"))
     else:
         acc.update(due=False, cause=None,
                    reason=(f"artifact current ({new_bars} new H1 "
@@ -477,10 +630,15 @@ def retrain_accrual(artifact: dict | None, h1_index,
 
 
 def needs_retrain(artifact: dict | None, h1_index,
-                  now: datetime.datetime) -> tuple[bool, str]:
+                  now: datetime.datetime,
+                  book: "ProbabilityBook | None" = None
+                  ) -> tuple[bool, str]:
     """The F2 retrain trigger: no (valid) artifact, enough new
-    H1 bars since the training cutoff, or an old artifact."""
-    acc = retrain_accrual(artifact, h1_index, now)
+    H1 bars since the training cutoff, an old artifact — or,
+    when the live book is passed, a horizon the artifact states
+    for whose live ECE has drifted outside the graduation gate
+    (see retrain_accrual)."""
+    acc = retrain_accrual(artifact, h1_index, now, book=book)
     return bool(acc["due"]), str(acc["reason"])
 
 
@@ -869,10 +1027,15 @@ class TrainedOutlook:
                     "large_dn": large.get("dn"),
                     "basis": basis}
             else:
+                cal = entry.get("calibration") or {}
+                reason = cal.get("reason") or (
+                    "trained estimator has no out-of-fold "
+                    "calibration fit")
                 fields["probabilities"] = {
                     "state": "uncalibrated",
-                    "reason": ("trained estimator has no "
-                               "out-of-fold calibration fit")}
+                    "reason": reason,
+                    "oof_n": cal.get("oof_n"),
+                }
             if atr is not None and atr > 0:
                 try:
                     spec = spec_for(h)
