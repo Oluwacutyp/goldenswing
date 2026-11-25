@@ -237,6 +237,29 @@ def evaluate_judgment(*, candidate: dict, decision: dict | None,
     regime = _parse_regime_label(context.get("regime"))
     structure = _structure_class(regime, inferred)
     bias_align, d1_opposed = _bias_alignment(observed, direction)
+    # ---- situation input (Phase 1, item 1) ----------------------
+    # The governing decision reads the current MarketSituation
+    # into its market-state picture — and nothing else.  The
+    # intended TF's structure phase fills the structure read
+    # only when the bedrock label says nothing, and the full
+    # contribution rides market_state below so the record names
+    # what the situation said.  The situation casts NO vote on
+    # the verdict: no support weight, no opposition weight
+    # (owner correction 2026-11-24 — the per-TF direction
+    # alignment is evidence on the record, never a penalty for
+    # a setup that fights the daily picture; a counter-D1 setup
+    # is judged on its own evidence, never vetoed at the margin
+    # by the picture).  Absent situation = absent input, never
+    # an assumed one — and with no situation the returned block
+    # is byte-identical to its pre-Phase-1 shape.
+    situation = evidence.get("situation") or {}
+    if not isinstance(situation, dict):
+        situation = {}
+    sit_phase = (situation.get("intended") or {}).get(
+        "structure_phase")
+    if structure == "unknown" and isinstance(sit_phase, str) \
+            and sit_phase:
+        structure = _structure_class({"structure": sit_phase}, {})
     adr_pct = _f(context.get("adr_pct"))
     adr_state = str(context.get("adr_state") or "")
     chop_affinity = 0.0
@@ -268,6 +291,12 @@ def evaluate_judgment(*, candidate: dict, decision: dict | None,
         "journey_state": inferred.get("journey_state"),
         "room_r": _f(inferred.get("room_r")),
     }
+    if situation:
+        # Phase 1, item 1: the verdict names the situation it
+        # weighed — the full contribution block (per-TF states
+        # + alignment).  Absent situation = absent key, so the
+        # block stays byte-identical to its pre-Phase-1 shape.
+        market_state["situation"] = situation
 
     # ---- geometry (a hard fact, stated before any weighing) ----
     if direction not in (1, -1) or entry is None or stop is None \

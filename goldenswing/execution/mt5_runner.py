@@ -566,13 +566,19 @@ class MT5RunnerConfig:
     # never change a decision (test-pinned on/off identity).  The
     # flag exists so a test (or a forensic A/B) can prove that.
     funnel_enabled: bool = True
-    # MARKET SITUATION (Pass 0, shadow): the shared per-TF market
-    # read (live/situation.py), rebuilt on TF closes after the
-    # append phase, journaled as a full snapshot on H1 closes
-    # (deltas on real state changes at other closes), and stamped
-    # onto the cycle's funnel records as ``situation_id``.
-    # OBSERVATION-ONLY: no decision path reads it in Pass 0; the
-    # flag exists so a test (or a forensic A/B) can prove that.
+    # MARKET SITUATION (Pass 0 measurement; Phase 1 governing
+    # input): the shared per-TF market read (live/situation.py),
+    # rebuilt on TF closes after the append phase, journaled as
+    # a full snapshot on H1 closes (deltas on real state changes
+    # at other closes), stamped onto the cycle's funnel records
+    # as ``situation_id`` — and, since Phase 1 item 1, read by
+    # the governing decision path: the judgment evaluation reads
+    # the situation's per-TF states into its market-state picture
+    # (execution/situation_input.py) and the funnel record names
+    # the contribution.  The situation casts no vote on the
+    # verdict (owner correction 2026-11-24).  With the
+    # flag off no keeper exists, so no input exists either and
+    # decisions keep their pre-Phase-1 shape.
     situation_enabled: bool = True
     # SCENARIO BOOK (MarketSituation Pass 2, shadow): every
     # tracked setup becomes a book scenario (execution/
@@ -3280,6 +3286,23 @@ class MT5Runner:
         _sit_id = self._current_situation_id()
         if _sit_id is not None:
             record["situation_id"] = _sit_id
+        # Phase 1, item 1: the record names what the situation
+        # contributed to this evaluation — the per-TF states read
+        # plus the direction alignment against this record's
+        # candidate.  Absent situation = absent block, so
+        # pre-situation records are byte-identical to before.
+        # The emitter never raises: a failure here degrades to
+        # no block, exactly like the assessment block below.
+        try:
+            from .situation_input import situation_contribution
+            _sit_contrib = situation_contribution(
+                self._current_situation(),
+                intended_tf=intended_tf,
+                direction=(candidate or {}).get("direction"))
+        except Exception:  # noqa: BLE001 — record must never break the signal path
+            _sit_contrib = None
+        if _sit_contrib is not None:
+            record["situation_contribution"] = _sit_contrib
         # Amendment 3 (owner, 2026-10-23): every evaluation record
         # carries a renderable MARKET ASSESSMENT — structure read,
         # HTF context, itemized evidence (detector + source-bar
@@ -3807,13 +3830,31 @@ class MT5Runner:
         {"judgment": <block, effective mode stamped over the
         core's own label>, "forecast_evidence": <E3 feed block
         or None>} — the forecast feed merge included, so the
-        weighed evidence is the record's evidence.  Raises on
+        weighed evidence is the record's evidence, and (Phase 1,
+        item 1) the current MarketSituation's contribution,
+        merged onto a copy of that evidence.  Raises on
         failure: the _emit_eval tap logs its note as before;
         the authority seam catches and fails closed."""
         from .judgment import (JudgmentConfig, evaluate_judgment)
         feed_block, judgment_evidence = self._forecast_feed_for(
             candidate=candidate, evidence=evidence,
             intended_tf=intended_tf, eval_now=eval_now)
+        # Phase 1, item 1: the governing decision reads the
+        # current MarketSituation into its market-state picture
+        # — the contribution (per-TF states + direction
+        # alignment) rides the evidence the core reads, on a
+        # copy, so the caller's evidence is untouched and the
+        # funnel record names the same block.  The situation
+        # casts no vote on the verdict (owner correction
+        # 2026-11-24).  No snapshot = no key: the evaluation is
+        # byte-identical to its pre-Phase-1 shape.
+        from .situation_input import situation_contribution
+        _sit = situation_contribution(
+            self._current_situation(), intended_tf=intended_tf,
+            direction=(candidate or {}).get("direction"))
+        if _sit is not None:
+            judgment_evidence = dict(judgment_evidence or {})
+            judgment_evidence["situation"] = _sit
         judgment = evaluate_judgment(
             candidate=candidate, decision=decision,
             evidence=judgment_evidence,
