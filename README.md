@@ -19,11 +19,16 @@ not on poll — management actions fire the moment price crosses the level.
   entry timeframe**, nested inside the higher-timeframe context —
   playbooks with their own native clock (`qm_m5` on M5, `qm_d1` on D1)
   evaluate on that clock and need no H1 trigger.
-- **Executed sleeves:** the full registry executes on the demo — all 18
-  playbooks (the 16-playbook H1 roster plus `qm_m5` and `qm_d1` on their
-  native routes). There is no shadow tier; the per-playbook kill switch
-  (`/set playbook.<name> off`) is the only opt-out, and the demo itself
-  is the measurement (live-demo doctrine: backtests map, demo decides).
+- **Executed sleeves:** 31 playbooks in the registry (the 18 originals
+  plus 13 newer families). The Judgment Core governs three routes on
+  demo today — `h1_trigger`, `qm_m5_native`, `qm_d1_native`. The 13
+  newer families evaluate live data and journal scenarios to the shared
+  Scenario Book, but their candidates do not reach demo execution yet —
+  they are shadow contributors, not governed routes. The per-playbook
+  kill switch (`/set playbook.<name> off`) is the opt-out, and the demo
+  itself is the measurement (live-demo doctrine: backtests map, demo
+  decides). Bringing the newer families into the shared demo decision
+  authority is the work in progress.
 - **AMD phase** rides as a tag on the stack, never a veto. Hard veto is OFF.
 - **Volume** comes from MT5 (tick volume, real volume where the symbol
   provides it) and nudges the score — it never gates a trade.

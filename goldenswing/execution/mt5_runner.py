@@ -5561,12 +5561,13 @@ class MT5Runner:
                 return
             import datetime as _dt
 
-            from ..forecast.trained import needs_retrain
+            from ..forecast.trained import ProbabilityBook, needs_retrain
             svc = self._forecast_trained_service()
             art, _note = svc.artifact()
             need, _reason = needs_retrain(
                 art, h1.index,
-                _dt.datetime.now(_dt.timezone.utc))
+                _dt.datetime.now(_dt.timezone.utc),
+                book=ProbabilityBook(st.get("prob_book") or {}))
             if not need:
                 return
             from ..forecast.mtf import (
