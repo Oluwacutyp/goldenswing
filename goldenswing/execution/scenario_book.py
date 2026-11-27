@@ -586,7 +586,7 @@ class ScenarioBook:
 
     def propose_from_setup(self, setup: TrackedSetup, *, ts,
                            situation_id=None,
-                           authority: str = "shadow",
+                           authority: str = "live",
                            evidence_groups=None, s1=None
                            ) -> list[dict]:
         """A tracked setup becomes a book scenario (identity =
@@ -829,7 +829,7 @@ class ScenarioBook:
                          invalidation_terms,
                          validity: dict | None = None,
                          situation_id=None,
-                         authority: str = "shadow",
+                         authority: str = "live",
                          management: dict | None = None,
                          score: float = 0.0,
                          initial_state: str = "proposed",
@@ -1139,7 +1139,7 @@ class ScenarioBook:
                     "scenario_id": tid,
                     "family": THESIS_FAMILY,
                     "route": "judgment_thesis",
-                    "authority": "shadow",
+                    "authority": "live",
                     "direction": int(active.get("direction")
                                      or 0),
                     "horizon": THESIS_HORIZON,

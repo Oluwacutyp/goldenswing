@@ -601,8 +601,8 @@ def test_registry_partition_covers_reversion():
     for spec in REVERSION_SPECS:
         assert spec in PLAYBOOK_REGISTRY
         assert spec not in ROSTER_SPECS
-        assert spec.playbook_class.live is False
-        assert spec.shadow_evaluation is True
+        assert spec.playbook_class.live is True
+        assert spec.shadow_evaluation is False
     assert {s.name for s in ROSTER_SPECS} | {
         s.name for s in NATIVE_SPECS} | {
         s.name for s in VOL_SPECS} | {
@@ -616,27 +616,32 @@ def test_registry_partition_covers_reversion():
         ROUTE_MEAN_REVERSION]
 
 
-def test_routes_declared_shadow_and_never_governing(tmp_path):
+def test_routes_declared_governing(tmp_path):
     runner, _ = _scan_runner(tmp_path)
     table = {row["route"]: row
              for row in runner._judgment_route_table()}
     for name in ("mean_reversion_extension_fade",
                  "mean_reversion_failed_continuation"):
         assert runner._judgment_route_state(name) == \
-            "shadow_declared"
+            "governing"
         assert runner._judgment_route_source(name) == "declared"
-        assert table[name]["governing_now"] is False
+        assert table[name]["governing_now"] is True
         assert JUDGMENT_ROUTE_PLAYBOOK[name] == name
     assert set(reversion_promotion.REVERSION_JUDGMENT_ROUTES) == \
         set(mt5_runner.REVERSION_JUDGMENT_ROUTE_NAMES)
 
 
-def test_family_has_no_order_path():
+def test_family_attributed_to_own_route():
+    """The route_promotion order table (order attribution
+    for the violation scan) maps each family playbook to
+    its OWN route, so a violation attributed to the
+    playbook demotes that route — and the route governs
+    by declaration since the owner's 2026-11-25 order."""
     from goldenswing.execution.route_promotion import (
         ORDER_ROUTE_BY_PLAYBOOK)
     for name in ("mean_reversion_extension_fade",
                  "mean_reversion_failed_continuation"):
-        assert name not in ORDER_ROUTE_BY_PLAYBOOK
+        assert ORDER_ROUTE_BY_PLAYBOOK[name] == name
 
 
 def test_undeclared_names_still_fail_closed(tmp_path):
@@ -815,7 +820,7 @@ def test_runner_scan_journals_evaluations_verdicts_and_book(
                    "authority_route")
                == "mean_reversion_extension_fade"]
     assert len(shadows) == 1
-    assert shadows[0]["judgment"]["authority"] == "shadow_declared"
+    assert shadows[0]["judgment"]["authority"] == "governing"
     # The scenario entered the book as a shadow proposal
     # with the family's clocks.
     setups = runner._setup_store.active()
@@ -963,7 +968,7 @@ def test_promotion_evaluation_insufficient_then_ready_binds_nothing(
     text = "\n".join(reversion_promotion.render_lines(state))
     assert "PROMOTION READY (recommendation only)" in text
     runner, _ = _scan_runner(tmp_path)
-    assert runner._judgment_route_state(route) == "shadow_declared"
+    assert runner._judgment_route_state(route) == "governing"
 
 
 def test_promotion_host_phase_journals_and_persists(tmp_path):

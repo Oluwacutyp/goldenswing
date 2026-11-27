@@ -339,10 +339,10 @@ def test_cross_window_accumulation_reaches_a_verdict():
 
 # ------------------------------------------------ route declaration
 
-def test_range_routes_declared_shadow_and_tables_agree():
+def test_range_routes_declared_governing_and_tables_agree():
     for spec in RANGE_SPECS:
         assert JUDGMENT_ROUTE_STATES[spec.name] \
-            == "shadow_declared"
+            == "governing"
         assert JUDGMENT_ROUTE_PLAYBOOK[spec.name] == spec.name
         assert rp.RANGE_JUDGMENT_ROUTES[spec.name] == spec.name
     assert rp.RANGE_PLAYBOOKS == tuple(
@@ -353,15 +353,16 @@ def test_range_route_state_resolution_and_typo_safety(tmp_path):
     runner = _runner(tmp_path)
     for name in rp.RANGE_PLAYBOOKS:
         assert runner._judgment_route_state(name) \
-            == "shadow_declared"
+            == "governing"
     # A typo in the promotion config can neither promote nor
     # demote (the completion-02 rule, on the new routes).
     runner.cfg.judgment_route_modes = {
         "range_qm": "governingg", "range_qm2": "governing"}
     assert runner._judgment_route_state("range_qm") \
-        == "shadow_declared"
-    # The explicit step CAN flip the state — that config step
-    # is the promotion the evaluation recommends into.
+        == "governing"
+    # The explicit step still resolves — that config step names
+    # source config; the route governs by declaration either
+    # way (owner order 2026-11-25).
     runner.cfg.judgment_route_modes = {"range_qm": "governing"}
     assert runner._judgment_route_state("range_qm") \
         == "governing"
@@ -370,7 +371,7 @@ def test_range_route_state_resolution_and_typo_safety(tmp_path):
     assert table["range_qm"]["governing_now"] is True
     for name in rp.RANGE_PLAYBOOKS:
         if name != "range_qm":
-            assert table[name]["governing_now"] is False
+            assert table[name]["governing_now"] is True
 
 
 # ------------------------------------------------ scan wiring
@@ -404,7 +405,7 @@ def _scan_shadows(runner):
             and r.get("playbook") == "range_qm"]
 
 
-def test_range_scan_journals_route_stamped_shadow(
+def test_range_scan_journals_route_stamped_governing(
         tmp_path, monkeypatch):
     runner = _drive_range_scan(tmp_path, monkeypatch)
     evals = _scan_evals(runner)
@@ -418,7 +419,7 @@ def test_range_scan_journals_route_stamped_shadow(
     assert len(shadows) == 1
     judgment = shadows[0]["judgment"]
     assert judgment["authority_route"] == "range_qm"
-    assert judgment["authority"] == "shadow_declared"
+    assert judgment["authority"] == "governing"
     assert shadows[0]["gate_result"] == "shadow"
     # The candidate's honest gap rides along: no asymmetry
     # breakdown exists on the scan path, and none is invented.
@@ -427,8 +428,8 @@ def test_range_scan_journals_route_stamped_shadow(
     table = {row["route"]: row
              for row in runner._judgment_route_table()}
     assert table["range_qm"]["judgment_records_this_run"] == 1
-    assert table["range_qm"]["authority"] == "shadow_declared"
-    assert table["range_qm"]["governing_now"] is False
+    assert table["range_qm"]["authority"] == "governing"
+    assert table["range_qm"]["governing_now"] is True
 
 
 def test_stamp_is_output_only(tmp_path, monkeypatch):
@@ -543,7 +544,7 @@ def test_manifest_block_and_status_line(tmp_path):
     assert core["range_promotion"]["routes"]["range_qm"][
         "verdict"] == "promotion_ready"
     table = {r["route"]: r for r in core["route_authority"]}
-    assert table["range_qm"]["authority"] == "shadow_declared"
+    assert table["range_qm"]["authority"] == "governing"
 
 
 # ------------------------------------------------ the report script

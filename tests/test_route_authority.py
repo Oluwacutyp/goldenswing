@@ -1,5 +1,7 @@
 """Route AUTHORITY (MarketSituation Pass 5; owner ruling
-2026-11-08, AMENDMENTS-1 §A5 — the strict boundary).
+2026-11-08, AMENDMENTS-1 §A5 — as amended by the owner's
+2026-11-25 order: everything goes live directly on demo,
+no shadow, no gating, no promotion, no prove-first).
 
 Runner-level pins:
 
@@ -12,25 +14,27 @@ Runner-level pins:
 - FAIL-CLOSED: a route with NO declaration cannot reach the
   order path — the seam refuses it in every mode and the
   attempt journals an undeclared_route alarm.
-- RESOLUTION: state + source resolve declared < config <
-  verdict, with an invariant demotion binding over all
-  three until released by a fresh verdict or a NEW config
-  step.
+- RESOLUTION: state + source resolve declared < config,
+  with an invariant demotion binding over both until
+  released by a clean audit window or a NEW config step.
+  Promotion verdicts bind NOTHING anymore — a stale
+  "verdict" entry in the dynamic state is ignored by
+  resolution and purged by the phase.
 - THE PER-CYCLE RECORD: one judgment_authority record per
   H1 close listing every route + state + source; the
   /status line renders the same table.
-- THE BOUNDARY: hot_scalp and the resting limit submit NO
-  independent demo orders while their route does not
-  govern — candidates are preserved as shadow (claim back
-  to touched / a journaled shadow eval), never placed;
-  under a governing verdict the order flows THROUGH the
-  seam, so a core abstention still blocks it.
+- THE BOUNDARY: hot_scalp and the resting limit submit
+  their independent demo orders through the seam like every
+  governed route — a core abstention still blocks them, and
+  a demoted route rests nothing until its invariant clears.
 - THE FULL LOOP on fabricated history through the S3 host:
-  criteria journal BEFORE the first verdict; a ready
-  verdict binds (route governs, source verdict); a
-  violation demotes; the STALE verdict does not release the
-  demotion; fresh history does; a later not_ready verdict
-  demotes a verdict-promoted route.
+  criteria journal BEFORE the first verdict; the evaluation
+  still computes promotion_ready (measurement only — the
+  route already governs by declaration, source "declared");
+  a violation demotes; a quiet cycle (no route activity)
+  does NOT release the demotion; fresh history in a clean
+  window does, source "invariant_cleared"; a later
+  not_ready verdict changes no authority.
 """
 from __future__ import annotations
 
@@ -53,7 +57,6 @@ from test_route_promotion import _arm as _history_arm
 from test_step14_setup_lifecycle import _scan_runner
 from test_step6_hot_scalp_promotion import _candidate as _hs_cand
 from test_step6_hot_scalp_promotion import _runner as _hs_runner
-from test_step6_hot_scalp_promotion import _status as _hs_status
 from test_step6_hot_scalp_promotion import _tick as _hs_tick
 
 
@@ -131,13 +134,18 @@ def test_route_audit_completeness_both_directions():
 
 
 def test_declared_table_is_the_owners_promotion_record():
+    # Owner order 2026-11-25 06:48 — everything goes live
+    # directly on demo; no shadow, no gating, no promotion.
+    # Every route in the table governs by declaration.
+    for route, state in JUDGMENT_ROUTE_STATES.items():
+        assert state == "governing", route
     assert JUDGMENT_ROUTE_STATES["h1_trigger"] == "governing"
     assert JUDGMENT_ROUTE_STATES["qm_m5_native"] == "governing"
     assert JUDGMENT_ROUTE_STATES["qm_d1_native"] == "governing"
     assert JUDGMENT_ROUTE_STATES["hot_scalp_promotion"] \
-        == "shadow_declared"
+        == "governing"
     assert JUDGMENT_ROUTE_STATES["resting_limit"] \
-        == "shadow_declared"
+        == "governing"
 
 
 # ------------------------------------------------ resolution
@@ -148,8 +156,12 @@ def test_resolution_sources(tmp_path):
         == "governing"
     assert runner._judgment_route_source("h1_trigger") \
         == "declared"
+    # Every route governs by declaration now (owner order
+    # 2026-11-25) — hot_scalp included.
     assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "shadow_declared"
+        == "governing"
+    assert runner._judgment_route_source(
+        "hot_scalp_promotion") == "declared"
     assert runner._route_declared("hot_scalp_promotion")
     # Config is the explicit step.
     runner = _jc_runner(
@@ -160,7 +172,10 @@ def test_resolution_sources(tmp_path):
         == "governing"
     assert runner._judgment_route_source(
         "hot_scalp_promotion") == "config"
-    # A verdict entry governs with source verdict.
+    # A verdict entry is RETIRED history: it binds nothing.
+    # The route governs by declaration, source "declared" —
+    # the stale entry is ignored by resolution (and purged
+    # by the phase on the next cycle).
     runner = _jc_runner(tmp_path / "c")
     runner._route_authority_state()["hot_scalp_promotion"] = {
         "state": "governing", "source": "verdict",
@@ -169,7 +184,7 @@ def test_resolution_sources(tmp_path):
     assert runner._judgment_route_state("hot_scalp_promotion") \
         == "governing"
     assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "verdict"
+        "hot_scalp_promotion") == "declared"
     # A demotion binds over the declared state.
     runner._route_authority_state()["h1_trigger"] = {
         "state": "shadow_declared", "source": "demoted",
@@ -246,10 +261,13 @@ def test_authority_cycle_journals_once_per_h1_close(tmp_path):
     assert table["h1_trigger"]["authority"] == "governing"
     assert table["h1_trigger"]["source"] == "declared"
     assert table["h1_trigger"]["governing_now"] is True
+    # Every route governs by declaration now (owner order
+    # 2026-11-25) — hot_scalp included.
     assert table["hot_scalp_promotion"]["authority"] \
-        == "shadow_declared"
+        == "governing"
+    assert table["hot_scalp_promotion"]["source"] == "declared"
     assert table["hot_scalp_promotion"]["governing_now"] \
-        is False
+        is True
 
 
 def test_authority_record_carries_the_priors_verdict(tmp_path):
@@ -304,56 +322,30 @@ def test_status_line_renders_the_same_table(tmp_path):
 
 # ------------------------------------------------ the boundary: hot scalp
 
-def _promote_via_verdict(runner):
-    runner._route_authority_state()["hot_scalp_promotion"] = {
-        "state": "governing", "source": "verdict",
-        "criteria_id": rp.criteria_id_for("hot_scalp_promotion"),
-        "verdict": "promotion_ready",
-        "since": "2026-11-08 00:00:00+00:00"}
-
-
-def test_hot_scalp_boundary_preserves_shadow_at_default(
-        tmp_path):
+def test_hot_scalp_boundary_submits_at_default(tmp_path):
+    # Owner order 2026-11-25: the route governs by
+    # declaration, so at default the candidate submits
+    # through the seam like every governed route — no
+    # verdict needed, no shadow preservation.
     runner = _hs_runner(tmp_path)
     placed_before = len(runner.executor.placed)
     assert runner._promote_hot_scalp_candidate(
-        _hs_cand(runner), _hs_tick(), {}) is False
-    # No independent demo order left the process.
-    assert len(runner.executor.placed) == placed_before
-    # The candidate is preserved, not consumed: the claim is
-    # back to touched and the shadow history carries the
-    # verdict + the seam's shadow evaluation.
-    assert _hs_status(runner) == "touched"
-    evals = _evals(runner, "hot_scalp")
-    assert evals and evals[-1]["decision"]["reason_code"] \
-        == "judgment.route_not_promoted"
-    assert evals[-1]["decision"]["order_result"] \
-        == "not_attempted"
-    shadows = [r for r in runner.journal.records()
-               if r.get("type") == "judgment_shadow"
-               and r.get("playbook") == "hot_scalp"]
-    assert shadows, "the boundary keeps the shadow history"
-    chain = [r for r in runner.journal.records()
-             if r.get("type") == "candidate_chain"
-             and r.get("stage") == "authority"]
-    assert chain and chain[-1]["execution_status"] \
-        == "shadow_preserved"
+        _hs_cand(runner), _hs_tick(), {}) is True
+    assert len(runner.executor.placed) == placed_before + 1
 
 
-def test_hot_scalp_promoted_submits_through_the_seam(tmp_path):
-    runner = _hs_runner(tmp_path / "promoted")
-    (tmp_path / "promoted").mkdir(exist_ok=True)
-    _promote_via_verdict(runner)
+def test_hot_scalp_submits_through_the_seam(tmp_path):
+    runner = _hs_runner(tmp_path / "placed")
+    (tmp_path / "placed").mkdir(exist_ok=True)
     assert runner._promote_hot_scalp_candidate(
         _hs_cand(runner), _hs_tick(), {}) is True
     assert len(runner.executor.placed) == 1
     # And through the seam means the seam still governs: a
-    # core abstention blocks the promoted route exactly like
-    # every governed route.
+    # core abstention blocks the route exactly like every
+    # governed route.
     runner = _hs_runner(tmp_path / "abstain")
     (tmp_path / "abstain").mkdir(exist_ok=True)
     runner.cfg.judgment_min_expected_r = 99.0
-    _promote_via_verdict(runner)
     assert runner._promote_hot_scalp_candidate(
         _hs_cand(runner), _hs_tick(), {}) is False
     assert runner.executor.placed == []
@@ -392,21 +384,20 @@ def _az_drive(tmp_path, **cfg_kw):
     return runner
 
 
-def test_resting_limit_boundary_rests_nothing_at_default(
-        tmp_path):
+def test_resting_limit_boundary_rests_at_default(tmp_path):
+    # Owner order 2026-11-25: the route governs by
+    # declaration, so at default the limit rests — no
+    # verdict, no config step needed.
     runner = _az_drive(tmp_path)
-    assert runner._pending_orders == {}
+    assert runner._pending_orders != {}
     evals = _evals(runner, "arrival_zone")
     assert len(evals) == 1
     assert evals[0]["decision"]["reason_code"] \
-        == "judgment.route_not_promoted"
-    assert evals[0]["decision"]["order_result"] \
-        == "not_attempted"
-    # The shadow journaling is deduped per zone+tick state:
-    # a second call inside the same approach adds no second
-    # record (the attempt is still refused, silently).
+        == "decision.resting_limit"
+    # A second call inside the same approach adds no second
+    # record: the pending order short-circuits the flow.
     runner._maybe_place_resting_limit(dict(_AZ_TICK), {})
-    assert runner._pending_orders == {}
+    assert runner._pending_orders != {}
     assert len(_evals(runner, "arrival_zone")) == 1
 
 
@@ -435,8 +426,12 @@ def _prime(runner, records):
         runner.journal.append(record)
 
 
-def test_full_loop_verdict_binds_demotes_and_releases(
+def test_full_loop_evaluation_measures_demotes_and_releases(
         tmp_path):
+    # Owner order 2026-11-25: the evaluation is measurement
+    # only — it never binds authority.  The route governs by
+    # declaration throughout; a violation still demotes it,
+    # and a clean window releases it.
     runner, h1 = _scan_runner(tmp_path)
     _prime(runner, _ready_hot_history())
     runner._self_audit_phase("2026-11-06 00:00:00+00:00", h1)
@@ -456,15 +451,14 @@ def test_full_loop_verdict_binds_demotes_and_releases(
     assert row["verdict"] == "promotion_ready"
     assert row["criteria_id"] == rp.criteria_id_for(
         "hot_scalp_promotion")
-    # The verdict BINDS: the route governs, source verdict.
+    # The verdict is MEASUREMENT only: the route governs by
+    # declaration, source "declared" — no authority change
+    # is journaled for a verdict anymore.
     assert runner._judgment_route_state("hot_scalp_promotion") \
         == "governing"
     assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "verdict"
-    changes = _records(runner, "route_authority_change")
-    assert any(c["route"] == "hot_scalp_promotion"
-               and c["to"] == "governing"
-               for c in changes)
+        "hot_scalp_promotion") == "declared"
+    assert _records(runner, "route_authority_change") == []
 
     # A5b: an invariant violation demotes it, with evidence.
     runner.journal.append({
@@ -483,37 +477,46 @@ def test_full_loop_verdict_binds_demotes_and_releases(
     assert demotions[0]["kind"] == "duplicate_order"
     assert demotions[0]["evidence"]["setup_id"] == "hs-dupe"
 
-    # The STALE verdict must not release the demotion: a
-    # quiet cycle folds no new outcomes.
+    # A quiet cycle must not release the demotion: no route
+    # activity in the window proves nothing about the
+    # invariant.
     runner._self_audit_phase("2026-11-06 02:00:00+00:00", h1)
     assert runner._judgment_route_source(
         "hot_scalp_promotion") == "demoted"
 
-    # Fresh outcomes fold a fresh evaluation: released.
+    # Fresh outcomes in a clean window: the route traded
+    # clean through it, so the invariant has cleared and
+    # the demotion releases — back to governing by
+    # declaration, source "invariant_cleared", entry gone.
     _prime(runner, _ready_hot_history(start=300))
     runner._self_audit_phase("2026-11-06 03:00:00+00:00", h1)
     assert runner._judgment_route_state("hot_scalp_promotion") \
         == "governing"
     assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "verdict"
-    entry = runner._route_authority_entry("hot_scalp_promotion")
-    assert entry.get("released_demotion", {}).get("kind") \
-        == "duplicate_order"
+        "hot_scalp_promotion") == "declared"
+    assert runner._route_authority_entry(
+        "hot_scalp_promotion") is None
     changes = _records(runner, "route_authority_change")
-    assert sum(1 for c in changes
-               if c["route"] == "hot_scalp_promotion"
-               and c["to"] == "governing") == 2
+    releases = [c for c in changes
+                if c["route"] == "hot_scalp_promotion"
+                and c["to"] == "governing"]
+    assert len(releases) == 1
+    assert releases[0]["source"] == "invariant_cleared"
+    assert releases[0]["kind"] == "duplicate_order"
 
 
-def test_not_ready_verdict_demotes_a_verdict_promotion(
-        tmp_path):
+def test_not_ready_verdict_changes_no_authority(tmp_path):
+    # Owner order 2026-11-25: a not_ready verdict is
+    # measurement only — it demotes nothing.  The route
+    # keeps governing by declaration through the losing
+    # batch, and no authority change is journaled.
     runner, h1 = _scan_runner(tmp_path)
     _prime(runner, _ready_hot_history())
     runner._self_audit_phase("2026-11-06 00:00:00+00:00", h1)
     assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "verdict"
+        "hot_scalp_promotion") == "declared"
     # A later, larger, losing batch flips the standing
-    # verdict; the route the verdict promoted falls with it.
+    # verdict; the route's authority does not move with it.
     records = _history_arm("hot_scalp", "hot_scalp_promotion",
                            "take", [-0.6] * 30, start=500)
     records += _history_arm("hot_scalp",
@@ -522,11 +525,16 @@ def test_not_ready_verdict_demotes_a_verdict_promotion(
     _prime(runner, records)
     runner._self_audit_phase("2026-11-06 01:00:00+00:00", h1)
     assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "shadow_declared"
+        == "governing"
+    assert runner._judgment_route_source(
+        "hot_scalp_promotion") == "declared"
+    evaluations = _records(runner, rp.EVALUATION_RECORD_TYPE)
+    assert evaluations
+    assert evaluations[-1]["routes"]["hot_scalp_promotion"][
+        "verdict"] == "not_ready"
     changes = _records(runner, "route_authority_change")
-    assert any(c["route"] == "hot_scalp_promotion"
-               and c["verdict"] == "not_ready"
-               for c in changes)
+    assert not any(c["route"] == "hot_scalp_promotion"
+                   for c in changes)
 
 
 def test_insufficient_history_changes_no_authority(tmp_path):
@@ -541,7 +549,7 @@ def test_insufficient_history_changes_no_authority(tmp_path):
         row["verdict"] == "insufficient_data"
         for row in evaluations[-1]["routes"].values())
     assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "shadow_declared"
+        == "governing"
     assert runner._judgment_route_source(
         "hot_scalp_promotion") == "declared"
     assert _records(runner, "route_authority_change") == []

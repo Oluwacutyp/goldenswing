@@ -78,12 +78,12 @@ The runner threads two facts in per scan, in the
   day levels for arm corroboration, the opening type
   as recorded evidence).
 
-``live = False``: the family's candidates are scored
-and logged, never in the live P&L book — the
-scheduled route is shadow (journal + scenario book
-only) until the family's own promotion evaluation
-earns a separate owner decision (SPEC §6 common
-contract).
+``live = True``: the family's candidates are live on demo —
+the scheduled route governs by declaration since the
+owner's 2026-11-25 order (everything goes live directly;
+the promotion evaluation is measurement only now, and the
+separate owner decision this flag waited for is that
+order).
 """
 from __future__ import annotations
 
@@ -132,7 +132,7 @@ class _SessionRangeBase(Playbook):
     regime_scope = "both"
     session_scope = "any"
     hunting_ground = HuntingGround(excluded=set(), bonuses={})
-    live = False
+    live = True  # LIVE on demo (owner order 2026-11-25).
     live_threshold = 60.0
 
     def __init__(self) -> None:

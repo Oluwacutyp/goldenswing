@@ -554,13 +554,13 @@ def test_registry_partition_and_posture():
         "auction_lvn_traversal"]
     for spec in AUCTION_SPECS:
         assert spec.route == ROUTE_AUCTION_VALUE
-        assert spec.shadow_evaluation is True
+        assert spec.shadow_evaluation is False
         assert spec.entry_thesis == "market"
         assert spec.management_horizon == "intraday"
         assert spec.chart_studies == ("volume_profile",)
         # NOT on the trigger path: the roster is untouched.
         assert spec not in ROSTER_SPECS
-        assert spec.playbook_class.live is False
+        assert spec.playbook_class.live is True
     assert {s.name for s in ROSTER_SPECS} | {
         s.name for s in NATIVE_SPECS} | {
         s.name for s in VOL_SPECS} | {
@@ -573,7 +573,7 @@ def test_registry_partition_and_posture():
         ROUTE_AUCTION_VALUE]
 
 
-def test_routes_declared_shadow_and_never_governing(tmp_path):
+def test_routes_declared_governing(tmp_path):
     runner, _ = _scan_runner(tmp_path)
     table = {row["route"]: row
              for row in runner._judgment_route_table()}
@@ -581,26 +581,27 @@ def test_routes_declared_shadow_and_never_governing(tmp_path):
                  "auction_value_rejection",
                  "auction_lvn_traversal"):
         assert runner._judgment_route_state(name) == \
-            "shadow_declared"
+            "governing"
         assert runner._judgment_route_source(name) == "declared"
-        assert table[name]["governing_now"] is False
+        assert table[name]["governing_now"] is True
         assert JUDGMENT_ROUTE_PLAYBOOK[name] == name
     # The runner's tables agree with the family's own map.
     assert set(auction_promotion.AUCTION_JUDGMENT_ROUTES) == \
         set(mr.AUCTION_JUDGMENT_ROUTE_NAMES)
 
 
-def test_family_has_no_order_path():
-    """No seam maps an auction playbook to an order route:
-    the route_promotion order table (built from the
-    trigger-path roster) names none of them, so no
-    candidate of this family can reach an order through
-    any existing route."""
-    from goldenswing.execution.route_promotion import ORDER_ROUTE_BY_PLAYBOOK
+def test_family_attributed_to_own_route():
+    """The route_promotion order table (order attribution
+    for the violation scan) maps each family playbook to
+    its OWN route, so a violation attributed to the
+    playbook demotes that route — and the route governs
+    by declaration since the owner's 2026-11-25 order."""
+    from goldenswing.execution.route_promotion import (
+        ORDER_ROUTE_BY_PLAYBOOK)
     for name in ("auction_value_acceptance",
                  "auction_value_rejection",
                  "auction_lvn_traversal"):
-        assert name not in ORDER_ROUTE_BY_PLAYBOOK
+        assert ORDER_ROUTE_BY_PLAYBOOK[name] == name
 
 
 def test_undeclared_names_still_fail_closed(tmp_path):
@@ -758,7 +759,7 @@ def test_runner_scan_journals_evaluations_verdicts_and_book(
                    "authority_route") == "auction_value_acceptance"]
     assert len(shadows) == 1
     assert shadows[0]["judgment"]["authority"] == \
-        "shadow_declared"
+        "governing"
     # The scenario entered the book as a shadow proposal
     # with the family's clocks.
     setups = runner._setup_store.active()
@@ -906,7 +907,7 @@ def test_promotion_evaluation_insufficient_then_ready_binds_nothing(
     # still declared shadow, still governing nowhere.
     runner, _ = _scan_runner(tmp_path)
     assert runner._judgment_route_state(route) == \
-        "shadow_declared"
+        "governing"
 
 
 def test_promotion_host_phase_journals_and_persists(tmp_path):

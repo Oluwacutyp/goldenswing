@@ -369,8 +369,7 @@ def test_manifest_journals_mode_and_boundary(tmp_path):
     assert core["mode_configured"] == "active"
     assert core["authority_routes"] == [
         "h1_trigger", "qm_m5_native", "qm_d1_native"]
-    assert core["not_authoritative"] == [
-        "hot_scalp_promotion", "resting_limit"]
+    assert core["not_authoritative"] == []
     runner = _runner(tmp_path / "m2", judgment_mode="shadow")
     runner._journal_manifest()
     core = [r for r in runner.journal.records()

@@ -635,8 +635,8 @@ def test_registry_partition_covers_session():
     for spec in SESSION_SPECS:
         assert spec in PLAYBOOK_REGISTRY
         assert spec not in ROSTER_SPECS
-        assert spec.playbook_class.live is False
-        assert spec.shadow_evaluation is True
+        assert spec.playbook_class.live is True
+        assert spec.shadow_evaluation is False
     assert {s.name for s in ROSTER_SPECS} | {
         s.name for s in NATIVE_SPECS} | {
         s.name for s in VOL_SPECS} | {
@@ -650,7 +650,7 @@ def test_registry_partition_covers_session():
         ROUTE_SESSION_RANGE]
 
 
-def test_routes_declared_shadow_and_never_governing(tmp_path):
+def test_routes_declared_governing(tmp_path):
     runner, _ = _scan_runner(tmp_path)
     table = {row["route"]: row
              for row in runner._judgment_route_table()}
@@ -659,22 +659,27 @@ def test_routes_declared_shadow_and_never_governing(tmp_path):
                  "session_drive_reversal",
                  "session_asia_sweep"):
         assert runner._judgment_route_state(name) == \
-            "shadow_declared"
+            "governing"
         assert runner._judgment_route_source(name) == "declared"
-        assert table[name]["governing_now"] is False
+        assert table[name]["governing_now"] is True
         assert JUDGMENT_ROUTE_PLAYBOOK[name] == name
     assert set(session_promotion.SESSION_JUDGMENT_ROUTES) == \
         set(mt5_runner.SESSION_JUDGMENT_ROUTE_NAMES)
 
 
-def test_family_has_no_order_path():
+def test_family_attributed_to_own_route():
+    """The route_promotion order table (order attribution
+    for the violation scan) maps each family playbook to
+    its OWN route, so a violation attributed to the
+    playbook demotes that route — and the route governs
+    by declaration since the owner's 2026-11-25 order."""
     from goldenswing.execution.route_promotion import (
         ORDER_ROUTE_BY_PLAYBOOK)
     for name in ("session_opening_breakout",
                  "session_opening_failure",
                  "session_drive_reversal",
                  "session_asia_sweep"):
-        assert name not in ORDER_ROUTE_BY_PLAYBOOK
+        assert ORDER_ROUTE_BY_PLAYBOOK[name] == name
 
 
 def test_undeclared_names_still_fail_closed(tmp_path):
@@ -840,7 +845,7 @@ def test_runner_scan_journals_evaluations_verdicts_and_book(
                    "authority_route")
                == "session_opening_breakout"]
     assert len(shadows) == 1
-    assert shadows[0]["judgment"]["authority"] == "shadow_declared"
+    assert shadows[0]["judgment"]["authority"] == "governing"
     # The scenario entered the book as a shadow proposal
     # with the family's clocks and BOTH targets (the
     # measured extension, then the situation zone).
@@ -1001,7 +1006,7 @@ def test_promotion_evaluation_insufficient_then_ready_binds_nothing(
     text = "\n".join(session_promotion.render_lines(state))
     assert "PROMOTION READY (recommendation only)" in text
     runner, _ = _scan_runner(tmp_path)
-    assert runner._judgment_route_state(route) == "shadow_declared"
+    assert runner._judgment_route_state(route) == "governing"
 
 
 def test_promotion_host_phase_journals_and_persists(tmp_path):

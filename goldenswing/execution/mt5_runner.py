@@ -316,26 +316,29 @@ def _tick_now_utc(last_tick: dict | None) -> datetime | None:
 #: from the global mode:
 #: - "governing": in active mode the route's orders require a
 #:   core "take" (the _judgment_authority seam refuses abstains).
-#: - "shadow_declared": the route's candidates receive funnel
-#:   evaluation records + journaled core evaluations — a real
-#:   shadow history accrues and is scored like every other
-#:   route's — but the verdict does NOT govern: the route's own
-#:   gate stack still decides.  A shadow-declared route becomes
-#:   governing only by the explicit step (config
-#:   ``judgment_route_modes`` naming it "governing", the same
-#:   kind of separate decision that promoted the core itself),
-#:   never because the global default flipped to active.
+#: - "shadow_declared": RETIRED by the owner's 2026-11-25
+#:   order (everything goes live directly on demo — no shadow,
+#:   no gating, no promotion, no prove-first).  Every route in
+#:   the table below is now declared "governing"; the state
+#:   string survives only as the invariant-violation demotion
+#:   target (a demoted route observes until its invariant
+#:   clears or the owner releases it).
 #: The manifest journals this table with each route's effective
 #: state and its judgment-record count for the run.
 #:
-#: PASS 5 (owner ruling 2026-11-08) adds two more authority
+#: PASS 5 (owner ruling 2026-11-08) added two more authority
 #: sources ABOVE this table (see _judgment_route_resolution
 #: for the full order): a binding promotion_ready verdict
-#: from execution/route_promotion.py promotes
+#: from execution/route_promotion.py used to promote
 #: hot_scalp_promotion / resting_limit (and a not_ready
-#: verdict demotes a verdict-promoted route), and an
+#: verdict demoted a verdict-promoted route), and an
 #: invariant-violation auto-demotion shadows ANY governing
-#: route until released.  This table remains the DECLARED
+#: route until released.  The verdict source is RETIRED by
+#: the owner's 2026-11-25 order (everything goes live
+#: directly on demo — no shadow, no gating, no promotion):
+#: verdicts are measurement only now, never an authority
+#: effect; the demotion release is a clean audit window, not
+#: a fresh verdict.  This table remains the DECLARED
 #: baseline every source is read against, and the boundary
 #: the ruling draws is enforced at the routes' submission
 #: points: in active mode a route that does not govern —
@@ -344,8 +347,8 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     "h1_trigger": "governing",
     "qm_m5_native": "governing",
     "qm_d1_native": "governing",
-    "hot_scalp_promotion": "shadow_declared",
-    "resting_limit": "shadow_declared",
+    "hot_scalp_promotion": "governing",
+    "resting_limit": "governing",
     # §G RANGE FAMILY (promotion-evaluation wiring, 2026-11-05):
     # the four range playbooks' §G scan route (playbook_registry
     # ROUTE_RANGE_H4_H1) declared shadow per playbook — route
@@ -358,10 +361,10 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     # also closes a latent hazard: an undeclared route name
     # resolves "governing" by default, so an accidental seam
     # call under one of these names would have governed.
-    "range_sweep_reclaim": "shadow_declared",
-    "range_qm": "shadow_declared",
-    "range_mean_reversion": "shadow_declared",
-    "range_compression_breakout": "shadow_declared",
+    "range_sweep_reclaim": "governing",
+    "range_qm": "governing",
+    "range_mean_reversion": "governing",
+    "range_compression_breakout": "governing",
     # VOLATILITY-EXPANSION FAMILY (MarketSituation Pass 7a,
     # SPEC §6.2): the two vol playbooks' scheduled scan route
     # (playbook_registry.ROUTE_VOLATILITY_EXPANSION) declared
@@ -374,8 +377,8 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     # Declaring the routes also closes the latent hazard the
     # §G comment names: an undeclared route name must never
     # be one seam call away from governing.
-    "vol_expansion_escape": "shadow_declared",
-    "vol_failed_expansion": "shadow_declared",
+    "vol_expansion_escape": "governing",
+    "vol_failed_expansion": "governing",
     # TREND / MOMENTUM FAMILY (MarketSituation Pass 7b,
     # SPEC §6.1): the two trend playbooks' scheduled scan
     # route (playbook_registry.ROUTE_TREND_MOMENTUM) declared
@@ -388,8 +391,8 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     # Declaring the routes also closes the latent hazard
     # the §G comment names: an undeclared route name must
     # never be one seam call away from governing.
-    "trend_impulse_pullback": "shadow_declared",
-    "trend_momentum_acceleration": "shadow_declared",
+    "trend_impulse_pullback": "governing",
+    "trend_momentum_acceleration": "governing",
     # AUCTION / VALUE FAMILY (MarketSituation Pass 7c,
     # SPEC §6.3): the three auction playbooks' scheduled
     # scan route (playbook_registry.ROUTE_AUCTION_VALUE)
@@ -402,9 +405,9 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     # Declaring the routes also closes the latent hazard
     # the §G comment names: an undeclared route name must
     # never be one seam call away from governing.
-    "auction_value_acceptance": "shadow_declared",
-    "auction_value_rejection": "shadow_declared",
-    "auction_lvn_traversal": "shadow_declared",
+    "auction_value_acceptance": "governing",
+    "auction_value_rejection": "governing",
+    "auction_lvn_traversal": "governing",
     # MEAN REVERSION FAMILY (MarketSituation Pass 7d,
     # SPEC §6.4): the two reversion playbooks' scheduled
     # scan route (playbook_registry.ROUTE_MEAN_REVERSION)
@@ -417,8 +420,8 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     # Declaring the routes also closes the latent hazard
     # the §G comment names: an undeclared route name must
     # never be one seam call away from governing.
-    "mean_reversion_extension_fade": "shadow_declared",
-    "mean_reversion_failed_continuation": "shadow_declared",
+    "mean_reversion_extension_fade": "governing",
+    "mean_reversion_failed_continuation": "governing",
     # SESSION / OPENING RANGE FAMILY (MarketSituation Pass
     # 7e, SPEC §6.5): the four session playbooks' scheduled
     # scan route (playbook_registry.ROUTE_SESSION_RANGE)
@@ -431,10 +434,10 @@ JUDGMENT_ROUTE_STATES: dict[str, str] = {
     # Declaring the routes also closes the latent hazard
     # the §G comment names: an undeclared route name must
     # never be one seam call away from governing.
-    "session_opening_breakout": "shadow_declared",
-    "session_opening_failure": "shadow_declared",
-    "session_drive_reversal": "shadow_declared",
-    "session_asia_sweep": "shadow_declared",
+    "session_opening_breakout": "governing",
+    "session_opening_failure": "governing",
+    "session_drive_reversal": "governing",
+    "session_asia_sweep": "governing",
 }
 
 #: The playbook name a route's judgment records journal under
@@ -665,28 +668,23 @@ class MT5RunnerConfig:
     judgment_priors: str = "calibrated"
     # PER-ROUTE authority overrides (completion-02): maps a
     # route name (JUDGMENT_ROUTE_STATES) to "governing" or
-    # "shadow_declared".  This is THE explicit promotion step
-    # for a connected route: naming a shadow-declared route
-    # "governing" here — a deliberate config decision, taken
-    # once its shadow record exists — makes the core's verdict
-    # govern that route at its decision point; naming a
-    # governing route "shadow_declared" demotes it to
-    # observe-only.  Any other value is ignored toward the
+    # "shadow_declared".  This is THE explicit per-route step
+    # for a connected route: naming a governing route
+    # "shadow_declared" here demotes it to observe-only, and
+    # naming a demoted route "governing" here — when config
+    # did not already say so at demotion time — releases the
+    # demotion (a reviewed owner decision taken after the
+    # evidence).  Any other value is ignored toward the
     # route's DECLARED state (a typo can neither silently
     # promote a route nor silently restore an unjudged path);
     # the manifest journals configured + effective per route,
     # so a bad value is a visible fact.
     # PASS 5 precedence (see _judgment_route_resolution): an
     # invariant-violation demotion binds OVER this override
-    # and the declared state — except that naming a demoted
-    # route "governing" here when config did not already say
-    # so at demotion time releases the demotion (a reviewed
-    # owner decision taken after the evidence).  A binding
-    # promotion verdict (route_promotion.py) is the other
-    # promotion source: it ranks BELOW this override in
-    # resolution, and a verdict never rewrites the source of
-    # a route this config governs (a not_ready verdict
-    # demotes only routes the verdict itself promoted).
+    # and the declared state — except for the release above.
+    # Promotion verdicts (route_promotion.py) are NO LONGER a
+    # source: since the owner's 2026-11-25 order they are
+    # measurement only and rank nowhere in resolution.
     judgment_route_modes: dict | None = None
     # JUDGMENT CORE S3 (owner spec 2026-11-02): outcome
     # reconciliation + self-audit — shadow judgments and theses are
@@ -2653,7 +2651,8 @@ class MT5Runner:
         substrate — the book reads its lifecycle, it does not
         re-implement it).  Shadow instances stay intrinsically
         stamped: the scenario's authority is the promotion
-        route's declared state, which is shadow_declared."""
+        route's declared state, which is governing (owner
+        order 2026-11-25)."""
         name = str(event.get("event", ""))
         setup = event.get("setup") or {}
         sid = event.get("setup_id") or setup.get("setup_id")
@@ -3574,11 +3573,13 @@ class MT5Runner:
         inside the S3 audit state file — the
         _range_promotion_state arrangement: per route, the
         latest binding effect that outranks the shipped
-        declaration: a verdict promotion / demotion
-        (source "verdict", written by _apply_route_verdict
-        from execution/route_promotion.py's binding
-        evaluations) or an invariant-violation auto-demotion
+        declaration: an invariant-violation auto-demotion
         (source "demoted", written by _apply_route_violation).
+        Promotion verdicts used to write entries here too
+        (source "verdict", written by _apply_route_verdict);
+        that source is RETIRED by the owner's 2026-11-25
+        order — verdict entries are inert history, ignored
+        by resolution and purged by _route_promotion_phase.
         Persisted with the audit state, so authority survives
         restarts as journaled fact, never as a re-derivation."""
         st = self._audit_state()
@@ -3611,11 +3612,16 @@ class MT5Runner:
     def _route_declared(self, route: str) -> bool:
         """Whether ANY authority source names this route: the
         shipped table, an exact config override, or a dynamic
-        (verdict / demotion) entry.  A route no source names is
+        demotion entry.  A retired "verdict" entry names
+        nothing: verdicts bind no authority since the owner's
+        2026-11-25 order, so a stale verdict entry alone does
+        not declare a route.  A route no source names is
         UNDECLARED — Pass 5's fail-closed case at the seam."""
         if str(route) in JUDGMENT_ROUTE_STATES:
             return True
-        if self._route_authority_entry(route) is not None:
+        entry = self._route_authority_entry(route)
+        if entry is not None \
+                and entry.get("source") == "demoted":
             return True
         return self._route_config_override(route) is not None
 
@@ -3623,27 +3629,32 @@ class MT5Runner:
                                    ) -> tuple[str, str]:
         """One route's effective authority: (state, source).
 
-        Resolution order (Pass 5 — every step is a journaled
-        fact, and the per-cycle judgment_authority record +
-        /status table render this exact function, so the
-        journal and the surface can never disagree):
+        Resolution order (Pass 5, as amended by the owner's
+        2026-11-25 order — everything goes live directly on
+        demo, no shadow, no gating, no promotion; promotion
+        verdicts are measurement only and rank nowhere here —
+        every step is a journaled fact, and the per-cycle
+        judgment_authority record + /status table render this
+        exact function, so the journal and the surface can
+        never disagree):
 
         1. an invariant-violation DEMOTION binds over the
-           declared and verdict states (source "demoted") —
-           released only by a fresh promotion_ready verdict
-           (fresher than the demotion; _apply_route_verdict)
-           or by the owner's explicit config step naming the
-           route "governing" when config did not already say
-           so at demotion time (that step is a reviewed
-           decision taken after the evidence, not the standing
-           state the violation occurred under);
+           declared and config states (source "demoted") —
+           released only by the owner's explicit config step
+           naming the route "governing" when config did not
+           already say so at demotion time (that step is a
+           reviewed decision taken after the evidence, not
+           the standing state the violation occurred under),
+           or by the promotion phase's clean-window release
+           (the route traded clean through a full audit
+           window after the demotion — see
+           _release_cleared_demotions).  A promotion verdict
+           NEVER releases a demotion;
         2. the explicit config step (source "config");
-        3. a binding promotion verdict's standing effect
-           (source "verdict");
-        4. the shipped declaration (source "declared" — for
-           the three governing routes, the owner's 2026-11-05
-           promotion recorded in JUDGMENT_ROUTE_STATES);
-        5. UNDECLARED: shadow_declared (source "undeclared") —
+        3. the shipped declaration (source "declared" — every
+           route in JUDGMENT_ROUTE_STATES is "governing"
+           since the 2026-11-25 order);
+        4. UNDECLARED: shadow_declared (source "undeclared") —
            the Pass-5 fail-closed flip: pre-Pass-5 an
            undeclared route resolved "governing", so a wiring
            mistake opened an unjudged path; now it observes,
@@ -3662,11 +3673,6 @@ class MT5Runner:
             return "shadow_declared", "demoted"
         if override is not None:
             return override, "config"
-        if entry is not None \
-                and entry.get("source") == "verdict" \
-                and entry.get("state") in (
-                        "governing", "shadow_declared"):
-            return str(entry["state"]), "verdict"
         if route in JUDGMENT_ROUTE_STATES:
             return JUDGMENT_ROUTE_STATES[route], "declared"
         return "shadow_declared", "undeclared"
@@ -3680,8 +3686,9 @@ class MT5Runner:
 
     def _judgment_route_source(self, route: str) -> str:
         """Where one route's effective state comes from:
-        "declared" | "config" | "verdict" | "demoted" |
-        "undeclared"."""
+        "declared" | "config" | "demoted" | "undeclared".
+        ("verdict" is retired: promotion verdicts bind
+        nothing since the owner's 2026-11-25 order.)"""
         return self._judgment_route_resolution(route)[1]
 
     def _undeclared_route_alarm(self, route: str) -> None:
@@ -3719,10 +3726,9 @@ class MT5Runner:
         (declared governing AND the global mode active), and —
         for the connected routes — how many judgment records
         this run has journaled under the route's playbook (the
-        accruing shadow history a promotion case is built
-        from).  Governed routes carry no count: their history
-        is the S1–S4 shadow journal, which predates per-route
-        counting."""
+        accruing judged history for the route).  Governed
+        routes carry no count: their history is the S1–S4
+        shadow journal, which predates per-route counting."""
         counts = getattr(self, "_judgment_record_counts", {})
         mode = self._judgment_mode()
         table = []
@@ -3734,11 +3740,11 @@ class MT5Runner:
                 "authority": state,
                 "declared": declared,
                 # Pass 5: where the effective state comes from
-                # (declared / config / verdict / demoted) — the
-                # per-cycle judgment_authority record and the
-                # /status table render this same table, so a
-                # verdict promotion or an auto-demotion is a
-                # visible fact with its source named.
+                # (declared / config / demoted) — the per-cycle
+                # judgment_authority record and the /status
+                # table render this same table, so an
+                # auto-demotion is a visible fact with its
+                # source named.
                 "source": source,
                 "governing_now": bool(
                     state == "governing" and mode == "active"),
@@ -4339,14 +4345,15 @@ class MT5Runner:
             window={"from_offset": from_offset,
                     "to_offset": new_offset,
                     "records": len(records)})
-        # Pass 5 route authority: binding promotion
-        # evaluations for the two connected routes + the
+        # Pass 5 route authority: the promotion evaluation
+        # (measurement only since the owner's 2026-11-25
+        # order — verdicts bind nothing) + the
         # invariant-violation scan — the same window, the
         # same cadence, the same state file.  Unlike the §G
-        # and priors phases, this one's findings DO move
-        # authority (the owner's 2026-11-08 ruling: verdicts
-        # bind, violations demote) — every effect is a
-        # journaled record written by the phase itself.
+        # and priors phases, this one's findings CAN move
+        # authority: violations demote, and a clean window
+        # releases a demotion — every effect is a journaled
+        # record written by the phase itself.
         self._route_promotion_phase(
             records, bar_key, damaged_lines=damaged,
             window={"from_offset": from_offset,
@@ -4644,17 +4651,15 @@ class MT5Runner:
     # ---- Route authority (Pass 5) ---------------------------
     # The machinery is execution/route_promotion.py; this is
     # its host + its effects.  The evaluations ride the S3
-    # cadence like the §G and priors phases, but their
-    # verdicts BIND (owner ruling 2026-11-08): a
-    # promotion_ready verdict writes the route's dynamic
-    # authority entry (source "verdict"), a not_ready verdict
-    # demotes a verdict-promoted route, and a scanned
-    # invariant violation demotes ANY governing route
-    # (source "demoted").  Every effect is journaled by the
-    # appliers below; the per-cycle judgment_authority record
-    # and /status render the result from
-    # _judgment_route_table, so the effect is observable
-    # without reading code.
+    # cadence like the §G and priors phases.  Their verdicts
+    # are MEASUREMENT ONLY since the owner's 2026-11-25 order
+    # (the 2026-11-08 "verdicts BIND" ruling is dead): a
+    # scanned invariant violation demotes ANY governing route
+    # (source "demoted"), and a clean window releases the
+    # demotion.  Every effect is journaled by the appliers
+    # below; the per-cycle judgment_authority record and
+    # /status render the result from _judgment_route_table,
+    # so the effect is observable without reading code.
     def _route_promotion_state(self) -> dict:
         from . import route_promotion as _route_promotion
 
@@ -4674,17 +4679,22 @@ class MT5Runner:
                                window: dict | None = None
                                ) -> None:
         """One Pass-5 cycle over the self-audit's journal
-        window: criteria registration + binding evaluations
-        (journaled by the module), verdict application, then
-        the invariant-violation scan + auto-demotion.  Called
-        from inside _self_audit_phase (itself inside the S3
-        cycle's guarded body): a failure here is logged by
-        that guard like any audit failure; the effects that
-        DID land are journaled records, never half-applied
-        silently."""
+        window: criteria registration + evaluations
+        (journaled by the module — MEASUREMENT ONLY since
+        the owner's 2026-11-25 order; the 2026-11-08
+        "verdicts BIND" ruling is dead, so no verdict is
+        applied to authority), then the invariant-violation
+        scan + auto-demotion, then the clean-window release
+        of demotions whose route traded clean through this
+        window.  Called from inside _self_audit_phase
+        (itself inside the S3 cycle's guarded body): a
+        failure here is logged by that guard like any audit
+        failure; the effects that DID land are journaled
+        records, never half-applied silently."""
         from . import route_promotion as _route_promotion
 
         sub = self._route_promotion_state()
+        self._retire_verdict_authority(sub, bar_key)
         for record in _route_promotion.cycle(
                 state=sub, records=records,
                 now=pd.Timestamp(bar_key),
@@ -4693,18 +4703,113 @@ class MT5Runner:
             self.journal.append(record)
         if damaged_lines:
             return
-        for route in _route_promotion.PROMOTION_ROUTES:
-            row = _route_promotion.applicable_verdict(
-                sub, route)
-            if row is not None:
-                self._apply_route_verdict(
-                    route, row, bar_key, sub)
         violations, _filled = _route_promotion.scan_violations(
             records,
             filled_identities=sub.setdefault(
                 "filled_identities", {}))
         for violation in violations:
             self._apply_route_violation(violation, bar_key)
+        self._release_cleared_demotions(
+            records, violations, bar_key)
+
+    def _retire_verdict_authority(self, promo_state: dict,
+                                  bar_key) -> None:
+        """Retire the binding-verdict machinery's standing
+        state, once: drop any route_authority entry whose
+        source is "verdict" (verdicts bind nothing since
+        the owner's 2026-11-25 order — a stale entry is
+        inert history, and resolution ignores it anyway),
+        and clear the promotion state's applied-verdict
+        bookkeeping (nothing applies verdicts anymore).
+        Journals one retirement record naming the dropped
+        routes, only on the run that actually drops any —
+        later runs find nothing to retire."""
+        dyn = self._route_authority_state()
+        dropped = sorted(
+            route for route, entry in dyn.items()
+            if isinstance(entry, dict)
+            and entry.get("source") == "verdict")
+        applied = promo_state.get("applied")
+        had_applied = bool(applied)
+        for route in dropped:
+            del dyn[route]
+        if isinstance(applied, dict):
+            promo_state["applied"] = {}
+        if not dropped and not had_applied:
+            return
+        self.journal.append({
+            "type": "route_authority_verdict_retired",
+            "routes": dropped,
+            "cleared_applied_bookkeeping": had_applied,
+            "ts": str(bar_key), "run_id": self._run_id,
+            "note": (
+                "promotion verdicts no longer bind (owner "
+                "order 2026-11-25: everything goes live "
+                "directly on demo) — retired verdict entries "
+                "are inert history; routes govern by "
+                "declaration, and only an invariant-violation "
+                "demotion or the owner's config step moves "
+                "authority now")})
+
+    def _release_cleared_demotions(self, records, violations,
+                                   bar_key) -> None:
+        """Release demotions whose invariant has cleared: a
+        demoted route that had ACTIVITY in this window (a
+        journal row attributed to the route — a submission,
+        an evaluation, a placement — by route_promotion's
+        own attribution) and NO new violation in this window
+        traded clean through it, so the demotion releases
+        and the route governs by declaration again.  A route
+        with no activity in the window proves nothing and
+        stays demoted; a route violated in this window
+        (including one demoted by this very cycle) is
+        excluded by the no-violation condition.  The release
+        journals one route_authority_change per route
+        (source "invariant_cleared") and clears the entry,
+        so resolution falls through to the declared state."""
+        from .route_promotion import _row_route
+
+        violated = {str(v.get("route") or "")
+                    for v in violations}
+        active: set[str] = set()
+        for row in records or []:
+            if not isinstance(row, dict):
+                continue
+            if row.get("type") in (
+                    "route_authority_change",
+                    "route_authority_demotion",
+                    "route_authority_verdict_retired",
+                    "judgment_authority",
+                    "route_invariant_violation"):
+                continue
+            route = _row_route(row)
+            if route:
+                active.add(str(route))
+        dyn = self._route_authority_state()
+        for route in sorted(dyn):
+            entry = dyn.get(route)
+            if not isinstance(entry, dict) \
+                    or entry.get("source") != "demoted":
+                continue
+            if route in violated or route not in active:
+                continue
+            kind = entry.get("kind")
+            del dyn[route]
+            self.journal.append({
+                "type": "route_authority_change",
+                "route": route, "from": "shadow_declared",
+                "to": "governing", "source": "invariant_cleared",
+                "kind": kind,
+                "ts": str(bar_key), "run_id": self._run_id,
+                "note": (
+                    "the route traded clean through a full "
+                    "audit window after its invariant-violation "
+                    "demotion (activity in the window, no new "
+                    "violation) — the invariant has cleared, "
+                    "so the demotion releases and the route "
+                    "governs by declaration again (owner order "
+                    "2026-11-25: no promotion gate; the "
+                    "invariant clearing is the release)")})
 
     # ---- Pass 9: self-evaluation, coverage, grading ---------
     # The machinery is execution/book_evaluation.py,
@@ -4829,115 +4934,6 @@ class MT5Runner:
         if record is not None:
             self.journal.append(record)
 
-    def _apply_route_verdict(self, route: str, row: dict,
-                             bar_key, promo_state: dict
-                             ) -> None:
-        """Apply one route's binding verdict to its dynamic
-        authority entry.  Idempotent: an unchanged verdict
-        already in force writes nothing.  A promotion_ready
-        verdict RELEASES a demotion only when the evaluation
-        is fresher than the demotion (the route-promotion
-        cycle counter has advanced since — new outcomes were
-        folded; a standing verdict re-read on a quiet window
-        never silently un-demotes)."""
-        from .route_promotion import (VERDICT_NOT_READY,
-                                      VERDICT_READY)
-
-        verdict = row.get("verdict")
-        applied = promo_state.setdefault("applied", {})
-        applied[route] = {
-            "verdict": verdict,
-            "criteria_id": row.get("criteria_id"),
-            "evaluation_ts": str(bar_key)}
-        dyn = self._route_authority_state()
-        current = dyn.get(route) or {}
-        source_now = current.get("source")
-        if verdict == VERDICT_READY:
-            if source_now == "demoted":
-                cycles = int(promo_state.get("cycles") or 0)
-                if cycles <= int(current.get(
-                        "eval_cycles_at_demotion") or 0):
-                    return  # stale verdict: demotion stands
-                dyn[route] = {
-                    "state": "governing", "source": "verdict",
-                    "since": str(bar_key),
-                    "criteria_id": row.get("criteria_id"),
-                    "verdict": verdict,
-                    "released_demotion": {
-                        "kind": current.get("kind"),
-                        "since": current.get("since")}}
-                self.journal.append({
-                    "type": "route_authority_change",
-                    "route": route, "from": "shadow_declared",
-                    "to": "governing", "source": "verdict",
-                    "verdict": verdict,
-                    "criteria_id": row.get("criteria_id"),
-                    "ts": str(bar_key), "run_id": self._run_id,
-                    "note": (
-                        "a FRESH promotion_ready verdict (new "
-                        "outcomes folded after the demotion) "
-                        "re-promotes the route and releases "
-                        "its invariant-violation demotion "
-                        "(A5b)")})
-                return
-            if source_now == "verdict" \
-                    and current.get("state") == "governing":
-                return  # already in force
-            if source_now == "config":
-                # The owner's explicit config step already
-                # governs this route; the ready verdict is
-                # recorded in the applied bookkeeping as
-                # corroboration but does not rewrite the
-                # source — a later not_ready verdict demotes
-                # only routes the verdict itself promoted.
-                return
-            dyn[route] = {
-                "state": "governing", "source": "verdict",
-                "since": str(bar_key),
-                "criteria_id": row.get("criteria_id"),
-                "verdict": verdict,
-                "take_paired": (row.get("take") or {}).get(
-                    "paired"),
-                "abstain_paired": (row.get("abstain") or {}).get(
-                    "paired")}
-            self.journal.append({
-                "type": "route_authority_change",
-                "route": route, "from": "shadow_declared",
-                "to": "governing", "source": "verdict",
-                "verdict": verdict,
-                "criteria_id": row.get("criteria_id"),
-                "ts": str(bar_key), "run_id": self._run_id,
-                "note": (
-                    "promotion_ready under criteria registered "
-                    "before the evaluation window — the route "
-                    "enters the active demo path THROUGH the "
-                    "judgment seam (owner ruling 2026-11-08); "
-                    "its orders now require a core take like "
-                    "every governed route's")})
-        elif verdict == VERDICT_NOT_READY:
-            if source_now == "verdict" \
-                    and current.get("state") == "governing":
-                dyn[route] = {
-                    "state": "shadow_declared",
-                    "source": "verdict",
-                    "since": str(bar_key),
-                    "criteria_id": row.get("criteria_id"),
-                    "verdict": verdict}
-                self.journal.append({
-                    "type": "route_authority_change",
-                    "route": route, "from": "governing",
-                    "to": "shadow_declared", "source": "verdict",
-                    "verdict": verdict,
-                    "criteria_id": row.get("criteria_id"),
-                    "ts": str(bar_key), "run_id": self._run_id,
-                    "note": (
-                        "a fresh evaluation read not_ready — "
-                        "a verdict-promoted route is demoted "
-                        "by the same measured rule that "
-                        "promoted it (verdicts bind both ways)")})
-        # insufficient_data: no authority effect — absence of
-        # evidence strips nothing a prior verdict earned.
-
     def _apply_route_violation(self, violation: dict,
                                bar_key) -> None:
         """Apply one scanned invariant violation: journal the
@@ -4990,19 +4986,21 @@ class MT5Runner:
             "ts": str(bar_key), "run_id": self._run_id,
             "note": (
                 "AUTO-DEMOTED to shadow_declared (A5b): the "
-                "route stops submitting until a FRESH "
-                "promotion_ready verdict (new outcomes folded "
-                "after this demotion) re-promotes it, or the "
-                "owner's explicit config step releases it")})
+                "route stops submitting until it trades clean "
+                "through a full audit window after this "
+                "demotion (no new violation in a window where "
+                "the route had activity), or the owner's "
+                "explicit config step releases it — never a "
+                "promotion verdict (owner order 2026-11-25)")})
 
     def _authority_cycle(self, appended, asof) -> None:
         """PASS 5: ONE judgment_authority record per H1 close —
         every route the core touches, its effective state, the
-        SOURCE of that state (declared / config / verdict /
-        demoted), and whether it governs right now.  The
-        /status table and the manifest render the same
-        _judgment_route_table, so the journal, the surface and
-        the manifest can never disagree about who may trade."""
+        SOURCE of that state (declared / config / demoted),
+        and whether it governs right now.  The /status table
+        and the manifest render the same _judgment_route_table,
+        so the journal, the surface and the manifest can never
+        disagree about who may trade."""
         if "H1" not in (appended or []):
             return
         record = {
@@ -8716,9 +8714,9 @@ class MT5Runner:
         route-stamped shadow history in plain words — takes vs
         abstains (median R, hit rate, paired n at +4h), with
         "not enough data yet" and "no candidates observed"
-        stated as the different facts they are.  A
-        promotion_ready line is a recommendation; promotion
-        itself is the owner's separate decision."""
+        stated as the different facts they are.  The verdict
+        is measurement only — routes govern by declaration
+        (owner order 2026-11-25)."""
         try:
             from . import range_promotion as _range_promotion
 
@@ -8731,9 +8729,9 @@ class MT5Runner:
         """One /status Vol Promotion block (Pass 7a
         evaluation): per volatility-expansion route, the
         promotion verdict over its own route-stamped shadow
-        history in plain words — the §G block's shape.  A
-        promotion_ready line is a recommendation; promotion
-        itself is the owner's separate decision."""
+        history in plain words — the §G block's shape.  The
+        verdict is measurement only — routes govern by
+        declaration (owner order 2026-11-25)."""
         try:
             from . import vol_promotion as _vol_promotion
 
@@ -8746,9 +8744,9 @@ class MT5Runner:
         """One /status Trend Promotion block (Pass 7b
         evaluation): per trend / momentum route, the
         promotion verdict over its own route-stamped shadow
-        history in plain words — the §G block's shape.  A
-        promotion_ready line is a recommendation; promotion
-        itself is the owner's separate decision."""
+        history in plain words — the §G block's shape.  The
+        verdict is measurement only — routes govern by
+        declaration (owner order 2026-11-25)."""
         try:
             from . import trend_promotion as _trend_promotion
 
@@ -8761,9 +8759,9 @@ class MT5Runner:
         """One /status Auction Promotion block (Pass 7c
         evaluation): per auction / value route, the
         promotion verdict over its own route-stamped shadow
-        history in plain words — the §G block's shape.  A
-        promotion_ready line is a recommendation; promotion
-        itself is the owner's separate decision."""
+        history in plain words — the §G block's shape.  The
+        verdict is measurement only — routes govern by
+        declaration (owner order 2026-11-25)."""
         try:
             from . import auction_promotion as _auction_promotion
 
@@ -8776,9 +8774,9 @@ class MT5Runner:
         """One /status Mean Reversion Promotion block (Pass
         7d evaluation): per mean reversion route, the
         promotion verdict over its own route-stamped shadow
-        history in plain words — the §G block's shape.  A
-        promotion_ready line is a recommendation; promotion
-        itself is the owner's separate decision."""
+        history in plain words — the §G block's shape.  The
+        verdict is measurement only — routes govern by
+        declaration (owner order 2026-11-25)."""
         try:
             from . import reversion_promotion as _reversion_promotion
 
@@ -8792,8 +8790,8 @@ class MT5Runner:
         7e evaluation): per session / opening range route,
         the promotion verdict over its own route-stamped
         shadow history in plain words — the §G block's
-        shape.  A promotion_ready line is a recommendation;
-        promotion itself is the owner's separate decision."""
+        shape.  The verdict is measurement only — routes
+        govern by declaration (owner order 2026-11-25)."""
         try:
             from . import session_promotion as _session_promotion
 
@@ -8808,9 +8806,9 @@ class MT5Runner:
         promotion instrument, side by side with the
         governing routes' measured history — the comparison
         table of execution/book_evaluation.py, consumed
-        from the family evaluations it does not re-run.  A
-        promotion_ready line is a recommendation; promotion
-        itself is the owner's separate decision."""
+        from the family evaluations it does not re-run.  The
+        verdicts are measurement only — routes govern by
+        declaration (owner order 2026-11-25)."""
         try:
             from . import book_evaluation as _book_evaluation
 
@@ -8850,23 +8848,24 @@ class MT5Runner:
     def judgment_authority_line(self) -> str:
         """One /status Judgment Authority block (Pass 5):
         every route's effective authority state AND its
-        source — the owner's 2026-11-05 declaration, the
-        explicit config step, a binding promotion verdict, or
-        an invariant-violation demotion — rendered from the
+        source — the owner's 2026-11-25 declaration (all
+        routes governing), the explicit config step, or an
+        invariant-violation demotion — rendered from the
         same _judgment_route_table the per-cycle
         judgment_authority journal record and the manifest
-        carry, followed by the two binding routes' standing
-        verdicts.  A route not governing in active mode
-        submits no independent demo orders (owner ruling
-        2026-11-08); the line says so per route."""
+        carry, followed by the two connected routes'
+        standing verdicts (measurement only).  A route not
+        governing in active mode submits no independent demo
+        orders (owner order 2026-11-25); the line says so
+        per route."""
         try:
             from . import route_promotion as _route_promotion
 
             lines = [
                 "judgment authority: who may trade, and on "
-                "whose say-so (owner ruling 2026-11-08: an "
-                "unpromoted route submits no independent "
-                "demo orders)"]
+                "whose say-so (owner order 2026-11-25: every "
+                "declared route governs; only a demotion or "
+                "the owner's config step holds one back)"]
             for row in self._judgment_route_table():
                 state = row["authority"]
                 source = row.get("source", "declared")
@@ -12925,18 +12924,14 @@ class MT5Runner:
         by a core evaluation through the shared seam and
         terminated by a funnel evaluation record (playbook
         "arrival_zone") carrying the journaled verdict.  The
-        route is declared SHADOW: the verdict is shadow history
-        and the floor + RiskGuards + margin stack remains the
-        deciding governance; only an explicit per-route
-        promotion (config judgment_route_modes naming this
-        route "governing") lets an abstention refuse a
-        placement, via the seam's refusal return.  PASS 5
-        (owner ruling 2026-11-08) supersedes the deciding
-        part: promotion also arrives by a binding
-        promotion_ready verdict (execution/route_promotion.py),
-        and while the route does not govern — from any
-        source — the boundary gate below the seam preserves
-        the candidate as shadow and rests nothing."""
+        route is declared GOVERNING (owner order 2026-11-25:
+        everything goes live directly on demo): the seam
+        returns the bundle and an abstention refuses the
+        placement, honored like a governed route's.  Only an
+        invariant-violation demotion or the owner's explicit
+        config step holds the route back — the boundary gate
+        below the seam enforces that, and no promotion
+        verdict is involved anymore."""
         if not self.cfg.resting_limit_enabled:
             return
         if self.cfg.paused or self._regime_pause is not None:
@@ -13112,14 +13107,14 @@ class MT5Runner:
         # the Asymmetry breakdown this flow computed, the
         # ZONE_PATH floor it just enforced); the evidence is the
         # zone itself plus the HTF bias stance, in the funnel's
-        # idiom.  Declared SHADOW: the seam returns the bundle
-        # and never a refusal, and an observation failure is
-        # swallowed — placement proceeds on its own stack
-        # exactly as before.  A refusal can arrive ONLY under
-        # the explicit per-route promotion to governing; it is
-        # then honored like a governed route's (no placement;
-        # the note + record are deduped by zone key, since this
-        # flow re-evaluates on every tick of the approach).
+        # idiom.  Declared GOVERNING (owner order 2026-11-25):
+        # the seam returns the bundle and a refusal when the
+        # core abstains, honored like a governed route's (no
+        # placement; the note + record are deduped by zone key,
+        # since this flow re-evaluates on every tick of the
+        # approach).  An observation failure is swallowed —
+        # placement proceeds on its own stack exactly as
+        # before.
         _az_candidate = None
         _az_evidence = None
         _az_bundle = None
@@ -13211,21 +13206,23 @@ class MT5Runner:
                 except Exception:
                     pass  # evidence only
             return
-        # PASS 5 BOUNDARY (owner ruling 2026-11-08 — the
-        # strict reading of AMENDMENTS-1 §A5): in active mode
-        # the resting limit rests ONLY when its route governs
-        # — by a binding promotion_ready verdict or the
-        # owner's explicit config step.  While it does not,
-        # the seam's verdict above is shadow history and NO
-        # order rests: the candidate is preserved, its
-        # terminal record journaled once per zone key (the
-        # dedupe discipline of the other refusals in this
-        # flow — the approach re-evaluates on every tick),
-        # and the flow returns exactly as a refused placement
-        # does.  Fail-closed: an attempt whose candidate
-        # could not even be constructed for the core rests
-        # nothing either.  In shadow (global) mode the kill
-        # switch's rollback posture is untouched.
+        # PASS 5 BOUNDARY (owner order 2026-11-25 — the
+        # strict reading of AMENDMENTS-1 §A5 as amended):
+        # in active mode the resting limit rests ONLY when
+        # its route governs — by declaration now (every
+        # route governs since the 2026-11-25 order).  While
+        # it does not — an invariant-violation demotion or
+        # the owner's explicit config step — the seam's
+        # verdict above is shadow history and NO order rests:
+        # the candidate is preserved, its terminal record
+        # journaled once per zone key (the dedupe discipline
+        # of the other refusals in this flow — the approach
+        # re-evaluates on every tick), and the flow returns
+        # exactly as a refused placement does.  Fail-closed:
+        # an attempt whose candidate could not even be
+        # constructed for the core rests nothing either.  In
+        # shadow (global) mode the kill switch's rollback
+        # posture is untouched.
         if self._judgment_mode() == "active" \
                 and self._judgment_route_state(
                     "resting_limit") != "governing":
@@ -13243,7 +13240,7 @@ class MT5Runner:
                     f"route resting_limit is {_az_authority} "
                     f"(source: {_az_source}); candidate "
                     f"preserved as shadow, no independent "
-                    f"demo order (owner ruling 2026-11-08)")
+                    f"demo order (owner order 2026-11-25)")
                 try:
                     self._emit_eval(
                         playbook="arrival_zone",
@@ -13254,8 +13251,8 @@ class MT5Runner:
                             "judgment.route_not_promoted"),
                         reason=(
                             "route resting_limit does not "
-                            "govern (no binding promotion "
-                            "verdict) — candidate preserved "
+                            "govern (demoted or held back by "
+                            "config) — candidate preserved "
                             "as shadow; no independent demo "
                             "order"),
                         candidate=_az_candidate,
@@ -13265,10 +13262,10 @@ class MT5Runner:
                                 "judgment.route_not_promoted"),
                             "reason": (
                                 "route resting_limit does not "
-                                "govern (no binding promotion "
-                                "verdict) — candidate preserved "
-                                "as shadow; no independent "
-                                "demo order"),
+                                "govern (demoted or held back "
+                                "by config) — candidate "
+                                "preserved as shadow; no "
+                                "independent demo order"),
                             "execution_eligible": False,
                             "order_result": "not_attempted",
                             **_verdict_blocks(
@@ -14333,25 +14330,18 @@ class MT5Runner:
         # funnel-shaped candidate/evidence built at the top of
         # this function, enriched with the setup payload's own
         # facts (context direction, entry zone).  The route is
-        # declared SHADOW: the seam returns the bundle and never
-        # a refusal, the verdict journals as this attempt's
-        # funnel record below (shadow history, scored like every
+        # declared GOVERNING (owner order 2026-11-25): the seam
+        # returns the bundle and a refusal when the core
+        # abstains, the verdict journals as this attempt's
+        # funnel record below (judged history, scored like every
         # other route's), and this path's own gate stack (live
         # authority, claim, sleeve gate, order shape, then the
-        # shared order path's safeguards) still decides.  ONLY
-        # an explicit per-route promotion (config
-        # judgment_route_modes naming this route "governing")
-        # makes the seam's abstention refuse the attempt — the
-        # refusal branch below is that promotion's whole
-        # mechanism, reached only when the seam returns one.
-        # PASS 5 (owner ruling 2026-11-08) supersedes the
-        # deciding part of that contract: promotion now also
-        # arrives by a binding promotion_ready verdict
-        # (execution/route_promotion.py), and while the route
-        # does NOT govern — from any source — the boundary
-        # gate below the judgment stage ends the attempt as
-        # shadow: this path's own gate stack no longer
-        # submits independently in active mode.
+        # shared order path's safeguards) still decides.  An
+        # invariant-violation demotion or the owner's explicit
+        # config step is what holds the route back now — the
+        # boundary gate below the judgment stage ends the
+        # attempt as shadow in that case; no promotion verdict
+        # is involved anymore.
         if _hs_candidate is not None:
             _ctx_dir = setup.get("context_direction")
             if _ctx_dir:
@@ -14405,13 +14395,13 @@ class MT5Runner:
                 _judgment_fields["core_error"] = \
                     _hs_bundle["evaluation_error"]
         if _hs_refusal is not None:
-            # Reachable ONLY under the explicit per-route
-            # promotion to governing (a shadow-declared route's
-            # seam never refuses): the core abstained at the
-            # decision point, so this attempt is refused under
-            # judgment.abstain — the candidate's claim resolves
-            # back to touched like every transient refusal, and
-            # the setup's lifecycle is otherwise untouched.
+            # The route governs by declaration, so the seam's
+            # abstention refuses the attempt: the core abstained
+            # at the decision point, so this attempt is refused
+            # under judgment.abstain — the candidate's claim
+            # resolves back to touched like every transient
+            # refusal, and the setup's lifecycle is otherwise
+            # untouched.
             self.journal.log_note(
                 f"mt5: hot_scalp promotion judgment-refused {sid}: "
                 f"{_hs_refusal}")
@@ -14453,22 +14443,22 @@ class MT5Runner:
             _judgment_fields["market_read_error"] = (
                 f"{type(exc).__name__}: {exc}")
         _chain("judgment", "evaluated", _judgment_fields)
-        # PASS 5 BOUNDARY (owner ruling 2026-11-08 — the
-        # strict reading of AMENDMENTS-1 §A5): in active mode
-        # this route submits ONLY when it governs — by a
-        # binding promotion_ready verdict or the owner's
-        # explicit config step.  While it does not, the
-        # candidate's shadow record is complete (the funnel
-        # record below carries the route-stamped verdict; the
-        # scenario book mirrors the setup) and the attempt
-        # ends HERE: no independent demo order bypasses the
-        # Judgment Core.  The claim resolves back to touched
-        # like every transient refusal — the setup stays live
-        # and its shadow history keeps accruing toward the
-        # verdict that decides this route.  In shadow (global)
-        # mode the kill switch's rollback posture is
-        # untouched: the chain decides exactly as
-        # pre-promotion.
+        # PASS 5 BOUNDARY (owner order 2026-11-25 — the
+        # strict reading of AMENDMENTS-1 §A5 as amended): in
+        # active mode this route submits ONLY when it governs
+        # — by declaration now (every route governs since the
+        # 2026-11-25 order).  While it does not — an
+        # invariant-violation demotion or the owner's explicit
+        # config step — the candidate's shadow record is
+        # complete (the funnel record below carries the
+        # route-stamped verdict; the scenario book mirrors the
+        # setup) and the attempt ends HERE: no independent demo
+        # order bypasses the Judgment Core.  The claim resolves
+        # back to touched like every transient refusal — the
+        # setup stays live and its judged history keeps
+        # accruing.  In shadow (global) mode the kill switch's
+        # rollback posture is untouched: the chain decides
+        # exactly as pre-promotion.
         if self._judgment_mode() == "active" \
                 and self._judgment_route_state(
                     "hot_scalp_promotion") != "governing":
@@ -14480,8 +14470,8 @@ class MT5Runner:
                 f"mt5: hot_scalp candidate {sid} preserved as "
                 f"shadow — route hot_scalp_promotion is "
                 f"{_hs_authority} (source: {_hs_source}); no "
-                f"independent demo order (owner ruling "
-                f"2026-11-08)")
+                f"independent demo order (owner order "
+                f"2026-11-25)")
             _chain("authority", "shadow_preserved", {
                 "reason_code": "judgment.route_not_promoted",
                 "route": "hot_scalp_promotion",
@@ -14492,9 +14482,10 @@ class MT5Runner:
                      order_result="not_attempted",
                      reason_code="judgment.route_not_promoted",
                      reason="route hot_scalp_promotion does "
-                            "not govern (no binding promotion "
-                            "verdict) — candidate preserved as "
-                            "shadow; no independent demo order",
+                            "not govern (demoted or held back "
+                            "by config) — candidate preserved "
+                            "as shadow; no independent demo "
+                            "order",
                      eligible=False)
             return False
         tracked_before = set(self.tick_manager.tickets())

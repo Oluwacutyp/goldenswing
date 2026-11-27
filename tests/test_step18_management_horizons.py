@@ -47,10 +47,16 @@ def test_horizon_grounding_follows_the_thesis_clock():
     assert management_horizon_for("qm_d1") == "swing"
 
 
-def test_shadow_playbooks_gain_no_authority_from_declaring():
+def test_live_playbooks_gain_authority_from_declaring():
+    """Owner order 2026-11-25: no shadow tier remains — the range
+    family specs are live, and their authority comes from the
+    declared governing route, not from a promotion verdict.
+    (This pin used to assert the shadow-evaluation contract:
+    shadow playbooks gaining no authority from declaring. That
+    contract is dead; the specs below are the same ones, live.)"""
     for spec in PLAYBOOK_REGISTRY:
         if spec.route == "range_h4_h1":
-            assert spec.shadow_evaluation is True
+            assert spec.shadow_evaluation is False
 
 
 # ------------------------------------------------------------- policies

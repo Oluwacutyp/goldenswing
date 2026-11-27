@@ -410,12 +410,12 @@ def test_registry_partition_and_posture():
         "vol_expansion_escape", "vol_failed_expansion"]
     for spec in VOL_SPECS:
         assert spec.route == ROUTE_VOLATILITY_EXPANSION
-        assert spec.shadow_evaluation is True
+        assert spec.shadow_evaluation is False
         assert spec.entry_thesis == "market"
         assert spec.management_horizon == "intraday"
         # NOT on the trigger path: the roster is untouched.
         assert spec not in ROSTER_SPECS
-        assert spec.playbook_class.live is False
+        assert spec.playbook_class.live is True
     assert {s.name for s in ROSTER_SPECS} | {
         s.name for s in VOL_SPECS} | {
         s.name for s in TREND_SPECS} | {
@@ -428,25 +428,23 @@ def test_registry_partition_and_posture():
         ROUTE_VOLATILITY_EXPANSION]
 
 
-def test_routes_declared_shadow_and_never_governing(tmp_path):
+def test_routes_declared_governing(tmp_path):
     runner, _ = _scan_runner(tmp_path)
     table = {row["route"]: row
              for row in runner._judgment_route_table()}
     for name in ("vol_expansion_escape", "vol_failed_expansion"):
         assert runner._judgment_route_state(name) == \
-            "shadow_declared"
+            "governing"
         assert runner._judgment_route_source(name) == "declared"
-        assert table[name]["governing_now"] is False
+        assert table[name]["governing_now"] is True
         assert JUDGMENT_ROUTE_PLAYBOOK[name] == name
     # The runner's tables agree with the family's own map.
     assert set(vol_promotion.VOL_JUDGMENT_ROUTES) == \
         set(mr.VOL_JUDGMENT_ROUTE_NAMES)
-    # Promotion exists ONLY as the owner's separate decision:
-    # an explicit config step on a DECLARED route (Pass 5's
-    # path; the family's pre-registered evaluation is the
-    # evidence it is decided on) — this pass grants nothing,
-    # and even a promoted route has no order path
-    # (test_family_has_no_order_path).
+    # The config step still resolves: an explicit governing
+    # step names source "config", and a typo'd value changes
+    # nothing — the route governs by declaration either way
+    # (owner order 2026-11-25).
     runner.cfg.judgment_route_modes = {
         "vol_expansion_escape": "governing"}
     assert runner._judgment_route_state(
@@ -456,23 +454,24 @@ def test_routes_declared_shadow_and_never_governing(tmp_path):
     table = {row["route"]: row
              for row in runner._judgment_route_table()}
     assert table["vol_expansion_escape"]["governing_now"] is True
-    assert table["vol_failed_expansion"]["governing_now"] is False
-    # A typo'd config VALUE promotes nothing either.
+    assert table["vol_failed_expansion"]["governing_now"] is True
+    # A typo'd config VALUE demotes nothing either.
     runner.cfg.judgment_route_modes = {
         "vol_expansion_escape": "governingg"}
     assert runner._judgment_route_state(
-        "vol_expansion_escape") == "shadow_declared"
+        "vol_expansion_escape") == "governing"
 
 
-def test_family_has_no_order_path():
-    """No seam maps a vol playbook to an order route: the
-    route_promotion order table (built from the trigger-path
-    roster) names neither, so no candidate of this family
-    can reach an order through any existing route."""
+def test_family_attributed_to_own_route():
+    """The route_promotion order table (order attribution
+    for the violation scan) maps each family playbook to
+    its OWN route, so a violation attributed to the
+    playbook demotes that route — and the route governs
+    by declaration since the owner's 2026-11-25 order."""
     from goldenswing.execution.route_promotion import (
         ORDER_ROUTE_BY_PLAYBOOK)
     for name in ("vol_expansion_escape", "vol_failed_expansion"):
-        assert name not in ORDER_ROUTE_BY_PLAYBOOK
+        assert ORDER_ROUTE_BY_PLAYBOOK[name] == name
 
 
 def test_undeclared_names_still_fail_closed(tmp_path):
@@ -675,7 +674,7 @@ def test_runner_scan_journals_evaluations_verdicts_and_book(tmp_path):
                and (r.get("judgment") or {}).get(
                    "authority_route") == "vol_expansion_escape"]
     assert len(shadows) == 1
-    assert shadows[0]["judgment"]["authority"] == "shadow_declared"
+    assert shadows[0]["judgment"]["authority"] == "governing"
     # The scenario entered the book as a shadow proposal
     # with the instance's clocks.
     setups = runner._setup_store.active()
@@ -769,7 +768,7 @@ def test_promotion_evaluation_insufficient_then_ready_binds_nothing(
     # The verdict changed nothing about the route's state:
     # still declared shadow, still governing nowhere.
     runner, _ = _scan_runner(tmp_path)
-    assert runner._judgment_route_state(route) == "shadow_declared"
+    assert runner._judgment_route_state(route) == "governing"
 
 
 def test_promotion_host_phase_journals_and_persists(tmp_path):

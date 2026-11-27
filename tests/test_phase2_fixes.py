@@ -374,14 +374,15 @@ def test_all_20_evaluate_on_their_clocks_without_trigger(tmp_path):
 
 
 def test_range_family_registry_contract():
-    """§G in the registry: H4 generation, H1 refinement, shadow
-    evaluation; the trigger-path roster keeps all 16 members
-    (no silent authority change)."""
+    """§G in the registry: H4 generation, H1 refinement, live
+    evaluation (owner order 2026-11-25 — no shadow tier remains);
+    the trigger-path roster keeps all 16 members (no silent
+    authority change)."""
     assert len(RANGE_SPECS) == 4
     for spec in RANGE_SPECS:
         assert spec.native_tf == "H4"
         assert spec.refinement_tf == "H1"
-        assert spec.shadow_evaluation is True
+        assert spec.shadow_evaluation is False
     assert len(ROSTER_SPECS) == 16
     assert {s.name for s in ROSTER_SPECS} >= {s.name
                                               for s in RANGE_SPECS}
@@ -480,7 +481,8 @@ def test_manifest_surfaces_effective_sizing_mode(tmp_path):
     roster = {row["name"]: row for row in man["roster"]}
     assert roster["range_qm"]["clock"] == "H4"
     assert roster["range_qm"]["refinement_clock"] == "H1"
-    assert roster["range_qm"]["shadow_evaluation"] is True
+    # Owner order 2026-11-25: live evaluation, no shadow tier.
+    assert roster["range_qm"]["shadow_evaluation"] is False
 
 
 def test_decision_solvency_places_minimum_under_new_ruling(tmp_path):

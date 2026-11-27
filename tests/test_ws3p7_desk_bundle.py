@@ -25,7 +25,7 @@ import os
 import subprocess
 import sys
 import zipfile
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -164,7 +164,12 @@ def test_devon_reader_verifies_and_landing_recognizes(tmp_path):
 # ── the commands ─────────────────────────────────────────────────────
 
 def _today_journal(tmp_path):
-    today = date.today().isoformat()
+    # The command stamps the bundle with the UTC day
+    # (_desk_day_stats: datetime.now(timezone.utc).date()), so the
+    # journal must use the same day — date.today() is local time
+    # and disagrees with UTC for hours every day, which failed
+    # this test whenever a suite ran across 00:00–07:00 UTC.
+    today = datetime.now(timezone.utc).date().isoformat()
     journal = TradeJournal(tmp_path / "today.jsonl")
     journal.append({"type": "open", "alert_id": "t1",
                     "instrument": "XAUUSD", "playbook": "fvg_limit",

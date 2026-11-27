@@ -1,16 +1,23 @@
-"""Route PROMOTION with binding verdicts (MarketSituation
-Pass 5; owner ruling 2026-11-08, AMENDMENTS-1 §A5).
+"""Route PROMOTION evaluation (MarketSituation Pass 5;
+owner ruling 2026-11-08, AMENDMENTS-1 §A5 — RETIRED as a
+gate by the owner's 2026-11-25 order: everything goes live
+directly on demo, no shadow, no gating, no promotion, no
+prove-first).
 
 The two connected non-roster routes — ``hot_scalp_promotion``
 (playbook hot_scalp) and ``resting_limit`` (playbook
 arrival_zone) — were declared ``shadow_declared`` by
 completion-02: their candidates are funnel-evaluated and
 core-judged, a shadow history accrues, and their own gate
-stacks decided orders.  This module is the measurement +
-authority machinery Pass 5 adds on top of that history, and
-it differs from the §G range evaluation
+stacks decided orders.  This module was the measurement +
+authority machinery Pass 5 added on top of that history, and
+it differed from the §G range evaluation
 (execution/range_promotion.py) in exactly one way: **the
-verdict binds**.
+verdict bound**.  That binding is RETIRED: the evaluation
+below is now measurement only — the verdict is journaled
+evidence about a route's judged history, never an authority
+effect.  Routes govern by declaration
+(JUDGMENT_ROUTE_STATES, all "governing" since 2026-11-25).
 
 - The EVALUATION is the range evaluator, shared — this module
   folds the routes' own route-stamped ``judgment_shadow``
@@ -33,18 +40,17 @@ verdict binds**.
   with no preceding criteria record can never apply
   (``applicable_verdict`` refuses it) — the bars may not move
   after results are seen.
-- The EFFECT (the runner applies it; this module stays
-  pure): a ``promotion_ready`` verdict promotes the route to
-  governing — its orders then flow through the
-  ``_judgment_authority`` seam like every governed route,
-  never around it.  A ``not_ready`` verdict demotes a
-  verdict-promoted route back to shadow.  ``insufficient_data``
-  changes nothing: absence of evidence strips no authority.
-  Under the owner's strict boundary (2026-11-08), a route
-  that does not govern submits NO independent demo orders —
-  its candidates are preserved as shadow (the runner's
-  boundary gates journal them) and keep accruing the history
-  this evaluation reads.
+- The EFFECT (RETIRED 2026-11-25): a ``promotion_ready``
+  verdict USED TO promote the route to governing.  It no
+  longer does: the verdict is journaled measurement only,
+  and ``applicable_verdict`` is the current-verdict accessor
+  for reporting, not a gate.  A ``not_ready`` verdict
+  likewise demotes nothing.  ``insufficient_data`` changes
+  nothing.  Under the owner's 2026-11-25 order every
+  declared route governs through the ``_judgment_authority``
+  seam like every governed route, never around it — the
+  strict boundary that remains is the invariant-violation
+  demotion (below) and the owner's explicit config step.
 - AUTO-ROLLBACK (A5b): ``scan_violations`` reads the same
   journal windows for invariant violations attributed to a
   route — a friction-gate breach on a PLACED order (a gate
@@ -52,11 +58,13 @@ verdict binds**.
   reconciliation divergence, a duplicate order for one setup
   identity, or an explicit ``route_invariant_violation``
   record (the forward contract any producer may journal).
-  The runner demotes a governing route on any of them,
-  journals the evidence, and the route stays shadow until a
-  FRESH evaluation (new outcomes folded after the demotion)
-  reads promotion_ready again, or the owner's explicit
-  config step releases it.
+  The runner demotes a governing route on any of them and
+  journals the evidence.  The demotion releases when the
+  route trades clean through a full audit window after it
+  (no new violation for the route in a window where the
+  route had activity), or by the owner's explicit config
+  step — never by a promotion verdict (owner order
+  2026-11-25).
 
 The cycle host is the unified self-audit (the runner feeds
 this module the same journal windows, inside the same S3
@@ -217,13 +225,13 @@ def criteria_record(route: str, *, ts, run_id: str | None = None,
             "the route), S4 pairing at the grading horizon, "
             "degenerate-R pairs excluded and counted"),
         "effect": (
-            "the verdict BINDS (owner ruling 2026-11-08): "
-            "promotion_ready promotes the route to governing "
-            "through the judgment seam; not_ready demotes a "
-            "verdict-promoted route; insufficient_data "
-            "changes nothing; an invariant violation demotes "
-            "any governing route until a fresh evaluation "
-            "re-promotes it"),
+            "MEASUREMENT ONLY since the owner's 2026-11-25 "
+            "order (the 2026-11-08 'verdict BINDS' ruling is "
+            "dead): promotion_ready and not_ready move no "
+            "authority — routes govern by declaration; "
+            "insufficient_data changes nothing; an invariant "
+            "violation demotes any governing route until a "
+            "clean window releases it"),
         "note": (
             "registered before any evaluation under these "
             "criteria reads outcomes — the bars may not move "
@@ -237,8 +245,11 @@ def new_state() -> dict:
     """The standing state (rides inside the S3 audit state
     file, under its own key — the self-audit's arrangement):
     the shared evaluator's standing block plus this module's
-    criteria registrations, applied-verdict bookkeeping,
-    duplicate-scan memory and last journaled evaluation."""
+    criteria registrations, duplicate-scan memory and last
+    journaled evaluation.  The "applied" verdict bookkeeping
+    is RETIRED (owner order 2026-11-25 — verdicts apply
+    nothing anymore); the key survives only so old state
+    files still parse, and the runner's purge clears it."""
     state = _rp.new_state()
     state.update({
         "criteria": {},
@@ -310,12 +321,16 @@ def _evaluation_snapshot(state: dict, snap: dict) -> dict:
 
 
 def applicable_verdict(state: dict, route: str) -> dict | None:
-    """The route's current verdict row IF it may bind, else
-    None.  A verdict binds only when it was computed under a
-    criteria record registered for the route (present in the
-    standing state) and cites that record's id — a verdict
-    computed without a preceding criteria record is refused
-    here, by construction (A5a's ordering pin)."""
+    """The route's current verdict row, else None — for
+    MEASUREMENT and reporting only.  Since the owner's
+    2026-11-25 order the verdict binds nothing: it is the
+    journaled evidence about the route's judged history, and
+    routes govern by declaration.  A verdict row is returned
+    only when it was computed under a criteria record
+    registered for the route (present in the standing state)
+    and cites that record's id — a verdict computed without
+    a preceding criteria record is refused here, by
+    construction (A5a's ordering pin)."""
     crit = (state.get("criteria") or {}).get(route)
     if not isinstance(crit, dict) or not crit.get("criteria_id"):
         return None
@@ -397,15 +412,16 @@ def cycle(*, state: dict, records: list[dict], now=None,
         "type": EVALUATION_RECORD_TYPE, "bar": bar,
         "run_id": run_id, "window": window, **evaluation,
         "note": (
-            "Binding promotion evaluation over the routes' "
+            "Promotion evaluation over the routes' "
             "own route-stamped shadow history (S4 pairing, "
             f"+{HORIZON_H}h, degenerate-R excluded), under "
             "criteria registered before the window's outcomes "
-            "were read.  promotion_ready promotes the route "
-            "through the judgment seam; not_ready demotes a "
-            "verdict-promoted route; invariant violations "
-            "demote any governing route (owner ruling "
-            "2026-11-08)."),
+            "were read.  MEASUREMENT ONLY since the owner's "
+            "2026-11-25 order: a promotion_ready verdict no "
+            "longer promotes a route and not_ready no longer "
+            "demotes one — routes govern by declaration; "
+            "invariant violations still demote any governing "
+            "route, and a clean window releases the demotion."),
     })
     return out
 
@@ -554,11 +570,12 @@ def scan_violations(records: list[dict], *,
 # ------------------------------------------------------------ rendering
 
 _VERDICT_PLAIN = {
-    VERDICT_READY: "PROMOTION READY — route governs through "
-                   "the judgment seam",
-    VERDICT_NOT_READY: "not ready — route stays shadow",
-    VERDICT_INSUFFICIENT: "not enough data yet — route stays "
-                          "shadow",
+    VERDICT_READY: "promotion ready — measurement only, "
+                   "route governs by declaration",
+    VERDICT_NOT_READY: "not ready — measurement only, route "
+                       "still governs by declaration",
+    VERDICT_INSUFFICIENT: "not enough data yet — measurement "
+                          "only",
 }
 
 
@@ -571,22 +588,25 @@ def _pct(value) -> str:
 
 
 def render_lines(state: dict) -> list[str]:
-    """The /status block for the two binding routes, plain
+    """The /status block for the two connected routes, plain
     words first: each route's standing verdict, the criteria
-    it was computed under, and the numbers behind it."""
+    it was computed under, and the numbers behind it.
+    Measurement only since the owner's 2026-11-25 order —
+    the verdict moves no authority."""
     snap = state.get("last_evaluation")
     if not snap:
-        return ["route promotion (binding): no evaluation "
-                "cycle has run yet — hot_scalp_promotion and "
-                "resting_limit stay shadow (no independent "
-                "demo orders) until a cycle journals a verdict "
-                "under pre-registered criteria"]
+        return ["route promotion (measurement only): no "
+                "evaluation cycle has run yet — routes govern "
+                "by declaration; verdicts are journaled "
+                "measurement once a cycle runs under "
+                "pre-registered criteria"]
     lines = [
-        f"route promotion (binding): graded at +{HORIZON_H}h, "
+        f"route promotion (measurement only): graded at "
+        f"+{HORIZON_H}h, "
         f"floor {MIN_PAIRED_PER_ARM} paired outcomes per arm; "
         f"window opened {snap.get('window_start') or '—'} "
-        f"(route-stamped shadow history only); verdicts bind "
-        f"under the owner's 2026-11-08 ruling"]
+        f"(route-stamped shadow history only); verdicts are "
+        f"measurement only since the owner's 2026-11-25 order"]
     damaged = int(state.get("damaged_cycles") or 0)
     if damaged:
         lines.append(
