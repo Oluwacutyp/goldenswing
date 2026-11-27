@@ -99,7 +99,7 @@ def test_arrival_trigger_fires_inside_the_zone(tmp_path):
     store, engine = _engine(tmp_path)
     store.arm(_short_setup())
     out = _run_ticks(engine, _ARRIVAL_TICKS)
-    candidates = [e for e in out if e.get("event") == "candidate_shadow"]
+    candidates = [e for e in out if e.get("event") == "candidate"]
     assert len(candidates) == 1
     candidate = candidates[0]
     assert candidate["trigger_mode"] == "arrival"
@@ -114,7 +114,7 @@ def test_arrival_disabled_keeps_only_cross_reclaim(tmp_path):
         arrival_trigger_enabled=False))
     store.arm(_short_setup())
     out = _run_ticks(engine, _ARRIVAL_TICKS)
-    assert not any(e.get("event") == "candidate_shadow" for e in out)
+    assert not any(e.get("event") == "candidate" for e in out)
 
 
 def test_approach_extension_saves_a_forming_setup(tmp_path):
@@ -211,7 +211,7 @@ def test_chain_links_the_whole_lifecycle(tmp_path):
     runner._hs_chain_from_event(
         {"event": "setup_touched", "setup_id": "hs-1"}, tick)
     runner._hs_chain_from_event({
-        "event": "candidate_shadow", "setup_id": "hs-1",
+        "event": "candidate", "setup_id": "hs-1",
         "parent_setup_id": "hp-1", "strategy": "pullback_continuation",
         "direction": -1, "entry_reference": 3928.96,
         "structural_stop": 3930.19, "target_reference": 3911.93,
@@ -228,24 +228,24 @@ def test_chain_links_the_whole_lifecycle(tmp_path):
     # the expired event carried no parent — the chain resolved it
     # from the armed record's mapping
     assert all(r["parent_id"] == "hp-1" for r in chain)
-    assert all(r["authority"]["research_stream"] == "shadow_only"
+    assert all(r["authority"]["sleeve_stream"] == "live"
                for r in chain)
     triggered = chain[2]
     assert triggered["targets"]["runner"] == "open"
     assert triggered["spread"] == 0.24
 
 
-def test_chain_records_a_promotion_refusal(tmp_path):
+def test_chain_records_a_placement_refusal(tmp_path):
     runner = _runner(tmp_path)
     runner.cfg.hot_scalp_live_enabled = False
-    ok = runner._promote_hot_scalp_candidate(
+    ok = runner._place_hot_scalp_candidate(
         {"setup_id": "hs-9", "parent_setup_id": "hp-9"},
         {"time": "2026-11-03T03:45:00Z"}, {})
     assert ok is False
     chain = [r for r in runner.journal.records
              if r.get("type") == "candidate_chain"]
     assert len(chain) == 1
-    assert chain[0]["stage"] == "promotion"
+    assert chain[0]["stage"] == "placement"
     assert chain[0]["execution_status"] == "refused"
-    assert chain[0]["reason_code"] == "promotion.live_authority_off"
+    assert chain[0]["reason_code"] == "hot_scalp.live_authority_off"
     assert chain[0]["authority"]["live_promotion"] is False

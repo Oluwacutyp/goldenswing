@@ -19,9 +19,10 @@ Honesty contract (test-pinned):
   never a silently omitted section;
 - a record with NO assessment block renders an explicit
   not-produced statement, not a fabricated read;
-- SHADOW records (§G range evaluation routes, observed roster
-  scans) are labelled SHADOW in the header and can never render
-  as a signal — shadow routes hold no order authority;
+- JUDGMENT records (type "judgment", or legacy shadow
+  evaluations from pre-rework journals) are labelled
+  JUDGMENT in the header and can never render as a signal
+  — a verdict record is not a signal;
 - capability markers (absent / not-integrated census facts) are
   rendered as explicit lines, exactly as the record carries
   them;
@@ -44,14 +45,21 @@ _VERDICT_EMOJI = {
 }
 
 
-def is_shadow_record(record: dict) -> bool:
-    """True when the record came from a route with NO order
-    authority (§G range shadow evaluations / observed scans).
-    Read from the record's own facts: the shadow flag on the
-    evidence block, a shadow decision result, or the
-    path.shadow_route reason code."""
+def is_judgment_record(record: dict) -> bool:
+    """True when the record is a judgment verdict record
+    (type "judgment", or the legacy "judgment_shadow" type
+    from pre-rework journals) — or, for old journal lines,
+    a shadow evaluation (the evidence shadow flag, a shadow
+    decision result, or the path.shadow_route reason code).
+    Both shapes are verdict/accounting records, never
+    signals: the runner never announces them, and the render
+    says so.  Live records carry the "judgment" type; the
+    legacy markers exist only so old journals still render
+    honestly."""
     if not isinstance(record, dict):
         return False
+    if record.get("type") in ("judgment", "judgment_shadow"):
+        return True
     ev = record.get("evidence") or {}
     if isinstance(ev, dict) and ev.get("shadow") is True:
         return True
@@ -386,7 +394,7 @@ def render_assessment(record: dict, *,
     clock = rec.get("evaluation_clock") or "clock not recorded"
     instrument = symbol or rec.get("instrument") \
         or "instrument not recorded"
-    shadow = is_shadow_record(rec)
+    shadow = is_judgment_record(rec)
     lines: list[str] = []
     lines.append(f"🧭 MARKET ASSESSMENT — {instrument}")
     route = (rec.get("evidence") or {}).get("route") \
@@ -414,9 +422,9 @@ def render_assessment(record: dict, *,
                      f"{source}: startup/replay scan, "
                      "analytical only, never routed to orders")
     if shadow:
-        lines.append("⚠️ SHADOW EVALUATION — journaled for "
-                     "grading; this route holds NO order "
-                     "authority and this is not a signal")
+        lines.append("⚠️ JUDGMENT RECORD — a verdict on a "
+                     "candidate, journaled for grading; this "
+                     "is not a signal")
     lines.append("")
 
     assessment = rec.get("assessment")
@@ -443,8 +451,8 @@ def render_assessment(record: dict, *,
     # --- verdict + plain-language reason ----------------------
     verdict = str(assessment.get("verdict") or "no-setup")
     if shadow and verdict == "signal":
-        # Belt and braces: a shadow record's derived verdict is
-        # "watch" by construction; if a future record shape
+        # Belt and braces: a judgment record's derived verdict
+        # is "watch" by construction; if a future record shape
         # ever carried signal here, it still must not render
         # as one.
         verdict = "watch"

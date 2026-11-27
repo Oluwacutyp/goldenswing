@@ -19,7 +19,7 @@ def _frame(tf_minutes, start, count, *, base=100.0):
                         index=idx)
 
 
-def test_hot_scalp_emits_one_shadow_candidate_after_live_touch_and_reclaim(tmp_path):
+def test_hot_scalp_emits_one_live_candidate_after_live_touch_and_reclaim(tmp_path):
     store = SetupStore(tmp_path / "hot-scalp.sqlite")
     setup = {
         "setup_id": "hs-test-parent-1", "symbol": "XAUUSD",
@@ -51,12 +51,12 @@ def test_hot_scalp_emits_one_shadow_candidate_after_live_touch_and_reclaim(tmp_p
     for tick in ticks:
         output.extend(engine.on_tick(symbol="XAUUSD", tick=tick,
                                      frames=frames, now=tick["time"]))
-    candidates = [event for event in output if event.get("event") == "candidate_shadow"]
+    candidates = [event for event in output if event.get("event") == "candidate"]
     assert len(candidates) == 1
     candidate = candidates[0]
     assert candidate["parent_setup_id"] == setup["setup_id"]
     assert candidate["trigger_source"] == "live_tick_reclaim"
-    assert candidate["execution_authority"] == "shadow_only"
+    assert candidate["execution_authority"] == "live"
     assert 0 <= candidate["score"] <= 100
     assert candidate["score_is_calibrated_probability"] is False
     evidence_categories = {row["category"] for row in candidate["evidence"]}
@@ -68,7 +68,7 @@ def test_hot_scalp_emits_one_shadow_candidate_after_live_touch_and_reclaim(tmp_p
     # A repeated scan/replayed trigger cannot emit a second candidate.
     output2 = engine.on_tick(symbol="XAUUSD", tick=ticks[-1], frames=frames,
                              now=ticks[-1]["time"])
-    assert not any(event.get("event") == "candidate_shadow" for event in output2)
+    assert not any(event.get("event") == "candidate" for event in output2)
 
 
 def _trend_frame(tf_minutes, end, count=120):

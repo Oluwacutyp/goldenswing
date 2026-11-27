@@ -253,9 +253,10 @@ def test_contradictory_evidence_weighed_and_truthful(tmp_path):
     record (weighed, never a veto) and the terminal outcome is
     the truth (ordered).  SHADOW mode: the subject is the
     ROUTE's weighing/record; under the core's active authority
-    (promotion, 2026-11-05) this same evidence is the core's
-    decision and it abstains — pinned in
-    tests/test_judgment_promotion.py."""
+    (owner order 2026-11-25/27) this same evidence is the
+    core's decision and it abstains — pinned in
+    tests/test_judgment_core.py (structure-driven abstention)
+    and tests/test_completion02_connections.py."""
     runner = _wire(_qm_runner(tmp_path, judgment_mode="shadow"),
                    _m5_fixture())
     runner._live_setup = {"bias_d1": 1, "bias_h4": 1,
@@ -280,7 +281,15 @@ def test_below_floor_qm_d1_terminal_record(tmp_path, monkeypatch):
     runner = _runner(tmp_path)
     runner._score_for = lambda **kw: _FakeScore(10.0, 5.0, 5.0)
     runner._get_engine = lambda: _StubEngine()
-    d1 = _frame([(4100.0, 4110.0, 4090.0, 4105.0)] * 40, freq="1d")
+    # The D1 frame carries the short's own structure: the last
+    # closes fall through the 4100 QM level (displacement down,
+    # acceptance below the entry, follow-through held) — the
+    # judgment reads the bars, so a flat frame abstains.
+    d1 = _frame([(4100.0, 4110.0, 4090.0, 4105.0)] * 36 + [
+        (4112.0, 4112.0, 4108.0, 4110.0),
+        (4102.0, 4102.0, 4098.0, 4100.0),
+        (4092.0, 4092.0, 4088.0, 4090.0),
+        (4082.0, 4082.0, 4078.0, 4080.0)], freq="1d")
     runner._run_qm_d1(d1, {})
     assert runner.executor.orders == []
     rec = _candidate_records(runner, "qm_d1")[0]
@@ -382,7 +391,7 @@ def test_range_family_registry_contract():
     for spec in RANGE_SPECS:
         assert spec.native_tf == "H4"
         assert spec.refinement_tf == "H1"
-        assert spec.shadow_evaluation is False
+        assert spec.trigger_kind == "h1_trigger_fire"
     assert len(ROSTER_SPECS) == 16
     assert {s.name for s in ROSTER_SPECS} >= {s.name
                                               for s in RANGE_SPECS}
@@ -421,7 +430,15 @@ def test_qm_d1_native_route_record_shape(tmp_path, monkeypatch):
     runner = _runner(tmp_path)
     runner._score_for = lambda **kw: _FakeScore(70.0, 25.0, 15.0)
     runner._get_engine = lambda: _StubEngine()
-    d1 = _frame([(4100.0, 4110.0, 4090.0, 4105.0)] * 40, freq="1d")
+    # The D1 frame carries the short's own structure: the last
+    # closes fall through the 4100 QM level (displacement down,
+    # acceptance below the entry, follow-through held) — the
+    # judgment reads the bars, so a flat frame abstains.
+    d1 = _frame([(4100.0, 4110.0, 4090.0, 4105.0)] * 36 + [
+        (4112.0, 4112.0, 4108.0, 4110.0),
+        (4102.0, 4102.0, 4098.0, 4100.0),
+        (4092.0, 4092.0, 4088.0, 4090.0),
+        (4082.0, 4082.0, 4078.0, 4080.0)], freq="1d")
     runner._stack = SimpleNamespace(
         frames={"D1": d1, "H1": _flat_h1(30, 4100.0)})
     runner._last_tick = {"mid": 4100.0, "bid": 4099.8,
@@ -482,7 +499,8 @@ def test_manifest_surfaces_effective_sizing_mode(tmp_path):
     assert roster["range_qm"]["clock"] == "H4"
     assert roster["range_qm"]["refinement_clock"] == "H1"
     # Owner order 2026-11-25: live evaluation, no shadow tier.
-    assert roster["range_qm"]["shadow_evaluation"] is False
+    assert roster["range_qm"]["trigger_kind"] == \
+        "h1_trigger_fire"
 
 
 def test_decision_solvency_places_minimum_under_new_ruling(tmp_path):
@@ -598,7 +616,7 @@ def _equity_runner(tmp_path, monkeypatch, equity, stop=100.34):
         # SHADOW mode: this helper's tests measure the sizing
         # machinery INSIDE the shared order path; the Judgment
         # Core's authority over the path is pinned separately
-        # (tests/test_judgment_promotion.py).
+        # (tests/test_judgment_core.py).
         judgment_mode="shadow",
         news_pause_enabled=False)
     runner = MT5Runner(cfg, feed=feed, executor=_FakeExecutor())
@@ -765,7 +783,7 @@ def test_competing_scenarios_coexist_on_the_record(
     subject is the ROUTE's Step-16 record treatment; under the
     core's active authority (promotion, 2026-11-05) the flipped
     evidence is the core's to decide on — pinned in
-    tests/test_judgment_promotion.py (a)."""
+    tests/test_judgment_core.py (a)."""
     runner = _wire(_qm_runner(tmp_path, judgment_mode="shadow"),
                    _m5_fixture())
     runner._run_qm_m5(_m5_fixture(), {})

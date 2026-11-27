@@ -46,8 +46,10 @@ import pandas as pd
 import pytest
 
 import goldenswing.execution.mt5_runner as mr
-from goldenswing.execution import route_promotion
+from goldenswing.execution.mt5_runner import LIVE_ORDER_ROUTES
 from goldenswing.execution.evidence_map import PLAYBOOK_EVIDENCE
+from goldenswing.execution.playbook_registry import (
+    CONNECTED_ORDER_ROUTES, order_route_for)
 from goldenswing.execution.playbook_registry import FLOOR_AUTHORITY, PLAYBOOK_REGISTRY
 from goldenswing.reader import indicators as reader_ind
 from goldenswing.research.bill_williams import evaluation, harness, journal
@@ -567,9 +569,11 @@ class TestIsolation:
     def test_absent_from_every_live_table(self):
         tables = {
             "registry": self._registry_names(),
-            "order routes": set(
-                route_promotion.ORDER_ROUTE_BY_PLAYBOOK.keys()),
-            "judgment routes": set(mr.JUDGMENT_ROUTE_STATES.keys()),
+            "order routes": {
+                order_route_for(spec.name) or spec.name
+                for spec in PLAYBOOK_REGISTRY} | set(
+                    CONNECTED_ORDER_ROUTES.values()),
+            "judgment routes": set(LIVE_ORDER_ROUTES),
             "evidence map": set(PLAYBOOK_EVIDENCE.keys()),
             "floor authority": set(FLOOR_AUTHORITY.keys()),
         }

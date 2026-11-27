@@ -508,14 +508,29 @@ def test_point3_fresh_h4_poi_absorption_produces_layer1_authorization_without_st
 
 def test_resting_limit_placed_for_fresh_major_zone(tmp_path):
     runner = _runner(tmp_path, resting_limit_enabled=True)
-    # PASS 5 (owner ruling 2026-11-08): the resting limit
-    # rests only while its route governs — this placement pin
-    # drives under the owner's explicit config step; the
-    # boundary at the declared posture is pinned in
-    # tests/test_route_authority.py.
-    runner.cfg.judgment_route_modes = {
-        "resting_limit": "governing"}
+    # The placement pin: a fresh MAJOR zone whose entry-clock
+    # reaction agrees with the long — the last closes rise
+    # through the zone top (displacement up, acceptance above
+    # the entry, follow-through held).  The bare point-3
+    # fixture (a down-leg lingering inside the band, no upward
+    # reaction) is the ABSTAIN case, pinned in
+    # tests/test_route_authority.py::test_resting_limit_
+    # abstention_refuses — the two pins share the fixture and
+    # differ only in the reaction, so this one carries the
+    # rising closes.  (The judgment_route_modes config step
+    # this test used to carry died with the promotion gate —
+    # owner order 2026-11-25/27, the field is inert, pinned
+    # by test_route_config_step_is_dead — it never
+    # distinguished the two cases.)
     frames = _point3_frames()
+    h1 = frames["H1"].copy()
+    h1.iloc[-4:, h1.columns.get_loc("close")] = [
+        4118.0, 4124.0, 4128.0, 4132.0]
+    h1.iloc[-4:, h1.columns.get_loc("high")] = [
+        4119.2, 4125.2, 4129.2, 4133.2]
+    h1.iloc[-4:, h1.columns.get_loc("low")] = [
+        4116.8, 4122.8, 4126.8, 4130.8]
+    frames["H1"] = h1
     runner._stack = SimpleNamespace(frames=frames)
     zone = StructuralZone(
         tf="H4", side="support", level=4110.0, top=4122.0,
@@ -663,7 +678,7 @@ def _drive_floor(tmp_path, *, verdict_extra, fake):
                         instrument="XAUUSD")
     stats: dict = {"signals": 0, "gated": 0}
     runner._run_one_playbook(
-        pb, sig_ctx=(ctx, _FloorEngine()), h1=h1, t=len(h1) - 1,
+        pb, sig_ctx=(ctx, _FloorEngine()), frame=h1, t=len(h1) - 1,
         verdict=verdict, stats=stats, zone_d=zone.to_dict(),
         funding=None)
     recs = [r for r in runner.journal.records()

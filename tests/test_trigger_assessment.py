@@ -28,7 +28,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from goldenswing.execution.assessment_render import (
-    is_shadow_record, render_assessment)
+    is_judgment_record, render_assessment)
 
 from test_funnel_m5 import _fresh_tick, _qm_runner
 from test_p3_trader import (_FakeScore, _StubPB, _drive_one,
@@ -197,7 +197,7 @@ def test_sweep_candidate_observed_objects(tmp_path):
             "fvg_midline", _sig(index=len(frame) - 1)))
     runner._sweep_eval_one(
         spec, frame, clock="h1_close", intended_tf="H1",
-        actual_tf="H1", source="live_close", shadow=False)
+        actual_tf="H1", source="live_close")
     # Step 14 (owner rulings 2026-10-30 §1): the sweep now also
     # journals setup_event records as the candidate registers —
     # this test pins the sweep's own playbook_eval record.
@@ -230,7 +230,7 @@ def test_sweep_candidate_observed_objects(tmp_path):
     assert "take the +1 fvg_midline setup at 2000.00" in text
 
 
-def test_sweep_candidate_range_shadow_objects(tmp_path):
+def test_sweep_candidate_range_live_objects(tmp_path):
     runner, _h1 = _sweep_runner(tmp_path)
     runner._live_setup = {"bias_d1": -1, "bias_h4": -1,
                           "regime": "range", "size_mult": 1.0}
@@ -241,7 +241,7 @@ def test_sweep_candidate_range_shadow_objects(tmp_path):
             "range_qm", _sig(index=len(frame) - 1)))
     runner._sweep_eval_one(
         spec, frame, clock="h4_generation", intended_tf="H4",
-        actual_tf="H4", source="live_close", shadow=True,
+        actual_tf="H4", source="live_close",
         extra_evidence={
             "stage": "h4_generation", "d1_bias_context": -1,
             "d1_role": "context only — recorded, never "
@@ -251,18 +251,22 @@ def test_sweep_candidate_range_shadow_objects(tmp_path):
             if r["outcome"] == "candidate_emitted"]
     assert recs
     rec = recs[-1]
-    assert is_shadow_record(rec)
-    assert rec["decision"]["result"] == "shadow"
+    assert not is_judgment_record(rec)
+    assert rec["decision"]["result"] == "registered"
     scen = rec["decision"]["competing_scenarios"]
-    assert "§G shadow" in scen[0]["status"]
+    assert "registered" in scen[0]["status"]
     # D1 disagreement is weighed CONTEXT on the §G routes, and
-    # the item says so — it is never dressed as a veto.
+    # the item says so — it is never dressed as a veto: the
+    # disagreement rides in the contradictory bucket as weighed
+    # evidence (the setup still registers and watches for its
+    # trigger), and the d1_role in the record's evidence says
+    # "context only".
     con = rec["assessment"]["contradictory_evidence"]
-    assert any("against structural D1 bias -1" in t
-               and "context only" in t for t in con)
+    assert any("against structural D1 bias -1" in t for t in con)
+    assert "context only" in str(rec.get("evidence"))
     text = rec["assessment_text"]
-    assert "SHADOW EVALUATION" in text
-    assert "VERDICT: SIGNAL" not in text
+    assert "JUDGMENT RECORD" not in text
+    assert "VERDICT: WATCH" in text
 
 
 def test_range_no_setup_live_carries_context(tmp_path):
@@ -278,7 +282,7 @@ def test_range_no_setup_live_carries_context(tmp_path):
             if r["outcome"] == "no_setup"]
     assert recs
     rec = recs[-1]
-    assert not is_shadow_record(rec)
+    assert not is_judgment_record(rec)
     a = rec["assessment"]
     assert a["htf_context"].get("d1_bias_context") == 1
     assert a["structure_read"].get("regime") == "trend"

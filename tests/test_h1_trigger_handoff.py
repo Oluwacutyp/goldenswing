@@ -32,10 +32,9 @@ default ON):
 - a fired trigger cannot vanish: a raising evaluation lands
   as journaled lifecycle transitions and the instance stays
   live (retry-safe re-arm);
-- shadow (§G) preservation: the instance is preserved, its
-  scan disposition vocabulary is unchanged, a same-direction
-  fire journals a trigger_observed disposition WITHOUT
-  routing it, and upkeep ends it journaled;
+- live registration: every scan registers a LIVE setup, a
+  same-direction fire binds and routes it, and upkeep ends
+  it journaled;
 - origination (owner order 2026-11-25): a live-registered
   family/range setup IS routed — a same-direction fire binds
   it, the seam takes it under the playbook's OWN route, the
@@ -136,13 +135,26 @@ def _episode_sweep(runner, frame):
     runner._sweep_eval_one(
         _episode_spec(_episode_sig(frame)), frame,
         clock="h1_close", intended_tf="H1", actual_tf="H1",
-        source="live_close", shadow=False)
+        source="live_close")
 
 
 def _flat_frame(price=2000.0, bars=40):
     idx = pd.date_range("2026-01-05", periods=bars, freq="1h",
                         tz="UTC")
     rows = [(price, price + 1.0, price - 1.0, price + 0.5)] * bars
+    return pd.DataFrame(rows, index=idx,
+                        columns=["open", "high", "low", "close"])
+
+
+def _down_frame(price=2000.0, bars=40):
+    """H1 frame falling through the entry: closes slide
+    2010 -> 1990 on tight ranges, so a long candidate at
+    2000 reads displacement down, acceptance rejected and
+    follow-through held short — the verdict abstains."""
+    idx = pd.date_range("2026-01-05", periods=bars, freq="1h",
+                        tz="UTC")
+    closes = [2010.0 - 20.0 * i / (bars - 1) for i in range(bars)]
+    rows = [(c + 0.2, c + 1.0, c - 1.0, c) for c in closes]
     return pd.DataFrame(rows, index=idx,
                         columns=["open", "high", "low", "close"])
 
@@ -164,7 +176,7 @@ def _basic_runner(tmp_path, frame, **cfg_kw):
     return runner
 
 
-def _sweep(runner, frame, name="fvg_midline", *, shadow=False,
+def _sweep(runner, frame, name="fvg_midline", *,
            direction=1, entry=2000.0, stop=1990.0,
            route="h1_roster", clock="h1_close", intended_tf="H1",
            entry_zone=None, validity_bars=None):
@@ -179,7 +191,7 @@ def _sweep(runner, frame, name="fvg_midline", *, shadow=False,
         spec.validity_bars = validity_bars
     runner._sweep_eval_one(
         spec, frame, clock=clock, intended_tf=intended_tf,
-        actual_tf=intended_tf, source="live_close", shadow=shadow)
+        actual_tf=intended_tf, source="live_close")
     return spec
 
 
@@ -226,7 +238,6 @@ def test_episode_order_block_preserved_and_terminated(tmp_path):
     assert s.touch_ts == "2026-11-04 05:00:00+00:00"
     assert s.expiry_ts == "2026-11-04 11:00:00+00:00"
     assert s.stage == slc.STAGE_ARMED
-    assert s.shadow is False
     # No live thesis adopted this candidate (the journal shows
     # none for the run) — the link is empty, not invented.
     assert s.thesis_id is None
@@ -240,7 +251,6 @@ def test_episode_order_block_preserved_and_terminated(tmp_path):
         ev = r["evidence"]
         assert ev["setup_id"] == EPISODE_SETUP_ID
         assert "thesis_id" in ev and ev["thesis_id"] is None
-        assert ev["shadow"] is False
 
     # The scan record carries the instance's real disposition;
     # the legacy observed disposition rides alongside.
@@ -485,66 +495,6 @@ def test_fired_trigger_cannot_vanish_on_exception(tmp_path):
     assert stages == [h["stage"] for h in s.history]
 
 
-# ------------------------------------------------- shadow preservation
-
-def test_shadow_instance_preserved_never_routed(tmp_path):
-    frame = _flat_frame(2000.0)
-    runner = _basic_runner(tmp_path, frame)
-    _sweep(runner, frame, name="range_qm", shadow=True,
-           route="range_h4_h1", clock="h4_generation",
-           intended_tf="H4")
-    active = runner._setup_store.active()
-    assert len(active) == 1
-    s = active[0]
-    assert s.shadow is True and s.stage == slc.STAGE_ARMED
-
-    # The scan record keeps the honest shadow disposition —
-    # vocabulary unchanged — but now names the instance.
-    rec = _scan_records(runner, "range_qm")[-1]
-    assert rec["reason_code"] == "path.shadow_route"
-    assert rec["decision"]["result"] == "shadow"
-    assert rec["decision"]["order_result"] == "not_attempted"
-    assert rec["decision"]["setup_id"] == s.setup_id
-    assert rec["evidence"]["setup_id"] == s.setup_id
-
-    # A same-direction fire does NOT route it (no execution
-    # intent, ever) — but the trigger-stage disposition is
-    # journaled on the instance instead of the setup vanishing.
-    runner._get_playbooks = lambda: [
-        _StubPB("range_qm", _sig(index=0))]
-    routing: dict = {}
-    stats = {"signals": 0, "gated": 0}
-    runner._run_signal_path(frame, len(frame) - 1, [], 1.0,
-                            _verdict(1), stats,
-                            lifecycle_routing=routing)
-    assert "range_qm" not in routing
-    observed = [r for r in _setup_events(runner, "range_qm")
-                if r["trigger_stage"] ==
-                slc.STAGE_TRIGGER_OBSERVED]
-    assert len(observed) == 1
-    assert observed[0]["evidence"]["setup_id"] == s.setup_id
-    assert observed[0]["evidence"]["shadow"] is True
-    assert "never routed" in observed[0]["reason"]
-    # Still armed afterwards — observation is not a transition.
-    assert runner._setup_store.get(s.setup_id).stage == \
-        slc.STAGE_ARMED
-
-    # Upkeep ends it with a journaled terminal state.
-    bad = _frame([(1985.0, 1986.0, 1984.0, 1985.0)] * 3,
-                 start=str(frame.index[-1]
-                           + pd.Timedelta(hours=1)))
-    runner._upkeep_setups(bad)
-    s2 = runner._setup_store.get(s.setup_id)
-    assert s2.stage == slc.STAGE_INVALIDATED
-    assert [h["stage"] for h in s2.history] == [
-        slc.STAGE_DETECTED, slc.STAGE_ARMED, slc.STAGE_INVALIDATED]
-
-
-# ------------------------------------------- origination: family order path
-
-#: The 13 family playbooks (registry order within each family),
-#: each with its registry route.  Each playbook's judgment
-#: route is its own name (ORDER_ROUTE_BY_PLAYBOOK).
 FAMILY_PLAYBOOKS = [
     ("vol_expansion_escape", "volatility_expansion"),
     ("vol_failed_expansion", "volatility_expansion"),
@@ -569,10 +519,9 @@ def _family_fire_runner(tmp_path, name, route):
     runner = _basic_runner(tmp_path, frame,
                            execute_playbooks=(name,))
     runner._score_for = lambda **kw: _FakeScore(70.0, 25.0, 15.0)
-    _sweep(runner, frame, name=name, shadow=False, route=route,
+    _sweep(runner, frame, name=name, route=route,
            entry_zone=(1995.0, 2005.0))
     setup = runner._setup_store.active()[0]
-    assert setup.shadow is False
     assert setup.stage == slc.STAGE_ARMED
     runner._get_playbooks = lambda: [_StubPB(name, _sig(index=0))]
     return runner, frame, setup
@@ -587,16 +536,16 @@ def _fire(runner, frame):
     return routing
 
 
-def _shadows(runner, playbook):
+def _judged(runner, playbook):
     return [r for r in runner.journal.records()
-            if r.get("type") == "judgment_shadow"
+            if r.get("type") == "judgment"
             and r.get("playbook") == playbook]
 
 
 def test_live_family_instance_routes_on_fire(tmp_path):
     """Origination (owner order 2026-11-25): the routed pin.  A
-    range_qm scan registers a LIVE setup now (shadow=False is
-    the production shape — the §G shadow contract is gone),
+    range_qm scan registers a LIVE setup now (the §G shadow
+    contract is gone — every scan registers live),
     and a same-direction fire binds it, routes it, and advances
     it to a terminal disposition, with an order placed under
     the playbook's own route."""
@@ -604,13 +553,13 @@ def test_live_family_instance_routes_on_fire(tmp_path):
     runner = _basic_runner(tmp_path, frame,
                            execute_playbooks=("range_qm",))
     runner._score_for = lambda **kw: _FakeScore(70.0, 25.0, 15.0)
-    _sweep(runner, frame, name="range_qm", shadow=False,
+    _sweep(runner, frame, name="range_qm",
            route="range_h4_h1", clock="h4_generation",
            intended_tf="H4", entry_zone=(1995.0, 2005.0))
     active = runner._setup_store.active()
     assert len(active) == 1
     s = active[0]
-    assert s.shadow is False and s.stage == slc.STAGE_ARMED
+    assert s.stage == slc.STAGE_ARMED
     rec = _scan_records(runner, "range_qm")[-1]
     assert rec["reason_code"] == "path.setup_registered"
     assert rec["decision"]["result"] == "registered"
@@ -630,9 +579,10 @@ def test_live_family_instance_routes_on_fire(tmp_path):
 def test_family_setup_routes_and_orders_under_own_route(
         tmp_path, name, route):
     """Origination, one per family playbook: scan -> armed live
-    setup -> same-direction h1_trigger fire -> bound -> seam
-    take under the playbook's OWN route -> order submitted /
-    filled with the route stamp on the funnel record."""
+    setup -> same-direction fire on the playbook's own trigger
+    clock -> bound -> seam take under the playbook's OWN route
+    -> order submitted / filled with the route stamp on the
+    funnel record."""
     runner, frame, setup = _family_fire_runner(tmp_path, name,
                                                 route)
     routing = _fire(runner, frame)
@@ -645,13 +595,13 @@ def test_family_setup_routes_and_orders_under_own_route(
     # The seam took under the family's own route: the funnel
     # record's judgment carries the route stamp with a take
     # decision and a filled/submitted order result (the scan's
-    # own shadow record carries pending_trigger instead).
-    shadows = _shadows(runner, name)
+    # own judgment record carries pending_trigger instead).
+    judged = _judged(runner, name)
     assert any(
-        (sh.get("judgment") or {}).get("authority_route") == name
+        (sh.get("judgment") or {}).get("authority_route") == route
         and (sh.get("judgment") or {}).get("decision") == "take"
         and sh.get("gate_order_result") in ("filled", "submitted")
-        for sh in shadows)
+        for sh in judged)
 
 
 @pytest.mark.parametrize("name,route", FAMILY_PLAYBOOKS)
@@ -663,7 +613,15 @@ def test_family_setup_abstain_refuses_and_rearms(
     (a transient refusal, not a terminal rejection)."""
     runner, frame, setup = _family_fire_runner(tmp_path, name,
                                                 route)
-    runner.cfg.judgment_min_expected_r = 99.0
+    # The abstention is forced by structure, not a threshold:
+    # the entry-clock frames fall through the entry after the
+    # sweep, so the long candidate fights the measured
+    # reaction (displacement down, acceptance rejected) and
+    # the verdict abstains.  Both clocks are overridden: the
+    # seam reads the playbook's NATIVE tf (H1 for most
+    # families, H4 for range/trend).
+    runner._stack.frames["H1"] = _down_frame()
+    runner._stack.frames["H4"] = _down_frame()
     routing = _fire(runner, frame)
     assert routing[name]["setup_id"] == setup.setup_id
     frags = runner._apply_lifecycle_routing(routing, 1)
@@ -750,9 +708,9 @@ def test_flag_off_scan_record_is_legacy_byte_identical(tmp_path):
     assert rec["reason"] == (
         "scheduled scan found a candidate on the closing bar; "
         "this scan route holds no order authority and does not "
-        "run the h1_trigger streaming evaluation — recorded as "
-        "observed, never routed from the scan (see Trigger "
-        "decision)")
+        "run the trigger-path streaming evaluation on the "
+        "playbook's own trigger clock — recorded as observed, "
+        "never routed from the scan (see Trigger decision)")
     d = rec["decision"]
     assert d["result"] == "observed"
     assert d["order_result"] == "not_attempted"
@@ -771,7 +729,7 @@ def test_flag_off_scan_record_is_legacy_byte_identical(tmp_path):
 
 # ------------------------------------------------------ store stamps
 
-def test_store_thesis_stamp_shadow_filter_and_old_file(tmp_path):
+def test_store_thesis_stamp_and_old_file(tmp_path):
     path = tmp_path / "lc.json"
     store = slc.SetupLifecycleStore(path)
     s = slc.TrackedSetup(
@@ -784,27 +742,13 @@ def test_store_thesis_stamp_shadow_filter_and_old_file(tmp_path):
     assert store.get(s.setup_id).thesis_id == "thesis-7"
     assert store.get(s.setup_id).thesis_version == 3
     assert store.stamp_thesis("nope", "thesis-7", 3) is False
-    # Shadow filter: None = all, True/False select.
-    sh = slc.TrackedSetup(
-        setup_id="pb2:2026-01-05 00:00:00:1:2000.00",
-        parent_setup_id="pb2:2026-01-05 00:00:00:1:2000.00",
-        playbook="pb2", route="range_h4_h1", direction=1,
-        entry_ref=2000.0, invalidation=1990.0, shadow=True)
-    assert store.register(sh, ts="2026-01-05 00:00:00") is True
-    assert len(store.active()) == 2
-    assert [x.setup_id for x in store.active(shadow=True)] == \
-        [sh.setup_id]
-    assert [x.setup_id for x in store.active(shadow=False)] == \
-        [s.setup_id]
-    # A pre-WS3 store file (no thesis/shadow keys) loads with
-    # honest defaults.
+    # A pre-WS3 store file (no thesis keys) loads with honest
+    # defaults.
     raw = json.loads(path.read_text())
     for rec in raw["setups"]:
         rec.pop("thesis_id", None)
         rec.pop("thesis_version", None)
-        rec.pop("shadow", None)
     path.write_text(json.dumps(raw))
     again = slc.SetupLifecycleStore(path)
     s2 = again.get(s.setup_id)
     assert s2.thesis_id is None and s2.thesis_version is None
-    assert s2.shadow is False

@@ -69,7 +69,6 @@ from .setup_lifecycle import (
     STAGE_REJECTED,
     STAGE_SUBMITTED,
     STAGE_TRIGGER_FIRED,
-    STAGE_TRIGGER_OBSERVED,
     TERMINAL_STAGES,
     TrackedSetup,
 )

@@ -132,7 +132,7 @@ def test_ready_verdict_when_judgment_outdecides():
     assert result["bars"]["discrimination_eval"] == "met"
     assert result["bars"]["discrimination_holdout"] == "met"
     report = render_markdown(result)
-    assert "promotion decision" in report
+    assert "go-live decision" in report
     assert "Holdout" in report
 
 

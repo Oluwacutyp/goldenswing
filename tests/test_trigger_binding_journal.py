@@ -17,7 +17,7 @@ routing selection journals ONE kind=trigger_binding record —
 the bound instance(s) with the rule that picked each
 (bracket / nearest / oldest / single), or the not-bound
 reason from the closed taxonomy (no_armed_instances /
-direction_mismatch / all_expired / shadow_only) with every
+direction_mismatch / all_expired / not_selected) with every
 armed instance's disposition at fire time.  Observation-only:
 the routing outcome itself is asserted unchanged everywhere.
 """
@@ -62,7 +62,7 @@ def _basic_runner(tmp_path, frame, **cfg_kw):
     return runner
 
 
-def _sweep(runner, frame, name="fvg_midline", *, shadow=False,
+def _sweep(runner, frame, name="fvg_midline", *,
            direction=1, entry=2000.0, stop=1990.0,
            entry_zone=None, validity_bars=None):
     sig = _sig(direction=direction, entry=entry, stop=stop,
@@ -76,7 +76,7 @@ def _sweep(runner, frame, name="fvg_midline", *, shadow=False,
         spec.validity_bars = validity_bars
     runner._sweep_eval_one(
         spec, frame, clock="h1_close", intended_tf="H1",
-        actual_tf="H1", source="live_close", shadow=shadow)
+        actual_tf="H1", source="live_close")
     return spec
 
 
@@ -309,29 +309,6 @@ def test_all_expired(tmp_path):
         "setup_id": setup.setup_id, "playbook": "order_block",
         "direction": 1, "expiry_ts": setup.expiry_ts,
         "disposition": "expired"}]
-
-
-def test_shadow_only(tmp_path):
-    frame = _flat_frame(2000.0)
-    runner = _basic_runner(tmp_path, frame,
-                           execute_playbooks=("order_block",))
-    runner._score_for = lambda **kw: _FakeScore(70.0, 25.0, 15.0)
-    _sweep(runner, frame, name="order_block", direction=1,
-           entry=2000.0, stop=1990.0, validity_bars=200,
-           shadow=True)
-    setup = runner._setup_store.active()[0]
-    assert setup.shadow is True
-    runner._get_playbooks = lambda: [
-        _StubPB("order_block", _sig(index=0))]
-    routing = _fire(runner, frame, _verdict(1, entry=2000.0))
-    # Shadow is preserved, never routed — unchanged behavior.
-    assert routing == {}
-    assert runner._setup_store.get(setup.setup_id).stage == \
-        slc.STAGE_ARMED
-    binding, rec = _binding(runner)
-    assert rec["reason_code"] == "path.binding_shadow_only"
-    assert binding["reason"] == "shadow_only"
-    assert binding["instances"][0]["disposition"] == "shadow"
 
 
 # ------------------------------------------------------ reach discipline

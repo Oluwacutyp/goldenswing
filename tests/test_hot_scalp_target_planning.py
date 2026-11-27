@@ -249,7 +249,7 @@ def test_exhibit_a_continuation_objective_was_there_all_along(tmp_path):
     events = _drive(engine, "XAUUSDm", _A_TICKS, _exhibit_a_frames())
     mine = [e for e in events
             if e.get("setup_id") == _A_SETUP["setup_id"]]
-    candidates = [e for e in mine if e["event"] == "candidate_shadow"]
+    candidates = [e for e in mine if e["event"] == "candidate"]
     assert len(candidates) == 1
     cand = candidates[0]
     plan = cand["target_plan"]
@@ -297,7 +297,7 @@ def test_exhibit_a_flag_off_is_byte_identical_legacy(tmp_path):
     assert event["risk"] == pytest.approx(5.585922201459198)
     assert event["reward"] == pytest.approx(0.6849999999999454)
     assert event["net_rr"] == pytest.approx(0.07638275703170794)
-    assert not any(e["event"] == "candidate_shadow" for e in mine)
+    assert not any(e["event"] == "candidate" for e in mine)
 
 
 # ---------------------------------------------------------------- Exhibit B
@@ -375,7 +375,7 @@ def test_exhibit_b_blocks_honestly_with_the_full_table(tmp_path):
     assert leg["net_rr"] < 1.20
     assert plan["planned_objective"] is None
     assert plan["plan_kind"] == "blocked"
-    assert not any(e["event"] == "candidate_shadow" for e in mine)
+    assert not any(e["event"] == "candidate" for e in mine)
 
 
 # ---------------------------------------------------------------- engine behaviour
@@ -433,7 +433,7 @@ def test_engine_continuation_plan_skips_exhausted_tp1(tmp_path):
     ]
     events = _drive(engine, "XAUUSD", ticks, _flat_frames())
     candidates = [e for e in events
-                  if e["event"] == "candidate_shadow"]
+                  if e["event"] == "candidate"]
     assert len(candidates) == 1
     cand = candidates[0]
     assert cand["target_plan"]["plan_kind"] == "continuation"
@@ -465,7 +465,7 @@ def test_engine_all_objectives_spent_blocks_with_table(tmp_path):
     assert blocked[0]["reason_code"] == "geometry.net_rr_below_min"
     assert blocked[0]["target_plan"]["legs"][0]["verdict"] == \
         "exhausted"
-    assert not any(e["event"] == "candidate_shadow" for e in events)
+    assert not any(e["event"] == "candidate" for e in events)
 
 
 def test_engine_spread_envelope_still_blocks_before_planning(tmp_path):
@@ -493,7 +493,7 @@ def test_engine_spread_envelope_still_blocks_before_planning(tmp_path):
     assert "target_plan" not in blocked[0]
 
 
-# ---------------------------------------------------------------- promotion ladder
+# ---------------------------------------------------------------- placement ladder
 
 def test_order_targets_prefers_the_planned_ladder():
     cand = {"planned_targets": [3955.51, 3964.50],

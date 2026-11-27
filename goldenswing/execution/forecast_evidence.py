@@ -15,7 +15,7 @@ Three honesty rules, mirroring the evidence_map doctrine:
    bar, or unscored ranks → no group, no vote, and the journaled
    block says which.  Nothing is synthesized to fill the gap.
 2. **Recorded before weighed.**  The feed block is journaled on
-   every ``judgment_shadow`` record verbatim, whether or not it
+   every ``judgment`` record verbatim, whether or not it
    voted.  Until the ensemble's live calibration (E2's book)
    has EARNED trust, the block is recorded with no decision
    weight — the census doctrine applied to a decision organ.

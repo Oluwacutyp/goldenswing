@@ -1,9 +1,9 @@
-"""Family binding probe (origination §7).
+"""Binding probe (origination §7, rework 2026-11-27: all 33).
 
-Replays recent real H1/M15 closes through the PRODUCTION
-family scans + the real trigger-binding path and counts, per
-family playbook: armed setups, in-direction zone-touch fires,
-bindings, and the binding rule that picked each.
+Replays recent real H1/M15/M5 closes through the PRODUCTION
+scans + the real trigger-binding path and counts, per playbook:
+armed setups, in-direction zone-touch fires, bindings, and the
+binding rule that picked each.
 
 What a "fire" is here: an H1 close landing inside an armed
 setup's entry zone in the setup's direction — the zone-touch
@@ -14,17 +14,37 @@ fire rate.  The verdict handed to ``_run_signal_path`` is
 built from the touching bar + the setup's own geometry
 (entry = the close, stop = the setup's invalidation, target
 = its first target); the binding selection, the seam, and the
-order path are the production code, unmodified.  No roster
-close evals run, so no roster setup competes for the one
-position — the binding counts are measured in isolation;
-the order counts are the binding's downstream effect, not a
-live-competition fill rate.
+order path are the production code, unmodified.  The roster
+close evals run on H1 closes, so roster setups compete for
+the one position alongside the families — the binding counts
+are measured in the live competition, and the order counts
+are the binding's downstream effect, not a live-competition
+fill rate.
 
-Data: the repo's OANDA XAUUSD H1/M15 CSVs (freshest real
-bars on disk; the files end 2026-10-12).  Window: the last
-30 days of H1 closes, with a 400-bar warmup before them.
-No MT5 connection, no live trading, demo-only (fake
-executor; orders never leave the process).
+Coverage (rework 2026-11-27): ALL 33 playbooks.  The 29 on
+the trigger path (roster 12 + range 4 + vol 2 + trend 2 +
+auction 3 + reversion 2 + session 4) go through the fire /
+binding loop below.  The two natives run their own routes on
+their own clocks: qm_m5 on M5 closes (real M5 CSV), qm_d1 on
+D1 closes (real D1 frame resampled from H1) — their orders
+are counted from the executor, not the fire loop.  The last
+two cannot be replayed from these bars and are reported as
+such, not faked: hot_scalp needs M1 closes (no M1 CSV on
+disk — its live path is proven by tests/test_hot_scalp_*.py
+and tests/test_completion02_connections.py) and
+arrival_zone is the resting-limit path (its live path is
+proven by the arrival-zone tests in
+tests/test_completion02_connections.py).  The 26 Nov Hot
+Scalp acceptance case is NOT in this probe: the OANDA CSVs
+end 2026-10-12 — it is pinned in
+tests/test_judgment_core.py::test_26_nov_pullback_sell_reads_buy.
+
+Data: the repo's OANDA XAUUSD H1/M15/M5 CSVs (freshest real
+bars on disk; the H1/M15 files end 2026-10-12, M5 starts
+2026-04-01).  Window: the last 30 days of H1 closes, with
+a 400-bar warmup before them.  No MT5 connection, no live
+trading, demo-only (fake executor; orders never leave the
+process).
 
 Usage (from the repo root):
     python scripts/family_binding_probe.py [--days N]
@@ -48,22 +68,43 @@ from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
 from goldenswing.execution.playbook_registry import (
     AUCTION_SPECS,
     REVERSION_SPECS,
+    ROSTER_SPECS,
     SESSION_SPECS,
     TREND_SPECS,
     VOL_SPECS,
+    order_route_for,
 )
 from goldenswing.execution.risk import gold_spec
 from goldenswing.live.hierarchy import TimeframeStack
 
-FAMILY = ([s.name for s in VOL_SPECS]
-          + [s.name for s in TREND_SPECS]
-          + [s.name for s in AUCTION_SPECS]
-          + [s.name for s in REVERSION_SPECS]
-          + [s.name for s in SESSION_SPECS])
-FAMILY_SET = set(FAMILY)
-FAMILY_OF = {s.name: s.route for s in (
-    list(VOL_SPECS) + list(TREND_SPECS) + list(AUCTION_SPECS)
+# The 29 trigger-path playbooks: every spec whose trigger is a
+# same-direction fire on its own clock, routed through the
+# shared signal path.  ROSTER_SPECS is 16 (12 H1 roster + the 4
+# range specs, which ride the H1 roster's scan cadence) — the
+# range specs are NOT added twice.
+TRIGGER_PATH = ([s.name for s in ROSTER_SPECS]
+                + [s.name for s in VOL_SPECS]
+                + [s.name for s in TREND_SPECS]
+                + [s.name for s in AUCTION_SPECS]
+                + [s.name for s in REVERSION_SPECS]
+                + [s.name for s in SESSION_SPECS])
+TRIGGER_PATH_SET = set(TRIGGER_PATH)
+ROUTE_OF = {s.name: s.route for s in (
+    list(ROSTER_SPECS) + list(VOL_SPECS)
+    + list(TREND_SPECS) + list(AUCTION_SPECS)
     + list(REVERSION_SPECS) + list(SESSION_SPECS))}
+# Natives on their own routes (own clocks, own _run_ methods).
+NATIVES = ("qm_m5", "qm_d1")
+# The two playbooks no real-bars replay on disk can drive.
+NOT_REPLAYABLE = {
+    "hot_scalp": "needs M1 closes (no M1 CSV on disk)",
+    "arrival_zone": "resting-limit path (no resting trigger in replay)",
+}
+ALL_PLAYBOOKS = TRIGGER_PATH + list(NATIVES) + list(NOT_REPLAYABLE)
+# Back-compat names for the old family-only probe.
+FAMILY = TRIGGER_PATH
+FAMILY_SET = TRIGGER_PATH_SET
+FAMILY_OF = ROUTE_OF
 
 
 class _FakeExecutor:
@@ -150,6 +191,27 @@ def _situation():
     permission)."""
 
 
+def _clean_state(tmp: Path) -> None:
+    """Delete the runner's persisted state files (see main)."""
+    import shutil
+
+    for name in (
+            "setup_lifecycle.json", "candidate_instances.json",
+            "scenario_book.json", "judgment_audit_state.json",
+            "judgment_thesis_state.json", "situations.jsonl",
+            "situation_latest.json", "mt5_journal.jsonl",
+            "mt5_risk.json", "hot_scalp_setups.db", "zones.db"):
+        try:
+            (tmp / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+    for name in ("deterministic", "mt5_charts"):
+        try:
+            shutil.rmtree(tmp / name, ignore_errors=True)
+        except OSError:
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=30)
@@ -158,6 +220,7 @@ def main() -> int:
 
     h1_all = _load("OANDA_XAU_USD_H1_20241001_20261012.csv")
     m15_all = _load("OANDA_XAU_USD_M15_20241001_20261012.csv")
+    m5_all = _load("OANDA_XAU_USD_M5_20260401_20261012.csv")
     h4_all = _resample(h1_all, "4h")
     d1_all = _resample(h1_all, "1d")
     end = h1_all.index[-1]
@@ -165,16 +228,28 @@ def main() -> int:
     warm = pd.Timedelta(hours=args.frame_bars)
     h1 = h1_all.loc[start - warm:end]
     m15 = m15_all.loc[start - warm:end]
+    m5 = m5_all.loc[start - warm:end]
     h4 = h4_all.loc[start - warm:end]
     d1 = d1_all.loc[start - warm:end]
     # Replay steps: the M15 closes inside the window.
     steps = m15.loc[start:end]
     print(f"H1 bars: {len(h1)} (window {start} .. {end}); "
-          f"M15 steps: {len(steps)}; H4: {len(h4)}; D1: {len(d1)}",
+          f"M15 steps: {len(steps)}; M5 bars: {len(m5)}; "
+          f"H4: {len(h4)}; D1: {len(d1)}",
           flush=True)
 
     tmp = REPO_ROOT / "tmp" / "family_binding_probe"
     tmp.mkdir(parents=True, exist_ok=True)
+    # Fresh replay every run: the runner restores its persistent
+    # state from this dir (setup lifecycle, scenario book,
+    # judgment audit/thesis, situations, risk, hot-scalp store,
+    # zones) — a second run over the same bars would re-detect
+    # the same setup IDs and dedupe them as already-known, so
+    # arming collapses (rework 2026-11-27: a reused dir armed
+    # 2 setups by close 100 where a fresh dir armed 53).  The
+    # output (binding_counts.json) is written at the end and is
+    # not among the deleted files.
+    _clean_state(tmp)
     cfg = MT5RunnerConfig(
         journal_path=tmp / "mt5_journal.jsonl",
         risk_state_path=tmp / "mt5_risk.json",
@@ -197,6 +272,7 @@ def main() -> int:
     binds: Counter = Counter()
     rules: dict[str, Counter] = defaultdict(Counter)
     orders: Counter = Counter()
+    native_orders: Counter = Counter()
     stages: dict[str, Counter] = defaultdict(Counter)
     h1_closes = 0
     t0 = time.time()
@@ -204,21 +280,34 @@ def main() -> int:
     h1_idx = h1.index
     h4_idx = h4.index
     d1_idx = d1.index
+    m5_idx = m5.index
     m15_base = int(m15.index.searchsorted(start))
     fb = args.frame_bars
+
+    def _count_orders(before: int, counter: Counter) -> None:
+        for o in runner.executor.orders[before:]:
+            pb = str(o.get("alert_id", "")).split("-")[1] \
+                if str(o.get("alert_id", "")).startswith("MT5-") \
+                else "?"
+            if pb in TRIGGER_PATH_SET or pb in NATIVES:
+                counter[pb] += 1
 
     for i, ts in enumerate(steps.index):
         # Frames end at the last closed bar of each clock.
         h1_n = int(h1_idx.searchsorted(ts, side="right"))
         h4_n = int(h4_idx.searchsorted(ts, side="right"))
         d1_n = int(d1_idx.searchsorted(ts, side="right"))
+        m5_n = int(m5_idx.searchsorted(ts, side="right"))
         m15_pos = m15_base + i
         m15_frame = m15.iloc[max(0, m15_pos - fb + 1):m15_pos + 1]
+        m5_frame = m5.iloc[max(0, m5_n - fb):m5_n]
+        d1_frame = d1.iloc[max(0, d1_n - fb):d1_n]
         runner._stack = TimeframeStack.from_frames({
             "H1": h1.iloc[max(0, h1_n - fb):h1_n],
             "H4": h4.iloc[max(0, h4_n - fb):h4_n],
-            "D1": d1.iloc[max(0, d1_n - fb):d1_n],
-            "M15": m15_frame})
+            "D1": d1_frame,
+            "M15": m15_frame,
+            "M5": m5_frame})
         tick = {"mid": float(m15_frame["close"].iloc[-1]),
                 "bid": float(m15_frame["close"].iloc[-1]) - 0.1,
                 "ask": float(m15_frame["close"].iloc[-1]) + 0.1,
@@ -239,7 +328,8 @@ def main() -> int:
         # from the replayed frames; also runs the book cycle
         # on H1 closes) — BEFORE the scans, as in _refresh_bars.
         runner._situation_on_closes(appended, tick)
-        # Production cadence (MT5Runner._refresh_bars Pass 7).
+        # Production cadence (MT5Runner._refresh_bars Pass 7 +
+        # the roster close evals + the native routes).
         runner._run_auction_value_family(
             ("H1",), {}, source="live_close")
         runner._run_mean_reversion_family(
@@ -248,8 +338,21 @@ def main() -> int:
             ("H1",), {}, source="live_close")
         runner._run_vol_expansion_family(
             ("M15",), {}, source="live_close")
+        # qm_m5 native route on its own clock (M5 closes; for
+        # probe purposes it runs on the M5 closes that land on
+        # an H1 close — the route still reads real M5 bars).
+        if is_h1:
+            _nb = len(runner.executor.orders)
+            runner._run_qm_m5(m5_frame, {})
+            _count_orders(_nb, native_orders)
+        if is_d1:
+            # qm_d1 native route on the D1 close.
+            _nb = len(runner.executor.orders)
+            runner._run_qm_d1(d1_frame, {})
+            _count_orders(_nb, native_orders)
         if is_h1:
             h1_closes += 1
+            runner._run_roster_close_evals({}, source="live_close")
             runner._run_vol_expansion_family(
                 ("H1",), {}, source="live_close")
             runner._run_trend_momentum_family(
@@ -352,23 +455,37 @@ def main() -> int:
     print(f"\nDone: {h1_closes} H1 closes in "
           f"{time.time() - t0:.0f}s; data ends {end}")
     rows = []
-    for name in FAMILY:
+    for name in ALL_PLAYBOOKS:
+        if name in TRIGGER_PATH_SET:
+            route = ROUTE_OF[name]
+            n_orders = orders[name]
+            note = ""
+        elif name in NATIVES:
+            route = order_route_for(name) or f"{name}_native"
+            n_orders = native_orders[name]
+            note = "native route (own clock)"
+        else:
+            route = order_route_for(name) or name
+            n_orders = 0
+            note = NOT_REPLAYABLE[name]
         rows.append({
             "playbook": name,
-            "route": FAMILY_OF[name],
+            "route": route,
             "armed": len(armed[name]),
             "fires": fires[name],
             "bindings": binds[name],
             "rules": dict(rules[name]),
-            "orders": orders[name],
+            "orders": n_orders,
             "stages": dict(stages[name]),
+            "note": note,
         })
     print(f"{'playbook':38s} {'armed':>5s} {'fires':>5s} "
           f"{'binds':>5s} {'orders':>6s}  rules / stages")
     for r in rows:
         print(f"{r['playbook']:38s} {r['armed']:5d} {r['fires']:5d} "
               f"{r['bindings']:5d} {r['orders']:6d}  "
-              f"{r['rules']} {r['stages']}")
+              f"{r['rules']} {r['stages']}"
+              + (f"  [{r['note']}]" if r["note"] else ""))
     out = tmp / "binding_counts.json"
     out.write_text(json.dumps(rows, indent=2))
     print(f"wrote {out}")

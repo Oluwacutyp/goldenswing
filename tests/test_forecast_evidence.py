@@ -120,14 +120,18 @@ def test_merge_adds_one_group_and_never_mutates_the_source():
     assert block["text"] in merged["supporting"]
     assert evidence["evidence_groups"] == {}   # source untouched
 
+    # The verdict is the structure's reads, never a text
+    # count (owner order 2026-11-27 — the formula core is
+    # RETIRED): the forecast feed rides the record as
+    # evidence, but the verdict is identical with or without
+    # the feed when the measured structure is the same.
     plain = evaluate_judgment(candidate=_candidate(),
                               decision={}, evidence=evidence,
                               context={})
     fed = evaluate_judgment(candidate=_candidate(), decision={},
                             evidence=merged, context={})
-    assert fed["evidence_balance"]["groups_for"] == [GROUP]
-    assert fed["support_score"] > plain["support_score"]
-    assert fed["expected_r"] > plain["expected_r"]
+    assert fed == plain
+    assert fed["decision"] == "abstain"  # no structure measured
 
 
 def test_unweighed_block_leaves_evidence_unchanged():

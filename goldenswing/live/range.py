@@ -504,9 +504,15 @@ def range_setup(range_def: RangeDef, *, bias_h4: int = 0,
 # playbooks arm in the breakout direction, range playbooks stop).
 # Size is 0.5x until a retest of the broken edge holds (price touches
 # the broken edge and closes back in the breakout direction), then
-# 1.0x.  No retest within RETEST_WINDOW_H1 H1 bars: the breakout
-# stands on the 2nd close + BOS alone, still 0.5x until a retest
-# holds (a later retest still upgrades the size).
+# 1.0x.  A retest is an ENTRY-CLOCK event (rework 2026-11-27): it is
+# detected on M15 closes, and the window is counted in M15 bars —
+# the old H1-close retest waited whole hours while price ran away
+# from the edge (25 Nov live status: $47.6 below the broken edge
+# while the retest was still "pending").  No retest within
+# RETEST_WINDOW_M15 M15 bars: the breakout stands on the 2nd close
+# + BOS alone, still 0.5x until a retest holds (a later retest
+# still upgrades the size).  The regime lock stays H1: the lock is
+# range-regime hysteresis and does not gate the fire.
 #
 # ANTI-WHIPSAW / HYSTERESIS:
 # - Regime lock: once the regime switches, it holds a minimum of
@@ -534,7 +540,10 @@ SWEEP_WICK_ATR = 0.25     # wick beyond edge to count as a sweep probe
 BREAKOUT_CLOSE_ATR = 0.5  # H1 close beyond edge to count as breakout
 BUFFER_ATR = 0.25         # no-trade band around an edge (regime switch)
 REGIME_LOCK_H1 = 4        # min H1 bars a regime holds before switching
-RETEST_WINDOW_H1 = 4      # H1 bars to see a retest after breakout
+RETEST_WINDOW_M15 = 16    # M15 bars to see a retest after breakout
+                          # (rework 2026-11-27: the retest is an
+                          # entry-clock event — 4 H1 bars of wall
+                          # time, counted in M15 bars)
 COOLDOWN_H1 = 2           # H1 bars cooldown per edge after false breakout
 SWEEP_WICK_EXPIRY_M15 = 12  # M15 bars a wick waits for reclaim
 SWEEP_CONFIRM_EXPIRY_M15 = 12  # M15 bars a sweep confirm stays armed
@@ -636,7 +645,7 @@ class BoundaryTracker:
             "breakout_id": self.breakout_id,
             "size_mult": self.size_mult,
             "retest_held": self.retest_held,
-            "retest_remaining_h1": int(self.retest_remaining),
+            "retest_remaining_m15": int(self.retest_remaining),
             "lock_remaining_h1": int(self.lock_remaining),
             "pending_revert": bool(self.pending_revert),
             "sweep_confirmed_edges": sorted(self.sweep_confirmed),
@@ -718,9 +727,9 @@ class BoundaryTracker:
             # A restored breakout is still awaiting its retest
             # unless the persist happened after it held — the
             # retest state itself is not persisted (it resolves
-            # on the next H1 bar from price action, conservatively
+            # on the next M15 bar from price action, conservatively
             # re-checking the touch rather than trusting a flag).
-            self.retest_remaining = RETEST_WINDOW_H1
+            self.retest_remaining = RETEST_WINDOW_M15
             self.breakout_id = 1  # restored breakout already fired
         if state.breakout_edge in EDGE_SIDES:
             self.edge[state.breakout_edge]["beyond_closes"] = int(
@@ -778,8 +787,8 @@ class BoundaryTracker:
     def update(self, h1, m15) -> list[BoundaryEvent]:
         """Consume newly closed H1 + M15 bars, in time order.
 
-        M15 bars first (sweep wick / reclaim / BOS live on M15),
-        then H1 bars (breakout closes / lock / cooldown / retest
+        M15 bars first (sweep wick / reclaim / BOS / retest live
+        on M15), then H1 bars (breakout closes / lock / cooldown
         live on H1).  Bars at or before the last-processed close
         are skipped — idempotent across restarts and re-feeds.
         """
@@ -894,6 +903,45 @@ class BoundaryTracker:
                                      close_price=close,
                                      upto_pos=pos):
                         self._confirm_breakout(ts, events)
+                elif self.regime == "breakout_trend" \
+                        and side == self.breakout_edge \
+                        and st["state"] == "awaiting_retest" \
+                        and not self.retest_held:
+                    # Retest on the ENTRY clock (rework 2026-11-27):
+                    # the M15 bar touches the broken edge band and
+                    # closes back in the breakout direction.  The
+                    # H1 close used to be the retest detector, so a
+                    # breakout waited whole hours while price ran
+                    # away from the edge.
+                    touches_band = (low <= edge_level + BUFFER_ATR * atr
+                                    and high >= edge_level - BUFFER_ATR * atr)
+                    closes_breakout_way = (close > edge_level) \
+                        if side == "high" else (close < edge_level)
+                    if touches_band and closes_breakout_way:
+                        self.retest_held = True
+                        st["state"] = "retest_held"
+                        events.append(BoundaryEvent(
+                            "retest_held", side,
+                            "retest of broken edge held — size 0.5x -> 1.0x",
+                            self.last_h1_ts))
+            # Retest window (rework 2026-11-27): counted in M15
+            # bars — one decrement per M15 close.  No retest within
+            # RETEST_WINDOW_M15 bars -> the breakout stands on 2nd
+            # close + BOS alone, still 0.5x until a retest holds (a
+            # later retest upgrades).
+            if self.regime == "breakout_trend" \
+                    and not self.retest_held \
+                    and self.retest_remaining > 0:
+                self.retest_remaining -= 1
+                if self.retest_remaining == 0:
+                    st = self.edge[self.breakout_edge]
+                    if st["state"] == "awaiting_retest":
+                        st["state"] = "breakout_no_retest"
+                    events.append(BoundaryEvent(
+                        "retest_missed", self.breakout_edge or "",
+                        "no retest within 16 M15 bars — breakout "
+                        "stands on 2nd close + BOS, size stays 0.5x",
+                        self.last_h1_ts))
         return events
 
     def _process_h1(self, h1, m15) -> list[BoundaryEvent]:
@@ -924,22 +972,6 @@ class BoundaryTracker:
             else:
                 self._process_h1_range(ts, close, high, low, events,
                                        m15=m15)
-            # Retest window: no retest within RETEST_WINDOW_H1 bars
-            # -> the breakout stands on 2nd close + BOS alone, still
-            # 0.5x until a retest holds (a later retest upgrades).
-            if self.regime == "breakout_trend" \
-                    and not self.retest_held \
-                    and self.retest_remaining > 0:
-                self.retest_remaining -= 1
-                if self.retest_remaining == 0:
-                    st = self.edge[self.breakout_edge]
-                    if st["state"] == "awaiting_retest":
-                        st["state"] = "breakout_no_retest"
-                    events.append(BoundaryEvent(
-                        "retest_missed", self.breakout_edge or "",
-                        "no retest within 4 H1 bars — breakout "
-                        "stands on 2nd close + BOS, size stays 0.5x",
-                        ts))
         return events
 
     def _process_h1_range(self, ts, close, high, low, events,
@@ -1018,7 +1050,14 @@ class BoundaryTracker:
 
     def _process_h1_breakout(self, h1, pos, ts, close, high, low,
                              events) -> None:
-        """H1 logic while regime == BREAKOUT_TREND: retest / failure."""
+        """H1 logic while regime == BREAKOUT_TREND: failure only.
+
+        The retest is an entry-clock (M15) event — detected in
+        _process_m15, never here (rework 2026-11-27).  What H1
+        still decides: a close back inside the edge after the
+        breakout is a false breakout (regime reverts after the
+        H1 lock expires).
+        """
         atr = self.atr
         side = self.breakout_edge
         if side not in EDGE_SIDES:
@@ -1028,21 +1067,10 @@ class BoundaryTracker:
             if side == "high" else self.range_def.low
         if self.retest_held:
             return  # retest held: breakout genuine, no revert
-        touches_band = (low <= edge_level + BUFFER_ATR * atr
-                        and high >= edge_level - BUFFER_ATR * atr)
-        closes_breakout_way = (close > edge_level) \
-            if side == "high" else (close < edge_level)
         closes_inside = (close < edge_level - BUFFER_ATR * atr) \
             if side == "high" else \
             (close > edge_level + BUFFER_ATR * atr)
-        if touches_band and closes_breakout_way:
-            self.retest_held = True
-            st["state"] = "retest_held"
-            events.append(BoundaryEvent(
-                "retest_held", side,
-                "retest of broken edge held — size 0.5x -> 1.0x",
-                ts))
-        elif closes_inside:
+        if closes_inside:
             self._false_breakout(side, ts, events,
                                  "close back inside after breakout")
 
@@ -1061,7 +1089,7 @@ class BoundaryTracker:
         self.breakout_edge = side
         self.breakout_id += 1
         self.lock_remaining = REGIME_LOCK_H1
-        self.retest_remaining = RETEST_WINDOW_H1
+        self.retest_remaining = RETEST_WINDOW_M15
         self.retest_held = False
         self.pending_revert = False
         self.regime_since_ts = ts

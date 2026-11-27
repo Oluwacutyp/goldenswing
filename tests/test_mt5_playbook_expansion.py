@@ -1,16 +1,16 @@
-"""MT5 playbook expansion: promotion + new real-trader setups.
+"""MT5 playbook expansion: live routes + new real-trader setups.
 
-A14 (rework, owner addendum 2026-10-21): the shadow tier is
-abolished on the MT5 path — every playbook the runner evaluates is
-eligible to execute through the same decision flow (Asymmetry
-Score floors, RiskPool, hard lines); the demo engine IS the
-shadow.  ``execute_playbooks`` defaults to None (= all evaluated);
-an explicit tuple remains the owner's narrowing override, and
-``disabled_playbooks`` is the per-playbook kill switch.  The
-promotion (sweep_reversal anchor + fvg_limit) and each new setup
-get their tests here: signal fires on the right structure, does
-not fire on chop, no repainting (batch candidates == live_signal
-signal set).
+A14 (rework, owner addendum 2026-10-21): every playbook the
+runner evaluates is eligible to execute through the same
+decision flow (Asymmetry Score floors, RiskPool, hard lines);
+the demo engine IS live — no shadow tier remains (owner order
+2026-11-25/27).  ``execute_playbooks`` defaults to None (=
+all evaluated); an explicit tuple remains the owner's
+narrowing override, and ``disabled_playbooks`` is the
+per-playbook kill switch.  The anchor (sweep_reversal +
+fvg_limit) and each new setup get their tests here: signal
+fires on the right structure, does not fire on chop, no
+repainting (batch candidates == live_signal signal set).
 """
 from __future__ import annotations
 
@@ -68,9 +68,9 @@ def _df(rows, freq="h"):
 
 def test_mt5_execute_set_defaults_to_all_evaluated(tmp_path):
     """A14: no validated-subset execute list any more — the default
-    config executes EVERY playbook the runner evaluates (shadow was
-    unconfirmable by construction; the demo engine is the shadow).
-    An explicit tuple remains the owner's narrowing override."""
+    config executes EVERY playbook the runner evaluates (no shadow
+    tier remains; the demo engine is live).  An explicit tuple
+    remains the owner's narrowing override."""
     from goldenswing.playbooks import (
         FVGLimitPlaybook,
         FVGMidlinePlaybook,
@@ -95,7 +95,7 @@ def test_mt5_execute_set_defaults_to_all_evaluated(tmp_path):
         s.name for s in ROSTER_SPECS + VOL_SPECS + TREND_SPECS
         + AUCTION_SPECS + REVERSION_SPECS + SESSION_SPECS}
     # Evaluated set == execute set under the default config —
-    # including the playbooks the old tier kept shadow
+    # including the playbooks the old tier kept back
     # (turtle_soup, v_reversal, retracement_trap, order_block).
     assert all(runner._executes(name) for name in evaluated)
     assert runner._executes("qm_m5") and runner._executes("qm_d1")

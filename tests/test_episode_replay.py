@@ -166,7 +166,7 @@ def test_hot_scalp_leg_exhibits(tmp_path):
     # Live: blocked at net_rr 0.0764 against a spent
     # micro-swing.  Current engine: the creation hierarchy is
     # priced instead — TP1 selected at 1.456 net R/R.
-    assert a["event"] == "candidate_shadow"
+    assert a["event"] == "candidate"
     assert a["hierarchy"] == [3955.51, 3964.50]
     assert a["legs"][0]["price"] == 3955.51
     assert a["legs"][0]["verdict"] == "selected"

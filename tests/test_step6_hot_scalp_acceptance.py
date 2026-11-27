@@ -14,9 +14,11 @@ until authoritative broker reconciliation).  Closed here:
   (scan_degraded), arming nothing and emitting no candidate;
 - cost envelope: a reclaim with spread beyond 0.20 x M1 ATR is
   blocked (costs.spread_too_wide), never a candidate;
-- shadow authority at the runner level: a candidate_shadow
-  journal record is produced while the executor receives ZERO
-  orders.
+- live authority at the runner level: a candidate journal
+  record is produced with execution authority live — and the
+  executor receives an order only when the seam's judgment
+  takes (this fixture's flat M5 frame abstains, so ZERO
+  orders land here).
 """
 
 from types import SimpleNamespace
@@ -106,7 +108,7 @@ def test_setup_expires_and_never_candidates(tmp_path):
     assert any(e.get("event") == "setup_expired"
                and e.get("reason_code") == "setup.expired"
                for e in events)
-    assert not any(e.get("event") == "candidate_shadow" for e in events)
+    assert not any(e.get("event") == "candidate" for e in events)
 
 
 def test_closed_m1_breach_invalidates_tick_wick_does_not(tmp_path):
@@ -124,7 +126,7 @@ def test_closed_m1_breach_invalidates_tick_wick_does_not(tmp_path):
     assert any(e.get("event") == "setup_invalidated"
                and e.get("reason_code") == "setup.invalidated_close"
                for e in events)
-    assert not any(e.get("event") == "candidate_shadow" for e in events)
+    assert not any(e.get("event") == "candidate" for e in events)
 
 
 def test_stale_frames_withhold_the_whole_scan(tmp_path):
@@ -139,7 +141,7 @@ def test_stale_frames_withhold_the_whole_scan(tmp_path):
     assert any(e.get("event") == "scan_degraded"
                and e.get("reason_code") == "data.stale"
                for e in events)
-    assert not any(e.get("event") in ("candidate_shadow", "setup_armed")
+    assert not any(e.get("event") in ("candidate", "setup_armed")
                    for e in events)
 
 
@@ -161,7 +163,7 @@ def test_wide_spread_blocks_the_reclaim(tmp_path):
     assert any(e.get("event") == "candidate_blocked"
                and e.get("reason_code") == "costs.spread_too_wide"
                for e in events)
-    assert not any(e.get("event") == "candidate_shadow" for e in events)
+    assert not any(e.get("event") == "candidate" for e in events)
 
 
 # ------------------------------------------------- runner shadow authority
@@ -199,7 +201,7 @@ def _h1_frame():
                             freq="h"))
 
 
-def test_runner_shadow_candidate_places_no_orders(tmp_path):
+def test_runner_live_candidate_abstains_places_no_orders(tmp_path):
     cfg = MT5RunnerConfig(
         journal_path=tmp_path / "mt5_journal.jsonl",
         risk_state_path=tmp_path / "mt5_risk.json",
@@ -225,10 +227,10 @@ def test_runner_shadow_candidate_places_no_orders(tmp_path):
         {"time": "2026-10-27T00:50:30Z", "mid": 100.30,
          "bid": 100.29, "ask": 100.31},
     ]:
-        runner._run_hot_scalp_shadow(tick)
+        runner._run_hot_scalp(tick)
     records = runner.journal.records()
     assert any(r.get("type") == "hot_scalp_event"
-               and r.get("event") == "candidate_shadow"
-               and r.get("execution_authority") == "shadow_only"
+               and r.get("event") == "candidate"
+               and r.get("execution_authority") == "live"
                for r in records)
     assert runner.executor.placed == []

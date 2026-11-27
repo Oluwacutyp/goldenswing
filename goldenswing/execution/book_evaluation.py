@@ -2,112 +2,107 @@
 SPEC §2.2's validation row + the §G discipline, generalised
 from per-family verdicts to one comparison surface).
 
-Passes 5 and 7a–7e each built a promotion evaluation for one
-family or route pair: the §G range routes, volatility
-expansion, trend / momentum, auction / value, mean
-reversion, session / opening range, and the two binding
-connected routes (hot_scalp_promotion / resting_limit).
-Each reads ONLY its own route-stamped shadow history
-through the ONE shared evaluator (execution/
-range_promotion.py).  What none of them does is put the
-whole book on one page: which families are measured at
-all, which discriminate the right way, and how the
-GOVERNING routes' own judged history (h1_trigger,
-qm_m5_native, qm_d1_native — every candidate on them also
-journals a route-stamped judgment_shadow verdict) grades
-on the identical instrument.
-
-This module is that page.  It re-implements NOTHING:
-
-- the shadow families' rows are their own modules'
-  snapshots, verbatim (execution/range_promotion.py,
-  vol_promotion.py, trend_promotion.py, auction_promotion.py,
-  reversion_promotion.py, session_promotion.py) and the
-  connected routes' rows are route_promotion.py's standing
-  evaluation, verbatim;
-- the governing routes' rows are folded from the journal
-  through range_promotion's accumulate with a governing
-  routes map — the same S4 pairing at +4h, the same
-  degenerate-R exclusions, the same per-arm floors;
-- each group's POOLED read (its routes' paired outcomes
-  combined) is verdict_for over the pooled arms — one
-  evaluator, one rule, applied to the pool: inverted
-  discrimination can never read ready at any level.
+Every family and route grades on ONE shared instrument
+(execution/evaluation.py — the S4 pairing at +4h, the same
+degenerate-R exclusions, the same per-arm floors): the five
+families' rows (range, volatility expansion, trend /
+momentum, auction / value, mean reversion, session /
+opening range) and the connected routes (hot_scalp,
+arrival_zone) and the roster / native routes
+(h1_roster, qm_m5_native, qm_d1_native).  Each group's
+POOLED read (its routes' paired outcomes combined) is
+verdict_for over the pooled arms — one evaluator, one
+rule, applied to the pool: inverted discrimination can
+never read ready at any level.
 
 POSTURE: evaluation and reporting only.  This record
-grants, demotes and changes NO authority.  The shadow
-families' promotion_ready verdicts remain recommendations
-to the owner; the connected routes' binding verdicts live
-in route_promotion's own records and are neither re-issued
-nor overridden here (their pooled read in this table is a
-comparison, binds=False); the governing routes are measured
-for the record — a governing route's pooled read is a
-performance fact, not a promotion question.
+grants, promotes, demotes and changes NO authority — the
+promotion gate is deleted (owner order 2026-11-25/27),
+so a verdict is a measurement, never a recommendation
+for a promotion that no longer exists.  Every route is
+live; the families' rows are their measured history, the
+same as the governing routes'.
 
 The cycle host is the unified self-audit (the runner feeds
 this module the same journal windows, inside the same S3
 cadence, persisted in the same state file under its own
-key, AFTER every family phase has folded the window — the
-comparison therefore reads this cycle's family snapshots,
-not last cycle's).  Findings feed back nowhere.
+key).  Findings feed back nowhere.
 """
 from __future__ import annotations
 
-from . import auction_promotion as _auction
-from . import range_promotion as _eval
-from . import reversion_promotion as _reversion
-from . import route_promotion as _route
-from . import session_promotion as _session
-from . import trend_promotion as _trend
-from . import vol_promotion as _vol
+from . import evaluation as _eval
+from .playbook_registry import (
+    AUCTION_SPECS, NATIVE_SPECS, RANGE_SPECS, REVERSION_SPECS,
+    ROSTER_SPECS, SESSION_SPECS, TREND_SPECS, VOL_SPECS,
+    order_route_for as _order_route_for)
 
 #: Journal record type for one comparison snapshot.
 RECORD_TYPE = "book_evaluation"
 
-#: The shadow families, in program order: (group key, plain
-#: label, module).  Each module's snapshot(state) is the
-#: family's own verdict table — consumed, never recomputed.
-FAMILY_GROUPS: tuple[tuple[str, str, object], ...] = (
-    ("range", "§G range", _eval),
-    ("vol", "volatility expansion", _vol),
-    ("trend", "trend / momentum", _trend),
-    ("auction", "auction / value", _auction),
-    ("reversion", "mean reversion", _reversion),
-    ("session", "session / opening range", _session),
+#: The families, in program order: (group key, plain label,
+#: the registry specs whose playbooks form the group).  Each
+#: group's route map is its playbooks' own live routes
+#: (playbook_registry.order_route_for) — one truth, derived.
+FAMILY_GROUPS: tuple[tuple[str, str, tuple], ...] = (
+    ("range", "§G range", RANGE_SPECS),
+    ("vol", "volatility expansion", VOL_SPECS),
+    ("trend", "trend / momentum", TREND_SPECS),
+    ("auction", "auction / value", AUCTION_SPECS),
+    ("reversion", "mean reversion", REVERSION_SPECS),
+    ("session", "session / opening range", SESSION_SPECS),
 )
 
-#: The governing routes and the playbooks whose judged
-#: history is stamped with them (route_promotion's own
-#: order-attribution table, minus the two connected routes
-#: whose binding evaluation is its own group below).
+#: Connected routes (the two sleeves outside the registry's
+#: playbook specs): hot_scalp and arrival_zone, each on its
+#: own live route.
+CONNECTED_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("connected", "connected routes",
+     ("hot_scalp", "arrival_zone")),
+)
+
+
+def _routes_map_for(specs) -> dict[str, str]:
+    """Playbook -> live route for a spec group (the registry's
+    order_route_for, one truth)."""
+    return {spec.name: (_order_route_for(spec.name) or spec.name)
+            for spec in specs}
+
+
+def _playbooks_for(specs) -> tuple[str, ...]:
+    return tuple(spec.name for spec in specs)
+
+#: The roster / native routes and the playbooks whose judged
+#: history is stamped with them: the roster playbooks ride
+#: the h1_roster route, the two natives ride their own
+#: native routes.  (The same playbooks' family-route history
+#: is a different question and is graded in those families'
+#: own rows, never here.)
 GOVERNING_ROUTES: tuple[str, ...] = (
-    "h1_trigger", "qm_m5_native", "qm_d1_native")
+    "h1_roster", "qm_m5_native", "qm_d1_native")
 GOVERNING_JUDGMENT_ROUTES: dict[str, str] = {
-    playbook: route
-    for playbook, route in _route.ORDER_ROUTE_BY_PLAYBOOK.items()
-    if route in GOVERNING_ROUTES}
+    spec.name: (_order_route_for(spec.name) or spec.name)
+    for spec in tuple(ROSTER_SPECS) + tuple(NATIVE_SPECS)
+    if (_order_route_for(spec.name) or spec.name)
+    in GOVERNING_ROUTES}
 GOVERNING_PLAYBOOKS: tuple[str, ...] = tuple(
     GOVERNING_JUDGMENT_ROUTES)
 
 _GOVERNING_BASIS = (
-    "governing routes' own route-stamped judgment_shadow "
+    "roster / native routes' own route-stamped judgment "
     "records only (judgment.authority_route naming the "
-    "route: h1_trigger for the roster + range playbooks' "
-    "roster firings, qm_m5_native / qm_d1_native for the "
-    "native routes).  The same playbooks' family-route "
-    "history (§G and Pass 7 stamps) is a different question "
-    "and is graded in those families' own rows, never here.")
+    "route: h1_roster for the roster, qm_m5_native / "
+    "qm_d1_native for the native routes).")
 
 _COMPARISON_BASIS = (
     "one instrument for every row: S4 pairing at +4h, "
     "degenerate-R pairs excluded and counted, per-arm "
     "paired floor of 20, medians and hit rates (never "
     "means alone), inverted discrimination can never read "
-    "promotion_ready.  Family rows are each family's own "
-    "evaluation snapshot; governing rows are folded from "
-    "the journal on the same machinery; each group's "
-    "pooled read combines its routes' paired outcomes and "
-    "applies the same verdict rule to the pool.")
+    "ready.  Family rows are each family's own evaluation "
+    "snapshot; roster / native rows are folded from the "
+    "journal on the same machinery; each group's pooled "
+    "read combines its routes' paired outcomes and applies "
+    "the same verdict rule to the pool.")
 
 
 # ------------------------------------------------------------ state
@@ -157,8 +152,7 @@ def _pooled_slot(route_slots: dict) -> dict:
 def _pooled_read(slot: dict, *, family: str) -> dict:
     """The verdict rule over one pooled slot — the same
     verdict_for every route faces, applied to the pool."""
-    verdict, reason = _eval.verdict_for(
-        slot, family=family, binds=False)
+    verdict, reason = _eval.verdict_for(slot, family=family)
     return {
         "binds": False,
         "evaluated": int(slot.get("evaluated") or 0),
@@ -210,42 +204,58 @@ def comparison(*, family_states: dict | None,
     states + the governing fold's standing state.  Pure: the
     same states in, the same table out.
 
-    ``family_states`` maps audit-state keys to standing
-    states: the six shadow families under their own keys
-    ("range_promotion" … "session_promotion") and the
-    connected routes under "route_promotion".  A family
-    whose state has not been supplied reads as an empty
-    snapshot — stated, never invented."""
+    ``family_states`` maps group keys ("range", "vol", …,
+    "connected") to their evaluator standing states (each
+    accumulated over the journal on the shared instrument).
+    A group whose state has not been supplied reads as an
+    empty snapshot — stated, never invented.  Every group
+    is live: the promotion gate is deleted, so no group
+    carries a shadow or governing posture anymore."""
     family_states = family_states or {}
     groups: list[dict] = []
-    for key, label, module in FAMILY_GROUPS:
-        sub = family_states.get(f"{key}_promotion")
+    for key, label, specs in FAMILY_GROUPS:
+        sub = family_states.get(key)
+        routes_map = _routes_map_for(specs)
+        playbooks = _playbooks_for(specs)
         if isinstance(sub, dict):
-            snap = module.snapshot(sub)
+            snap = _eval.snapshot(
+                sub, routes_map=routes_map, playbooks=playbooks,
+                family=label)
             pool = sub.get("routes") or {}
         else:
-            snap = module.snapshot(module.new_state())
+            snap = _eval.snapshot(
+                _eval.new_state(), routes_map=routes_map,
+                playbooks=playbooks, family=label)
             pool = {}
-        groups.append(_group(
-            key, label, "shadow_declared", snap, pool))
-    route_sub = family_states.get("route_promotion")
-    if isinstance(route_sub, dict):
-        route_snap = route_sub.get("last_evaluation") or {}
-        route_pool = route_sub.get("routes") or {}
+        groups.append(_group(key, label, "live", snap, pool))
+    connected_map = {"hot_scalp": "hot_scalp_promotion",
+                     "arrival_zone": "resting_limit"}
+    connected_playbooks = ("hot_scalp", "arrival_zone")
+    connected_sub = family_states.get("connected")
+    if isinstance(connected_sub, dict):
+        connected_snap = _eval.snapshot(
+            connected_sub, routes_map=connected_map,
+            playbooks=connected_playbooks,
+            family="connected routes")
+        connected_pool = connected_sub.get("routes") or {}
     else:
-        route_snap, route_pool = {}, {}
+        connected_snap = _eval.snapshot(
+            _eval.new_state(), routes_map=connected_map,
+            playbooks=connected_playbooks,
+            family="connected routes")
+        connected_pool = {}
     groups.append(_group(
-        "connected", "connected routes (binding evaluation)",
-        "shadow_declared", route_snap, route_pool))
+        "connected", "connected routes",
+        "live", connected_snap, connected_pool))
     governing_snap = _eval.snapshot(
         governing_state, routes_map=GOVERNING_JUDGMENT_ROUTES,
         playbooks=GOVERNING_PLAYBOOKS, basis=_GOVERNING_BASIS,
-        family="governing routes", binds=False)
+        family="governing routes")
     for row in governing_snap["routes"].values():
-        row["authority"] = "governing"
+        row["authority"] = "live"
     groups.append(_group(
         "governing", "governing routes (measured)",
-        "governing", governing_snap,
+        "live", governing_snap,
         governing_state.get("routes") or {}))
     return {
         "horizon_h": _eval.HORIZON_H,
@@ -259,18 +269,19 @@ def comparison(*, family_states: dict | None,
 # ------------------------------------------------------------ the cycle
 
 def cycle(*, state: dict, records: list[dict],
-          family_states: dict | None = None, now=None,
-          damaged_lines: int = 0, window: dict | None = None,
-          run_id: str | None = None,
+          now=None, damaged_lines: int = 0,
+          window: dict | None = None, run_id: str | None = None,
           bar: str | None = None) -> dict | None:
     """One comparison cycle over one journal window (the
     self-audit's contract): fold the window into the
-    governing routes' standing state, read every family's
-    current snapshot, and return the journal record when
-    the comparison changed — or None.  The FIRST cycle
-    always journals: that record is the deployment marker
-    stating the comparison has opened.  A damaged window
-    degrades the cycle (counted, nothing folded)."""
+    governing routes' standing state AND into each family's
+    own standing state (kept here, under ``family_<key>`` —
+    the promotion modules that used to hold them are
+    deleted), and return the journal record when the
+    comparison changed — or None.  The FIRST cycle always
+    journals: that record is the deployment marker stating
+    the comparison has opened.  A damaged window degrades
+    the cycle (counted, nothing folded)."""
     for key, value in new_state().items():
         state.setdefault(key, value)
     if damaged_lines:
@@ -281,7 +292,24 @@ def cycle(*, state: dict, records: list[dict],
         state, records, now=now,
         routes_map=GOVERNING_JUDGMENT_ROUTES,
         playbooks=GOVERNING_PLAYBOOKS, basis=_GOVERNING_BASIS,
-        family="governing routes", binds=False)
+        family="governing routes")
+    family_states: dict[str, dict] = {}
+    for key, label, specs in FAMILY_GROUPS:
+        sub = state.setdefault(f"family_{key}", _eval.new_state())
+        _eval.accumulate(
+            sub, records, now=now,
+            routes_map=_routes_map_for(specs),
+            playbooks=_playbooks_for(specs), family=label)
+        family_states[key] = sub
+    connected_sub = state.setdefault(
+        "family_connected", _eval.new_state())
+    _eval.accumulate(
+        connected_sub, records, now=now,
+        routes_map={"hot_scalp": "hot_scalp_promotion",
+                    "arrival_zone": "resting_limit"},
+        playbooks=("hot_scalp", "arrival_zone"),
+        family="connected routes")
+    family_states["connected"] = connected_sub
     table = comparison(family_states=family_states,
                        governing_state=state)
     state["last_comparison"] = table
@@ -294,95 +322,57 @@ def cycle(*, state: dict, records: list[dict],
         "type": RECORD_TYPE, "bar": bar, "run_id": run_id,
         "window": window, **table,
         "note": (
-            "Whole-book self-evaluation: every family's "
-            "promotion evaluation and the governing routes' "
-            "measured history on one instrument (S4 pairing, "
-            "+4h, degenerate-R excluded).  This record "
-            "grants, demotes and changes no authority — "
-            "shadow verdicts remain recommendations, the "
-            "connected routes' binding verdicts live in "
-            "route_promotion's own records, and governing "
-            "routes are measured, not promoted or demoted, "
-            "here."),
+            "Whole-book self-evaluation: every family's and "
+            "the governing routes' measured history on one "
+            "instrument (S4 pairing, +4h, degenerate-R "
+            "excluded).  This record grants, promotes, "
+            "demotes and changes no authority — every route "
+            "is live, and the verdicts here are measurements, "
+            "never actions."),
     }
 
 
 def evaluate_records(records: list[dict], *, now=None) -> dict:
     """One-shot comparison over a complete record list (an
     exported journal): every family's own accumulate over
-    fresh states, the connected routes' one-shot evaluation,
-    and the governing fold — the same computation the live
-    cycle performs."""
+    fresh states, the connected routes' accumulate, and the
+    governing fold — the same computation the live cycle
+    performs."""
     if now is None:
         stamps = [str(r.get("ts") or "") for r in records
-                  if r.get("type") == "judgment_shadow"]
+                  if r.get("type") in _eval.JUDGMENT_RECORD_TYPES]
         now = max(stamps) if stamps else None
     family_states: dict[str, dict] = {}
-    for key, _label, module in FAMILY_GROUPS:
-        sub = module.new_state()
+    for key, label, specs in FAMILY_GROUPS:
+        sub = _eval.new_state()
         _eval.accumulate(
             sub, records, now=now,
-            routes_map=getattr(
-                module, _ROUTES_ATTR[key]),
-            playbooks=getattr(module, _PLAYBOOKS_ATTR[key]),
-            basis=None, family=_label, binds=False)
-        family_states[f"{key}_promotion"] = sub
-    route_eval = _route.evaluate_records(records, now=now)
-    route_sub = _route.new_state()
+            routes_map=_routes_map_for(specs),
+            playbooks=_playbooks_for(specs),
+            basis=None, family=label)
+        family_states[key] = sub
+    connected_sub = _eval.new_state()
     _eval.accumulate(
-        route_sub, records, now=now,
-        routes_map=_route.ROUTE_JUDGMENT_ROUTES,
-        playbooks=_route.PROMOTION_PLAYBOOKS, basis=None,
-        family="connected routes", binds=True)
-    family_states["route_promotion"] = {
-        "last_evaluation": route_eval,
-        "routes": route_sub.get("routes") or {}}
+        connected_sub, records, now=now,
+        routes_map={"hot_scalp": "hot_scalp_promotion",
+                    "arrival_zone": "resting_limit"},
+        playbooks=("hot_scalp", "arrival_zone"),
+        basis=None, family="connected routes")
+    family_states["connected"] = connected_sub
     governing = new_state()
     _eval.accumulate(
         governing, records, now=now,
         routes_map=GOVERNING_JUDGMENT_ROUTES,
         playbooks=GOVERNING_PLAYBOOKS, basis=_GOVERNING_BASIS,
-        family="governing routes", binds=False)
-    table = comparison(family_states=family_states,
-                       governing_state=governing)
-    # The one-shot route evaluation is computed fresh (the
-    # standing-state shortcut above cannot reproduce its
-    # criteria-bound snapshot); splice its rows in.
-    for group in table["groups"]:
-        if group["key"] == "connected":
-            group["routes"] = route_eval.get("routes") or {}
-            group["route_verdicts"] = _verdict_counts(
-                group["routes"])
-            group["window_start"] = route_eval.get(
-                "window_start")
-    return table
-
-
-#: Each family module's routes-map / playbooks constants
-#: (the one-shot path folds through the shared evaluator
-#: with the family's own tables, exactly as its cycle does).
-_ROUTES_ATTR = {
-    "range": "RANGE_JUDGMENT_ROUTES",
-    "vol": "VOL_JUDGMENT_ROUTES",
-    "trend": "TREND_JUDGMENT_ROUTES",
-    "auction": "AUCTION_JUDGMENT_ROUTES",
-    "reversion": "REVERSION_JUDGMENT_ROUTES",
-    "session": "SESSION_JUDGMENT_ROUTES",
-}
-_PLAYBOOKS_ATTR = {
-    "range": "RANGE_PLAYBOOKS",
-    "vol": "VOL_PLAYBOOKS",
-    "trend": "TREND_PLAYBOOKS",
-    "auction": "AUCTION_PLAYBOOKS",
-    "reversion": "REVERSION_PLAYBOOKS",
-    "session": "SESSION_PLAYBOOKS",
-}
+        family="governing routes")
+    return comparison(family_states=family_states,
+                      governing_state=governing)
 
 
 # ------------------------------------------------------------ rendering
 
 _VERDICT_PLAIN = {
-    _eval.VERDICT_READY: "PROMOTION READY (recommendation only)",
+    _eval.VERDICT_READY: "ready (measured)",
     _eval.VERDICT_NOT_READY: "not ready",
     _eval.VERDICT_INSUFFICIENT: "not enough data yet",
 }

@@ -12,7 +12,7 @@ died as observations while the market cascaded.
 
 The contract this module owns:
 
-- PERSISTENCE: every non-shadow roster candidate a live scan
+- PERSISTENCE: every roster candidate a live scan
   detects is registered here with its formation, trigger,
   invalidation and expiry facts, and survives restarts (atomic
   JSON beside the journal).  A registered setup is never
@@ -34,10 +34,11 @@ The contract this module owns:
 
 - AUTHORITY: this module grants none.  Registration is not an
   order; routing happens only when the declared trigger fires
-  (the h1_trigger streaming path, same direction), and the
+  (the playbook's own trigger clock, same direction), and the
   routed candidate passes through the same decision flow and
   shared order path as any fresh candidate — every gate intact.
-  Shadow-evaluation routes are never registered here.
+  Every registered setup is live (owner order 2026-11-25/27:
+  nothing shadowed).
 
 WS3 ADDENDUM (owner approval 2026-11-04, workstream 3 — H1
 trigger handoff; runner flag ``h1_trigger_handoff_enabled``):
@@ -49,15 +50,6 @@ trigger handoff; runner flag ``h1_trigger_handoff_enabled``):
   the journal chain reads parent thesis -> child setup ->
   armed -> trigger -> judgment -> execution -> broker outcome
   from the records alone.
-
-- SHADOW PRESERVATION: §G shadow-route candidates are now
-  registered too, marked ``shadow=True``.  Preservation is not
-  authority: a shadow setup is NEVER routed to execution
-  evaluation (the routing selection excludes it in every mode),
-  but it no longer vanishes after its scan record — a
-  same-direction trigger fire journals a ``trigger_observed``
-  disposition on the instance, and upkeep still ends it through
-  a journaled expiry / invalidation.
 """
 from __future__ import annotations
 
@@ -85,16 +77,12 @@ TERMINAL_STAGES = frozenset(
 ACTIVE_STAGES = frozenset(
     {STAGE_DETECTED, STAGE_ARMED, STAGE_SUBMITTED})
 
-#: The trigger that routes an armed roster setup in v1: the
-#: h1_trigger streaming path fires in the setup's direction.
-TRIGGER_H1_FIRE = "h1_trigger_fire"
-
-#: Journal-only disposition marker (WS3): a same-direction
-#: h1_trigger fire was observed against an armed SHADOW setup.
-#: It is journaled on the instance (via the runner's setup-event
-#: record) but is NOT a store stage — the instance does not
-#: move; it stays armed until upkeep ends it.  Never routed.
-STAGE_TRIGGER_OBSERVED = "trigger_observed"
+#: The trigger kind for a setup, derived from its own trigger
+#: clock — ``<tf>_trigger_fire``.  There is no H1 default: the
+#: kind always names the playbook's own declared trigger clock
+#: (owner order 2026-11-27).
+def trigger_kind_for(trigger_tf: str) -> str:
+    return f"{str(trigger_tf or 'H1').lower()}_trigger_fire"
 
 
 @dataclass
@@ -138,10 +126,9 @@ class TrackedSetup:
     #: thesis had adopted this candidate as its child.
     thesis_id: str | None = None
     thesis_version: int | None = None
-    #: WS3: a §G shadow-route instance — preserved and traced,
-    #: never routed to execution evaluation in any mode.
-    shadow: bool = False
-    trigger_kind: str = TRIGGER_H1_FIRE
+    #: The trigger kind names the setup's own trigger clock
+    #: (derived in __post_init__ when not given explicitly).
+    trigger_kind: str = ""
     trigger_tf: str = "H1"
     validity_bars: int = 6
     expiry_ts: str | None = None
@@ -149,6 +136,14 @@ class TrackedSetup:
     alert_id: str | None = None
     ticket: int | None = None
     history: list = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # The trigger kind always names the setup's own trigger
+        # clock — never a hardcoded H1 default.  An explicit
+        # kind (from the registry spec) is kept; an empty one
+        # is derived from trigger_tf.
+        if not self.trigger_kind:
+            self.trigger_kind = trigger_kind_for(self.trigger_tf)
 
     @property
     def active(self) -> bool:
@@ -302,15 +297,12 @@ class SetupLifecycleStore:
         return self._setups.get(setup_id)
 
     def active(self, *, direction: int | None = None,
-               armed_only: bool = False,
-               shadow: bool | None = None) -> list[TrackedSetup]:
+               armed_only: bool = False) -> list[TrackedSetup]:
         out = [s for s in self._setups.values() if s.active]
         if armed_only:
             out = [s for s in out if s.armed]
         if direction is not None:
             out = [s for s in out if int(s.direction) == int(direction)]
-        if shadow is not None:
-            out = [s for s in out if bool(s.shadow) is bool(shadow)]
         out.sort(key=lambda s: (s.created_ts or "", s.setup_id))
         return out
 

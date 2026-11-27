@@ -144,27 +144,29 @@ def detector_facts(signal, frame=None) -> dict:
 
 def trigger_decision_block(*, route: str, source: str,
                            reason_code: str | None,
-                           shadow: bool,
                            detector_facts: dict | None) -> dict:
     """The complete trigger account for a scheduled-scan candidate.
 
     The scan route never orders: that is the first fact, not a
     footnote.  The second fact is the scan's own limit — it did
-    not run the h1_trigger streaming evaluation, so it records
-    no verdict for it.  A reader who wants the streaming
-    verdict finds it on the h1_trigger record for the same
-    playbook + instance, never inferred from this scan.
+    not run the trigger-path streaming evaluation on the
+    playbook's own trigger clock, so it records no verdict for
+    it.  A reader who wants the streaming verdict finds it on
+    the trigger record for the same playbook + instance, never
+    inferred from this scan.  The candidate IS registered as a
+    live setup instance by the scan (owner order 2026-11-25/27:
+    nothing shadowed) — the trigger path routes it, the scan
+    itself never orders.
     """
-    if shadow:
-        authority = ("none — §G shadow route: journaled for "
-                     "grading, holds NO order authority")
-    else:
-        authority = ("none — scheduled scan: the scan observes "
-                     "and journals; only the h1_trigger streaming "
-                     "evaluation can route to orders")
+    authority = ("none — scheduled scan: the scan observes, "
+                 "journals and registers the candidate as a live "
+                 "setup; only the trigger-path streaming "
+                 "evaluation on the playbook's own trigger clock "
+                 "can route it to orders")
     if source == "live_close":
-        eligibility = ("live-close scan — still no order "
-                       "authority on this route (see above)")
+        eligibility = ("live-close scan — the candidate is "
+                       "registered live; order authority belongs "
+                       "to the trigger path (see above)")
     else:
         eligibility = (source_note(source) or
                        f"source {source!r} — analytical record")
@@ -176,12 +178,12 @@ def trigger_decision_block(*, route: str, source: str,
         "source_eligibility": eligibility,
         "trigger_path_evaluated_by_this_scan": False,
         "trigger_path_note": (
-            "this scan does not run the h1_trigger streaming "
+            "this scan does not run the trigger-path streaming "
             "evaluation and records no verdict for it — it "
             "neither fired nor failed here.  Execution requires "
             "the streaming instance to emit the same instance "
             "on a live close; that verdict, if any, lives on "
-            "the h1_trigger record for the same playbook and "
+            "the trigger record for the same playbook and "
             "instance key"),
         "reason_code": reason_code,
         "detector_facts": dict(detector_facts or {}),

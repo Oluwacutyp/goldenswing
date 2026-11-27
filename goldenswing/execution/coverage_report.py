@@ -61,7 +61,7 @@ import copy
 
 from . import gap_response as _response
 from . import judgment_book as _jb
-from . import range_promotion as _eval
+from . import evaluation as _eval
 
 #: Journal record type for one standing coverage report.
 RECORD_TYPE = "coverage_report"

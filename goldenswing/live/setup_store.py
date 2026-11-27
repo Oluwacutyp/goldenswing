@@ -217,7 +217,7 @@ class SetupStore:
                 f"could not extend setup expiry: {exc}") from exc
 
     def terminate(self, setup_id: str, status: str, reason: str, now: Any) -> bool:
-        allowed = {"expired", "invalidated", "blocked", "shadow_triggered", "order_reconciled"}
+        allowed = {"expired", "invalidated", "blocked", "order_reconciled"}
         if status not in allowed:
             raise ValueError(f"invalid terminal status: {status}")
         try:
@@ -278,21 +278,6 @@ class SetupStore:
             return cur.rowcount == 1
         except sqlite3.Error as exc:
             raise SetupStoreError(f"could not persist event: {exc}") from exc
-
-    def finish_shadow_trigger(self, *, setup_id: str, claimant: str,
-                              fencing_token: int, now: Any) -> bool:
-        """Close a shadow-only trigger. This is not used to authorize orders."""
-        try:
-            with self._connect() as con:
-                cur = con.execute("""UPDATE hot_scalp_setups
-                    SET status='shadow_triggered', updated_at=?, version=version+1
-                    WHERE setup_id=? AND status='claimed' AND claimed_by=?
-                      AND fencing_token=?""",
-                    (self._now_text(now), str(setup_id), str(claimant),
-                     int(fencing_token)))
-            return cur.rowcount == 1
-        except sqlite3.Error as exc:
-            raise SetupStoreError(f"could not finish shadow trigger: {exc}") from exc
 
     def resolve_claim_after_broker_reconciliation(self, *, setup_id: str,
                                                   fencing_token: int,

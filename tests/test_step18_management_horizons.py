@@ -56,7 +56,7 @@ def test_live_playbooks_gain_authority_from_declaring():
     contract is dead; the specs below are the same ones, live.)"""
     for spec in PLAYBOOK_REGISTRY:
         if spec.route == "range_h4_h1":
-            assert spec.shadow_evaluation is False
+            assert spec.trigger_kind == "h1_trigger_fire"
 
 
 # ------------------------------------------------------------- policies

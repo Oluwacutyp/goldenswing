@@ -19,23 +19,18 @@ Pins:
   priors; a holdout win puts MEASURED priors in force, and
   the cycle's verdict record cites the calibration version
   it judged.
-* purity: evaluate_judgment without priors_for is
-  byte-identical to the pristine (b0f4adb) output; a stated
-  provider changes no number, only adds the trace; a measured
-  provider re-prices.
-* the runner seam: the standing calibration state folds
-  journal windows on the S3 cadence, journals deployment
-  records, and _judgment_evaluate stamps the priors trace.
+* the verdict no longer takes priors (owner order
+  2026-11-27 — the formula core is RETIRED): the
+  calibration module measures priors from the journal
+  for the validation reports, which read it directly.
+  Only the config default (calibrated) is pinned here.
 """
 from __future__ import annotations
 
 import json
 
 from goldenswing.execution import judgment_calibration as cal
-from goldenswing.execution.judgment import evaluate_judgment
 from goldenswing.execution.judgment_validation import compare_priors
-
-from test_p3_trader import _runner
 
 
 # ------------------------------------------------------------ fixtures
@@ -321,157 +316,12 @@ def test_cycle_dedupes_repeated_windows():
     assert len(state["pairs"]) == n_pairs == 6
 
 
-# ------------------------------------------------------------ assessor purity
-_CAND = {"direction": 1, "entry": 2000.0, "stop": 1990.0,
-         "targets": [2020.0], "asymmetry_score": 72.0}
-_DEC = {"floor_result": {"total": 72.0, "floor": 50.0}}
-_EV = {"observed": {"bias_d1": 1, "bias_h4": 1, "stop_dist": 10.0,
-                    "session_bucket": "london"},
-       "inferred": {"regime": "clean_trend", "posture": "aligned",
-                    "score_total": 72.0, "room_r": 2.0},
-       "evidence_groups": {"htf_structure": ["bos up"],
-                           "zone_context": ["at demand"]},
-       "supporting": ["bos up", "at demand"], "contradictory": []}
-_CTX = {"regime": "up/clean_trend/normal/expansion/london",
-        "adr_pct": 40.0, "adr_state": "fresh", "posture": "aligned"}
-
-#: The pristine (b0f4adb) output for the fixture above —
-#: generated from the pre-Pass-4 tree; the no-provider call
-#: must reproduce it exactly.
-_PRISTINE = {
-    "confidence": 0.5781, "decision": "take",
-    "evidence_balance": {"against": 0.0, "groups_against": [],
-                         "groups_for": ["htf_structure",
-                                        "zone_context"],
-                         "support": 2.5},
-    "expected_r": 1.8562,
-    "market_state": {"adr_pct": 40.0, "adr_state": "fresh",
-                     "bias_alignment": 2, "day_type": None,
-                     "journey_state": None, "phase": "expansion",
-                     "posture": "aligned",
-                     "regime_direction": "up", "room_r": 2.0,
-                     "session": "london", "smt": None,
-                     "structure": "trend", "volatility": "normal"},
-    "mode": "shadow", "opposition": 0.0,
-    "reason": "continuation leads (p=0.94 vs reversal 0.02); "
-              "expected +1.86R at 2.00R to the first target on "
-              "2.5 vs 0.0 weighed evidence",
-    "reason_category": 4,
-    "scenarios": [
-        {"name": "continuation", "p": 0.9401, "payoff_r": 2.0},
-        {"name": "reversal", "p": 0.0201, "payoff_r": -1.0},
-        {"name": "chop", "p": 0.0397, "payoff_r": -0.1}],
-    "score": {"edge": 0.44, "floor": 50.0, "total": 72.0},
-    "support_score": 4.16,
-    "thresholds": {"min_confidence": 0.15, "min_expected_r": 0.05},
-}
-
-
-def test_no_provider_is_byte_identical_to_pristine():
-    out = evaluate_judgment(candidate=_CAND, decision=_DEC,
-                            evidence=_EV, context=_CTX)
-    assert out == _PRISTINE
-    assert "priors" not in out
-
-
-def test_stated_provider_changes_no_number_only_trace():
-    provider = cal.PriorsProvider(mode="stated")
-    out = evaluate_judgment(
-        candidate=_CAND, decision=_DEC, evidence=_EV,
-        context=_CTX, priors_for=provider.for_cell)
-    trace = out.pop("priors")
-    assert out == _PRISTINE
-    assert trace == {"source": "stated", "version": "stated",
-                     "cell": "trend|with_bias", "n": 0.0}
-
-
-def test_measured_provider_reprices_and_traces():
-    body = cal.calibrate(cal.build_calibration_pairs(
-        _dataset(300, outcome_r=1.2)))
-    provider = cal.PriorsProvider(
-        calibration=body, verdict={"verdict": "measured_wins"},
-        mode="calibrated", version=3)
-    out = evaluate_judgment(
-        candidate=_CAND, decision=_DEC, evidence=_EV,
-        context=_CTX, priors_for=provider.for_cell)
-    assert out["priors"]["source"] == "measured"
-    assert out["priors"]["version"] == 3
-    assert out["priors"]["cell"].startswith("trend|with_bias")
-    cont = next(s for s in out["scenarios"]
-                if s["name"] == "continuation")
-    assert cont["p"] != _PRISTINE["scenarios"][0]["p"]
-
-
-def test_rel_dir_derivation_agrees_with_calibration():
-    seen = {}
-
-    def probe(*, structure, rel_dir, volatility):
-        seen.update(structure=structure, rel_dir=rel_dir,
-                    volatility=volatility)
-        return {**cal.STATED_PRIORS, "source": "stated",
-                "version": "stated", "cell": "x", "n": 0.0}
-
-    for word, direction in (("up", 1), ("up", -1), ("down", -1),
-                            ("down", 1), ("flat", 1)):
-        ctx = dict(_CTX)
-        ctx["regime"] = f"{word}/clean_trend/normal/expansion/london"
-        cand = dict(_CAND, direction=direction)
-        evaluate_judgment(candidate=cand, decision=_DEC,
-                          evidence=_EV, context=ctx,
-                          priors_for=probe)
-        assert seen["rel_dir"] == cal.rel_direction(word, direction)
-        assert seen["structure"] == "trend"
-        assert seen["volatility"] == "normal"
-
-
 # ------------------------------------------------------------ runner seam
-def _journal_rows(runner):
-    path = runner.cfg.journal_path
-    return [json.loads(line) for line in
-            path.read_text().splitlines() if line.strip()]
-
-
-def test_runner_default_trace_is_stated(tmp_path):
-    runner = _runner(tmp_path)
-    bundle = runner._judgment_evaluate(
-        candidate=_CAND, decision=_DEC, evidence=_EV,
-        intended_tf="M5", eval_now="2026-10-14 12:00:00")
-    trace = bundle["judgment"]["priors"]
-    assert trace["source"] == "stated"
-    assert trace["version"] == "stated"
-    assert trace["n"] == 0.0
-
-
-def test_runner_first_phase_journals_deployment_records(tmp_path):
-    runner = _runner(tmp_path)
-    runner._priors_phase([], "2026-10-14 13:00:00")
-    types = [r["type"] for r in _journal_rows(runner)]
-    assert "judgment_priors" in types
-    assert "judgment_priors_verdict" in types
-
-
-def test_runner_measured_in_force_after_winning_windows(tmp_path):
-    runner = _runner(tmp_path, judgment_priors="calibrated")
-    # The desk's decision context is an input, not the seam
-    # under test: pin it to the fixture's so the evaluated
-    # candidate lands in the measured cell.
-    runner._decision_context = lambda: dict(_CTX)
-    records = _gate_dataset(holdout_r=1.2)
-    runner._priors_phase(records, "2026-11-05 00:00:00")
-    provider = runner._priors_provider()
-    assert provider is not None
-    assert provider.in_force == "measured"
-    bundle = runner._judgment_evaluate(
-        candidate=_CAND, decision=_DEC, evidence=_EV,
-        intended_tf="M5", eval_now="2026-11-05 01:00:00")
-    assert bundle["judgment"]["priors"]["source"] == "measured"
-    # And with the config gate shut, the same state prices
-    # stated — the config is the owner's kill switch.
-    runner.cfg.judgment_priors = "stated"
-    bundle = runner._judgment_evaluate(
-        candidate=_CAND, decision=_DEC, evidence=_EV,
-        intended_tf="M5", eval_now="2026-11-05 02:00:00")
-    assert bundle["judgment"]["priors"]["source"] == "stated"
+# The verdict no longer takes priors (owner order
+# 2026-11-27 — the formula core is RETIRED): the
+# calibration module measures priors from the journal
+# for the validation reports, which read it directly.
+# Only the config default is pinned here.
 
 
 def test_calibrated_is_the_default_priors_mode():

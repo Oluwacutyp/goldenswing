@@ -10,7 +10,7 @@ fired at 03:30 left no downstream record at all.
 Acceptance shape (journal evidence, per the ruling):
 - a live-close scan candidate is REGISTERED with a stable setup
   ID + parent ID and journaled candidate_detected -> setup_armed;
-- a warmup or shadow scan registers NOTHING;
+- a warmup scan registers NOTHING;
 - a same-direction trigger fire routes the PERSISTED candidate
   through the shared decision/order path (provenance shows the
   trigger path + the original touch; the decision record joins
@@ -129,7 +129,7 @@ def _scan_runner(tmp_path, **kw):
     return runner, h1
 
 
-def _sweep(runner, frame, *, source="live_close", shadow=False,
+def _sweep(runner, frame, *, source="live_close",
            direction=1):
     spec = SimpleNamespace(
         name="fvg_midline", route="h1_roster",
@@ -138,7 +138,7 @@ def _sweep(runner, frame, *, source="live_close", shadow=False,
             _sig(direction=direction, index=len(frame) - 1)))
     runner._sweep_eval_one(
         spec, frame, clock="h1_close", intended_tf="H1",
-        actual_tf="H1", source=source, shadow=shadow)
+        actual_tf="H1", source=source)
     return spec
 
 
@@ -171,18 +171,36 @@ def test_scan_candidate_registers_setup(tmp_path):
     assert rec["reason_code"] == "path.trigger_not_fired"
 
 
-def test_warmup_and_shadow_scans_register_nothing(tmp_path):
+def test_warmup_scans_register_nothing(tmp_path):
     # Amended for WS3 (2026-11-04): pinned under the LEGACY
-    # (handoff flag OFF) behavior — warmup scans never register
-    # in any mode, and shadow-marked candidates register only
-    # with the handoff on, as preserved shadow instances
-    # (pinned in tests/test_h1_trigger_handoff.py).
+    # (handoff flag OFF) behavior — a warmup scan never
+    # registers, whatever the candidate.  (A live-close sweep
+    # with the flag off DOES register, via the legacy path —
+    # the candidate is live, not shadow — pinned by
+    # test_live_close_registers_via_legacy_path below.)
     runner, frame = _scan_runner(
         tmp_path, h1_trigger_handoff_enabled=False)
     _sweep(runner, frame, source="warmup_scan")
-    _sweep(runner, frame, source="live_close", shadow=True)
     assert runner._setup_store.active() == []
     assert _setup_events(runner) == []
+
+
+def test_live_close_registers_via_legacy_path(tmp_path):
+    # Step 14 (owner rulings 2026-10-30 §1): with the handoff
+    # flag OFF, a live-close candidate still registers — via
+    # the legacy path, as an armed LIVE setup that a later
+    # trigger fire can route.  (Before the rework this sweep
+    # was shadow-marked and the legacy path skipped it; there
+    # are no shadow candidates anymore, so the exclusion is
+    # gone with the shadow lifecycle — owner order
+    # 2026-11-27.)
+    runner, frame = _scan_runner(
+        tmp_path, h1_trigger_handoff_enabled=False)
+    _sweep(runner, frame, source="live_close")
+    active = runner._setup_store.active()
+    assert len(active) == 1
+    assert active[0].stage == slc.STAGE_ARMED
+    assert _setup_events(runner)
 
 
 def test_rescan_same_instance_does_not_duplicate(tmp_path):
@@ -272,7 +290,7 @@ def test_expired_setup_is_not_routed_and_upkeep_expires_it(
             "fvg_midline", _sig(index=len(h1) - 1)))
     runner._sweep_eval_one(
         spec, h1, clock="h1_close", intended_tf="H1",
-        actual_tf="H1", source="live_close", shadow=False)
+        actual_tf="H1", source="live_close")
     routing: dict = {}
     stats = {"signals": 0, "gated": 0}
     runner._run_signal_path(h1, len(h1) - 1, [], 1.0, _verdict(1),

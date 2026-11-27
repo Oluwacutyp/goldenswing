@@ -123,7 +123,7 @@ def _drive(runner, h1, pb, engine, t=29, zone_d=None):
     from goldenswing.playbooks.base import EngineContext
     ctx = EngineContext(df=h1, states=[], years=0.0,
                         instrument="XAUUSD")
-    runner._run_one_playbook(pb, sig_ctx=(ctx, engine), h1=h1, t=t,
+    runner._run_one_playbook(pb, sig_ctx=(ctx, engine), frame=h1, t=t,
                              verdict=_verdict(),
                              stats={"signals": 0, "gated": 0},
                              zone_d=zone_d)

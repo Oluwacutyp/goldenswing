@@ -450,7 +450,7 @@ def handoff_leg(ep: dict, workdir: Path) -> tuple[list[dict], dict]:
             "spread": 0.2, "time": _ts(cand["eval_ts"])}
         runner._sweep_eval_one(
             spec, frame, clock="h1_close", intended_tf="H1",
-            actual_tf="H1", source="live_close", shadow=False)
+            actual_tf="H1", source="live_close")
         registered.add(cand["playbook"])
         rows.append(_row(
             ep["name"], cand["playbook"], "candidate_detected",
@@ -464,7 +464,7 @@ def handoff_leg(ep: dict, workdir: Path) -> tuple[list[dict], dict]:
             "playbook": s.playbook, "direction": s.direction,
             "entry": s.entry_ref, "invalidation": s.invalidation,
             "targets": s.targets, "score": s.score,
-            "stage": s.stage, "shadow": s.shadow,
+            "stage": s.stage,
             "thesis_id": s.thesis_id,
             "history": [h.get("stage") for h in s.history],
             "terminal": s.stage in slc.TERMINAL_STAGES}
@@ -546,7 +546,7 @@ def hot_scalp_leg(ep: dict, workdir: Path) -> tuple[list[dict], dict]:
         mine = [e for e in events
                 if e.get("setup_id") == ex["setup_id"]]
         cand = next((e for e in mine
-                     if e["event"] in ("candidate_shadow",
+                     if e["event"] in ("candidate",
                                        "candidate_blocked")), None)
         result = {"id": ex["id"], "setup_id": ex["setup_id"],
                   "journal_facts": ex["journal_facts"],
@@ -759,7 +759,7 @@ def _verdicts(result: dict) -> dict:
         ex = {e["id"]: e for e in legs["hot_scalp"]["exhibits"]}
         a, b = ex.get("A"), ex.get("B")
         geo = legs["hot_scalp"]["geometry_blocked_by_direction"]
-        ok_a = bool(a and a.get("event") == "candidate_shadow"
+        ok_a = bool(a and a.get("event") == "candidate"
                     and a.get("legs") and a["legs"][0]["net_rr"] >= 1.20)
         ok_b = bool(b and b.get("event") == "candidate_blocked"
                     and b.get("plan_kind") == "blocked")
@@ -898,7 +898,7 @@ def _residuals(result: dict) -> list[str]:
             "one kind=trigger_binding record — the bound "
             "instance and its rule, or the not-bound reason "
             "(no_armed_instances / direction_mismatch / "
-            "all_expired / shadow_only) with every armed "
+            "all_expired / not_selected) with every armed "
             "instance's disposition — so a future episode reads "
             "its answer off one record instead of a forensic "
             "pass.  Capture of that long is still not claimed: "

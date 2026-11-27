@@ -22,7 +22,7 @@ What is pinned here:
   candidate identity has a scenario, every scenario has a
   candidate identity, and no identity is ever live twice.
 
-* JUDGMENT (shadow): per H1 book cycle, competing pairs are
+* JUDGMENT (live): per H1 book cycle, competing pairs are
   resolved on the assessor's own numbers (§5.2 rules 2–4) and
   lone triggered scenarios are judged on their S1 verdicts;
   every verdict journals a book_judgment record citing the
@@ -37,7 +37,7 @@ What is pinned here:
   coverage_gap record; a covered configuration never gaps;
   the cycle summary names the strongest active gap.
 
-* SHADOW DISCIPLINE: decision / evaluation / judgment_shadow
+* LIVE DISCIPLINE: decision / evaluation / judgment
   records are byte-identical with the book-judgment cycle on
   vs off; scenario_book_enabled=False silences the whole
   apparatus.
@@ -335,7 +335,7 @@ def test_coverage_covered_configuration_never_gaps(tmp_path):
                 "entry_tf": "H1", "management_tf": "H1"},
         geometry={"entry": 100.0, "stop": 99.0,
                   "targets": [103.0]},
-        invalidation_terms=["x"], authority="shadow")
+        invalidation_terms=["x"], authority="live")
     tracker = jb.CoverageTracker()
     sit = _situation(tfs={"D1": _tf_state("D1")})
     for i in range(5):
@@ -359,7 +359,7 @@ def test_coverage_counterdirection_scenario_does_not_cover(
                 "entry_tf": "H1", "management_tf": "H1"},
         geometry={"entry": 100.0, "stop": 101.0,
                   "targets": [97.0]},
-        invalidation_terms=["x"], authority="shadow")
+        invalidation_terms=["x"], authority="live")
     tracker = jb.CoverageTracker()
     sit = _situation(tfs={"D1": _tf_state("D1")})
     fired = []
@@ -481,10 +481,10 @@ def test_mirror_close_is_terminal_and_sticky(tmp_path):
               direction=-1, horizon="swing",
               clocks={"formation_tf": "D1", "trigger_tf": "D1",
                       "entry_tf": "D1", "management_tf": "D1"},
-              invalidation_terms=["native"], authority="shadow")
+              invalidation_terms=["native"], authority="live")
     book.propose_scenario(
         "K2", ts="T0", geometry={"entry": 10.0, "stop": 11.0,
-                                 "targets": []}, **kw)
+                                 "targets": [9.0]}, **kw)
     recs = book.sync_scenario(
         "K2", ts="T1", close_reason="rejected",
         stage="candidate_disposed", detail="veto: hard lines")
@@ -493,7 +493,7 @@ def test_mirror_close_is_terminal_and_sticky(tmp_path):
     # A closed scenario never re-opens through the mirror.
     assert book.propose_scenario(
         "K2", ts="T2", geometry={"entry": 10.0, "stop": 11.0,
-                                 "targets": []}, **kw) == []
+                                 "targets": [9.0]}, **kw) == []
     assert book.get("K2") is None
 
 
@@ -575,10 +575,10 @@ def test_population_audit_funnel_wide(tmp_path):
     runner._hot_scalp = SimpleNamespace(
         on_tick=lambda **kw: [armed_event],
         store=real_engine.store)
-    runner._run_hot_scalp_shadow(_hs_tick())
+    runner._run_hot_scalp(_hs_tick())
     runner._hot_scalp = SimpleNamespace(
         on_tick=lambda **kw: [cand], store=real_engine.store)
-    runner._run_hot_scalp_shadow(_hs_tick())
+    runner._run_hot_scalp(_hs_tick())
     runner._hot_scalp = real_engine
     _hs_promote(runner, cand)
     # A book cycle while the real tick manager still holds the
@@ -600,12 +600,11 @@ def test_population_audit_funnel_wide(tmp_path):
     warm_sig.entry_ref = 3900.0  # a distinct instance key
     runner._sweep_eval_one(
         _episode_spec(warm_sig), frame, clock="h1_close",
-        intended_tf="H1", actual_tf="H1", source="warmup",
-        shadow=True)
+        intended_tf="H1", actual_tf="H1", source="warmup")
     runner._sweep_eval_one(
         _episode_spec(_episode_sig(frame)), frame,
         clock="h1_close", intended_tf="H1", actual_tf="H1",
-        source="live_close", shadow=False)
+        source="live_close")
     # --- Native leg: a live qm_m5 touch through the shared
     # order path (the funnel fixture's proven fill drive).
     runner._score_for = lambda **kw: _FakeScore(70.0, 25.0,
@@ -685,7 +684,7 @@ def test_book_judgment_through_runner_cycle(tmp_path):
     assert summaries[-1]["judgment"]["pairs_taken"] == 1
 
 
-# --------------------------------------- shadow discipline
+# --------------------------------------- live discipline
 
 def _scrub(records):
     """The Pass 2 comparison scrub: run ids / commits /
@@ -716,7 +715,7 @@ def _scrub(records):
 def _decision_records(runner):
     return [r for r in runner.journal.records()
             if r.get("type") in ("evaluation", "decision",
-                                 "judgment_shadow")]
+                                 "judgment")]
 
 
 def _drive_episode(runner):
@@ -733,7 +732,7 @@ def _drive_episode(runner):
     runner._sweep_eval_one(
         _episode_spec(_episode_sig(frame)), frame,
         clock="h1_close", intended_tf="H1", actual_tf="H1",
-        source="live_close", shadow=False)
+        source="live_close")
     runner._book_cycle(["H1"], asof="2026-11-04T07:00:00+00:00")
 
 

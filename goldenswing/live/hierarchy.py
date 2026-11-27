@@ -1338,16 +1338,20 @@ def resolve_setup_for_touch(setup: dict, *, mid: float) -> dict:
 
 
 def check_live_trigger(setup: dict, *, entry_frame: pd.DataFrame,
-                       h1_open, close: float) -> dict | None:
+                       h1_open, close: float,
+                       touch_ts=None) -> dict | None:
     """Confirm an armed zone touch with the POI confirmation family.
 
     Runs :func:`confirm_at_poi` on the entry-clock bars composing
-    the forming H1 bar (index >= ``h1_open``) against the setup's
-    zone band, with the full entry frame as lookback context.  The
-    confirmation window is therefore the entry bars composing the
-    forming H1 bar — up to 4 for M15, 2 for M30, 12 for M5 — the
-    same window the old entry leg used; the pending expires at the
-    H1 close, so a touch-to-confirm span is bounded by one H1 bar.
+    the pending's own confirmation window.  The window starts at
+    the entry bar containing the touch (``touch_ts`` — rework
+    2026-11-27): the confirmation window belongs to the touch,
+    not to the H1 bar that happens to contain it.  When no touch
+    time is given, the window starts at the forming H1 bar's open
+    (``h1_open``), the old shape — up to 4 entry bars for M15, 2
+    for M30, 12 for M5.  The pending lives until its own
+    entry-clock TTL, so a touch-to-confirm span is bounded by the
+    TTL (3 entry bars), never by the H1 close.
 
     AT-POI: the confirming bar must overlap the POI band.  The
     family itself does NOT require this for bos / choch /
@@ -1371,7 +1375,18 @@ def check_live_trigger(setup: dict, *, entry_frame: pd.DataFrame,
     direction = int(setup["direction"])
     if entry_frame is None or len(entry_frame) == 0:
         return None
-    composing = entry_frame[entry_frame.index >= pd.Timestamp(h1_open)]
+    if touch_ts is not None:
+        # The window starts at the entry bar containing the touch:
+        # floor the touch time to the frame's own bar spacing.
+        try:
+            _spacing = entry_frame.index.to_series().diff().median()
+            _mins = int(_spacing.total_seconds() // 60) or 1
+            _start = pd.Timestamp(touch_ts).floor(f"{_mins}min")
+        except Exception:
+            _start = pd.Timestamp(h1_open)
+        composing = entry_frame[entry_frame.index >= _start]
+    else:
+        composing = entry_frame[entry_frame.index >= pd.Timestamp(h1_open)]
     if len(composing) == 0:
         return None
     ann = confirm_at_poi(composing, direction, zone["bottom"],

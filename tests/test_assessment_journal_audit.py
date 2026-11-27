@@ -103,13 +103,13 @@ def test_detector_facts_empty_without_live_context():
 def test_trigger_decision_block_fields():
     block = journal_audit.trigger_decision_block(
         route="h1_roster", source="warmup_scan",
-        reason_code="path.trigger_not_fired", shadow=False,
+        reason_code="path.trigger_not_fired",
         detector_facts={"zone_formed_idx": 15})
     assert block["route"] == "h1_roster"
     assert block["order_authority"].startswith("none")
     assert block["source_is_live_decision"] is False
     assert block["trigger_path_evaluated_by_this_scan"] is False
-    assert "does not run the h1_trigger" in block["trigger_path_note"]
+    assert "does not run the trigger-path streaming" in block["trigger_path_note"]
     assert block["reason_code"] == "path.trigger_not_fired"
     assert block["detector_facts"]["zone_formed_idx"] == 15
 
@@ -120,18 +120,24 @@ def test_trigger_decision_block_live_close_still_no_authority():
     # order authority — the streaming path does.
     block = journal_audit.trigger_decision_block(
         route="h1_roster", source="live_close",
-        reason_code="path.trigger_not_fired", shadow=False,
+        reason_code="path.trigger_not_fired",
         detector_facts={})
     assert block["source_is_live_decision"] is True
     assert block["order_authority"].startswith("none")
 
 
-def test_trigger_decision_block_shadow_authority():
+def test_trigger_decision_block_live_route_authority():
+    # Every route is live now (owner order 2026-11-27): the
+    # block never names a shadow authority — the scan observes,
+    # journals and registers the candidate as a live setup, and
+    # only the trigger path routes it to orders.
     block = journal_audit.trigger_decision_block(
         route="range_h4_h1", source="warmup_scan",
-        reason_code="path.shadow_route", shadow=True,
+        reason_code="path.trigger_not_fired",
         detector_facts={})
-    assert "shadow" in block["order_authority"]
+    assert "shadow" not in block["order_authority"]
+    assert "live setup" in block["order_authority"]
+    assert block["route"] == "range_h4_h1"
 
 
 def test_freshness_lines_absent_measurement_renders_explicitly():
@@ -254,7 +260,7 @@ def _sweep_candidate(runner, frame, source):
             "fvg_midline", _sig(index=len(frame) - 1)))
     runner._sweep_eval_one(
         spec, frame, clock="h1_close", intended_tf="H1",
-        actual_tf="H1", source=source, shadow=False)
+        actual_tf="H1", source=source)
     # Step 14 (owner rulings 2026-10-30 §1): a live-close sweep
     # candidate now ALSO journals setup_event records (outcome
     # candidate_emitted) as it registers — this helper pins the

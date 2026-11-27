@@ -50,7 +50,7 @@ ATR units — never a claim without the numbers beside it.
 """
 from __future__ import annotations
 
-from . import range_promotion as _eval
+from . import evaluation as _eval
 
 #: Forward window for a detector evaluation, in hours.  6h is 24
 #: M15 bars — one session's worth of follow-through for the

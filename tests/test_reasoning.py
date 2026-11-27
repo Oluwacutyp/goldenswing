@@ -211,7 +211,7 @@ def test_runner_accepted_signal_carries_reasoning_and_study(tmp_path):
     ctx = EngineContext(df=h1, states=[], years=0.0)
     sig = _sig()
     runner._run_one_playbook(_PB(sig), sig_ctx=(ctx, _Engine()),
-                             h1=h1, t=59,
+                             frame=h1, t=59,
                              verdict=_verdict(),
                              stats={"signals": 0})
     records = signal_records(runner.journal.records())
@@ -267,7 +267,7 @@ def test_runner_shadow_signal_gets_no_reasoning(tmp_path):
     runner._stack = TimeframeStack.from_frames({"H1": h1})
     ctx = EngineContext(df=h1, states=[], years=0.0)
     runner._run_one_playbook(_PB(_sig()), sig_ctx=(ctx, _Engine()),
-                             h1=h1, t=59,
+                             frame=h1, t=59,
                              verdict=_verdict(),
                              stats={"signals": 0})
     records = signal_records(runner.journal.records())

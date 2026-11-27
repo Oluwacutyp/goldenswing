@@ -208,8 +208,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "bars closed by the H1 bar feed the "
                     "detector) + H1 refinement; sweep of a "
                     "range edge reclaimed",
-        "authority": "NONE in v1 — §G shadow: journaled for "
-                     "grading, never orders",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "D1 bias is recorded as context only, never "
                  "consulted as permission (§G: D1 never vetoes).",
     },
@@ -218,8 +218,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
         "detector": "H4 range state (causally sliced, as "
                     "above) + H1 refinement; QM structure "
                     "inside the range",
-        "authority": "NONE in v1 — §G shadow: journaled for "
-                     "grading, never orders",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "D1 bias is context only (§G).",
     },
     "range_mean_reversion": {
@@ -227,8 +227,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
         "detector": "H4 range state (causally sliced, as "
                     "above) + H1 refinement; fade of a range "
                     "edge",
-        "authority": "NONE in v1 — §G shadow: journaled for "
-                     "grading, never orders",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "D1 bias is context only (§G).",
     },
     "range_compression_breakout": {
@@ -236,8 +236,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
         "detector": "H4 range state (causally sliced, as "
                     "above) + H1 refinement; compression then "
                     "breakout of the range",
-        "authority": "NONE in v1 — §G shadow: journaled for "
-                     "grading, never orders",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "D1 bias is context only (§G).",
     },
     "vol_expansion_escape": {
@@ -252,12 +252,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "the coil, entry at the ACCEPTANCE close "
                     "(a following bar whose whole range holds "
                     "beyond the coil)",
-        "authority": "NONE — Pass 7a shadow: scheduled scans "
-                     "journal evaluations + arm records and "
-                     "propose book scenarios; never orders. "
-                     "Promotion is the family's own "
-                     "evaluation (execution/vol_promotion.py) "
-                     "plus the owner's separate decision",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "Distinct from range_compression_breakout: "
                  "that playbook trades a RangeDetector range "
                  "OBJECT on H4 in the D1-flat range regime, "
@@ -278,8 +274,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "Fade to the coil mid, then the opposite "
                     "edge; stop beyond the escape's excursion "
                     "extreme",
-        "authority": "NONE — Pass 7a shadow, as "
-                     "vol_expansion_escape",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "The family's second hypothesis shares the "
                  "escape's coil/trigger measurement by "
                  "construction (one state machine, two "
@@ -307,12 +303,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "absorbed at the turn); the entry is the "
                     "pullback's minor-structure turn on the "
                     "trigger clock",
-        "authority": "NONE — Pass 7b shadow: scheduled scans "
-                     "journal evaluations + arm records and "
-                     "propose book scenarios; never orders. "
-                     "Promotion is the family's own "
-                     "evaluation (execution/trend_promotion.py) "
-                     "plus the owner's separate decision",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "Distinct from trendline_retest / fvg_*: "
                  "those are level-return patterns (price "
                  "returns to a drawn level / gap).  This "
@@ -342,8 +334,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "confirmed formation swing within the "
                     "last two formation bars, every close "
                     "since holding beyond it",
-        "authority": "NONE — Pass 7b shadow, as "
-                     "trend_impulse_pullback",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "Continuation, not breakout: a break of a "
                  "swing in a non-trend state, or without "
                  "the velocity percentile, is not this "
@@ -375,12 +367,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "outside the probed edge (range back "
                     "to the edge, close outside, no prior "
                     "M15 close back inside)",
-        "authority": "NONE — Pass 7c shadow: scheduled scans "
-                     "journal evaluations + arm records and "
-                     "propose book scenarios; never orders. "
-                     "Promotion is the family's own "
-                     "evaluation (execution/auction_promotion.py) "
-                     "plus the owner's separate decision",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "Distinct from range_compression_breakout "
                  "and the range family: no RangeDetector "
                  "range object, no regime verdict — the "
@@ -406,8 +394,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "rotation targets the POC, then the "
                     "opposite edge; stop beyond the probe "
                     "extreme",
-        "authority": "NONE — Pass 7c shadow, as "
-                     "auction_value_acceptance",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "Distinct from range_mean_reversion: that "
                  "playbook fades a range edge re-entry "
                  "toward a range mid; this hypothesis is "
@@ -416,7 +404,7 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                  "its targets are value's own (POC, far "
                  "edge).  The classic rotation-completion "
                  "rate (the '80% rule') is a stated "
-                 "hypothesis this family's shadow book "
+                 "hypothesis this family's live book "
                  "validates — never an assumption in the "
                  "detector (SPEC §6.3).",
     },
@@ -433,8 +421,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "against the formation value state at "
                     "the last closed H1 bar; target the "
                     "far shelf; stop beyond the near shelf",
-        "authority": "NONE — Pass 7c shadow, as "
-                     "auction_value_acceptance",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "A close that jumps the whole span is "
                  "the traversal already done — never "
                  "chased; a close already inside the span "
@@ -470,13 +458,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "(named post-exhaustion states "
                     "excepted) — refusals journal as arm "
                     "records",
-        "authority": "NONE — Pass 7d shadow: scheduled scans "
-                     "journal evaluations + arm records and "
-                     "propose book scenarios; never orders. "
-                     "Promotion is the family's own "
-                     "evaluation (execution/"
-                     "reversion_promotion.py) plus the "
-                     "owner's separate decision",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "Distinct from auction_value_rejection "
                  "and range_mean_reversion: 7c trades the "
                  "auction's answer to a probe AT the value "
@@ -507,8 +490,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "targets the POC, then the opposite "
                     "edge; stop beyond the extension "
                     "extreme",
-        "authority": "NONE — Pass 7d shadow, as "
-                     "mean_reversion_extension_fade",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "SPEC §6.4 registers trend_exhaustion's "
                  "mirror in THIS family (not §6.1's) so "
                  "the bookkeeping lives in one place: "
@@ -547,13 +530,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "session; targets the measured "
                     "extension (the IB height projected), "
                     "then the next situation zone",
-        "authority": "NONE — Pass 7e shadow: scheduled scans "
-                     "journal evaluations + arm records and "
-                     "propose book scenarios; never orders. "
-                     "Promotion is the family's own "
-                     "evaluation (execution/"
-                     "session_promotion.py) plus the "
-                     "owner's separate decision",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "Distinct from killzone_open: that is a "
                  "PRE-SESSION range break at the London / "
                  "NY opens on the H1 clock, entered on the "
@@ -586,8 +564,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "targets the IB mid first, then the "
                     "opposite edge (staged); stop beyond "
                     "the probe extreme",
-        "authority": "NONE — Pass 7e shadow, as "
-                     "session_opening_breakout",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "The failed auction at the session's "
                  "own scale: the reference is the frozen "
                  "session range and the clock is the "
@@ -621,8 +599,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "close; fade toward the IB mid first, "
                     "then the prior value edge the drive "
                     "left; stop beyond the sweep extreme",
-        "authority": "NONE — Pass 7e shadow, as "
-                     "session_opening_breakout",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "SPEC §6.5's opening_drive_reversal.  "
                  "The premise partitions it from its "
                  "sibling session_asia_sweep: the SAME "
@@ -654,8 +632,8 @@ PLAYBOOK_EVIDENCE: dict[str, dict] = {
                     "rotation to the Asia mid first, then "
                     "the opposite Asia edge (staged); "
                     "stop beyond the sweep extreme",
-        "authority": "NONE — Pass 7e shadow, as "
-                     "session_opening_breakout",
+        "authority": "LIVE — orders through the trigger path "
+                     "on the playbook's own clock",
         "notes": "SPEC §6.5's asia_range_play: the Asia "
                  "range as the day's first value, "
                  "London's raid of it as the signal.  "

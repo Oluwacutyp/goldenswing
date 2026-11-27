@@ -66,7 +66,6 @@ from .funnel import (
     category_for_code,
     decision_bucket,
 )
-from .judgment import GROUP_WEIGHTS
 from .judgment_validation import GATE_EXECUTED, build_pairs, gate_class
 
 #: The five audit categories, in report order.
@@ -81,6 +80,22 @@ ITEM_LIMIT = 5
 #: many of the known correlation groups (score channel
 #: included) was judged on a thin vector.
 WEAK_MAX_GROUPS = 2
+
+#: The measured reads the code rung's verdict counts
+#: (execution/judgment.py DecisionStructure.reads) — the
+#: evidence vector a new judgment record carries.
+KNOWN_READS = frozenset({"displacement", "acceptance",
+                         "follow_through", "htf_bias",
+                         "asymmetry"})
+
+#: The retired formula core's correlation groups — the
+#: evidence vector a PRE-REWORK journal record carries
+#: (evidence_balance groups_for/against + the score
+#: channel).  Read only as a legacy fallback so old
+#: journals still audit; no live record carries them.
+LEGACY_KNOWN_GROUPS = frozenset({
+    "htf_structure", "asymmetry_score", "journey_geometry",
+    "zone_context", "funding_events", "forecast_ensemble"})
 
 #: Post-exit measurement window (hours): how long after an
 #: exit the audit watches for the position's own target —
@@ -100,7 +115,7 @@ PENDING_EXIT_CAP = 200
 
 #: A shadow judgment whose reconciliation never lands within
 #: this many hours is unmeasurable, not pending forever.
-SHADOW_MAX_AGE_H = 48
+JUDGMENT_MAX_AGE_H = 48
 #: An open record whose close never lands within this many
 #: hours stops being carried.
 OPEN_MAX_AGE_H = 24 * 7
@@ -318,11 +333,11 @@ def _wrong_judgments(state: dict, records: list[dict],
                      now) -> dict:
     """(b) Takes that lost + abstains that would have won,
     graded by the S4 pairing machinery (build_pairs joins
-    judgment_shadow records to their S3 reconciliations on
+    judgment records to their S3 reconciliations on
     the clean set — degenerate-R pairs arrive excluded and
     are counted, never graded).  Shadows whose outcome has
     not landed yet are carried in the standing state across
-    windows; a shadow older than SHADOW_MAX_AGE_H with no
+    windows; a shadow older than JUDGMENT_MAX_AGE_H with no
     reconciliation is unmeasurable, not pending forever."""
     pending = list(state.get("pending_shadows") or [])
     pending_keys = {(str(s.get("ts") or ""),
@@ -330,7 +345,7 @@ def _wrong_judgments(state: dict, records: list[dict],
                     for s in pending}
     fresh_shadows = []
     for row in records:
-        if row.get("type") != "judgment_shadow":
+        if row.get("type") not in ("judgment", "judgment_shadow"):
             continue
         key = (str(row.get("ts") or ""),
                str(row.get("playbook") or ""))
@@ -357,7 +372,7 @@ def _wrong_judgments(state: dict, records: list[dict],
             judged = _ts(shadow.get("ts"))
             if judged is not None and now is not None and (
                     now - judged).total_seconds() \
-                    > SHADOW_MAX_AGE_H * 3600:
+                    > JUDGMENT_MAX_AGE_H * 3600:
                 unmeasurable += 1
             else:
                 still_pending.append(shadow)
@@ -411,20 +426,21 @@ def _wrong_judgments(state: dict, records: list[dict],
 def _weak_setups(state: dict, records: list[dict]) -> dict:
     """(c) Attempts executed on a thin evidence vector.
 
-    An attempt is a judgment_shadow whose gate class is
+    An attempt is a judgment record whose gate class is
     EXECUTED.  The evidence vector is the journaled judgment
-    block itself — never reconstructed: the correlation
-    groups that voted (evidence_balance groups_for/against)
-    plus the score channel when a score was present.  Thin =
-    at most WEAK_MAX_GROUPS of the known groups engaged, or
-    confidence under the record's own stated bar.  The
-    finding names the known groups that never voted."""
-    known = set(GROUP_WEIGHTS)
+    block itself — never reconstructed: the measured reads
+    the code rung counted (structure.reads on a new record;
+    the evidence_balance groups + the score channel on a
+    pre-rework record).  Thin = at most WEAK_MAX_GROUPS of
+    the known reads engaged.  The finding names the known
+    reads that never voted.  (The retired core's
+    min_confidence bar is gone with it — no threshold bar
+    exists anymore, so there is no below-bar check.)"""
     found = 0
     unmeasurable = 0
     items: list[dict] = []
     for row in records:
-        if row.get("type") != "judgment_shadow":
+        if row.get("type") not in ("judgment", "judgment_shadow"):
             continue
         if gate_class(row) != GATE_EXECUTED:
             continue
@@ -432,26 +448,33 @@ def _weak_setups(state: dict, records: list[dict]) -> dict:
         slot = _route_slot(state, playbook)
         slot["attempts"] += 1
         judgment = row.get("judgment") or {}
-        balance = judgment.get("evidence_balance")
-        if not isinstance(balance, dict):
-            unmeasurable += 1
-            continue
-        present = set(balance.get("groups_for") or []) \
-            | set(balance.get("groups_against") or [])
-        score = judgment.get("score") or {}
-        if isinstance(score, dict) \
-                and score.get("total") is not None:
-            present.add("asymmetry_score")
+        structure = judgment.get("structure") or {}
+        reads = structure.get("reads") if isinstance(
+            structure, dict) else None
+        if isinstance(reads, list):
+            known = set(KNOWN_READS)
+            present = {str(r.get("name") or "")
+                       for r in reads if isinstance(r, dict)}
+            present &= known
+        else:
+            # Legacy pre-rework record: the evidence_balance
+            # groups + the score channel.
+            known = set(LEGACY_KNOWN_GROUPS)
+            balance = judgment.get("evidence_balance")
+            if not isinstance(balance, dict):
+                unmeasurable += 1
+                continue
+            present = set(balance.get("groups_for") or []) \
+                | set(balance.get("groups_against") or [])
+            score = judgment.get("score") or {}
+            if isinstance(score, dict) \
+                    and score.get("total") is not None:
+                present.add("asymmetry_score")
+            present &= known
         engaged = present & known
         absent = sorted(known - present)
-        thresholds = judgment.get("thresholds") or {}
-        min_conf = _f(thresholds.get("min_confidence"))
         confidence = _f(judgment.get("confidence"))
-        thin = len(engaged) <= WEAK_MAX_GROUPS
-        below_bar = (min_conf is not None
-                     and confidence is not None
-                     and confidence < min_conf)
-        if thin or below_bar:
+        if len(engaged) <= WEAK_MAX_GROUPS:
             found += 1
             slot["weak"] += 1
             items.append({
@@ -717,7 +740,8 @@ def _execution_failures(records: list[dict]) -> dict:
 #: ONLY other types (notes, forecasts, the audit's own
 #: records) produces no audit record: the cycle journals on
 #: evidence, not on the clock alone.
-_CONSUMED_TYPES = ("evaluation", "judgment_shadow",
+_CONSUMED_TYPES = ("evaluation", "judgment",
+                       "judgment_shadow",
                    "judgment_reconciliation",
                    "judgment_audit_event", "signal", "open",
                    "close")

@@ -32,7 +32,7 @@ rung must beat".  This module is that rung's measurement half:
    verdict-abstain AND shadow-evaluated (a verdict that never
    carried authority is still a judged candidate with a
    forward outcome).  The measurement is built from
-   judgment_shadow ⋈ judgment_reconciliation pairs; the gate
+   judgment ⋈ judgment_reconciliation pairs; the gate
    stack's execution result is journaled on each pair for the
    record, never used as a filter.  A rate computed from
    executed trades only is impossible by construction here:
@@ -105,11 +105,6 @@ import math
 from datetime import timedelta
 from typing import Any
 
-from .judgment import (
-    PRIOR_CHOP,
-    PRIOR_CONTINUATION,
-    PRIOR_REVERSAL,
-)
 from .judgment_validation import (
     BAR_MIN_HOLDOUT, build_pairs, gate_class)
 
@@ -144,6 +139,19 @@ _SHADOWS_CAP = 2000
 #: many hours is stale evidence; the horizon is +4h and the
 #: audit cycle lands it within a cycle or two.
 _SHADOW_STALE_HOURS = 48
+
+#: The STATED reference rates — the baseline the measured
+#: rates are blended against (shrinkage) and judged against
+#: on the holdout (measured wins only by strictly lower
+#: holdout log-loss).  These live HERE, in the calibration
+#: measurement layer, and nowhere else: the verdict (the
+#: formula core that priced scenarios with them) is RETIRED
+#: by owner order 2026-11-27, and no verdict path reads
+#: them.  They are the reference the measurement is judged
+#: against, never a verdict input.
+PRIOR_CONTINUATION = 0.42
+PRIOR_REVERSAL = 0.38
+PRIOR_CHOP = 0.20
 
 STATED_PRIORS = {
     "continuation": PRIOR_CONTINUATION,
@@ -223,7 +231,7 @@ def build_calibration_pairs(records: list[dict],
     for row in records:
         key = (str(row.get("ts") or row.get("judged_ts") or ""),
                str(row.get("playbook") or ""))
-        if row.get("type") == "judgment_shadow":
+        if row.get("type") in ("judgment", "judgment_shadow"):
             shadows.setdefault(key, row)
         elif row.get("type") == "judgment_reconciliation" \
                 and int(row.get("horizon_h") or 0) == int(horizon_h):
@@ -590,7 +598,7 @@ def _compact_pair(shadow: dict, recon: dict) -> dict | None:
 def _fold(state: dict, records: list[dict]) -> None:
     shadows = state["shadows"]
     for row in records:
-        if row.get("type") != "judgment_shadow":
+        if row.get("type") not in ("judgment", "judgment_shadow"):
             continue
         key = f"{row.get('ts') or ''}|{row.get('playbook') or ''}"
         if key not in shadows:

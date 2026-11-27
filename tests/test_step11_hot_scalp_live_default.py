@@ -30,7 +30,7 @@ from goldenswing.execution.mt5_runner import MT5RunnerConfig
 @pytest.fixture(autouse=True)
 def _no_live_env(monkeypatch):
     monkeypatch.delenv("GS_HOT_SCALP_LIVE", raising=False)
-    monkeypatch.delenv("GS_HOT_SCALP_SHADOW", raising=False)
+    monkeypatch.delenv("GS_HOT_SCALP_ENABLED", raising=False)
 
 
 def test_live_on_by_default_with_no_configuration(tmp_path):
@@ -60,4 +60,4 @@ def test_shadow_still_on_by_default(tmp_path):
     cfg = MT5RunnerConfig(journal_path=tmp_path / "j.jsonl",
                           risk_state_path=tmp_path / "r.json",
                           kill_switch_path=tmp_path / "KILL")
-    assert cfg.hot_scalp_shadow_enabled is True
+    assert cfg.hot_scalp_enabled is True

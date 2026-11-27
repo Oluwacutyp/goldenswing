@@ -927,7 +927,7 @@ class HotScalpResearchEngine:
                 if claim is None:
                     continue  # another process already claimed this setup
                 candidate = {
-                    "event": "candidate_shadow",
+                    "event": "candidate",
                     "setup_id": sid,
                     "parent_setup_id": str(setup.get("parent_setup_id") or sid),
                     "entry_id": child_entry_id(
@@ -978,7 +978,7 @@ class HotScalpResearchEngine:
                         "requires_broker_normalized_stop_risk": True,
                         "execution_authority": "research_policy_only",
                     },
-                    "execution_authority": "shadow_only",
+                    "execution_authority": "live",
                     "claim": claim,
                 }
                 if target_plan is not None:
@@ -999,12 +999,14 @@ class HotScalpResearchEngine:
                     candidate["legacy_geometry"] = legacy_geometry
                 if self.store.write_event_once(
                         event_id=f"candidate:{sid}", setup_id=sid,
-                        event_type="candidate_shadow", now=now_ts.isoformat(),
+                        event_type="candidate", now=now_ts.isoformat(),
                         payload=candidate):
                     events.append(candidate)
-                self.store.finish_shadow_trigger(
-                    setup_id=sid, claimant=self.instance_id,
-                    fencing_token=int(claim["fencing_token"]), now=now_ts.isoformat())
+                # The claim stays 'claimed': the runner resolves it
+                # after the live order path runs (order placed ->
+                # order_reconciled; refused -> touched, re-arms).
+                # Nothing here closes it as shadow — the sleeve is
+                # live (owner order 2026-11-25/27).
         except SetupStoreError as exc:
             # Fail closed: a persistence/ownership failure cannot produce a
             # candidate that looks eligible for execution.

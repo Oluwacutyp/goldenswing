@@ -22,7 +22,6 @@ import json
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from goldenswing.execution.judgment import evaluate_judgment
 from goldenswing.execution.situation_input import (
@@ -235,17 +234,17 @@ def test_core_situation_casts_no_vote():
             _snapshot(direction_word="down", phase="reversal"),
             intended_tf="H1", direction=1)),
         context=_TREND_CTX)
-    # No support weight, no opposition weight, no verdict change
-    # — the situation is read into the picture and recorded,
-    # never a penalty for fighting the daily picture.
-    assert up["support_score"] == pytest.approx(
-        base["support_score"])
-    assert dn["support_score"] == pytest.approx(
-        base["support_score"])
-    assert up["opposition"] == pytest.approx(base["opposition"])
-    assert dn["opposition"] == pytest.approx(base["opposition"])
+    # No verdict change — the situation is read into the
+    # picture and recorded, never a vote for or against the
+    # candidate.  (support_score/opposition were the retired
+    # formula core's fields; the new verdict's decision,
+    # direction and expected_r are what must not move.)
     assert up["decision"] == base["decision"]
     assert dn["decision"] == base["decision"]
+    assert up["direction"] == base["direction"]
+    assert dn["direction"] == base["direction"]
+    assert up["expected_r"] == base["expected_r"]
+    assert dn["expected_r"] == base["expected_r"]
     assert up["market_state"]["situation"]["alignment"]["net"] == 1
     assert dn["market_state"]["situation"]["alignment"][
         "d1_opposed"] is True
@@ -339,9 +338,9 @@ def test_runner_funnel_record_names_contribution(tmp_path):
     # The crafted frames rise on every TF.
     assert contrib["alignment"]["net"] == 1
     assert contrib["alignment"]["d1_opposed"] is False
-    # The shadow verdict weighed the same block.
+    # The judgment verdict weighed the same block.
     shadows = [r for r in _journal_records(tmp_path)
-               if r["type"] == "judgment_shadow"]
+               if r["type"] == "judgment"]
     assert len(shadows) == 1
     assert shadows[0]["judgment"]["market_state"]["situation"] \
         == contrib
@@ -358,7 +357,7 @@ def test_runner_no_contribution_before_first_situation(tmp_path):
     assert "situation_contribution" not in rec
     assert "situation_id" not in rec
     shadows = [r for r in _journal_records(tmp_path)
-               if r["type"] == "judgment_shadow"]
+               if r["type"] == "judgment"]
     assert len(shadows) == 1
     assert "situation" not in shadows[0]["judgment"]["market_state"]
 
@@ -376,6 +375,6 @@ def test_runner_no_contribution_when_disabled(tmp_path):
     assert "situation_contribution" not in rec
     assert "situation_id" not in rec
     shadows = [r for r in _journal_records(tmp_path)
-               if r["type"] == "judgment_shadow"]
+               if r["type"] == "judgment"]
     assert len(shadows) == 1
     assert "situation" not in shadows[0]["judgment"]["market_state"]

@@ -113,7 +113,7 @@ def _runner(tmp_path):
 def test_shadow_judgment_reconciles_at_both_horizons(tmp_path):
     runner = _runner(tmp_path)
     runner._last_tick = {"mid": 3900.0, "bid": 3899.9, "ask": 3900.1}
-    runner._audit_register_shadow(
+    runner._audit_register_judgment(
         {"decision": "take", "expected_r": 0.5, "confidence": 0.6},
         {"direction": -1, "entry": 3900.0, "stop": 3910.0},
         "2026-11-03T00:30:00Z", playbook="qm_m5")

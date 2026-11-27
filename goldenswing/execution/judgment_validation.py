@@ -7,7 +7,7 @@ the gate stack's or the judgment core's?**  Judged by decision
 quality, never by balance (the directive).  The dataset is the
 live journal itself:
 
-- every ``judgment_shadow`` record already carries BOTH
+- every ``judgment`` record already carries BOTH
   verdicts on the same candidate (the gate stack's result +
   reason, and the judgment core's take/abstain with its
   expected R and confidence);
@@ -33,9 +33,10 @@ decision error would corrupt the verdict.  Execution failures
 also separate.  Invalid geometry / not-evaluated rows are not
 decisions at all.
 
-The output is an ACCEPTANCE REPORT for the owner's promotion
-decision (first promotion, if any, is M5-route-only and needs
-its own approval — this module promotes nothing).
+The output is an ACCEPTANCE REPORT for the owner's go-live
+decision — every route is already live by declaration (owner
+order 2026-11-25/27), so this report measures whether the
+judgment out-decides the gate stack; it promotes nothing.
 """
 from __future__ import annotations
 
@@ -166,7 +167,7 @@ def build_pairs(records: list[dict],
         outcomes[key] = row
     pairs: list[dict] = []
     for row in records:
-        if row.get("type") != "judgment_shadow":
+        if row.get("type") not in ("judgment", "judgment_shadow"):
             continue
         judgment = row.get("judgment") or {}
         key = (str(row.get("ts") or ""),
@@ -420,13 +421,13 @@ def render_markdown(result: dict[str, Any]) -> str:
             "The judgment core's decisions beat the gate stack's "
             "on the same candidates, in both the evaluation window "
             "and the untouched holdout. This is the evidence for "
-            "the owner's promotion decision (M5 route only, "
-            "separate approval) — nothing is promoted by this "
-            "report."),
+            "the owner's go-live decision — nothing is promoted "
+            "by this report (every route is already live)."),
         "not_ready": (
             "On the same candidates, the judgment core has not "
             "yet out-decided the gate stack by the stated bars. "
-            "It stays shadow. The bars below say exactly where "
+            "It stays measured, never gated — every route is "
+            "already live. The bars below say exactly where "
             "it fell short."),
         "insufficient_data": (
             "There is not enough judged history yet to call this "

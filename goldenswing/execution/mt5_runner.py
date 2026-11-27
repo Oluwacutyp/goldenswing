@@ -199,8 +199,8 @@ from .funnel import (assessment_block as _assessment_block,
                      decision_bucket as _decision_bucket,
                      terminal_decision as _terminal_decision,
                      verdict_blocks as _verdict_blocks)
-from .assessment_render import (is_shadow_record as
-                                _is_shadow_record,
+from .assessment_render import (is_judgment_record as
+                                _is_judgment_record,
                                 render_assessment as
                                 _render_assessment)
 from . import candidate_lifecycle as _lifecycle
@@ -221,6 +221,8 @@ from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 MANAGEMENT_HORIZONS as
                                 _MANAGEMENT_HORIZONS,
                                 AUCTION_SPECS,
+                                CONNECTED_ORDER_ROUTES as
+                                _CONNECTED_ORDER_ROUTES,
                                 PLAYBOOK_REGISTRY, RANGE_SPECS,
                                 REVERSION_SPECS,
                                 ROSTER_SPECS, ROSTER_SPECS_H1,
@@ -234,11 +236,11 @@ from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 management_policy_for_horizon as
                                 _management_policy_for_horizon,
                                 native_tf_of as _native_tf,
+                                order_route_for as _order_route_for,
                                 policy_params_for as
                                 _policy_params_for,
-                                spec_for as _spec_for)
-from .route_promotion import (
-    ORDER_ROUTE_BY_PLAYBOOK as _ORDER_ROUTE_BY_PLAYBOOK)
+                                spec_for as _spec_for,
+                                trigger_tf_of as _trigger_tf_of)
 from .risk import RiskConfig, RiskGuards
 from .tick_manager import (DEFAULT_TIME_EXIT_BARS, TickAction, TickConfig,
                           TickManager, sl_level_valid)
@@ -310,210 +312,66 @@ def _tick_now_utc(last_tick: dict | None) -> datetime | None:
         return None
 
 
-#: Per-route Judgment Core authority (completion-02, owner
-#: program 2026-11-05).  The 2026-11-05 promotion made the core
-#: the demo decision authority on the routes it had
-#: shadow-evaluated (the S1–S4 program's history); authority is
-#: therefore a PER-ROUTE state, declared here, never inferred
-#: from the global mode:
-#: - "governing": in active mode the route's orders require a
-#:   core "take" (the _judgment_authority seam refuses abstains).
-#: - "shadow_declared": RETIRED by the owner's 2026-11-25
-#:   order (everything goes live directly on demo — no shadow,
-#:   no gating, no promotion, no prove-first).  Every route in
-#:   the table below is now declared "governing"; the state
-#:   string survives only as the invariant-violation demotion
-#:   target (a demoted route observes until its invariant
-#:   clears or the owner releases it).
-#: The manifest journals this table with each route's effective
-#: state and its judgment-record count for the run.
-#:
-#: PASS 5 (owner ruling 2026-11-08) added two more authority
-#: sources ABOVE this table (see _judgment_route_resolution
-#: for the full order): a binding promotion_ready verdict
-#: from execution/route_promotion.py used to promote
-#: hot_scalp_promotion / resting_limit (and a not_ready
-#: verdict demoted a verdict-promoted route), and an
-#: invariant-violation auto-demotion shadows ANY governing
-#: route until released.  The verdict source is RETIRED by
-#: the owner's 2026-11-25 order (everything goes live
-#: directly on demo — no shadow, no gating, no promotion):
-#: verdicts are measurement only now, never an authority
-#: effect; the demotion release is a clean audit window, not
-#: a fresh verdict.  This table remains the DECLARED
-#: baseline every source is read against, and the boundary
-#: the ruling draws is enforced at the routes' submission
-#: points: in active mode a route that does not govern —
-#: from any source — submits no independent demo orders.
-JUDGMENT_ROUTE_STATES: dict[str, str] = {
-    "h1_trigger": "governing",
-    "qm_m5_native": "governing",
-    "qm_d1_native": "governing",
-    "hot_scalp_promotion": "governing",
-    "resting_limit": "governing",
-    # §G RANGE FAMILY (promotion-evaluation wiring, 2026-11-05):
-    # the four range playbooks' §G scan route (playbook_registry
-    # ROUTE_RANGE_H4_H1) declared shadow per playbook — route
-    # name == playbook name, because the journal's shadow
-    # records are keyed by playbook and the promotion evaluation
-    # (execution/range_promotion.py) reads per-playbook history.
-    # The scans hold no order authority in any mode (the §G
-    # contract); the same playbooks' roster orders remain under
-    # the h1_trigger route, untouched.  Declaring the routes
-    # also closes a latent hazard: an undeclared route name
-    # resolves "governing" by default, so an accidental seam
-    # call under one of these names would have governed.
-    "range_sweep_reclaim": "governing",
-    "range_qm": "governing",
-    "range_mean_reversion": "governing",
-    "range_compression_breakout": "governing",
-    # VOLATILITY-EXPANSION FAMILY (MarketSituation Pass 7a,
-    # SPEC §6.2): the two vol playbooks' scheduled scan route
-    # (playbook_registry.ROUTE_VOLATILITY_EXPANSION) declared
-    # shadow per playbook — route name == playbook name, the
-    # §G precedent (the journal's shadow records are keyed by
-    # playbook and the promotion evaluation
-    # (execution/vol_promotion.py) reads per-playbook
-    # history).  The scans hold no order authority in any
-    # mode; the family is not on the trigger path at all.
-    # Declaring the routes also closes the latent hazard the
-    # §G comment names: an undeclared route name must never
-    # be one seam call away from governing.
-    "vol_expansion_escape": "governing",
-    "vol_failed_expansion": "governing",
-    # TREND / MOMENTUM FAMILY (MarketSituation Pass 7b,
-    # SPEC §6.1): the two trend playbooks' scheduled scan
-    # route (playbook_registry.ROUTE_TREND_MOMENTUM) declared
-    # shadow per playbook — route name == playbook name, the
-    # §G precedent (the journal's shadow records are keyed
-    # by playbook and the promotion evaluation
-    # (execution/trend_promotion.py) reads per-playbook
-    # history).  The scans hold no order authority in any
-    # mode; the family is not on the trigger path at all.
-    # Declaring the routes also closes the latent hazard
-    # the §G comment names: an undeclared route name must
-    # never be one seam call away from governing.
-    "trend_impulse_pullback": "governing",
-    "trend_momentum_acceleration": "governing",
-    # AUCTION / VALUE FAMILY (MarketSituation Pass 7c,
-    # SPEC §6.3): the three auction playbooks' scheduled
-    # scan route (playbook_registry.ROUTE_AUCTION_VALUE)
-    # declared shadow per playbook — route name == playbook
-    # name, the §G precedent (the journal's shadow records
-    # are keyed by playbook and the promotion evaluation
-    # (execution/auction_promotion.py) reads per-playbook
-    # history).  The scans hold no order authority in any
-    # mode; the family is not on the trigger path at all.
-    # Declaring the routes also closes the latent hazard
-    # the §G comment names: an undeclared route name must
-    # never be one seam call away from governing.
-    "auction_value_acceptance": "governing",
-    "auction_value_rejection": "governing",
-    "auction_lvn_traversal": "governing",
-    # MEAN REVERSION FAMILY (MarketSituation Pass 7d,
-    # SPEC §6.4): the two reversion playbooks' scheduled
-    # scan route (playbook_registry.ROUTE_MEAN_REVERSION)
-    # declared shadow per playbook — route name == playbook
-    # name, the §G precedent (the journal's shadow records
-    # are keyed by playbook and the promotion evaluation
-    # (execution/reversion_promotion.py) reads per-playbook
-    # history).  The scans hold no order authority in any
-    # mode; the family is not on the trigger path at all.
-    # Declaring the routes also closes the latent hazard
-    # the §G comment names: an undeclared route name must
-    # never be one seam call away from governing.
-    "mean_reversion_extension_fade": "governing",
-    "mean_reversion_failed_continuation": "governing",
-    # SESSION / OPENING RANGE FAMILY (MarketSituation Pass
-    # 7e, SPEC §6.5): the four session playbooks' scheduled
-    # scan route (playbook_registry.ROUTE_SESSION_RANGE)
-    # declared shadow per playbook — route name == playbook
-    # name, the §G precedent (the journal's shadow records
-    # are keyed by playbook and the promotion evaluation
-    # (execution/session_promotion.py) reads per-playbook
-    # history).  The scans hold no order authority in any
-    # mode; the family is not on the trigger path at all.
-    # Declaring the routes also closes the latent hazard
-    # the §G comment names: an undeclared route name must
-    # never be one seam call away from governing.
-    "session_opening_breakout": "governing",
-    "session_opening_failure": "governing",
-    "session_drive_reversal": "governing",
-    "session_asia_sweep": "governing",
-}
+#: LIVE ROUTES (owner order 2026-11-25/27 — the promotion gate is
+#: DELETED, and with it the per-route authority table).  Every route
+#: governs: there is no shadow state, no demoted state, no
+#: promotion verdict that binds or demotes.  A route's orders go
+#: through the judgment seam (take proceeds, abstain refuses) and
+#: the risk rules (max drawdown 15% sole halt, max positions 3,
+#: max consecutive losses 6, friction gate) — those are the only
+#: authorities.  The route a playbook rides is declared in the
+#: registry (playbook_registry.order_route_for); this list is the
+#: same truth, derived, for the manifest's per-route table.
+LIVE_ORDER_ROUTES: frozenset = frozenset(
+    _order_route_for(spec.name) or spec.name
+    for spec in PLAYBOOK_REGISTRY) | frozenset(
+    _CONNECTED_ORDER_ROUTES.values())
 
-#: The playbook name a route's judgment records journal under
-#: (the shadow-history counter the manifest reports).  Only the
-#: connected routes need an entry: the governed routes predate
-#: per-route counting (their history is the S1–S4 journal).
-JUDGMENT_ROUTE_PLAYBOOK: dict[str, str] = {
-    "hot_scalp_promotion": "hot_scalp",
-    "resting_limit": "arrival_zone",
-    "range_sweep_reclaim": "range_sweep_reclaim",
-    "range_qm": "range_qm",
-    "range_mean_reversion": "range_mean_reversion",
-    "range_compression_breakout": "range_compression_breakout",
-    "vol_expansion_escape": "vol_expansion_escape",
-    "vol_failed_expansion": "vol_failed_expansion",
-    "trend_impulse_pullback": "trend_impulse_pullback",
-    "trend_momentum_acceleration": "trend_momentum_acceleration",
-    "auction_value_acceptance": "auction_value_acceptance",
-    "auction_value_rejection": "auction_value_rejection",
-    "auction_lvn_traversal": "auction_lvn_traversal",
-    "mean_reversion_extension_fade":
-        "mean_reversion_extension_fade",
-    "mean_reversion_failed_continuation":
-        "mean_reversion_failed_continuation",
-    "session_opening_breakout": "session_opening_breakout",
-    "session_opening_failure": "session_opening_failure",
-    "session_drive_reversal": "session_drive_reversal",
-    "session_asia_sweep": "session_asia_sweep",
-}
 
-#: The §G range playbooks whose scheduled scans journal
-#: route-stamped shadow verdicts (derived from the registry's
-#: RANGE_SPECS — one truth; range_promotion.RANGE_JUDGMENT_ROUTES
-#: is pinned to this set by test).
+#: The range playbooks whose scheduled scans journal
+#: route-stamped verdicts (derived from the registry's
+#: RANGE_SPECS — one truth; the stamp is attribution for the
+#: manifest's per-route table, never an authority).
 RANGE_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in RANGE_SPECS)
 
 #: The Pass 7a volatility-expansion playbooks whose
-#: scheduled scans journal route-stamped shadow verdicts
+#: scheduled scans journal route-stamped verdicts
 #: (derived from the registry's VOL_SPECS — one truth;
-#: vol_promotion.VOL_JUDGMENT_ROUTES is pinned to this set
-#: by test).
+#: the stamp is attribution for the manifest's per-route
+#: table, never an authority).
 VOL_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in VOL_SPECS)
 
 #: The Pass 7b trend / momentum playbooks whose scheduled
-#: scans journal route-stamped shadow verdicts (derived
+#: scans journal route-stamped verdicts (derived
 #: from the registry's TREND_SPECS — one truth;
-#: trend_promotion.TREND_JUDGMENT_ROUTES is pinned to this
-#: set by test).
+#: the stamp is attribution for the manifest's per-route
+#: table, never an authority).
 TREND_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in TREND_SPECS)
 
 #: The Pass 7c auction / value playbooks whose scheduled
-#: scans journal route-stamped shadow verdicts (derived
+#: scans journal route-stamped verdicts (derived
 #: from the registry's AUCTION_SPECS — one truth;
-#: auction_promotion.AUCTION_JUDGMENT_ROUTES is pinned to
-#: this set by test).
+#: the stamp is attribution for the manifest's per-route
+#: table, never an authority).
 AUCTION_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in AUCTION_SPECS)
 
 #: The Pass 7d mean reversion playbooks whose scheduled
-#: scans journal route-stamped shadow verdicts (derived
+#: scans journal route-stamped verdicts (derived
 #: from the registry's REVERSION_SPECS — one truth;
-#: reversion_promotion.REVERSION_JUDGMENT_ROUTES is pinned
-#: to this set by test).
+#: the stamp is attribution for the manifest's per-route
+#: table, never an authority).
 REVERSION_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in REVERSION_SPECS)
 
 #: The Pass 7e session / opening range playbooks whose
-#: scheduled scans journal route-stamped shadow verdicts
+#: scheduled scans journal route-stamped verdicts
 #: (derived from the registry's SESSION_SPECS — one truth;
-#: session_promotion.SESSION_JUDGMENT_ROUTES is pinned to
-#: this set by test).
+#: the stamp is attribution for the manifest's per-route
+#: table, never an authority).
 SESSION_JUDGMENT_ROUTE_NAMES: frozenset = frozenset(
     spec.name for spec in SESSION_SPECS)
 
@@ -608,19 +466,17 @@ class MT5RunnerConfig:
     # decision path.  Rides the book's gates (silent when the
     # book or the situation program is off).
     judgment_book_enabled: bool = True
-    # JUDGMENT CORE (owner rulings 2026-10-23; build ordered
-    # 2026-11-02): evaluation of every candidate-bearing funnel
-    # record — market-state estimation -> competing scenarios ->
-    # evidence evaluation -> take/abstain, journaled as
-    # judgment_shadow records (the record type keeps its name:
-    # the S3/S4 consumers read it).  PROMOTION (owner decision
-    # 2026-11-05 — the separate approval the program always
-    # required): the core is the DEMO decision authority, per
-    # judgment_mode below.  Hard risk invariants stay outside
+    # JUDGMENT (owner order 2026-11-27 — the formula core is
+    # RETIRED: no priors, no weights, no min_expected_r /
+    # min_confidence bars): the verdict is computed from the
+    # market's own measured structure/reaction (the code rung,
+    # execution/judgment.py) and, at the order decision point,
+    # the brain reads the same measured structure and calls it
+    # (the brain rung, execution/judgment_brain.py; active
+    # only when a provider is configured).  Journaled as
+    # judgment records.  Hard risk invariants stay outside
     # the model, in risk/friction, in every mode.
-    judgment_shadow_enabled: bool = True
-    judgment_min_expected_r: float = 0.05
-    judgment_min_confidence: float = 0.15
+    judgment_record_enabled: bool = True
     # JUDGMENT MODE — the kill switch (owner decision
     # 2026-11-05).  "active" (default): on every route the core
     # evaluates — the H1 roster trigger path (incl. lifecycle-
@@ -636,57 +492,37 @@ class MT5RunnerConfig:
     # necessary, never sufficient.  "shadow": the pre-promotion
     # behavior exactly (gate stack decides, core observes) —
     # rollback without a code change.  In active mode the seam
-    # evaluation runs regardless of judgment_shadow_enabled
+    # evaluation runs regardless of judgment_record_enabled
     # (that flag gates only the passive tap): an order without
     # a core record must be impossible, not merely unjournaled.
-    # NOT under the core's authority (named, not silent):
-    # the hot_scalp promotion path and the A6 resting limit
-    # (playbook "arrival_zone") had never been shadow-evaluated
-    # at promotion time, so there was no verdict history to
-    # promote.  COMPLETION-02 (2026-11-05) connected both: their
-    # candidates now take funnel evaluation records + journaled
-    # core evaluations (a shadow history accrues), declared
-    # SHADOW per route (JUDGMENT_ROUTE_STATES) — evaluated and
-    # journaled, never governing, until the explicit per-route
-    # promotion below.  Their own gate stacks still decide.
+    # The hot_scalp placement path and the A6 resting limit
+    # (playbook "arrival_zone") were connected at COMPLETION-02
+    # (2026-11-05): their candidates take funnel evaluation
+    # records + journaled core evaluations (a measured history
+    # accrues), declared LIVE per route — evaluated and
+    # journaled, governing by declaration like every route
+    # (owner order 2026-11-25; promotion gate deleted
+    # 2026-11-27).  Their own gate stacks still decide.
     judgment_mode: str = "active"
     # MEASURED PRIORS (MarketSituation Pass 4; SPEC §5.3 +
-    # AMENDMENTS-1 §A3): the S1 core's scenario priors are the
-    # stated constants (0.42/0.38/0.20) unless this reads
-    # "calibrated" AND the calibration's locked-holdout verdict
-    # (a judgment_priors_verdict record, recomputed on the S3
-    # cycle from the reconciliation book) is a measured WIN.
-    # "stated": the measured set is computed and journaled but
-    # never prices a verdict — every verdict still journals
-    # its priors trace (source/version/cell/n) under both
-    # settings.  "calibrated" (default, E3 earned 2026-11-14:
-    # the full live journal — 108 calibration pairs, 30 on the
-    # locked holdout — returns measured_wins, measured
-    # log-loss 1.3732 vs stated 1.3796): the verdict of record
-    # rules — no verdict or a loss, and the stated constants
-    # price, automatically.  The measurement is
-    # execution/judgment_calibration.py; RESPONSE / OPPOSITION
-    # / CHOP coefficients stay stated under the same rule.
+    # AMENDMENTS-1 §A3): the calibration (execution/
+    # judgment_calibration.py) still measures stated vs
+    # measured priors from the journal for the validation
+    # reports — but NO verdict reads priors anymore (the
+    # formula core that priced verdicts from the stated
+    # constants 0.42/0.38/0.20 was retired 2026-11-27; the
+    # verdict now comes from measured structure).  This
+    # field is kept so old configs still parse; it prices
+    # nothing.
     judgment_priors: str = "calibrated"
-    # PER-ROUTE authority overrides (completion-02): maps a
-    # route name (JUDGMENT_ROUTE_STATES) to "governing" or
-    # "shadow_declared".  This is THE explicit per-route step
-    # for a connected route: naming a governing route
-    # "shadow_declared" here demotes it to observe-only, and
-    # naming a demoted route "governing" here — when config
-    # did not already say so at demotion time — releases the
-    # demotion (a reviewed owner decision taken after the
-    # evidence).  Any other value is ignored toward the
-    # route's DECLARED state (a typo can neither silently
-    # promote a route nor silently restore an unjudged path);
-    # the manifest journals configured + effective per route,
-    # so a bad value is a visible fact.
-    # PASS 5 precedence (see _judgment_route_resolution): an
-    # invariant-violation demotion binds OVER this override
-    # and the declared state — except for the release above.
-    # Promotion verdicts (route_promotion.py) are NO LONGER a
-    # source: since the owner's 2026-11-25 order they are
-    # measurement only and rank nowhere in resolution.
+    # PER-ROUTE authority overrides (completion-02): INERT
+    # since the rework (2026-11-27).  The resolution it fed
+    # (_judgment_route_resolution) is deleted with the
+    # promotion gate; nothing reads this field, and no value
+    # here — even nonsense — changes any route's authority
+    # (tests/test_completion02_connections.py pins that).
+    # Every route governs by declaration.  Kept so old
+    # configs still parse.
     judgment_route_modes: dict | None = None
     # JUDGMENT CORE S3 (owner spec 2026-11-02): outcome
     # reconciliation + self-audit — shadow judgments and theses are
@@ -912,10 +748,11 @@ class MT5RunnerConfig:
     # real choice, not inert config.  Config-file / env only.
     scalp_playbooks: tuple = ()
     scalp_cap_minutes: float = 15.0  # owner's scalping_max_holding
-    # The first Hot Scalp implementation is a distinct, persistent RESEARCH
-    # sleeve. It journals candidates from M1 reactions + M5 structure + M15
-    # context, but deliberately has no order-dispatch path.
-    hot_scalp_shadow_enabled: bool = True
+    # Hot Scalp is a distinct, persistent LIVE sleeve. It journals
+    # candidates from M1 reactions + M5 structure + M15 context,
+    # and its candidates route to the live order path (owner order
+    # 2026-11-25/27: nothing shadowed).
+    hot_scalp_enabled: bool = True
     hot_scalp_db_path: Path | None = None
     # Step 6 promotion switch — DEFAULT ON per owner order
     # 2026-10-27 ("I meant live"; "I don't have time to be
@@ -976,16 +813,19 @@ class MT5RunnerConfig:
     score_decay_enabled: bool = True
     score_decay_floor: float | None = None
     score_decay_bars: int = 2
-    # Armed-state TTL (owner rule, 2026-10-15): an armed zone
-    # touch disarms as stale after armed_ttl_bars ENTRY-TF bars
-    # without confirmation.  Counted in entry-TF bars (the state
-    # machine runs on the entry clock), not wall clock.  The
-    # number 2 mirrors score_decay_bars (the codebase's existing
-    # "two bars of no-confirmation = stale" rule), counted on the
-    # entry clock instead of H1 closes.  On M15 it binds after
-    # 2 closes (30 min); on M30 it coincides with the H1-close
-    # expiry.  Config-file / env only.
-    armed_ttl_bars: int = 2
+    # Armed-state TTL (owner rule, 2026-10-15, reworked 2026-11-27):
+    # an armed zone touch disarms as stale after armed_ttl_bars
+    # ENTRY-TF bars without confirmation.  Counted in entry-TF bars
+    # (the state machine runs on the entry clock), not wall clock.
+    # The number is 3, not 2: the confirmation family can need a
+    # 3rd entry bar (sweep + reclaim + confirm), and a TTL of 2
+    # killed every setup before its 3rd bar arrived — the armed
+    # setups in the 25–27 Nov live statuses died at 2/3, never
+    # firing.  The TTL is the confirmation window: the confirm
+    # shot runs BEFORE the TTL increment on each close, so a
+    # confirming 3rd bar fires before the TTL disarms it.
+    # Config-file / env only.
+    armed_ttl_bars: int = 3
     # Multi-zone limit ladder (owner's-bot floor): a LIMIT order's
     # size staggers across rungs from the playbook level to the
     # adverse zone edge; only rung 0 is placed, the next rung
@@ -1085,9 +925,9 @@ class MT5RunnerConfig:
         # Same for the Friday-close action: unknown -> "hold".
         if self.friday_close_action not in ("hold", "close"):
             self.friday_close_action = "hold"
-        env_shadow = os.environ.get("GS_HOT_SCALP_SHADOW")
-        if env_shadow is not None:
-            self.hot_scalp_shadow_enabled = env_shadow.strip().lower() in (
+        env_hs = os.environ.get("GS_HOT_SCALP_ENABLED")
+        if env_hs is not None:
+            self.hot_scalp_enabled = env_hs.strip().lower() in (
                 "1", "true", "yes", "on")
         env_live = os.environ.get("GS_HOT_SCALP_LIVE")
         if env_live is not None:
@@ -1121,7 +961,7 @@ def direction_flip_block(score, pb_name: str, *,
     direction-flip block for a candidate whose asymmetry score
     flipped — the flip's evidence, its stance for THIS candidate,
     and, when the candidate proceeded, the pre-Step-16
-    counterfactual (the live shadow comparison: the journal itself
+    counterfactual (the live comparison: the journal itself
     measures what the old blanket veto would have killed).
 
     ``refused`` is True only for the declared-premise refusal (the
@@ -1538,7 +1378,7 @@ class MT5Runner:
         self._hot_scalp: HotScalpResearchEngine | None = None
         self._hot_scalp_last_degraded_key: str | None = None
         self._hot_scalp_instance_id = uuid.uuid4().hex
-        if self.cfg.hot_scalp_shadow_enabled:
+        if self.cfg.hot_scalp_enabled:
             try:
                 _hs_store = SetupStore(self.cfg.hot_scalp_db_path)
                 self._hot_scalp = HotScalpResearchEngine(
@@ -1549,7 +1389,7 @@ class MT5Runner:
                     instance_id=self._hot_scalp_instance_id)
             except Exception as _hs_exc:
                 self.journal.log_note(
-                    "hot_scalp: shadow sleeve disabled because shared setup "
+                    "hot_scalp: live sleeve disabled because shared setup "
                     f"storage is unavailable: {_hs_exc}")
         # Forecast service (owner rulings §3): forecasts + alerts only.
         # The engine trains itself: untrained at warm start, or stale
@@ -1757,10 +1597,18 @@ class MT5Runner:
         # order decision using the new counts.
         self._boundary: BoundaryTracker | None = None
         self._boundary_snapshot: dict = {}
-        # breakout_id already fired on the tick clock (one fire per
-        # confirmed breakout — a confirmed breakout fires once, it
-        # never re-fires on later ticks).
+        # breakout_id already fired on the tick clock.  Marked ONLY
+        # when a fire produced an order (rework 2026-11-27): a
+        # packaging failure or a signal-path refusal leaves the
+        # breakout fireable, retrying on a new entry-clock bar
+        # until its window expires.  A confirmed breakout fires
+        # once it takes — it never re-fires on later ticks after
+        # that.
         self._breakout_fired_id: int = 0
+        # Last breakout-fire attempt, keyed (breakout_id, last
+        # closed entry-clock bar): a refused fire retries only
+        # when a new entry bar has printed, never every tick.
+        self._breakout_last_attempt: tuple | None = None
         # Continuation break_keys already fired (arming-gate fix
         # F2: one arm per break — a break that fired never re-arms
         # while price stays beyond the broken level; the stateless
@@ -1923,11 +1771,10 @@ class MT5Runner:
         self._config_fingerprint_cache: str | None = None
         self._funnel_seq: int = 0
         self._funnel_counts: dict[str, dict] = {}
-        # Completion-02: judgment_shadow records journaled this
-        # run, per playbook — the accruing shadow history the
-        # manifest's per-route authority table reports (a
-        # shadow-declared route's promotion case is built from
-        # exactly these records + their S3 outcome scoring).
+        # Judgment records journaled this run, per playbook —
+        # the accruing judged history the manifest's per-route
+        # table reports (each route's verdicts + their S3
+        # outcome scoring).
         self._judgment_record_counts: dict[str, int] = {}
         self._funnel_refusals: dict[str, int] = {}
         self._funnel_trigger: dict | None = None
@@ -2016,8 +1863,9 @@ class MT5Runner:
         Origination (owner order 2026-11-25, all-live half-2):
         the five families are on this path now — their
         scheduled scans register live setups, and a
-        same-direction h1_trigger fire routes them through
-        this loop under their own routes (see
+        same-direction fire on the playbook's own trigger
+        clock routes them through this loop under their own
+        routes (see
         :meth:`_judgment_authority`).  Fresh evaluation on
         the fire path is safe for them: the four
         two-clock families (trend / auction / reversion /
@@ -2271,7 +2119,7 @@ class MT5Runner:
                 "scenario_book: disabled for this run "
                 f"({type(exc).__name__}: {exc}) — book state "
                 "could not be trusted; live decisions are "
-                "unaffected (shadow layer)")
+                "unaffected (observation layer)")
             self._scenario_book = False
             return None
         return book
@@ -2289,19 +2137,14 @@ class MT5Runner:
                 pass
 
     def _book_authority_for(self, setup) -> str:
-        """A book scenario's authority stamp: a shadow instance
-        is shadow intrinsically (WS3); a lifecycle-routed setup
-        rides its OWN route (ORDER_ROUTE_BY_PLAYBOOK — roster
-        playbooks h1_trigger, each family playbook its own
-        route), so its stamp is that route's declared state.
-        A demoted family route must not stamp governing just
-        because the roster route governs."""
-        if getattr(setup, "shadow", False):
-            return "shadow"
-        _route = _ORDER_ROUTE_BY_PLAYBOOK.get(
-            getattr(setup, "playbook", ""), "h1_trigger")
-        return ("governing" if self._judgment_route_state(
-            _route) == "governing" else "shadow")
+        """A book scenario's authority stamp: every setup is
+        live (owner order 2026-11-25/27 — the promotion gate
+        is deleted, no route is shadowed or demoted).  A
+        lifecycle-routed setup rides its OWN route
+        (playbook_registry.order_route_for — roster playbooks
+        their route, each family playbook its own route), so
+        its stamp names that route's live authority."""
+        return "live"
 
     def _book_propose_setup(self, setup) -> None:
         book = self._scenario_book_get()
@@ -2547,10 +2390,7 @@ class MT5Runner:
                         "validity_bars": prov.get(
                             "validity_window_bars")},
                     situation_id=situation_id,
-                    authority=("governing"
-                               if self._judgment_route_state(
-                                   route) == "governing"
-                               else "shadow"),
+                    authority="live",
                     management=management,
                     score=float(getattr(sig, "score", 0.0)
                                 or 0.0),
@@ -2652,7 +2492,7 @@ class MT5Runner:
                     "expires_ts": None,
                     "validity_bars": (prov or {}).get(
                         "validity_window_bars")},
-                situation_id=situation_id, authority="shadow",
+                situation_id=situation_id, authority="live",
                 score=float(getattr(sig, "score", 0.0) or 0.0),
                 detail="scenario proposed from scan candidate "
                        "(unregistered residue)",
@@ -2723,11 +2563,7 @@ class MT5Runner:
                         "expires_ts": setup.get("expires_at"),
                         "validity_bars": None},
                     situation_id=situation_id,
-                    authority=(
-                        "governing"
-                        if self._judgment_route_state(
-                            "hot_scalp_promotion") == "governing"
-                        else "shadow"),
+                    authority="live",
                     initial_state="armed",
                     stage="setup_armed",
                     detail="hot scalp setup armed (sleeve "
@@ -2739,15 +2575,15 @@ class MT5Runner:
                         "zone": {
                             "low": setup.get("zone_low"),
                             "high": setup.get("zone_high")}})
-            elif name == "candidate_shadow":
+            elif name == "candidate":
                 targets = _targets_as_prices(
                     event.get("targets")
                     or event.get("target_reference"))
                 records += book.sync_scenario(
                     str(sid), ts=ts, to_state="triggered",
-                    stage="candidate_shadow",
+                    stage="candidate",
                     detail="sleeve candidate triggered "
-                           "(shadow bookkeeping complete)",
+                           "(bookkeeping complete)",
                     situation_id=situation_id,
                     geometry_patch={
                         "entry": float(
@@ -3429,7 +3265,7 @@ class MT5Runner:
                     slot["qualified"] += 1
         # Judgment core (owner rulings 2026-10-23; promotion
         # owner decision 2026-11-05): every candidate-bearing
-        # LIVE record also gets a judgment_shadow record — the
+        # LIVE record also gets a judgment record — the
         # judgment core's take/abstain on the SAME inputs the
         # gate stack decided on, so the verdict can be scored
         # against outcomes.  In shadow mode this tap is the only
@@ -3452,7 +3288,7 @@ class MT5Runner:
                 and kind != "trigger_event" \
                 and source != "warmup_scan" \
                 and (precomputed_judgment is not None
-                     or getattr(self.cfg, "judgment_shadow_enabled",
+                     or getattr(self.cfg, "judgment_record_enabled",
                                 True)):
             try:
                 if precomputed_judgment is not None:
@@ -3470,8 +3306,8 @@ class MT5Runner:
                     _feed_block = _bundle["forecast_evidence"]
                     _judgment = _bundle["judgment"]
                 if _judgment is not None:
-                    _shadow_record = {
-                        "type": "judgment_shadow",
+                    _judgment_record = {
+                        "type": "judgment",
                         "ts": str(_eval_now),
                         "run_id": self._run_id,
                         "playbook": playbook,
@@ -3489,7 +3325,7 @@ class MT5Runner:
                     # PASS 0 — the shadow verdict consumed the
                     # same situation as its evaluation record.
                     if record.get("situation_id") is not None:
-                        _shadow_record["situation_id"] = \
+                        _judgment_record["situation_id"] = \
                             record["situation_id"]
                     # Completion-05: the self-audit's standing
                     # per-route rates, cited on the record as
@@ -3497,9 +3333,9 @@ class MT5Runner:
                     # evaluate_judgment never sees it.
                     _audit_fb = self._audit_feedback_for(playbook)
                     if _audit_fb is not None:
-                        _shadow_record["audit_feedback"] = \
+                        _judgment_record["audit_feedback"] = \
                             _audit_fb
-                    self.journal.append(_shadow_record)
+                    self.journal.append(_judgment_record)
                     # PASS 2 — when the candidate is a tracked
                     # setup's, the scenario book adopts this
                     # record's S1 verdict + the correlation
@@ -3548,12 +3384,12 @@ class MT5Runner:
                     if _counts is not None:
                         _counts[playbook] = \
                             _counts.get(playbook, 0) + 1
-                    self._audit_register_shadow(
+                    self._audit_register_judgment(
                         _judgment, candidate, _eval_now,
                         playbook=playbook)
             except Exception as exc:
                 self.journal.log_note(
-                    f"mt5: judgment shadow failed for "
+                    f"mt5: judgment failed for "
                     f"{playbook}: {type(exc).__name__}: {exc}")
         # Judgment core S2 (owner spec 2026-11-02): the five-scenario
         # market read + the maintained thesis, fed by the same cycle
@@ -3596,188 +3432,38 @@ class MT5Runner:
                   or "active").strip().lower()
         return "shadow" if raw == "shadow" else "active"
 
-    def _route_authority_state(self) -> dict:
-        """The standing DYNAMIC authority block (Pass 5),
-        inside the S3 audit state file — the
-        _range_promotion_state arrangement: per route, the
-        latest binding effect that outranks the shipped
-        declaration: an invariant-violation auto-demotion
-        (source "demoted", written by _apply_route_violation).
-        Promotion verdicts used to write entries here too
-        (source "verdict", written by _apply_route_verdict);
-        that source is RETIRED by the owner's 2026-11-25
-        order — verdict entries are inert history, ignored
-        by resolution and purged by _route_promotion_phase.
-        Persisted with the audit state, so authority survives
-        restarts as journaled fact, never as a re-derivation."""
-        st = self._audit_state()
-        sub = st.get("route_authority")
-        if not isinstance(sub, dict):
-            sub = {}
-            st["route_authority"] = sub
-        return sub
-
-    def _route_authority_entry(self, route: str) -> dict | None:
-        entry = self._route_authority_state().get(str(route))
-        return entry if isinstance(entry, dict) else None
-
-    def _route_config_override(self, route: str) -> str | None:
-        """The explicit per-route config step's exact say:
-        "governing" / "shadow_declared" when
-        judgment_route_modes names the route exactly (after
-        case/space normalization), else None — a typo counts
-        for nothing, toward any source."""
-        overrides = getattr(self.cfg, "judgment_route_modes",
-                            None) or {}
-        raw = overrides.get(str(route)) \
-            if isinstance(overrides, dict) else None
-        if isinstance(raw, str):
-            norm = raw.strip().lower()
-            if norm in ("governing", "shadow_declared"):
-                return norm
-        return None
-
-    def _route_declared(self, route: str) -> bool:
-        """Whether ANY authority source names this route: the
-        shipped table, an exact config override, or a dynamic
-        demotion entry.  A retired "verdict" entry names
-        nothing: verdicts bind no authority since the owner's
-        2026-11-25 order, so a stale verdict entry alone does
-        not declare a route.  A route no source names is
-        UNDECLARED — Pass 5's fail-closed case at the seam."""
-        if str(route) in JUDGMENT_ROUTE_STATES:
-            return True
-        entry = self._route_authority_entry(route)
-        if entry is not None \
-                and entry.get("source") == "demoted":
-            return True
-        return self._route_config_override(route) is not None
-
-    def _judgment_route_resolution(self, route: str
-                                   ) -> tuple[str, str]:
-        """One route's effective authority: (state, source).
-
-        Resolution order (Pass 5, as amended by the owner's
-        2026-11-25 order — everything goes live directly on
-        demo, no shadow, no gating, no promotion; promotion
-        verdicts are measurement only and rank nowhere here —
-        every step is a journaled fact, and the per-cycle
-        judgment_authority record + /status table render this
-        exact function, so the journal and the surface can
-        never disagree):
-
-        1. an invariant-violation DEMOTION binds over the
-           declared and config states (source "demoted") —
-           released only by the owner's explicit config step
-           naming the route "governing" when config did not
-           already say so at demotion time (that step is a
-           reviewed decision taken after the evidence, not
-           the standing state the violation occurred under),
-           or by the promotion phase's clean-window release
-           (the route traded clean through a full audit
-           window after the demotion — see
-           _release_cleared_demotions).  A promotion verdict
-           NEVER releases a demotion;
-        2. the explicit config step (source "config");
-        3. the shipped declaration (source "declared" — every
-           route in JUDGMENT_ROUTE_STATES is "governing"
-           since the 2026-11-25 order);
-        4. UNDECLARED: shadow_declared (source "undeclared") —
-           the Pass-5 fail-closed flip: pre-Pass-5 an
-           undeclared route resolved "governing", so a wiring
-           mistake opened an unjudged path; now it observes,
-           and the seam refuses its submissions outright with
-           a journaled alarm.
-        """
-        route = str(route)
-        entry = self._route_authority_entry(route)
-        override = self._route_config_override(route)
-        if entry is not None \
-                and entry.get("source") == "demoted":
-            if override == "governing" \
-                    and entry.get("config_at_demotion") \
-                    != "governing":
-                return "governing", "config"
-            return "shadow_declared", "demoted"
-        if override is not None:
-            return override, "config"
-        if route in JUDGMENT_ROUTE_STATES:
-            return JUDGMENT_ROUTE_STATES[route], "declared"
-        return "shadow_declared", "undeclared"
-
-    def _judgment_route_state(self, route: str) -> str:
-        """One route's effective authority state:
-        "governing" or "shadow_declared" (see
-        _judgment_route_resolution for the sources and their
-        order)."""
-        return self._judgment_route_resolution(route)[0]
-
-    def _judgment_route_source(self, route: str) -> str:
-        """Where one route's effective state comes from:
-        "declared" | "config" | "demoted" | "undeclared".
-        ("verdict" is retired: promotion verdicts bind
-        nothing since the owner's 2026-11-25 order.)"""
-        return self._judgment_route_resolution(route)[1]
-
-    def _undeclared_route_alarm(self, route: str) -> None:
-        """Journal the undeclared-route alarm — once per route
-        per run (the seam refuses every such submission; the
-        journal needs the fact, not a flood)."""
-        alarmed = getattr(self, "_undeclared_route_alarmed",
-                          None)
-        if alarmed is None:
-            alarmed = set()
-            self._undeclared_route_alarmed = alarmed
-        if str(route) in alarmed:
-            return
-        alarmed.add(str(route))
-        try:
-            self.journal.append({
-                "type": "undeclared_route",
-                "route": str(route),
-                "run_id": self._run_id,
-                "note": (
-                    "a submission named a judgment route no "
-                    "authority source declares (not in "
-                    "JUDGMENT_ROUTE_STATES, no config override, "
-                    "no verdict entry) — the seam refuses it "
-                    "fail-closed and the route observes as "
-                    "shadow_declared (Pass 5; pre-Pass-5 this "
-                    "defaulted to governing)")})
-        except Exception:  # noqa: BLE001 - alarm is evidence
-            pass
-
     def _judgment_route_table(self) -> list[dict]:
-        """The manifest's per-route authority table
-        (completion-02): every route the core touches, its
-        effective declared state, whether it governs RIGHT NOW
-        (declared governing AND the global mode active), and —
-        for the connected routes — how many judgment records
-        this run has journaled under the route's playbook (the
-        accruing judged history for the route).  Governed
-        routes carry no count: their history is the S1–S4
-        shadow journal, which predates per-route counting."""
+        """The manifest's per-route table: every live order
+        route, its authority (always \"live\" — the promotion
+        gate is deleted, no route is shadowed or demoted),
+        whether it governs RIGHT NOW (live AND the global mode
+        active), and how many judgment records this run has
+        journaled under the route's playbook (the accruing
+        judged history for the route).  The route a playbook
+        rides is declared in the registry
+        (playbook_registry.order_route_for)."""
         counts = getattr(self, "_judgment_record_counts", {})
         mode = self._judgment_mode()
         table = []
-        for route, declared in JUDGMENT_ROUTE_STATES.items():
-            state, source = self._judgment_route_resolution(
-                route)
+        for route in sorted(LIVE_ORDER_ROUTES):
             row = {
                 "route": route,
-                "authority": state,
-                "declared": declared,
-                # Pass 5: where the effective state comes from
-                # (declared / config / demoted) — the per-cycle
-                # judgment_authority record and the /status
-                # table render this same table, so an
-                # auto-demotion is a visible fact with its
-                # source named.
-                "source": source,
-                "governing_now": bool(
-                    state == "governing" and mode == "active"),
+                "authority": "live",
+                "declared": "live",
+                "source": "live",
+                "governing_now": bool(mode == "active"),
             }
-            playbook = JUDGMENT_ROUTE_PLAYBOOK.get(route)
+            playbook = None
+            for spec in PLAYBOOK_REGISTRY:
+                if (_order_route_for(spec.name) or spec.name) \
+                        == route:
+                    playbook = spec.name
+                    break
+            if playbook is None:
+                for pb, rt in _CONNECTED_ORDER_ROUTES.items():
+                    if rt == route:
+                        playbook = pb
+                        break
             if playbook is not None:
                 row["judgment_records_this_run"] = int(
                     counts.get(playbook, 0))
@@ -3814,51 +3500,26 @@ class MT5Runner:
         except Exception:  # noqa: BLE001 - annotation is evidence
             return None
 
-    def _priors_provider(self):  # type: ignore[no-untyped-def]
-        """The live priors provider (Pass 4) over the standing
-        calibration state, or None when the measurement layer
-        cannot be read — None prices exactly as pre-Pass-4
-        (stated constants, no trace), so a calibration fault
-        can never reach the decision path."""
+    def _brain_rung_configured(self) -> bool:
+        """Whether the brain rung has a provider configured —
+        the manifest's plain fact, never an assumption.  The
+        provider is built lazily at the first order decision
+        point, so this reads the env directly when no provider
+        has been built yet."""
+        provider = getattr(self, "_brain_judgment_provider", None)
+        if provider is not None:
+            return bool(provider.available())
         try:
-            from . import judgment_calibration as _cal
+            from .judgment_brain import BrainJudgmentProvider
 
-            mode = str(getattr(
-                self.cfg, "judgment_priors", "stated") or "stated")
-            if mode not in ("stated", "calibrated"):
-                mode = "stated"
-            return _cal.provider_from_state(
-                self._priors_state(), mode=mode)
-        except Exception:  # noqa: BLE001 - measurement is evidence
-            return None
-
-    def _priors_for_candidate(self, candidate, intended_tf):  # type: ignore[no-untyped-def]
-        """The priors_for callable for one evaluation: the
-        provider bound to this candidate's family/timeframe
-        (the assessor itself supplies structure / direction /
-        volatility from its own estimation).  The candidate
-        dicts on the funnel do not reliably carry a playbook
-        name (the seam's playbook is a separate value), so the
-        family sub-cell resolves only where the candidate
-        names one; tf / regime / base resolution is unaffected."""
-        provider = self._priors_provider()
-        if provider is None:
-            return None
-        playbook = None
-        if isinstance(candidate, dict):
-            playbook = candidate.get("playbook") \
-                or candidate.get("strategy")
-
-        def _priors_for(*, structure, rel_dir, volatility):
-            return provider.for_cell(
-                structure, rel_dir, playbook=playbook,
-                intended_tf=intended_tf, volatility=volatility)
-
-        return _priors_for
+            return BrainJudgmentProvider.from_env() is not None
+        except Exception:  # noqa: BLE001 - unconfigured is False
+            return False
 
     def _judgment_evaluate(self, *, candidate, decision,
                            evidence, intended_tf, eval_now,
-                           route: str | None = None):
+                           route: str | None = None,
+                           use_brain: bool = False):
         """ONE core evaluation of one candidate, in the exact
         shape the journal carries: returns the bundle
         {"judgment": <block, effective mode stamped over the
@@ -3868,8 +3529,25 @@ class MT5Runner:
         item 1) the current MarketSituation's contribution,
         merged onto a copy of that evidence.  Raises on
         failure: the _emit_eval tap logs its note as before;
-        the authority seam catches and fails closed."""
-        from .judgment import (JudgmentConfig, evaluate_judgment)
+        the authority seam catches and fails closed.
+
+        Two rungs (owner order 2026-11-27 — the formula core
+        is RETIRED, no priors, no weights, no threshold bars):
+        the CODE rung measures the structure from the bars at
+        decision time (judgment.measure_decision_structure)
+        and the verdict is the reads themselves.  The BRAIN
+        rung (judgment_brain.judge_with_brain) reads the SAME
+        measured structure and calls it — it runs only at
+        the order decision point (use_brain=True, from the
+        seam), never on the passive _emit_eval tap, and only
+        when a provider is configured.  No brain verdict
+        (unconfigured, unreachable, unparseable, incoherent)
+        -> the code rung decides and the record says so
+        plainly (brain_note), never a faked brain call."""
+        from .judgment import (
+            measure_decision_structure,
+            verdict_from_structure,
+        )
         feed_block, judgment_evidence = self._forecast_feed_for(
             candidate=candidate, evidence=evidence,
             intended_tf=intended_tf, eval_now=eval_now)
@@ -3889,44 +3567,79 @@ class MT5Runner:
         if _sit is not None:
             judgment_evidence = dict(judgment_evidence or {})
             judgment_evidence["situation"] = _sit
-        judgment = evaluate_judgment(
-            candidate=candidate, decision=decision,
-            evidence=judgment_evidence,
-            context=self._decision_context(),
-            priors_for=self._priors_for_candidate(
-                candidate, intended_tf),
-            config=JudgmentConfig(
-                min_expected_r=float(getattr(
-                    self.cfg, "judgment_min_expected_r", 0.05)),
-                min_confidence=float(getattr(
-                    self.cfg, "judgment_min_confidence", 0.15))))
+        # The bars at decision time: the entry-clock frame is
+        # the playbook's own clock (the reaction is read on
+        # it, never on H1 by default).
+        frames = {}
+        try:
+            frames = self._stack.frames if self._stack else {}
+        except Exception:  # noqa: BLE001 - no stack, no bars
+            frames = {}
+        structure = measure_decision_structure(
+            candidate=candidate, evidence=judgment_evidence,
+            context=self._decision_context(), frames=frames,
+            entry_tf=intended_tf, decision=decision)
+        code_verdict = verdict_from_structure(
+            structure, candidate)
+        judgment = code_verdict
+        if use_brain:
+            from .judgment_brain import (
+                BrainJudgmentProvider,
+                judge_with_brain,
+            )
+            provider = getattr(
+                self, "_brain_judgment_provider", None)
+            if provider is None:
+                provider = BrainJudgmentProvider.from_env()
+                self._brain_judgment_provider = provider
+            brain_verdict = judge_with_brain(
+                structure.to_dict(), candidate, provider)
+            if brain_verdict is not None:
+                # The brain calls the direction; the payoff
+                # and the agreement share stay the measured
+                # structure's own numbers — the brain never
+                # invents a price.
+                brain_verdict["expected_r"] = code_verdict.get(
+                    "expected_r")
+                brain_verdict["confidence"] = code_verdict.get(
+                    "confidence")
+                brain_verdict["market_state"] = code_verdict.get(
+                    "market_state")
+                brain_verdict["structure"] = structure.to_dict()
+                brain_verdict["rung"] = "brain"
+                judgment = brain_verdict
+            else:
+                judgment["brain_note"] = (
+                    "no brain model up (provider unconfigured "
+                    "or unreachable) — the code rung's verdict "
+                    "is the solid part")
         judgment["mode"] = self._judgment_mode()
         if route is not None:
             # Completion-02: a route-stamped verdict — the
-            # record itself states whether this route's verdict
-            # governed or was shadow-declared observation, so a
-            # shadow history can never be misread as authority
-            # (or an authority record as mere observation).
+            # record itself states the route the verdict
+            # governed under.  Every route is live (the
+            # promotion gate is deleted), so the stamp is
+            # always "live".
             judgment["authority_route"] = str(route)
-            judgment["authority"] = self._judgment_route_state(
-                route)
+            judgment["authority"] = "live"
         return {"judgment": judgment,
                 "forecast_evidence": feed_block}
 
     def _judgment_authority(self, *, candidate, decision,
                             evidence, intended_tf, eval_now,
                             route: str | None = None):
-        """The promotion seam, called by every order route the
-        core evaluates (the H1 trigger path — roster AND the
-        five families, each under its own route — qm_m5, qm_d1)
-        at its order decision point — after the route's own
-        facts and gates, BEFORE any order dispatch.  The shared
-        safeguard stack inside the order path (friction gate,
-        protective-stop presence, RiskGuards / pool budget +
-        min-lot floor, 15% drawdown halt, position caps) still
-        runs after, unchanged and above: a "take" is necessary,
-        never sufficient, and a safeguard refusal journals under
-        the safeguard's own reason, never this one's.
+        """The judgment seam, called by every order route the
+        core evaluates (the trigger path — roster AND the
+        five families, each under its own route — qm_m5, qm_d1,
+        hot_scalp, resting_limit) at its order decision point
+        — after the route's own facts and gates, BEFORE any
+        order dispatch.  The shared safeguard stack inside the
+        order path (friction gate, protective-stop presence,
+        RiskGuards / pool budget + min-lot floor, 15% drawdown
+        halt, position caps) still runs after, unchanged and
+        above: a "take" is necessary, never sufficient, and a
+        safeguard refusal journals under the safeguard's own
+        reason, never this one's.
 
         Returns (bundle, refusal_reason):
         - shadow mode: (None, None) — the caller proceeds
@@ -3945,82 +3658,25 @@ class MT5Runner:
           reason) — fail closed: no core record, no order; the
           caller's refusal record states the failure.
 
-        PER-ROUTE authority (post-half-1 truth, all-live
-        2026-11-26): every declared route governs — the
-        completion-02 shadow tier is gone, and the
-        ``shadow_declared`` branch below is reachable only for
-        a route demoted by config or by a verdict (a
-        demotion releases only by a clean audit window with
-        activity, source ``invariant_cleared``).  A caller
-        naming such a demoted route gets the evaluation WITHOUT
-        the authority: active mode evaluates and returns
-        (bundle, None) whatever the verdict — the caller
-        proceeds on its own gate stack and journals the bundle
-        as its record's precomputed_judgment, so the verdict
-        becomes shadow history, scored like every other
-        route's.  An evaluation failure there returns a bundle
-        carrying "evaluation_error" and no refusal: observation
-        must never fail a route it does not govern.  In shadow
-        (global) mode a demoted route returns (None, None) like
-        every route — its terminal record's tap journals the
-        verdict.  A route that governs takes the ordinary
-        active path below, route-stamped.
-
-        PASS 5: a caller naming a route NO authority source
-        declares (not in JUDGMENT_ROUTE_STATES, no config
-        override, no verdict entry) is refused fail-closed in
-        every mode, with a journaled undeclared_route alarm —
-        a wiring mistake produces a refused submission and a
-        record, never an unjudged order (pre-Pass-5 the
-        undeclared default resolved "governing").  And the two
-        connected routes' boundary gates (the hot_scalp
-        promotion path, the resting limit) now end any attempt
-        whose route does not govern in active mode: the seam's
-        (bundle, None) for a shadow route feeds their shadow
-        preservation, never an independent submission."""
-        if route is not None and not self._route_declared(
-                route):
-            self._undeclared_route_alarm(route)
-            refusal = (
-                f"undeclared judgment route {route!r}: no "
-                "authority source (JUDGMENT_ROUTE_STATES, "
-                "config judgment_route_modes, verdict) names "
-                "it — fail closed: no submission under an "
-                "undeclared route (Pass 5)")
-            if self._judgment_mode() != "active":
-                return None, refusal
-            try:
-                bundle = self._judgment_evaluate(
-                    candidate=candidate, decision=decision,
-                    evidence=evidence, intended_tf=intended_tf,
-                    eval_now=eval_now, route=route)
-            except Exception:  # noqa: BLE001 - fail closed
-                bundle = {"judgment": None,
-                          "forecast_evidence": None}
-            return bundle, refusal
-        if route is not None \
-                and self._judgment_route_state(route) \
-                == "shadow_declared":
-            if self._judgment_mode() != "active":
-                return None, None
-            try:
-                bundle = self._judgment_evaluate(
-                    candidate=candidate, decision=decision,
-                    evidence=evidence, intended_tf=intended_tf,
-                    eval_now=eval_now, route=route)
-            except Exception as exc:  # noqa: BLE001 - observe-only
-                return {"judgment": None,
-                        "forecast_evidence": None,
-                        "evaluation_error":
-                            f"{type(exc).__name__}: {exc}"}, None
-            return bundle, None
+        Every route is live (owner order 2026-11-25/27 — the
+        promotion gate is deleted, no route is shadowed or
+        demoted, no promotion verdict binds or demotes).  The
+        route a playbook rides is declared in the registry
+        (playbook_registry.order_route_for); a caller naming a
+        route the registry does not know is a wiring mistake,
+        and the evaluation itself fails closed below rather
+        than through a separate authority table."""
         if self._judgment_mode() != "active":
             return None, None
         try:
+            # The order decision point is where the brain rung
+            # runs (use_brain=True): the brain reads the same
+            # measured structure and calls it; no brain verdict
+            # -> the code rung decides and the record says so.
             bundle = self._judgment_evaluate(
                 candidate=candidate, decision=decision,
                 evidence=evidence, intended_tf=intended_tf,
-                eval_now=eval_now, route=route)
+                eval_now=eval_now, route=route, use_brain=True)
         except Exception as exc:  # noqa: BLE001 - fail closed
             return {"judgment": None, "forecast_evidence": None}, (
                 "judgment core evaluation failed at the order "
@@ -4204,12 +3860,11 @@ class MT5Runner:
                 **payload})
 
     def _handoff_enabled(self) -> bool:
-        """WS3 (owner approval 2026-11-04): the H1 trigger
+        """WS3 (owner approval 2026-11-04): the trigger
         handoff — registered scan dispositions, thesis-linked
-        setup instances, corresponding-instance trigger binding
-        and shadow-instance preservation.  Default ON per the
-        deployment ruling; OFF restores the legacy behavior
-        byte-identically."""
+        setup instances and corresponding-instance trigger
+        binding.  Default ON per the deployment ruling; OFF
+        restores the legacy behavior byte-identically."""
         return bool(getattr(
             self.cfg, "h1_trigger_handoff_enabled", True))
 
@@ -4323,75 +3978,14 @@ class MT5Runner:
             run_id=self._run_id, bar=bar_key)
         if record is not None:
             self.journal.append(record)
-        # §G range promotion evaluation: the same window, the
-        # same cadence, the same state file — no new scheduler.
-        self._range_promotion_phase(
-            records, bar_key, damaged_lines=damaged,
-            window={"from_offset": from_offset,
-                    "to_offset": new_offset,
-                    "records": len(records)})
-        # Pass 7a volatility-expansion promotion evaluation:
-        # the same window, the same cadence, the same state
-        # file — no new scheduler (§G host precedent).
-        self._vol_promotion_phase(
-            records, bar_key, damaged_lines=damaged,
-            window={"from_offset": from_offset,
-                    "to_offset": new_offset,
-                    "records": len(records)})
-        # Pass 7b trend / momentum promotion evaluation:
-        # the same window, the same cadence, the same state
-        # file — no new scheduler (the 7a host arrangement).
-        self._trend_promotion_phase(
-            records, bar_key, damaged_lines=damaged,
-            window={"from_offset": from_offset,
-                    "to_offset": new_offset,
-                    "records": len(records)})
-        # Pass 7c auction / value promotion evaluation:
-        # the same window, the same cadence, the same state
-        # file — no new scheduler (the 7a host arrangement).
-        self._auction_promotion_phase(
-            records, bar_key, damaged_lines=damaged,
-            window={"from_offset": from_offset,
-                    "to_offset": new_offset,
-                    "records": len(records)})
-        # Pass 7d mean reversion promotion evaluation:
-        # the same window, the same cadence, the same state
-        # file — no new scheduler (the 7a host arrangement).
-        self._reversion_promotion_phase(
-            records, bar_key, damaged_lines=damaged,
-            window={"from_offset": from_offset,
-                    "to_offset": new_offset,
-                    "records": len(records)})
-        # Pass 7e session / opening range promotion
-        # evaluation: the same window, the same cadence,
-        # the same state file — no new scheduler (the 7a
-        # host arrangement).
-        self._session_promotion_phase(
-            records, bar_key, damaged_lines=damaged,
-            window={"from_offset": from_offset,
-                    "to_offset": new_offset,
-                    "records": len(records)})
-        # Pass 4 measured priors: the same window, the same
-        # cadence, the same state file — no new scheduler.
-        self._priors_phase(
-            records, bar_key, damaged_lines=damaged,
-            window={"from_offset": from_offset,
-                    "to_offset": new_offset,
-                    "records": len(records)})
-        # Pass 5 route authority: the promotion evaluation
-        # (measurement only since the owner's 2026-11-25
-        # order — verdicts bind nothing) + the
-        # invariant-violation scan — the same window, the
-        # same cadence, the same state file.  Unlike the §G
-        # and priors phases, this one's findings CAN move
-        # authority: violations demote, and a clean window
-        # releases a demotion — every effect is a journaled
-        # record written by the phase itself.
-        self._route_promotion_phase(
-            records, bar_key, damaged_lines=damaged,
-            window={"from_offset": from_offset,
-                    "to_offset": new_offset,
-                    "records": len(records)})
+        # Pass 4 measured priors: the calibration cycle was
+        # never wired (no _priors_phase / _priors_state
+        # exists) and the formula core that consumed priors
+        # is retired (owner order 2026-11-27) — the call is
+        # deleted, not worked around.  The calibration module
+        # itself (judgment_calibration.py) stays: it measures
+        # priors from the journal for the validation reports,
+        # which read it directly.
         # Pass 9: the three consumers of everything the
         # earlier passes journaled — the whole-book
         # comparison over the family states JUST folded by
@@ -4405,453 +3999,6 @@ class MT5Runner:
                     "to_offset": new_offset,
                     "records": len(records)})
 
-    # ---- §G range promotion evaluation ----------------------
-    # The verdict machinery is execution/range_promotion.py;
-    # this is only its host (the self-audit's arrangement: a
-    # standing block inside the S3 state file, fed the audit's
-    # journal windows, journaled on change, rendered on
-    # /status and the manifest).  Findings feed back nowhere —
-    # a verdict is a recommendation record, never a decision
-    # input, a parameter change or a demotion.
-    def _range_promotion_state(self) -> dict:
-        from . import range_promotion as _range_promotion
-
-        st = self._audit_state()
-        sub = st.get("range_promotion")
-        if not isinstance(sub, dict):
-            sub = _range_promotion.new_state()
-            st["range_promotion"] = sub
-        else:
-            for key, value in _range_promotion.new_state().items():
-                sub.setdefault(key, value)
-        return sub
-
-    def _range_promotion_phase(self, records, bar_key, *,
-                               damaged_lines: int = 0,
-                               window: dict | None = None) -> None:
-        """One §G promotion-evaluation cycle over the
-        self-audit's journal window.  Called from inside
-        _self_audit_phase (itself inside the S3 cycle's guarded
-        body): a failure here is logged by that guard like any
-        audit failure and never reaches a decision path."""
-        from . import range_promotion as _range_promotion
-
-        sub = self._range_promotion_state()
-        record = _range_promotion.cycle(
-            state=sub, records=records,
-            now=pd.Timestamp(bar_key),
-            damaged_lines=damaged_lines, window=window,
-            run_id=self._run_id, bar=bar_key)
-        if record is not None:
-            self.journal.append(record)
-
-    # ---- Pass 7a vol-expansion promotion evaluation --------
-    # The verdict machinery is execution/vol_promotion.py
-    # (the §G evaluator, re-parameterised for the family);
-    # this is only its host, in the exact range-promotion
-    # arrangement.  Findings feed back nowhere — the family's
-    # verdicts recommend; promotion stays the owner's
-    # separate decision.
-    def _vol_promotion_state(self) -> dict:
-        from . import vol_promotion as _vol_promotion
-
-        st = self._audit_state()
-        sub = st.get("vol_promotion")
-        if not isinstance(sub, dict):
-            sub = _vol_promotion.new_state()
-            st["vol_promotion"] = sub
-        else:
-            for key, value in _vol_promotion.new_state().items():
-                sub.setdefault(key, value)
-        return sub
-
-    def _vol_promotion_phase(self, records, bar_key, *,
-                             damaged_lines: int = 0,
-                             window: dict | None = None) -> None:
-        """One Pass 7a promotion-evaluation cycle over the
-        self-audit's journal window.  Called from inside
-        _self_audit_phase (inside the S3 cycle's guarded
-        body): a failure here is logged by that guard like
-        any audit failure and never reaches a decision
-        path."""
-        from . import vol_promotion as _vol_promotion
-
-        sub = self._vol_promotion_state()
-        record = _vol_promotion.cycle(
-            state=sub, records=records,
-            now=pd.Timestamp(bar_key),
-            damaged_lines=damaged_lines, window=window,
-            run_id=self._run_id, bar=bar_key)
-        if record is not None:
-            self.journal.append(record)
-
-    # ---- Trend / momentum promotion evaluation (Pass 7b) -----
-    # The measurement machinery is execution/
-    # trend_promotion.py; this is only its host (the
-    # vol-promotion arrangement: a standing block inside the
-    # S3 state file, fed the audit's journal windows,
-    # journaled on change).  Findings feed back nowhere.
-    def _trend_promotion_state(self) -> dict:
-        from . import trend_promotion as _trend_promotion
-
-        st = self._audit_state()
-        sub = st.get("trend_promotion")
-        if not isinstance(sub, dict):
-            sub = _trend_promotion.new_state()
-            st["trend_promotion"] = sub
-        else:
-            for key, value in _trend_promotion.new_state().items():
-                sub.setdefault(key, value)
-        return sub
-
-    def _trend_promotion_phase(self, records, bar_key, *,
-                               damaged_lines: int = 0,
-                               window: dict | None = None) -> None:
-        """One Pass 7b promotion-evaluation cycle over the
-        self-audit's journal window.  Called from inside
-        _self_audit_phase (inside the S3 cycle's guarded
-        body): a failure here is logged by that guard like
-        any audit failure and never reaches a decision
-        path."""
-        from . import trend_promotion as _trend_promotion
-
-        sub = self._trend_promotion_state()
-        record = _trend_promotion.cycle(
-            state=sub, records=records,
-            now=pd.Timestamp(bar_key),
-            damaged_lines=damaged_lines, window=window,
-            run_id=self._run_id, bar=bar_key)
-        if record is not None:
-            self.journal.append(record)
-
-    # ---- Auction / value promotion evaluation (Pass 7c) ----
-    # The measurement machinery is execution/
-    # auction_promotion.py; this is only its host (the
-    # vol-promotion arrangement: a standing block inside
-    # the S3 state file, fed the audit's journal windows,
-    # journaled on change).  Findings feed back nowhere.
-    def _auction_promotion_state(self) -> dict:
-        from . import auction_promotion as _auction_promotion
-
-        st = self._audit_state()
-        sub = st.get("auction_promotion")
-        if not isinstance(sub, dict):
-            sub = _auction_promotion.new_state()
-            st["auction_promotion"] = sub
-        else:
-            for key, value in _auction_promotion.new_state().items():
-                sub.setdefault(key, value)
-        return sub
-
-    def _auction_promotion_phase(self, records, bar_key, *,
-                                 damaged_lines: int = 0,
-                                 window: dict | None = None) -> None:
-        """One Pass 7c promotion-evaluation cycle over the
-        self-audit's journal window.  Called from inside
-        _self_audit_phase (inside the S3 cycle's guarded
-        body): a failure here is logged by that guard like
-        any audit failure and never reaches a decision
-        path."""
-        from . import auction_promotion as _auction_promotion
-
-        sub = self._auction_promotion_state()
-        record = _auction_promotion.cycle(
-            state=sub, records=records,
-            now=pd.Timestamp(bar_key),
-            damaged_lines=damaged_lines, window=window,
-            run_id=self._run_id, bar=bar_key)
-        if record is not None:
-            self.journal.append(record)
-
-    # ---- Mean reversion promotion evaluation (Pass 7d) ----
-    # The measurement machinery is execution/
-    # reversion_promotion.py; this is only its host (the
-    # vol-promotion arrangement: a standing block inside
-    # the S3 state file, fed the audit's journal windows,
-    # journaled on change).  Findings feed back nowhere.
-    def _reversion_promotion_state(self) -> dict:
-        from . import reversion_promotion as _reversion_promotion
-
-        st = self._audit_state()
-        sub = st.get("reversion_promotion")
-        if not isinstance(sub, dict):
-            sub = _reversion_promotion.new_state()
-            st["reversion_promotion"] = sub
-        else:
-            for key, value in _reversion_promotion.new_state().items():
-                sub.setdefault(key, value)
-        return sub
-
-    def _reversion_promotion_phase(self, records, bar_key, *,
-                                   damaged_lines: int = 0,
-                                   window: dict | None = None) -> None:
-        """One Pass 7d promotion-evaluation cycle over the
-        self-audit's journal window.  Called from inside
-        _self_audit_phase (inside the S3 cycle's guarded
-        body): a failure here is logged by that guard like
-        any audit failure and never reaches a decision
-        path."""
-        from . import reversion_promotion as _reversion_promotion
-
-        sub = self._reversion_promotion_state()
-        record = _reversion_promotion.cycle(
-            state=sub, records=records,
-            now=pd.Timestamp(bar_key),
-            damaged_lines=damaged_lines, window=window,
-            run_id=self._run_id, bar=bar_key)
-        if record is not None:
-            self.journal.append(record)
-
-    # ---- Session range promotion evaluation (Pass 7e) ----
-    # The measurement machinery is execution/
-    # session_promotion.py; this is only its host (the
-    # vol-promotion arrangement: a standing block inside
-    # the S3 state file, fed the audit's journal windows,
-    # journaled on change).  Findings feed back nowhere.
-    def _session_promotion_state(self) -> dict:
-        from . import session_promotion as _session_promotion
-
-        st = self._audit_state()
-        sub = st.get("session_promotion")
-        if not isinstance(sub, dict):
-            sub = _session_promotion.new_state()
-            st["session_promotion"] = sub
-        else:
-            for key, value in _session_promotion.new_state().items():
-                sub.setdefault(key, value)
-        return sub
-
-    def _session_promotion_phase(self, records, bar_key, *,
-                                 damaged_lines: int = 0,
-                                 window: dict | None = None) -> None:
-        """One Pass 7e promotion-evaluation cycle over the
-        self-audit's journal window.  Called from inside
-        _self_audit_phase (inside the S3 cycle's guarded
-        body): a failure here is logged by that guard like
-        any audit failure and never reaches a decision
-        path."""
-        from . import session_promotion as _session_promotion
-
-        sub = self._session_promotion_state()
-        record = _session_promotion.cycle(
-            state=sub, records=records,
-            now=pd.Timestamp(bar_key),
-            damaged_lines=damaged_lines, window=window,
-            run_id=self._run_id, bar=bar_key)
-        if record is not None:
-            self.journal.append(record)
-
-    # ---- Measured priors (Pass 4) -----------------------------
-    # The measurement machinery is execution/
-    # judgment_calibration.py; this is only its host (the
-    # range-promotion arrangement: a standing block inside the
-    # S3 state file, fed the audit's journal windows, journaled
-    # on change).  The calibration's ONLY decision-path contact
-    # is the priors provider the judgment seam consults —
-    # gated by config + the journaled holdout verdict, and
-    # fail-soft to the stated constants on any fault.
-    def _priors_state(self) -> dict:
-        from . import judgment_calibration as _cal
-
-        st = self._audit_state()
-        sub = st.get("priors")
-        if not isinstance(sub, dict):
-            sub = _cal.new_state()
-            st["priors"] = sub
-        else:
-            for key, value in _cal.new_state().items():
-                sub.setdefault(key, value)
-        return sub
-
-    def _priors_phase(self, records, bar_key, *,
-                      damaged_lines: int = 0,
-                      window: dict | None = None) -> None:
-        """One Pass-4 calibration cycle over the self-audit's
-        journal window.  Called from inside _self_audit_phase
-        (itself inside the S3 cycle's guarded body): a failure
-        here is logged by that guard like any audit failure and
-        never reaches a decision path."""
-        from . import judgment_calibration as _cal
-
-        sub = self._priors_state()
-        for record in _cal.cycle(
-                state=sub, records=records,
-                now=pd.Timestamp(bar_key),
-                damaged_lines=damaged_lines, window=window,
-                run_id=self._run_id, bar=bar_key):
-            self.journal.append(record)
-
-    # ---- Route authority (Pass 5) ---------------------------
-    # The machinery is execution/route_promotion.py; this is
-    # its host + its effects.  The evaluations ride the S3
-    # cadence like the §G and priors phases.  Their verdicts
-    # are MEASUREMENT ONLY since the owner's 2026-11-25 order
-    # (the 2026-11-08 "verdicts BIND" ruling is dead): a
-    # scanned invariant violation demotes ANY governing route
-    # (source "demoted"), and a clean window releases the
-    # demotion.  Every effect is journaled by the appliers
-    # below; the per-cycle judgment_authority record and
-    # /status render the result from _judgment_route_table,
-    # so the effect is observable without reading code.
-    def _route_promotion_state(self) -> dict:
-        from . import route_promotion as _route_promotion
-
-        st = self._audit_state()
-        sub = st.get("route_promotion")
-        if not isinstance(sub, dict):
-            sub = _route_promotion.new_state()
-            st["route_promotion"] = sub
-        else:
-            for key, value in \
-                    _route_promotion.new_state().items():
-                sub.setdefault(key, value)
-        return sub
-
-    def _route_promotion_phase(self, records, bar_key, *,
-                               damaged_lines: int = 0,
-                               window: dict | None = None
-                               ) -> None:
-        """One Pass-5 cycle over the self-audit's journal
-        window: criteria registration + evaluations
-        (journaled by the module — MEASUREMENT ONLY since
-        the owner's 2026-11-25 order; the 2026-11-08
-        "verdicts BIND" ruling is dead, so no verdict is
-        applied to authority), then the invariant-violation
-        scan + auto-demotion, then the clean-window release
-        of demotions whose route traded clean through this
-        window.  Called from inside _self_audit_phase
-        (itself inside the S3 cycle's guarded body): a
-        failure here is logged by that guard like any audit
-        failure; the effects that DID land are journaled
-        records, never half-applied silently."""
-        from . import route_promotion as _route_promotion
-
-        sub = self._route_promotion_state()
-        self._retire_verdict_authority(sub, bar_key)
-        for record in _route_promotion.cycle(
-                state=sub, records=records,
-                now=pd.Timestamp(bar_key),
-                damaged_lines=damaged_lines, window=window,
-                run_id=self._run_id, bar=bar_key):
-            self.journal.append(record)
-        if damaged_lines:
-            return
-        violations, _filled = _route_promotion.scan_violations(
-            records,
-            filled_identities=sub.setdefault(
-                "filled_identities", {}))
-        for violation in violations:
-            self._apply_route_violation(violation, bar_key)
-        self._release_cleared_demotions(
-            records, violations, bar_key)
-
-    def _retire_verdict_authority(self, promo_state: dict,
-                                  bar_key) -> None:
-        """Retire the binding-verdict machinery's standing
-        state, once: drop any route_authority entry whose
-        source is "verdict" (verdicts bind nothing since
-        the owner's 2026-11-25 order — a stale entry is
-        inert history, and resolution ignores it anyway),
-        and clear the promotion state's applied-verdict
-        bookkeeping (nothing applies verdicts anymore).
-        Journals one retirement record naming the dropped
-        routes, only on the run that actually drops any —
-        later runs find nothing to retire."""
-        dyn = self._route_authority_state()
-        dropped = sorted(
-            route for route, entry in dyn.items()
-            if isinstance(entry, dict)
-            and entry.get("source") == "verdict")
-        applied = promo_state.get("applied")
-        had_applied = bool(applied)
-        for route in dropped:
-            del dyn[route]
-        if isinstance(applied, dict):
-            promo_state["applied"] = {}
-        if not dropped and not had_applied:
-            return
-        self.journal.append({
-            "type": "route_authority_verdict_retired",
-            "routes": dropped,
-            "cleared_applied_bookkeeping": had_applied,
-            "ts": str(bar_key), "run_id": self._run_id,
-            "note": (
-                "promotion verdicts no longer bind (owner "
-                "order 2026-11-25: everything goes live "
-                "directly on demo) — retired verdict entries "
-                "are inert history; routes govern by "
-                "declaration, and only an invariant-violation "
-                "demotion or the owner's config step moves "
-                "authority now")})
-
-    def _release_cleared_demotions(self, records, violations,
-                                   bar_key) -> None:
-        """Release demotions whose invariant has cleared: a
-        demoted route that had ACTIVITY in this window (a
-        journal row attributed to the route — a submission,
-        an evaluation, a placement — by route_promotion's
-        own attribution) and NO new violation in this window
-        traded clean through it, so the demotion releases
-        and the route governs by declaration again.  A route
-        with no activity in the window proves nothing and
-        stays demoted; a route violated in this window
-        (including one demoted by this very cycle) is
-        excluded by the no-violation condition.  The release
-        journals one route_authority_change per route
-        (source "invariant_cleared") and clears the entry,
-        so resolution falls through to the declared state."""
-        from .route_promotion import _row_route
-
-        violated = {str(v.get("route") or "")
-                    for v in violations}
-        active: set[str] = set()
-        for row in records or []:
-            if not isinstance(row, dict):
-                continue
-            if row.get("type") in (
-                    "route_authority_change",
-                    "route_authority_demotion",
-                    "route_authority_verdict_retired",
-                    "judgment_authority",
-                    "route_invariant_violation"):
-                continue
-            route = _row_route(row)
-            if route:
-                active.add(str(route))
-        dyn = self._route_authority_state()
-        for route in sorted(dyn):
-            entry = dyn.get(route)
-            if not isinstance(entry, dict) \
-                    or entry.get("source") != "demoted":
-                continue
-            if route in violated or route not in active:
-                continue
-            kind = entry.get("kind")
-            del dyn[route]
-            self.journal.append({
-                "type": "route_authority_change",
-                "route": route, "from": "shadow_declared",
-                "to": "governing", "source": "invariant_cleared",
-                "kind": kind,
-                "ts": str(bar_key), "run_id": self._run_id,
-                "note": (
-                    "the route traded clean through a full "
-                    "audit window after its invariant-violation "
-                    "demotion (activity in the window, no new "
-                    "violation) — the invariant has cleared, "
-                    "so the demotion releases and the route "
-                    "governs by declaration again (owner order "
-                    "2026-11-25: no promotion gate; the "
-                    "invariant clearing is the release)")})
-
-    # ---- Pass 9: self-evaluation, coverage, grading ---------
-    # The machinery is execution/book_evaluation.py,
-    # execution/coverage_report.py and
-    # execution/book_grading.py; this is only their host
-    # (standing blocks inside the S3 state file, fed the
-    # audit's journal windows, journaled on change, rendered
-    # on /status).  Findings feed back nowhere — this pass
-    # grants, demotes and changes NO authority.
     def _book_evaluation_state(self) -> dict:
         from . import book_evaluation as _book_evaluation
 
@@ -4897,9 +4044,9 @@ class MT5Runner:
                      damaged_lines: int = 0,
                      window: dict | None = None) -> None:
         """One Pass-9 cycle over the self-audit's journal
-        window: the whole-book comparison (consuming the
-        family promotion states folded moments earlier in
-        this same audit cycle), the coverage standing
+        window: the whole-book comparison (each family's own
+        standing state, folded by the book evaluation itself
+        from this same window), the coverage standing
         account (adjudicated against the latest situation
         and the book's live scenarios), and the book-vs-S1
         paired grading (fed the book's persisted closed
@@ -4912,23 +4059,9 @@ class MT5Runner:
         from . import book_grading as _book_grading
         from . import coverage_report as _coverage_report
 
-        family_states = {
-            "range_promotion": self._range_promotion_state(),
-            "vol_promotion": self._vol_promotion_state(),
-            "trend_promotion":
-                self._trend_promotion_state(),
-            "auction_promotion":
-                self._auction_promotion_state(),
-            "reversion_promotion":
-                self._reversion_promotion_state(),
-            "session_promotion":
-                self._session_promotion_state(),
-            "route_promotion":
-                self._route_promotion_state(),
-        }
         record = _book_evaluation.cycle(
             state=self._book_evaluation_state(),
-            records=records, family_states=family_states,
+            records=records,
             now=pd.Timestamp(bar_key),
             damaged_lines=damaged_lines, window=window,
             run_id=self._run_id, bar=bar_key)
@@ -4967,72 +4100,15 @@ class MT5Runner:
         if record is not None:
             self.journal.append(record)
 
-    def _apply_route_violation(self, violation: dict,
-                               bar_key) -> None:
-        """Apply one scanned invariant violation: journal the
-        violation itself, and — when the route currently
-        governs (any source) — demote it to shadow_declared
-        with the evidence attached (A5b auto-rollback).  A
-        violation against a route that does not govern is
-        journaled with demotion_applied False: the record is
-        the fact; there was no authority to roll back."""
-        route = str(violation.get("route") or "")
-        if not route:
-            return
-        state_now, source_now = \
-            self._judgment_route_resolution(route)
-        demotes = state_now == "governing"
-        self.journal.append({
-            "type": "route_invariant_violation",
-            "route": route,
-            "kind": violation.get("kind"),
-            "evidence": violation.get("evidence") or {},
-            "detected_ts": violation.get("ts"),
-            "scan_source": violation.get("source"),
-            "ts": str(bar_key), "run_id": self._run_id,
-            "demotion_applied": demotes,
-            "note": (
-                "an invariant violation attributed to this "
-                "route (friction-gate breach on a placed order "
-                "/ broker reconciliation divergence / "
-                "duplicate order) — a governing route is "
-                "auto-demoted; the safeguards themselves are "
-                "untouched and keep their own authority")})
-        if not demotes:
-            return
-        override = self._route_config_override(route)
-        promo = self._route_promotion_state()
-        self._route_authority_state()[route] = {
-            "state": "shadow_declared", "source": "demoted",
-            "since": str(bar_key),
-            "kind": violation.get("kind"),
-            "evidence": violation.get("evidence") or {},
-            "previous_source": source_now,
-            "config_at_demotion": override,
-            "eval_cycles_at_demotion": int(
-                promo.get("cycles") or 0)}
-        self.journal.append({
-            "type": "route_authority_demotion",
-            "route": route, "kind": violation.get("kind"),
-            "evidence": violation.get("evidence") or {},
-            "previous_source": source_now,
-            "ts": str(bar_key), "run_id": self._run_id,
-            "note": (
-                "AUTO-DEMOTED to shadow_declared (A5b): the "
-                "route stops submitting until it trades clean "
-                "through a full audit window after this "
-                "demotion (no new violation in a window where "
-                "the route had activity), or the owner's "
-                "explicit config step releases it — never a "
-                "promotion verdict (owner order 2026-11-25)")})
-
     def _authority_cycle(self, appended, asof) -> None:
         """PASS 5: ONE judgment_authority record per H1 close —
-        every route the core touches, its effective state, the
-        SOURCE of that state (declared / config / demoted),
-        and whether it governs right now.  The /status table
-        and the manifest render the same _judgment_route_table,
-        so the journal, the surface and the manifest can never
+        every live route, its authority ("live") and whether
+        it governs right now (judgment_mode "active").  There
+        is no demoted state anymore — the promotion gate and
+        its resolution are deleted (2026-11-27); every route
+        governs by declaration.  The /status table and the
+        manifest render the same _judgment_route_table, so
+        the journal, the surface and the manifest can never
         disagree about who may trade."""
         if "H1" not in (appended or []):
             return
@@ -5080,7 +4156,7 @@ class MT5Runner:
         except Exception:  # noqa: BLE001 - bookkeeping only
             pass
 
-    def _audit_register_shadow(self, judgment, candidate, ts,  # type: ignore[no-untyped-def]
+    def _audit_register_judgment(self, judgment, candidate, ts,  # type: ignore[no-untyped-def]
                                *, playbook) -> None:
         try:
             if not getattr(self.cfg, "judgment_audit_enabled", True):
@@ -5108,7 +4184,7 @@ class MT5Runner:
 
             st = self._audit_state()
             st["pending"].append({
-                "kind": "shadow", "ts": str(ts_pd),
+                "kind": "judgment", "ts": str(ts_pd),
                 "playbook": playbook, "direction": direction,
                 "decision": judgment.get("decision"),
                 "expected_r": judgment.get("expected_r"),
@@ -5200,7 +4276,7 @@ class MT5Runner:
         when fresh AND calibration-trusted — see
         forecast_evidence.py for the gate.  Any failure returns
         (None, the untouched evidence): the feed is evidence,
-        never a dependency of the shadow path."""
+        never a dependency of the order path."""
         try:
             if not getattr(
                     self.cfg,
@@ -6011,7 +5087,7 @@ class MT5Runner:
                     _lifecycle.SOURCE_LIVE_CLOSE,
                     _lifecycle.SOURCE_TRIGGER_PATH):
                 return
-            if _is_shadow_record(record):
+            if _is_judgment_record(record):
                 return
             assessment = record.get("assessment") or {}
             if assessment.get("verdict") not in ("signal", "watch"):
@@ -6075,9 +5151,9 @@ class MT5Runner:
         that picked each (bracket / nearest / oldest / single),
         or the not-bound reason from the closed taxonomy —
         ``no_armed_instances`` / ``direction_mismatch`` /
-        ``all_expired`` / ``shadow_only`` — plus every armed
+        ``all_expired`` / ``not_selected`` — plus every armed
         instance's disposition at fire time (bound:<rule> /
-        not_selected / other_direction / shadow / expired), so
+        not_selected / other_direction / expired), so
         the selection is reconstructable from this record
         alone.  Emitted only where the selection actually runs
         (a live fire's signal path with a setup store);
@@ -6099,8 +5175,6 @@ class MT5Runner:
                 disp = f"bound:{rules.get(s.playbook, '')}"
             elif int(s.direction) != int(direction):
                 disp = "other_direction"
-            elif getattr(s, "shadow", False):
-                disp = "shadow"
             elif self._binding_expired(s, bar_ts):
                 disp = "expired"
             else:
@@ -6133,10 +5207,10 @@ class MT5Runner:
                         "instance(s), none in the fire's "
                         "direction")
             elif live_same:
-                reason = "shadow_only"
+                reason = "not_selected"
                 text = (f"fire {int(direction):+d}: no instance "
-                        "bound — same-direction instances are "
-                        "shadow-only (preserved, never routed)")
+                        "bound — same-direction instances exist "
+                        "but the binding rules selected none")
             else:
                 reason = "all_expired"
                 text = (f"fire {int(direction):+d}: no instance "
@@ -6184,13 +5258,12 @@ class MT5Runner:
         if self._handoff_enabled():
             # WS3 trace completeness: every link of the chain
             # also carries the parent thesis link (WS1 child
-            # registration) and the shadow marker, so the full
-            # chain — thesis -> setup -> trigger -> judgment ->
-            # execution -> broker outcome — reconstructs from
-            # the journal alone.
+            # registration), so the full chain — thesis ->
+            # setup -> trigger -> judgment -> execution ->
+            # broker outcome — reconstructs from the journal
+            # alone.
             evidence["thesis_id"] = setup.thesis_id
             evidence["thesis_version"] = setup.thesis_version
-            evidence["shadow"] = bool(setup.shadow)
         self._emit_eval(
             playbook=setup.playbook, kind="setup_event",
             evaluation_clock="setup_lifecycle",
@@ -6288,16 +5361,16 @@ class MT5Runner:
 
     def _build_scan_setup(self, spec, sig, prov, *, frame, t,
                           formation_ts, eval_now, intended_tf,
-                          shadow: bool = False,
                           thesis_link: dict | None = None):
         """Construct the tracked setup a scan candidate becomes
         (owner rulings 2026-10-30 §1).  Detection happens at the
         level on a live close, so the setup arms immediately;
-        its declared trigger is a same-direction h1_trigger fire
-        inside its validity window.  ``thesis_link`` / ``shadow``
-        are the WS3 stamps (parent thesis link from the WS1
-        child registration; §G shadow-route marker) — both None /
-        False on the legacy path, so the instance is unchanged."""
+        its declared trigger is a same-direction fire of its own
+        trigger kind inside its validity window, on the
+        playbook's own trigger clock.  ``thesis_link`` is the
+        WS3 stamp (parent thesis link from the WS1 child
+        registration) — None on the legacy path, so the
+        instance is unchanged."""
         clean_ctx, _dropped = _setup_lc.sanitize_context(
             getattr(sig, "live_context", None))
         touch_ts = frame.index[t]
@@ -6325,7 +5398,8 @@ class MT5Runner:
                           if formation_ts is not None else None),
             touch_ts=str(touch_ts), created_ts=str(eval_now),
             trigger_kind=str(getattr(
-                spec, "trigger_kind", "h1_trigger_fire")),
+                spec, "trigger_kind",
+                _setup_lc.trigger_kind_for(str(intended_tf)))),
             trigger_tf=str(intended_tf),
             validity_bars=int(getattr(spec, "validity_bars", 6)),
             expiry_ts=str(touch_ts + delta
@@ -6333,8 +5407,7 @@ class MT5Runner:
                                         6))),
             thesis_id=(thesis_link or {}).get("thesis_id"),
             thesis_version=(thesis_link or {}).get(
-                "thesis_version"),
-            shadow=bool(shadow))
+                "thesis_version"))
 
     def _register_scan_setup(self, spec, sig, prov, *, frame, t,
                              formation_ts, eval_now,
@@ -6359,7 +5432,7 @@ class MT5Runner:
             self._transition_setup(
                 setup, _setup_lc.STAGE_ARMED,
                 f"armed: trigger {setup.trigger_kind} "
-                f"(same-direction h1_trigger fire) within "
+                f"(same-direction {setup.trigger_kind} fire) within "
                 f"{setup.validity_bars} {setup.trigger_tf} bars; "
                 f"invalidation {setup.invalidation:.2f}; "
                 f"expiry {setup.expiry_ts}")
@@ -6367,20 +5440,20 @@ class MT5Runner:
     def _register_scan_setup_handoff(self, spec, sig, prov, *,
                                      frame, t, formation_ts,
                                      eval_now, intended_tf,
-                                     shadow, thesis_link):
+                                     thesis_link):
         """WS3 registration (flag on): persist the scan
-        candidate as a setup instance stamped with its parent
-        thesis link and (for §G routes) its shadow marker, and
-        journal detected + armed.  Returns the tracked instance
-        (existing or new) so the scan's evaluation record can
-        carry the instance's real disposition; None when the
-        registration itself failed (the caller then falls back
-        to the honest legacy disposition on its record)."""
+        candidate as a live setup instance stamped with its
+        parent thesis link, and journal detected + armed.
+        Returns the tracked instance (existing or new) so the
+        scan's evaluation record can carry the instance's real
+        disposition; None when the registration itself failed
+        (the caller then falls back to the honest legacy
+        disposition on its record)."""
         try:
             setup = self._build_scan_setup(
                 spec, sig, prov, frame=frame, t=t,
                 formation_ts=formation_ts, eval_now=eval_now,
-                intended_tf=intended_tf, shadow=shadow,
+                intended_tf=intended_tf,
                 thesis_link=thesis_link)
             is_new = self._setup_store.register(
                 setup, ts=str(eval_now))
@@ -6401,32 +5474,17 @@ class MT5Runner:
         # PASS 2 — the registered setup is also a book scenario
         # from birth (same instance key, thesis link included).
         self._book_propose_setup(setup)
-        if shadow:
-            detected_detail = (
-                f"scan-detected {setup.playbook} "
-                f"{setup.direction:+d} @ {setup.entry_ref:.2f} — "
-                "shadow route: preserved as a tracked instance "
-                "(never routed; trigger-stage disposition and "
-                "terminal state journaled on this instance)")
-            armed_detail = (
-                f"armed (shadow): trigger {setup.trigger_kind} "
-                f"fires in this direction are observed against "
-                f"this instance for accounting only — no order "
-                f"authority; invalidation "
-                f"{setup.invalidation:.2f}; "
-                f"expiry {setup.expiry_ts}")
-        else:
-            detected_detail = (
-                f"scan-detected {setup.playbook} "
-                f"{setup.direction:+d} @ {setup.entry_ref:.2f} — "
-                "registered for trigger routing (the scan itself "
-                "holds no order authority)")
-            armed_detail = (
-                f"armed: trigger {setup.trigger_kind} "
-                f"(same-direction h1_trigger fire) within "
-                f"{setup.validity_bars} {setup.trigger_tf} bars; "
-                f"invalidation {setup.invalidation:.2f}; "
-                f"expiry {setup.expiry_ts}")
+        detected_detail = (
+            f"scan-detected {setup.playbook} "
+            f"{setup.direction:+d} @ {setup.entry_ref:.2f} — "
+            "registered for trigger routing (the scan itself "
+            "holds no order authority)")
+        armed_detail = (
+            f"armed: trigger {setup.trigger_kind} "
+            f"(same-direction {setup.trigger_kind} fire) within "
+            f"{setup.validity_bars} {setup.trigger_tf} bars; "
+            f"invalidation {setup.invalidation:.2f}; "
+            f"expiry {setup.expiry_ts}")
         if setup.thesis_id:
             detected_detail += (
                 f"; parent thesis {setup.thesis_id} "
@@ -6557,66 +5615,6 @@ class MT5Runner:
             pass
         return block
 
-    def _route_promotion_manifest_block(self) -> dict:
-        """Route authority (Pass 5): the binding evaluations'
-        standing state for the run manifest — per route: the
-        pre-registered criteria id, the standing verdict with
-        its paired arms, and the applied authority effect.
-        Self-guarded like _range_promotion_manifest_block: a
-        gap reads as an empty block, never a crash and never
-        a fabricated history."""
-        block: dict = {"cycles": 0, "damaged_cycles": 0,
-                       "last_cycle_bar": None, "routes": {},
-                       "criteria": {}, "applied": {}}
-        try:
-            from . import route_promotion as _route_promotion
-
-            sub = self._route_promotion_state()
-            block["cycles"] = int(sub.get("cycles") or 0)
-            block["damaged_cycles"] = int(
-                sub.get("damaged_cycles") or 0)
-            block["last_cycle_bar"] = sub.get("last_cycle_bar")
-            snap = sub.get("last_evaluation") or {}
-            block["horizon_h"] = snap.get("horizon_h")
-            block["floors"] = snap.get("floors")
-            block["window_start"] = snap.get("window_start")
-            block["routes"] = snap.get("routes") or {}
-            block["criteria"] = {
-                route: (crit or {}).get("criteria_id")
-                for route, crit in
-                (sub.get("criteria") or {}).items()}
-            block["applied"] = sub.get("applied") or {}
-        except Exception:  # noqa: BLE001 - manifest must not die
-            pass
-        return block
-
-    def _range_promotion_manifest_block(self) -> dict:
-        """§G range promotion evaluation: the standing verdict
-        snapshot for the run manifest — per route: evaluated /
-        paired arms (hit rates, median R), degenerate
-        exclusions, the verdict and its reason, and the
-        evaluation window's opening stamp.  Self-guarded like
-        _self_audit_manifest_block: a gap reads as an empty
-        block, never a crash and never a fabricated history
-        (routes stay absent until a cycle has run)."""
-        block: dict = {"cycles": 0, "damaged_cycles": 0,
-                       "last_cycle_bar": None, "routes": {}}
-        try:
-            sub = self._range_promotion_state()
-            block["cycles"] = int(sub.get("cycles") or 0)
-            block["damaged_cycles"] = int(
-                sub.get("damaged_cycles") or 0)
-            block["last_cycle_bar"] = sub.get("last_cycle_bar")
-            snap = sub.get("last_snapshot") or {}
-            block["horizon_h"] = snap.get("horizon_h")
-            block["floors"] = snap.get("floors")
-            block["window_start"] = snap.get("window_start")
-            block["window_basis"] = snap.get("window_basis")
-            block["routes"] = snap.get("routes") or {}
-        except Exception:  # noqa: BLE001 — manifest must not die
-            pass
-        return block
-
     def _forecast_manifest_block(self) -> dict:
         """Completion-04: the predictive system's standing state
         for the run manifest — retrain accrual for both
@@ -6733,8 +5731,8 @@ class MT5Runner:
                 "roster": [{"name": s.name, "clock": s.native_tf,
                             "route": s.route,
                             "refinement_clock": s.refinement_tf,
-                            "shadow_evaluation":
-                                s.shadow_evaluation}
+                            "trigger_kind": s.trigger_kind,
+                            "trigger_clock": s.trigger_tf}
                            for s in PLAYBOOK_REGISTRY],
                 "doctrine": {
                     "execute_playbooks": self.cfg.execute_playbooks,
@@ -6760,41 +5758,37 @@ class MT5Runner:
                         f"k={float(self.cfg.risk_pct)}, C=1.0 (held)"),
                     "min_score": self.cfg.min_score,
                     "floor_authority": dict(_FLOOR_AUTHORITY),
-                    # Judgment core: PROMOTED to the demo
-                    # decision authority by the owner's decision
-                    # of 2026-11-05 (the separate approval the
-                    # shadow program always required).  The
+                    # Judgment (owner order 2026-11-27 — the
+                    # formula core is RETIRED): the verdict is
+                    # computed from the market's own measured
+                    # structure/reaction (the code rung) and,
+                    # at the order decision point, the brain
+                    # reads the same measured structure and
+                    # calls it (the brain rung, active only
+                    # when a provider is configured).  The
                     # manifest journals the EFFECTIVE mode (the
                     # kill switch's real state), the configured
-                    # value verbatim, and the authority boundary:
-                    # the routes the core governs vs the routes
-                    # it does not (not_authoritative — the
-                    # hot_scalp promotion and the A6 resting
-                    # limit keep their own gate stacks as the
-                    # deciding layer).  COMPLETION-02
-                    # (2026-11-05): those two routes are now
-                    # CONNECTED — funnel records + journaled
-                    # core evaluations, declared shadow per
-                    # route — and route_authority journals every
-                    # route's declared/effective state, whether
-                    # it governs right now, and the connected
-                    # routes' accruing shadow-history counts, so
-                    # "evaluated but not governing" is a stated
-                    # fact with a number, never a silent dual
-                    # path in either direction.
+                    # value verbatim, and the authority
+                    # boundary: every live order route governs
+                    # (the promotion gate is deleted, no route
+                    # is shadowed or demoted), and
+                    # route_authority journals every route's
+                    # declared/effective state, whether it
+                    # governs right now, and the accruing
+                    # judged-history counts, so "evaluated but
+                    # not governing" is a stated fact with a
+                    # number, never a silent dual path.
                     "judgment_core": {
                         "mode": self._judgment_mode(),
                         "mode_configured": str(getattr(
                             self.cfg, "judgment_mode", "active")),
-                        "authority_routes": [
-                            "h1_trigger", "qm_m5_native",
-                            "qm_d1_native"],
+                        "authority_routes": sorted(
+                            LIVE_ORDER_ROUTES),
                         # Pass 5: computed, not hardcoded — a
-                        # connected route promoted by a binding
-                        # verdict (or the config step) leaves
-                        # this list the moment it governs; the
-                        # route_authority table below carries
-                        # the state + source either way.
+                        # route leaves this list the moment it
+                        # governs; the route_authority table
+                        # below carries the state + source
+                        # either way.
                         "not_authoritative": [
                             route for route in (
                                 "hot_scalp_promotion",
@@ -6807,14 +5801,12 @@ class MT5Runner:
                         "route_authority":
                             self._judgment_route_table(),
                         "enabled": bool(getattr(
-                            self.cfg, "judgment_shadow_enabled",
+                            self.cfg, "judgment_record_enabled",
                             True)),
-                        "min_expected_r": float(getattr(
-                            self.cfg, "judgment_min_expected_r",
-                            0.05)),
-                        "min_confidence": float(getattr(
-                            self.cfg, "judgment_min_confidence",
-                            0.15)),
+                        # The brain rung: configured (a provider
+                        # is set) or not — never assumed.
+                        "brain_rung":
+                            self._brain_rung_configured(),
                         "thesis": (
                             self._thesis_keeper.status()
                             if getattr(self, "_thesis_keeper",
@@ -6834,24 +5826,7 @@ class MT5Runner:
                         # (five categories, standing totals +
                         # per-route feedback rates).
                         "self_audit":
-                            self._self_audit_manifest_block(),
-                        # §G range promotion evaluation: the
-                        # four range routes' verdicts over their
-                        # own route-stamped shadow history
-                        # (recommendations to the owner; this
-                        # block promotes nothing — the explicit
-                        # promotion step stays
-                        # judgment_route_modes).
-                        "range_promotion":
-                            self._range_promotion_manifest_block(),
-                        # Pass 5: the binding route evaluations
-                        # (criteria, standing verdicts, applied
-                        # authority effects) — unlike the §G
-                        # block above, these verdicts MOVE
-                        # authority; the route_authority table
-                        # shows the result.
-                        "route_promotion":
-                            self._route_promotion_manifest_block()}},
+                            self._self_audit_manifest_block()}},
                 # FORECAST LOOP (completion-04): the predictive
                 # system's standing state in the same manifest —
                 # retrain accrual for both lifecycles, per-horizon
@@ -7202,7 +6177,7 @@ class MT5Runner:
             raise
 
         stats: dict = {"ticks": 0, "bars": 0, "signals": 0,
-                       "executed": 0, "shadow": 0, "gated": 0,
+                       "executed": 0, "gated": 0,
                        "hierarchy_blocked": 0, "tick_actions": 0,
                        "reconciled_closed": 0, "triggers": 0,
                        "invalidated": 0, "pending": 0,
@@ -7281,7 +6256,7 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5 runner: stopped: {stats['ticks']} ticks, "
                 f"{stats['bars']} H1 bars, {stats['signals']} signals, "
-                f"{stats['executed']} executed, {stats['shadow']} shadow, "
+                f"{stats['executed']} executed, "
                 f"{stats['hierarchy_blocked']} hierarchy-blocked, "
                 f"{stats['triggers']} triggers, "
                 f"{stats['invalidated']} invalidated, "
@@ -8741,102 +7716,10 @@ class MT5Runner:
         except Exception as exc:  # noqa: BLE001 — status must not die
             return f"self-audit: unavailable ({exc})"
 
-    def range_promotion_line(self) -> str:
-        """One /status Range Promotion block (§G evaluation):
-        per range route, the promotion verdict over its own
-        route-stamped shadow history in plain words — takes vs
-        abstains (median R, hit rate, paired n at +4h), with
-        "not enough data yet" and "no candidates observed"
-        stated as the different facts they are.  The verdict
-        is measurement only — routes govern by declaration
-        (owner order 2026-11-25)."""
-        try:
-            from . import range_promotion as _range_promotion
-
-            return "\n".join(_range_promotion.render_lines(
-                self._range_promotion_state()))
-        except Exception as exc:  # noqa: BLE001 — status must not die
-            return f"range promotion: unavailable ({exc})"
-
-    def vol_promotion_line(self) -> str:
-        """One /status Vol Promotion block (Pass 7a
-        evaluation): per volatility-expansion route, the
-        promotion verdict over its own route-stamped shadow
-        history in plain words — the §G block's shape.  The
-        verdict is measurement only — routes govern by
-        declaration (owner order 2026-11-25)."""
-        try:
-            from . import vol_promotion as _vol_promotion
-
-            return "\n".join(_vol_promotion.render_lines(
-                self._vol_promotion_state()))
-        except Exception as exc:  # noqa: BLE001 — status must not die
-            return f"vol promotion: unavailable ({exc})"
-
-    def trend_promotion_line(self) -> str:
-        """One /status Trend Promotion block (Pass 7b
-        evaluation): per trend / momentum route, the
-        promotion verdict over its own route-stamped shadow
-        history in plain words — the §G block's shape.  The
-        verdict is measurement only — routes govern by
-        declaration (owner order 2026-11-25)."""
-        try:
-            from . import trend_promotion as _trend_promotion
-
-            return "\n".join(_trend_promotion.render_lines(
-                self._trend_promotion_state()))
-        except Exception as exc:  # noqa: BLE001 — status must not die
-            return f"trend promotion: unavailable ({exc})"
-
-    def auction_promotion_line(self) -> str:
-        """One /status Auction Promotion block (Pass 7c
-        evaluation): per auction / value route, the
-        promotion verdict over its own route-stamped shadow
-        history in plain words — the §G block's shape.  The
-        verdict is measurement only — routes govern by
-        declaration (owner order 2026-11-25)."""
-        try:
-            from . import auction_promotion as _auction_promotion
-
-            return "\n".join(_auction_promotion.render_lines(
-                self._auction_promotion_state()))
-        except Exception as exc:  # noqa: BLE001 — status must not die
-            return f"auction promotion: unavailable ({exc})"
-
-    def reversion_promotion_line(self) -> str:
-        """One /status Mean Reversion Promotion block (Pass
-        7d evaluation): per mean reversion route, the
-        promotion verdict over its own route-stamped shadow
-        history in plain words — the §G block's shape.  The
-        verdict is measurement only — routes govern by
-        declaration (owner order 2026-11-25)."""
-        try:
-            from . import reversion_promotion as _reversion_promotion
-
-            return "\n".join(_reversion_promotion.render_lines(
-                self._reversion_promotion_state()))
-        except Exception as exc:  # noqa: BLE001 — status must not die
-            return f"reversion promotion: unavailable ({exc})"
-
-    def session_promotion_line(self) -> str:
-        """One /status Session Range Promotion block (Pass
-        7e evaluation): per session / opening range route,
-        the promotion verdict over its own route-stamped
-        shadow history in plain words — the §G block's
-        shape.  The verdict is measurement only — routes
-        govern by declaration (owner order 2026-11-25)."""
-        try:
-            from . import session_promotion as _session_promotion
-
-            return "\n".join(_session_promotion.render_lines(
-                self._session_promotion_state()))
-        except Exception as exc:  # noqa: BLE001 — status must not die
-            return f"session promotion: unavailable ({exc})"
-
     def book_evaluation_line(self) -> str:
         """One /status Book Evaluation block (Pass 9): every
-        family's shadow history graded on the one shared
-        promotion instrument, side by side with the
+        family's measured history graded on the one shared
+        evaluation instrument, side by side with the
         governing routes' measured history — the comparison
         table of execution/book_evaluation.py, consumed
         from the family evaluations it does not re-run.  The
@@ -8879,51 +7762,28 @@ class MT5Runner:
             return f"book grading: unavailable ({exc})"
 
     def judgment_authority_line(self) -> str:
-        """One /status Judgment Authority block (Pass 5):
-        every route's effective authority state AND its
-        source — the owner's 2026-11-25 declaration (all
-        routes governing), the explicit config step, or an
-        invariant-violation demotion — rendered from the
+        """One /status Judgment Authority block: every live
+        route's authority — always "live" (owner order
+        2026-11-25/27: the promotion gate is deleted, no
+        route is shadowed or demoted) — rendered from the
         same _judgment_route_table the per-cycle
         judgment_authority journal record and the manifest
-        carry, followed by the two connected routes'
-        standing verdicts (measurement only).  A route not
-        governing in active mode submits no independent demo
-        orders (owner order 2026-11-25); the line says so
-        per route."""
+        carry.  A route governs in active mode; its orders
+        need a core take."""
         try:
-            from . import route_promotion as _route_promotion
-
             lines = [
                 "judgment authority: who may trade, and on "
-                "whose say-so (owner order 2026-11-25: every "
-                "declared route governs; only a demotion or "
-                "the owner's config step holds one back)"]
+                "whose say-so (owner order 2026-11-25/27: "
+                "every route is live; no promotion gate)"]
             for row in self._judgment_route_table():
-                state = row["authority"]
-                source = row.get("source", "declared")
                 if row["governing_now"]:
                     now = "GOVERNS NOW (orders need a core take)"
-                elif state == "governing":
-                    now = ("governing route, but the global "
-                           "mode is shadow — the kill switch's "
-                           "rollback posture")
                 else:
-                    now = ("shadow — evaluated and journaled, "
-                           "submits nothing independently")
-                extra = ""
-                if source == "demoted":
-                    entry = self._route_authority_entry(
-                        row["route"]) or {}
-                    kind = entry.get("kind") \
-                        or "invariant violation"
-                    extra = (f" · auto-demoted: {kind} at "
-                             f"{entry.get('since') or '—'}")
+                    now = ("live route, but the global mode is "
+                           "shadow — the kill switch's rollback "
+                           "posture")
                 lines.append(
-                    f"  {row['route']}: {state} "
-                    f"(source: {source}) — {now}{extra}")
-            lines += _route_promotion.render_lines(
-                self._route_promotion_state())
+                    f"  {row['route']}: {row['authority']} — {now}")
             return "\n".join(lines)
         except Exception as exc:  # noqa: BLE001 — status must not die
             return f"judgment authority: unavailable ({exc})"
@@ -12527,12 +11387,15 @@ class MT5Runner:
                         f"expired: no fill after "
                         f"{self.cfg.pending_expiry_bars} H1 bars",
                         stats)
-        # A pending trigger belongs to the H1 bar that just closed:
-        # without entry confirmation it is invalidated by
-        # non-confirmation — logged, never erased.
-        if self._pending is not None:
-            self._invalidate_pending("h1_close_without_entry_confirm",
-                                     stats)
+        # An armed pending is NOT expired by the H1 close (rework
+        # 2026-11-27): the pending belongs to its own entry clock,
+        # and the H1 close used to kill every armed touch after one
+        # H1 bar — the 25–27 Nov live statuses show setups dying at
+        # 2/3 confirmations, never firing.  The pending lives until
+        # its own entry-clock TTL disarms it as stale (phase 3) or
+        # a genuine invalidation kills it (Close Rule, left zone,
+        # bias flip).  Native pendings were already exempt the same
+        # way (their own clock, above).
         # The new forming H1 bar starts with this tick (the tick that
         # crossed the boundary belongs to the new bar).  Volume
         # starts at zero: _evaluate_live_tick owns accumulation, so
@@ -12679,8 +11542,6 @@ class MT5Runner:
         # an armed plan's fate must be queryable, not prose-only.
         _stage, _code = {
             "stale": ("expired", "path.trigger_not_fired"),
-            "h1_close_without_entry_confirm": (
-                "expired", "path.trigger_not_fired"),
             "invalidation": ("invalidated",
                              "path.invalidated_close_rule"),
             "bias_flipped": ("invalidated", "path.bias_flip"),
@@ -13242,82 +12103,12 @@ class MT5Runner:
                 except Exception:
                     pass  # evidence only
             return
-        # PASS 5 BOUNDARY (owner order 2026-11-25 — the
-        # strict reading of AMENDMENTS-1 §A5 as amended):
-        # in active mode the resting limit rests ONLY when
-        # its route governs — by declaration now (every
-        # route governs since the 2026-11-25 order).  While
-        # it does not — an invariant-violation demotion or
-        # the owner's explicit config step — the seam's
-        # verdict above is shadow history and NO order rests:
-        # the candidate is preserved, its terminal record
-        # journaled once per zone key (the dedupe discipline
-        # of the other refusals in this flow — the approach
-        # re-evaluates on every tick), and the flow returns
-        # exactly as a refused placement does.  Fail-closed:
-        # an attempt whose candidate could not even be
-        # constructed for the core rests nothing either.  In
-        # shadow (global) mode the kill switch's rollback
-        # posture is untouched.
-        if self._judgment_mode() == "active" \
-                and self._judgment_route_state(
-                    "resting_limit") != "governing":
-            if _az_candidate is not None \
-                    and getattr(self, "_resting_shadow_key",
-                                None) != key:
-                self._resting_shadow_key = key
-                _az_authority = self._judgment_route_state(
-                    "resting_limit")
-                _az_source = self._judgment_route_source(
-                    "resting_limit")
-                self.journal.log_note(
-                    f"mt5 resting limit: NOT placed at fresh "
-                    f"MAJOR {major.get('tf', '?')} {prox:.1f} — "
-                    f"route resting_limit is {_az_authority} "
-                    f"(source: {_az_source}); candidate "
-                    f"preserved as shadow, no independent "
-                    f"demo order (owner order 2026-11-25)")
-                try:
-                    self._emit_eval(
-                        playbook="arrival_zone",
-                        evaluation_clock="tick", intended_tf="H1",
-                        actual_input_tf="H1",
-                        outcome="candidate_emitted",
-                        reason_code=(
-                            "judgment.route_not_promoted"),
-                        reason=(
-                            "route resting_limit does not "
-                            "govern (demoted or held back by "
-                            "config) — candidate preserved "
-                            "as shadow; no independent demo "
-                            "order"),
-                        candidate=_az_candidate,
-                        decision={
-                            "result": "refused",
-                            "reason_code": (
-                                "judgment.route_not_promoted"),
-                            "reason": (
-                                "route resting_limit does not "
-                                "govern (demoted or held back "
-                                "by config) — candidate "
-                                "preserved as shadow; no "
-                                "independent demo order"),
-                            "execution_eligible": False,
-                            "order_result": "not_attempted",
-                            **_verdict_blocks(
-                                analytical="qualified",
-                                eligible=False,
-                                execution_code=(
-                                    "judgment.route_not_"
-                                    "promoted"),
-                                outcome="not_attempted")},
-                        evidence=_az_evidence,
-                        desk_cycle=False,
-                        judgment_route="resting_limit",
-                        precomputed_judgment=_az_bundle)
-                except Exception:
-                    pass  # evidence only
-            return
+        # The resting limit's route is live (owner order
+        # 2026-11-25/27 — the promotion gate is deleted, no
+        # route is shadowed or demoted): the seam's verdict
+        # above governs, and the placement below runs.  A
+        # failed candidate construction still rests nothing
+        # (fail-closed, above).
         request = OrderRequest(
             symbol=self.cfg.symbol, direction=direction,
             volume=lots, stop_loss=float(stop0),
@@ -13344,7 +12135,7 @@ class MT5Runner:
         if _az_candidate is not None:
             # The route's terminal funnel record (completion-02):
             # the placement's outcome, with the seam's verdict
-            # journaled beside it as shadow history.
+            # journaled beside it as measured history.
             _az_code = ("decision.resting_limit" if placed
                         else "execution.order_path_refused")
             _az_reason = (
@@ -13419,13 +12210,15 @@ class MT5Runner:
                 trigger_source="resting_limit",
                 context=self._decision_context())
 
-    def _run_hot_scalp_shadow(self, tick: dict) -> list[dict]:
-        """Observe the separate Hot Scalp sleeve without granting order authority.
+    def _run_hot_scalp(self, tick: dict) -> list[dict]:
+        """Run the separate Hot Scalp sleeve on a live tick.
 
-        Returns the engine's events (step 6: the live loop feeds
-        candidate_shadow events to the flag-gated promotion path;
-        returning them changes no existing caller, which ignored
-        the previous None).
+        Returns the engine's events (the live loop feeds
+        candidate events to the live order path; returning them
+        changes no existing caller, which ignored the previous
+        None).  The sleeve is LIVE (owner order 2026-11-25/27):
+        its candidates route to the order seam, not to a shadow
+        book.
         """
         engine = getattr(self, "_hot_scalp", None)
         stack = getattr(self, "_stack", None)
@@ -13461,9 +12254,9 @@ class MT5Runner:
                 "symbol": str(getattr(self.cfg, "symbol", "XAUUSD")),
                 "event": name,
                 "reason_code": event.get("reason_code"),
-                "execution_authority": "shadow_only",
-                "research_only": True,
-                # The research stream's own label stays — and the
+                "execution_authority": "live",
+                "research_only": False,
+                # The sleeve's own label stays — and the
                 # live path's disposition travels WITH the record,
                 # so no reader ever has to guess whether a candidate
                 # from this stream was also evaluated for execution
@@ -13487,7 +12280,7 @@ class MT5Runner:
             # (§4.4): armed / triggered / terminal events land
             # as scenario transitions beside the chain records.
             self._book_mirror_hs_event(event, tick)
-            if name in ("setup_armed", "candidate_shadow", "candidate_blocked",
+            if name in ("setup_armed", "candidate", "candidate_blocked",
                         "setup_invalidated", "setup_expired", "scan_degraded"):
                 try:
                     self.journal.log_note(
@@ -13504,7 +12297,7 @@ class MT5Runner:
         "setup_armed": "armed",
         "setup_touched": "zone_touched",
         "setup_extended": "extended",
-        "candidate_shadow": "triggered",
+        "candidate": "triggered",
         "candidate_blocked": "blocked",
         "setup_invalidated": "invalidated",
         "setup_expired": "expired",
@@ -13514,16 +12307,14 @@ class MT5Runner:
                   tick, fields=None) -> None:
         """One canonical lifecycle record per transition.
 
-        The research stream and the live execution stream used to
-        describe the same candidate in two vocabularies — a
-        promoted candidate still read as ``shadow_only`` in its
-        research record, and the live path's refusals were free-text
-        notes.  The chain is the single auditable thread: parent
-        thesis → child setup → zone → trigger → judgment →
-        execution intent → friction/broker outcome → (later)
-        outcome.  Every record carries explicit authority and
-        execution-status fields.  Best-effort: a chain write failure
-        never breaks the tick loop (and never grants authority)."""
+        The sleeve stream and the live execution stream describe
+        the same candidate in one vocabulary: the chain is the
+        single auditable thread — parent thesis → child setup →
+        zone → trigger → judgment → execution intent →
+        friction/broker outcome → (later) outcome.  Every record
+        carries explicit authority and execution-status fields.
+        Best-effort: a chain write failure never breaks the tick
+        loop (and never grants authority)."""
         if not chain_id:
             return
         record = {
@@ -13533,7 +12324,7 @@ class MT5Runner:
             "stage": stage,
             "execution_status": status,
             "authority": {
-                "research_stream": "shadow_only",
+                "sleeve_stream": "live",
                 "live_promotion": bool(
                     getattr(self.cfg, "hot_scalp_live_enabled", False)),
             },
@@ -13574,7 +12365,7 @@ class MT5Runner:
                 "expires_at": setup.get("expires_at"),
                 "cost_viability": setup.get("cost_viability"),
             })
-        elif name == "candidate_shadow":
+        elif name == "candidate":
             fields.update({
                 "strategy": event.get("strategy"),
                 "direction": event.get("direction"),
@@ -13693,7 +12484,7 @@ class MT5Runner:
             "child_tickets": [s["ticket"] for s in children],
             "aggregate_stop_exposure": aggregate}
 
-    def _promote_hot_scalp_candidate(self, candidate: dict, tick: dict,
+    def _place_hot_scalp_candidate(self, candidate: dict, tick: dict,
                                      stats: dict) -> bool:
         """Promote one shadow candidate to the SHARED order path (step 6).
 
@@ -13738,18 +12529,16 @@ class MT5Runner:
 
         # COMPLETION-02 (owner program 2026-11-05): this route
         # connects to the shared funnel + Judgment Core.  Every
-        # promotion attempt terminates in ONE funnel evaluation
+        # placement attempt terminates in ONE funnel evaluation
         # record (playbook "hot_scalp") carrying the candidate in
         # the funnel's shape, and every such record carries a
         # journaled core evaluation — computed at the judgment
         # stage by the authority seam for dispatch-bound
         # candidates, by the _emit_eval tap for route-gate
-        # refusals.  The route is declared SHADOW
-        # (JUDGMENT_ROUTE_STATES): the verdicts are shadow
-        # history, scored like every other route's; the chain's
-        # own gate stack still decides — unless the route is
-        # explicitly promoted to governing by config, in which
-        # case the seam's abstention refuses the attempt below
+        # refusals.  The route is declared LIVE: the verdicts
+        # are measured history, scored like every other
+        # route's; the chain's own gate stack still decides —
+        # and the seam's abstention refuses the attempt below
         # exactly as on the governed routes.  The emit is
         # evidence only: it is guarded so a funnel failure can
         # never change a claim's fate.
@@ -13858,12 +12647,12 @@ class MT5Runner:
 
         if not self.cfg.hot_scalp_live_enabled:
             self.journal.log_note(
-                f"mt5: hot_scalp promotion refused {sid}: "
+                f"mt5: hot_scalp placement refused {sid}: "
                 f"live authority OFF (hot_scalp_live_enabled=False)")
-            _chain("promotion", "refused",
-                   {"reason_code": "promotion.live_authority_off"})
+            _chain("placement", "refused",
+                   {"reason_code": "hot_scalp.live_authority_off"})
             _emit_hs(result="refused", order_result="not_attempted",
-                     reason_code="promotion.live_authority_off",
+                     reason_code="hot_scalp.live_authority_off",
                      reason="hot_scalp live authority OFF "
                             "(hot_scalp_live_enabled=False)",
                      eligible=False)
@@ -13873,12 +12662,12 @@ class MT5Runner:
         claim = candidate.get("claim") or {}
         if str(claim.get("claimant") or "") != str(engine.instance_id):
             self.journal.log_note(
-                f"mt5: hot_scalp promotion refused {sid}: claim owned "
+                f"mt5: hot_scalp placement refused {sid}: claim owned "
                 f"by another process ({claim.get('claimant')})")
-            _chain("promotion", "refused",
-                   {"reason_code": "promotion.claim_owned_elsewhere"})
+            _chain("placement", "refused",
+                   {"reason_code": "hot_scalp.claim_owned_elsewhere"})
             _emit_hs(result="refused", order_result="not_attempted",
-                     reason_code="promotion.claim_owned_elsewhere",
+                     reason_code="hot_scalp.claim_owned_elsewhere",
                      reason="claim owned by another process "
                             f"({claim.get('claimant')})",
                      eligible=False)
@@ -13897,12 +12686,12 @@ class MT5Runner:
 
         if self.cfg.paused:
             self.journal.log_note(
-                f"mt5: hot_scalp promotion refused {sid}: runner paused")
-            _chain("promotion", "refused",
-                   {"reason_code": "promotion.runner_paused"})
+                f"mt5: hot_scalp placement refused {sid}: runner paused")
+            _chain("placement", "refused",
+                   {"reason_code": "hot_scalp.runner_paused"})
             _resolve(False)
             _emit_hs(result="refused", order_result="not_attempted",
-                     reason_code="promotion.runner_paused",
+                     reason_code="hot_scalp.runner_paused",
                      reason="runner paused", eligible=False)
             return False
         # COMPLETION-03 (owner program 2026-11-05): the sleeve is
@@ -13933,17 +12722,17 @@ class MT5Runner:
                            if s["setup_id"] == sid]
             if _same_setup:
                 self.journal.log_note(
-                    f"mt5: hot_scalp promotion refused {sid}: this "
+                    f"mt5: hot_scalp placement refused {sid}: this "
                     f"setup already holds position ticket "
                     f"{_same_setup[0]['ticket']} — a setup never "
                     f"opens twice")
-                _chain("promotion", "refused",
-                       {"reason_code": "promotion.setup_already_open",
+                _chain("placement", "refused",
+                       {"reason_code": "hot_scalp.setup_already_open",
                         "ticket": _same_setup[0]["ticket"]})
                 _resolve(False)
                 _emit_hs(result="refused",
                          order_result="not_attempted",
-                         reason_code="promotion.setup_already_open",
+                         reason_code="hot_scalp.setup_already_open",
                          reason="this setup already holds a position "
                                 f"(ticket {_same_setup[0]['ticket']})"
                                 " — a setup never opens twice",
@@ -13961,13 +12750,13 @@ class MT5Runner:
                         f"same-thesis revalidation could not read "
                         f"the setup store ({exc}) — claim left "
                         f"claimed")
-                    _chain("promotion", "withheld",
+                    _chain("placement", "withheld",
                            {"reason_code":
-                            "promotion.sleeve_state_unavailable"})
+                            "hot_scalp.sleeve_state_unavailable"})
                     _emit_hs(result="refused",
                              order_result="not_attempted",
                              reason_code=
-                             "promotion.sleeve_state_unavailable",
+                             "hot_scalp.sleeve_state_unavailable",
                              reason="same-thesis revalidation could "
                                     f"not read the setup store "
                                     f"({exc}) — claim left claimed",
@@ -13977,45 +12766,45 @@ class MT5Runner:
                                   or "")
                 if _row_status == "invalidated":
                     self.journal.log_note(
-                        f"mt5: hot_scalp promotion refused {sid}: "
+                        f"mt5: hot_scalp placement refused {sid}: "
                         f"the setup was invalidated after its "
                         f"trigger — parent thesis {_cand_parent} "
                         f"no longer stands (same-thesis "
                         f"revalidation)")
-                    _chain("promotion", "refused",
+                    _chain("placement", "refused",
                            {"reason_code":
-                            "promotion.thesis_invalidated",
+                            "hot_scalp.thesis_invalidated",
                             "parent_setup_id": _cand_parent,
                             "terminal_reason":
                             (_cand_row or {}).get("terminal_reason")})
                     _resolve(False)
                     _emit_hs(result="refused",
                              order_result="not_attempted",
-                             reason_code="promotion.thesis_invalidated",
+                             reason_code="hot_scalp.thesis_invalidated",
                              reason="the setup was invalidated after "
                                     "its trigger — a stale trigger "
                                     "does not ride a dead thesis "
                                     "read (same-thesis revalidation)",
                              eligible=False)
                     return False
-                # Live-at-promotion statuses are 'claimed' (direct
-                # claim) and 'shadow_triggered' (the engine finished
-                # its shadow bookkeeping before this promotion ran);
-                # only the genuinely dead states refuse here.
+                # The live-at-placement status is 'claimed' (the
+                # claim stays claimed until this placement resolves
+                # it live); only the genuinely dead states refuse
+                # here.
                 if _row_status in ("expired", "blocked"):
                     self.journal.log_note(
-                        f"mt5: hot_scalp promotion refused {sid}: "
+                        f"mt5: hot_scalp placement refused {sid}: "
                         f"the setup is no longer live (store status "
                         f"{_row_status}) — same-thesis revalidation")
-                    _chain("promotion", "refused",
+                    _chain("placement", "refused",
                            {"reason_code":
-                            "promotion.setup_no_longer_live",
+                            "hot_scalp.setup_no_longer_live",
                             "store_status": _row_status})
                     _resolve(False)
                     _emit_hs(result="refused",
                              order_result="not_attempted",
                              reason_code=
-                             "promotion.setup_no_longer_live",
+                             "hot_scalp.setup_no_longer_live",
                              reason=f"the setup is no longer live "
                                     f"(store status {_row_status}) "
                                     f"— same-thesis revalidation",
@@ -14047,15 +12836,15 @@ class MT5Runner:
                             break
                     if _zone_holder is not None:
                         self.journal.log_note(
-                            f"mt5: hot_scalp promotion refused "
+                            f"mt5: hot_scalp placement refused "
                             f"{sid}: entry zone "
                             f"{_cand_zone[0]:.2f}–{_cand_zone[1]:.2f} "
                             f"already carries same-thesis position "
                             f"ticket {_zone_holder['ticket']} — "
                             f"zone consumed")
-                        _chain("promotion", "refused",
+                        _chain("placement", "refused",
                                {"reason_code":
-                                "promotion.zone_already_consumed",
+                                "hot_scalp.zone_already_consumed",
                                 "parent_setup_id": _cand_parent,
                                 "ticket": _zone_holder["ticket"],
                                 "zone": list(_cand_zone)})
@@ -14063,7 +12852,7 @@ class MT5Runner:
                         _emit_hs(result="refused",
                                  order_result="not_attempted",
                                  reason_code=
-                                 "promotion.zone_already_consumed",
+                                 "hot_scalp.zone_already_consumed",
                                  reason="the entry zone already "
                                         "carries a same-thesis "
                                         "position (ticket "
@@ -14130,16 +12919,16 @@ class MT5Runner:
                     if _same_thesis and \
                             _parent_open + _est > _envelope + 1e-9:
                         self.journal.log_note(
-                            f"mt5: hot_scalp promotion refused "
+                            f"mt5: hot_scalp placement refused "
                             f"{sid}: parent thesis {_cand_parent} "
                             f"risk budget — aggregate stop exposure "
                             f"{_parent_open + _est:.2f} (open "
                             f"{_parent_open:.2f} + candidate est. "
                             f"{_est:.2f}) exceeds the authorized "
                             f"envelope {_envelope:.2f}")
-                        _chain("promotion", "refused",
+                        _chain("placement", "refused",
                                {"reason_code":
-                                "promotion.parent_risk_budget",
+                                "hot_scalp.parent_risk_budget",
                                 "parent_setup_id": _cand_parent,
                                 "authorized_envelope": _envelope,
                                 "open_exposure": _parent_open,
@@ -14150,7 +12939,7 @@ class MT5Runner:
                         _emit_hs(result="refused",
                                  order_result="not_attempted",
                                  reason_code=
-                                 "promotion.parent_risk_budget",
+                                 "hot_scalp.parent_risk_budget",
                                  reason="parent thesis aggregate "
                                         f"exposure "
                                         f"{_parent_open + _est:.2f} "
@@ -14162,15 +12951,15 @@ class MT5Runner:
                         return False
                     if _sleeve_open + _est > _sleeve_cap + 1e-9:
                         self.journal.log_note(
-                            f"mt5: hot_scalp promotion refused "
+                            f"mt5: hot_scalp placement refused "
                             f"{sid}: sleeve risk budget — aggregate "
                             f"stop exposure {_sleeve_open + _est:.2f} "
                             f"(open {_sleeve_open:.2f} + candidate "
                             f"est. {_est:.2f}) exceeds the sleeve "
                             f"envelope {_sleeve_cap:.2f}")
-                        _chain("promotion", "refused",
+                        _chain("placement", "refused",
                                {"reason_code":
-                                "promotion.sleeve_risk_budget",
+                                "hot_scalp.sleeve_risk_budget",
                                 "authorized_envelope": _sleeve_cap,
                                 "open_exposure": _sleeve_open,
                                 "candidate_estimated_exposure": _est,
@@ -14180,7 +12969,7 @@ class MT5Runner:
                         _emit_hs(result="refused",
                                  order_result="not_attempted",
                                  reason_code=
-                                 "promotion.sleeve_risk_budget",
+                                 "hot_scalp.sleeve_risk_budget",
                                  reason="sleeve aggregate exposure "
                                         f"{_sleeve_open + _est:.2f} "
                                         f"(open {_sleeve_open:.2f} + "
@@ -14194,13 +12983,13 @@ class MT5Runner:
                     f"mt5: hot_scalp promotion withheld {sid}: "
                     f"sleeve aggregate accounting failed ({exc}) — "
                     f"claim left claimed")
-                _chain("promotion", "withheld",
+                _chain("placement", "withheld",
                        {"reason_code":
-                        "promotion.sleeve_accounting_failed"})
+                        "hot_scalp.sleeve_accounting_failed"})
                 _emit_hs(result="refused",
                          order_result="not_attempted",
                          reason_code=
-                         "promotion.sleeve_accounting_failed",
+                         "hot_scalp.sleeve_accounting_failed",
                          reason=f"sleeve aggregate accounting "
                                 f"failed ({exc}) — claim left claimed",
                          eligible=False)
@@ -14220,10 +13009,10 @@ class MT5Runner:
             self.journal.log_note(
                 f"mt5: hot_scalp promotion withheld {sid}: broker "
                 f"lookup failed ({exc}) — claim left claimed")
-            _chain("promotion", "withheld",
-                   {"reason_code": "promotion.broker_lookup_failed"})
+            _chain("placement", "withheld",
+                   {"reason_code": "hot_scalp.broker_lookup_failed"})
             _emit_hs(result="refused", order_result="not_attempted",
-                     reason_code="promotion.broker_lookup_failed",
+                     reason_code="hot_scalp.broker_lookup_failed",
                      reason=f"broker lookup failed ({exc}) — "
                             "claim left claimed",
                      eligible=False)
@@ -14234,12 +13023,12 @@ class MT5Runner:
                       not in _tracked_now]
         if _untracked:
             self.journal.log_note(
-                f"mt5: hot_scalp promotion refused {sid}: broker "
+                f"mt5: hot_scalp placement refused {sid}: broker "
                 f"shows an untracked magic position — claim left claimed")
-            _chain("promotion", "refused",
-                   {"reason_code": "promotion.broker_untracked_position"})
+            _chain("placement", "refused",
+                   {"reason_code": "hot_scalp.broker_untracked_position"})
             _emit_hs(result="refused", order_result="not_attempted",
-                     reason_code="promotion.broker_untracked_position",
+                     reason_code="hot_scalp.broker_untracked_position",
                      reason="broker shows an untracked magic "
                             "position — claim left claimed",
                      eligible=False)
@@ -14257,15 +13046,15 @@ class MT5Runner:
         if spread is None or spread < 0 or atr1 <= 0 \
                 or spread > engine.cfg.max_spread_atr_m1 * atr1:
             self.journal.log_note(
-                f"mt5: hot_scalp promotion refused {sid}: cost "
+                f"mt5: hot_scalp placement refused {sid}: cost "
                 f"envelope unverifiable or exceeded at promotion "
                 f"(spread={spread}, m1_atr={atr1})")
-            _chain("promotion", "refused",
-                   {"reason_code": "promotion.cost_envelope",
+            _chain("placement", "refused",
+                   {"reason_code": "hot_scalp.cost_envelope",
                     "spread": spread, "m1_atr": atr1})
             _resolve(False)
             _emit_hs(result="refused", order_result="not_attempted",
-                     reason_code="promotion.cost_envelope",
+                     reason_code="hot_scalp.cost_envelope",
                      reason="cost envelope unverifiable or "
                             f"exceeded at promotion (spread={spread}, "
                             f"m1_atr={atr1})",
@@ -14281,11 +13070,11 @@ class MT5Runner:
         mid = float(tick.get("mid") or entry_ref)
         setup_row = None
         try:
-            # The candidate's own row, any status: at promotion
-            # time it is 'claimed' or 'shadow_triggered', neither
-            # of which active() returns — reading only active()
-            # silently dropped the payload (atr, zone, context)
-            # the rest of this path is built on.
+            # The candidate's own row, any status: at placement
+            # time it is 'claimed', which active() does not
+            # return — reading only active() silently dropped
+            # the payload (atr, zone, context) the rest of this
+            # path is built on.
             setup_row = engine.store.get(sid)
         except Exception:
             setup_row = None
@@ -14308,14 +13097,14 @@ class MT5Runner:
             atr=atr_m5)
         if kind != "market":
             self.journal.log_note(
-                f"mt5: hot_scalp promotion refused {sid}: order "
+                f"mt5: hot_scalp placement refused {sid}: order "
                 f"shape is {kind}, not market (market-shape-only v1)")
-            _chain("promotion", "refused",
-                   {"reason_code": "promotion.order_shape_not_market",
+            _chain("placement", "refused",
+                   {"reason_code": "hot_scalp.order_shape_not_market",
                     "order_shape": kind})
             _resolve(False)
             _emit_hs(result="refused", order_result="not_attempted",
-                     reason_code="promotion.order_shape_not_market",
+                     reason_code="hot_scalp.order_shape_not_market",
                      reason=f"order shape is {kind}, not market "
                             "(market-shape-only v1)",
                      eligible=False)
@@ -14424,7 +13213,7 @@ class MT5Runner:
                     "confidence": _core.get("confidence"),
                     "authority": _core.get("authority"),
                     "governing": bool(
-                        _core.get("authority") == "governing"),
+                        _core.get("authority") == "live"),
                     "reason": _core.get("reason"),
                 }
             elif _hs_bundle.get("evaluation_error"):
@@ -14479,51 +13268,13 @@ class MT5Runner:
             _judgment_fields["market_read_error"] = (
                 f"{type(exc).__name__}: {exc}")
         _chain("judgment", "evaluated", _judgment_fields)
-        # PASS 5 BOUNDARY (owner order 2026-11-25 — the
-        # strict reading of AMENDMENTS-1 §A5 as amended): in
-        # active mode this route submits ONLY when it governs
-        # — by declaration now (every route governs since the
-        # 2026-11-25 order).  While it does not — an
-        # invariant-violation demotion or the owner's explicit
-        # config step — the candidate's shadow record is
-        # complete (the funnel record below carries the
-        # route-stamped verdict; the scenario book mirrors the
-        # setup) and the attempt ends HERE: no independent demo
-        # order bypasses the Judgment Core.  The claim resolves
-        # back to touched like every transient refusal — the
-        # setup stays live and its judged history keeps
-        # accruing.  In shadow (global) mode the kill switch's
-        # rollback posture is untouched: the chain decides
-        # exactly as pre-promotion.
-        if self._judgment_mode() == "active" \
-                and self._judgment_route_state(
-                    "hot_scalp_promotion") != "governing":
-            _hs_authority = self._judgment_route_state(
-                "hot_scalp_promotion")
-            _hs_source = self._judgment_route_source(
-                "hot_scalp_promotion")
-            self.journal.log_note(
-                f"mt5: hot_scalp candidate {sid} preserved as "
-                f"shadow — route hot_scalp_promotion is "
-                f"{_hs_authority} (source: {_hs_source}); no "
-                f"independent demo order (owner order "
-                f"2026-11-25)")
-            _chain("authority", "shadow_preserved", {
-                "reason_code": "judgment.route_not_promoted",
-                "route": "hot_scalp_promotion",
-                "authority": _hs_authority,
-                "source": _hs_source})
-            _resolve(False)
-            _emit_hs(result="refused",
-                     order_result="not_attempted",
-                     reason_code="judgment.route_not_promoted",
-                     reason="route hot_scalp_promotion does "
-                            "not govern (demoted or held back "
-                            "by config) — candidate preserved "
-                            "as shadow; no independent demo "
-                            "order",
-                     eligible=False)
-            return False
+        # The sleeve's route is live (owner order
+        # 2026-11-25/27 — the promotion gate is deleted, no
+        # route is shadowed or demoted): the seam's verdict
+        # above governs, and the placement below runs.  A
+        # refusal below resolves the claim back to touched
+        # like every transient refusal — the setup stays live
+        # and its judged history keeps accruing.
         tracked_before = set(self.tick_manager.tickets())
         self._last_tick = dict(tick)
         # score=None on purpose: _place_live_order's score parameter
@@ -14601,12 +13352,12 @@ class MT5Runner:
                {"tickets": sorted(str(t) for t in tracked_new)})
         _emit_hs(result="accepted", order_result="filled",
                  reason_code=None,
-                 reason="promoted: order placed by the shared "
+                 reason="placed: order placed by the shared "
                         "order path and reconciled at the broker "
                         "(claim resolved)",
                  eligible=True)
         self.journal.log_note(
-            f"mt5: hot_scalp promoted {sid}: order reconciled at "
+            f"mt5: hot_scalp placed {sid}: order reconciled at "
             f"broker (claim resolved)")
         # COMPLETION-03: the parent thesis record on the chain
         # ledger gains its sleeve view — its open children and
@@ -14633,21 +13384,21 @@ class MT5Runner:
             return
         # Independent Hot Scalp research: it runs on every live tick even while
         # the main sleeve is holding/paused. Its only output is a journaled
-        # shadow candidate; it cannot submit orders or alter existing gates.
+        # live candidate; it cannot submit orders or alter existing gates.
         # Step 6: when (and only when) the operator has enabled live
-        # Hot Scalp authority on the host, this tick's shadow
-        # candidates also flow to the flag-gated promotion path.
-        _hs_events = self._run_hot_scalp_shadow(tick)
+        # Hot Scalp authority on the host, this tick's candidates
+        # also flow to the flag-gated placement path.
+        _hs_events = self._run_hot_scalp(tick)
         if self.cfg.hot_scalp_live_enabled:
             for _event in _hs_events or []:
-                if _event.get("event") == "candidate_shadow":
+                if _event.get("event") == "candidate":
                     # Safety boundary: a promotion failure must
                     # never break the tick loop (the shared order
                     # path can raise after a fill, e.g. on a
                     # journal error — the claim then stays claimed,
                     # fail closed, and the loop continues).
                     try:
-                        self._promote_hot_scalp_candidate(
+                        self._place_hot_scalp_candidate(
                             _event, tick, stats)
                     except Exception as exc:
                         self.journal.log_note(
@@ -14703,7 +13454,11 @@ class MT5Runner:
             # (Confirmation on an entry close is evaluated before
             # this block runs — see _refresh_bars phase 3 — so a
             # confirming close wins over a disarm on the same
-            # tick.)
+            # tick.)  An armed pending does NOT block the breakout
+            # branch below (rework 2026-11-27): a tracker-confirmed
+            # breakout fires even while a POI pending is armed.  The
+            # re-arm guard lives at the arming section instead, so
+            # this tick never overwrites the armed pending.
             pend = self._pending
             buf = pend["setup"]["buf"]
             hi = pend["zone"]["top"] + buf
@@ -14711,7 +13466,6 @@ class MT5Runner:
                     (pend["direction"] < 0 and
                      mid <= pend["zone"]["bottom"] - buf):
                 self._invalidate_pending("left_zone", stats)
-            return
         # Regime pause (corrupt-state rebuild): no arming, no
         # breakout fire, no new setups — the rebuild must finish
         # (2 clean H1 bars) or the owner must /resume first.
@@ -14778,42 +13532,67 @@ class MT5Runner:
                 and str(setup.get("break_key") or "") \
                 in self._continuation_spent:
             return
+        # BREAKOUT_TREND fire (rework 2026-11-27): the boundary
+        # machine confirmed the breakout (2 H1 closes beyond + M15
+        # BOS); the tick clock fires the outward trade.  The
+        # breakout is consumed ONLY when the fire produces an order
+        # — a packaging failure or a signal-path refusal leaves it
+        # fireable, and it retries on a new entry-clock bar (never
+        # every tick: the structure only changes when a new entry
+        # bar prints) until the breakout's window expires (regime
+        # revert / retest window).  The old code marked the id
+        # before the fire ran, so one refusal spent the breakout
+        # forever while /status kept showing it ARMED.  This branch
+        # sits BEFORE the one-trigger-per-H1-bar guard below (the
+        # breakout_id one-shot already prevents duplicates) and
+        # before the POI arming section (a pending does not block
+        # it — see the pending block above).
+        if setup.get("regime") == "breakout_trend" \
+                and self._boundary is not None:
+            tracker = self._boundary
+            if tracker.breakout_id != self._breakout_fired_id:
+                fired = self._breakout_fired(setup, tick, bar_open)
+                if fired is not None:
+                    _attempt_key = self._breakout_attempt_key(
+                        tracker.breakout_id, tick)
+                    if _attempt_key != self._breakout_last_attempt:
+                        self._breakout_last_attempt = _attempt_key
+                        _before = (len(self._pending_orders),
+                                   len(self.tick_manager.tickets()))
+                        self._run_live_signal(fired, tick, stats)
+                        _after = (len(self._pending_orders),
+                                  len(self.tick_manager.tickets()))
+                        if _after != _before:
+                            # The fire produced an order / position:
+                            # the breakout is spent.
+                            self._breakout_fired_id = \
+                                tracker.breakout_id
+                            self._fired_h1_bar = bar_open
+                            stats["triggers"] = \
+                                stats.get("triggers", 0) + 1
+                            self.journal.log_note(
+                                f"mt5: trigger fired range_breakout "
+                                f"{'+' if fired['direction'] > 0 else '-'}1 "
+                                f"@ {fired['entry']:.2f} (H1 bar {bar_open}) — "
+                                f"tracker-confirmed breakout (2 closes + BOS)")
+                            self._emit_trigger_event(
+                                "fired", "",
+                                f"range_breakout "
+                                f"{'+' if fired['direction'] > 0 else '-'}1 "
+                                f"@ {fired['entry']:.2f} — tracker-confirmed "
+                                "breakout (2 closes + BOS)")
+                            return
+                        self.journal.log_note(
+                            "mt5: breakout fire refused (no order "
+                            "placed) — breakout "
+                            f"{tracker.breakout_id} stays fireable, "
+                            "retries on the next entry-clock bar")
         # One trigger per H1-bar window: this bar already fired —
         # the setup is fixed within the bar, so a second fire here
         # would be the same setup re-firing on the same composing
         # bars (trigger storm).  The next H1 bar is a fresh window.
         if bar_open == self._fired_h1_bar:
             return
-        # BREAKOUT_TREND fire: the boundary machine confirmed the
-        # breakout (2 H1 closes beyond + M15 BOS); the tick clock
-        # fires the outward trade ONCE per confirmed breakout
-        # (breakout_id).  The compression-breakout playbook
-        # re-verifies the pattern on the H1 frame in the signal
-        # path; the tracker is the gate, the playbook is the
-        # scorer.  A single close beyond never fires (see
-        # BoundaryTracker); the old 1-close trigger is gone.
-        if setup.get("regime") == "breakout_trend" \
-                and self._boundary is not None:
-            tracker = self._boundary
-            if tracker.breakout_id != self._breakout_fired_id:
-                self._breakout_fired_id = tracker.breakout_id
-                fired = self._breakout_fired(setup, tick, bar_open)
-                if fired is not None:
-                    self._fired_h1_bar = bar_open
-                    stats["triggers"] = stats.get("triggers", 0) + 1
-                    self.journal.log_note(
-                        f"mt5: trigger fired range_breakout "
-                        f"{'+' if fired['direction'] > 0 else '-'}1 "
-                        f"@ {fired['entry']:.2f} (H1 bar {bar_open}) — "
-                        f"tracker-confirmed breakout (2 closes + BOS)")
-                    self._emit_trigger_event(
-                        "fired", "",
-                        f"range_breakout "
-                        f"{'+' if fired['direction'] > 0 else '-'}1 "
-                        f"@ {fired['entry']:.2f} — tracker-confirmed "
-                        "breakout (2 closes + BOS)")
-                    self._run_live_signal(fired, tick, stats)
-                    return
         # TRIGGER, REDESIGNED (2026-10-15): a tick AT the POI band
         # arms the pending; the confirmation family decides whether
         # it fires (see _evaluate_pending_entry).  The old
@@ -14821,6 +13600,12 @@ class MT5Runner:
         # inside the zone — geometrically near-impossible (0/573
         # armed windows in the full-engine backtest) and against
         # the doctrine (entries AT the POI, never above it).
+        # A pending is already armed (it survived the left-zone
+        # check at the top of this tick): do not re-arm — the armed
+        # pending owns the zone touch, and re-arming here would
+        # reset its TTL on every tick.
+        if self._pending is not None:
+            return
         if not check_zone_touch(setup, mid=mid):
             return
         session = _compose_session(tick_time)
@@ -14852,6 +13637,27 @@ class MT5Runner:
             f"zone_touch {'+' if direction > 0 else '-'}1 "
             f"@ {mid:.2f} (entry clock {session['entry_clock']})")
         self._evaluate_pending_entry(tick, stats)
+
+    def _breakout_attempt_key(self, breakout_id: int,
+                              tick: dict) -> tuple:
+        """Retry key for a refused breakout fire.
+
+        (breakout_id, last closed entry-clock bar): a refused fire
+        retries only when a new entry bar has printed, since the
+        structure the signal path reads only changes then.  Falls
+        back to the tick's H1 bar when the entry frame is missing.
+        """
+        try:
+            _session = _compose_session(pd.Timestamp(tick["time"]))
+            _clock = _session.get("entry_clock") or "M15"
+            _frame = (self._stack.frames.get(_clock)
+                      if self._stack is not None else None)
+            if _frame is not None and len(_frame):
+                return (int(breakout_id), str(_frame.index[-1]))
+        except Exception:
+            pass
+        return (int(breakout_id),
+                str(pd.Timestamp(tick["time"]).floor("h")))
 
     def _breakout_fired(self, setup: dict, tick: dict,
                        bar_open) -> dict | None:
@@ -14906,14 +13712,14 @@ class MT5Runner:
         composing entry bars) and on each entry-TF close.  A
         confirmed touch FIRES the trigger — the pending is consumed
         and the signal path runs.  Non-confirmation leaves the
-        pending armed until the H1 close expires it (the window
-        lapses), the armed TTL disarms it as stale (entry-TF bars
-        without confirmation — see _refresh_bars phase 3), the
-        Close Rule invalidates it (an entry-TF bar CLOSED beyond
-        the invalidation level — a tick through the level is a
-        wick, not an invalidation), price leaving the zone disarms
-        it, or a bias flip kills it — the touch is logged, never
-        erased.
+        pending armed until the entry-clock TTL disarms it as stale
+        (entry-TF bars without confirmation — see _refresh_bars
+        phase 3; the H1 close does NOT expire it — rework
+        2026-11-27), the Close Rule invalidates it (an entry-TF bar
+        CLOSED beyond the invalidation level — a tick through the
+        level is a wick, not an invalidation), price leaving the zone
+        disarms it, or a bias flip kills it — the touch is logged,
+        never erased.
         """
         pend = self._pending
         if pend is None or self._stack is None:
@@ -14926,7 +13732,9 @@ class MT5Runner:
         entry_frame = self._stack.frames.get(pend["entry_clock"])
         trig = check_live_trigger(
             pend["setup"], entry_frame=entry_frame,
-            h1_open=pend["h1_open"], close=float(tick["mid"]))
+            h1_open=pend["h1_open"],
+            touch_ts=pend.get("touch_ts"),
+            close=float(tick["mid"]))
         if trig is None:
             return  # no confirming shape yet: pending stands
         self._pending = None
@@ -15055,7 +13863,9 @@ class MT5Runner:
             self._run_signal_path(h1_closed, t, states, years,
                                   verdict, stats,
                                   forming=forming_record,
-                                  lifecycle_routing=_routing)
+                                  lifecycle_routing=_routing,
+                                  fire_entry_clock=pend.get(
+                                      "entry_clock"))
         except Exception:
             self._emit_trigger_event(
                 "execution_evaluated", "path.exception",
@@ -15065,11 +13875,8 @@ class MT5Runner:
         _frags = self._apply_lifecycle_routing(_routing, _fire_dir)
         _armed_waiting = 0
         if self._setup_store is not None and _fire_dir in (1, -1):
-            # WS3: shadow instances are never routable, so they
-            # do not count as "armed setups remaining" here.
             _armed_waiting = len(self._setup_store.active(
-                direction=_fire_dir, armed_only=True,
-                shadow=False))
+                direction=_fire_dir, armed_only=True))
         self._emit_trigger_event(
             "execution_evaluated", "",
             f"fire {_fire_dir:+d}: signal path emitted "
@@ -15104,10 +13911,15 @@ class MT5Runner:
                     f"{setup.setup_id}: not routed (playbook "
                     "disabled; stays armed)")
                 continue
+            if status == "skipped_no_frame":
+                out.append(
+                    f"{setup.setup_id}: not routed (no closed bars "
+                    "on its own clock; stays armed)")
+                continue
             self._transition_setup(
                 setup, _setup_lc.STAGE_TRIGGER_FIRED,
-                f"h1_trigger fired {direction:+d} — routed to "
-                "execution evaluation")
+                f"{setup.trigger_kind} fired {direction:+d} — "
+                "routed to execution evaluation")
             if status == "exception":
                 self._transition_setup(
                     setup, _setup_lc.STAGE_EVALUATED,
@@ -16038,11 +14850,38 @@ class MT5Runner:
         return picked, ("nearest" if distances.count(best) == 1
                         else "oldest")
 
+    def _eval_clock_frame(self, clock, cache):
+        """(frame, states, t) for one evaluation clock, featurized
+        once per fire and cached.  The frame is the clock's own
+        closed bars from the stack and the states are featurized
+        ON that frame — a playbook's states and its frame always
+        share a clock, never H1 states under an M15 frame (that
+        silent misalignment is exactly what this method exists
+        to prevent).  None when the stack has no closed bars on
+        that clock: the caller falls back to the fire's own
+        frame (see _run_signal_path), never silently on H1."""
+        if clock in cache:
+            return cache[clock]
+        frame = None
+        try:
+            frame = self._stack.frames.get(clock) \
+                if self._stack is not None else None
+        except Exception:  # noqa: BLE001 - no stack, no frame
+            frame = None
+        if frame is None or len(frame) == 0:
+            cache[clock] = None
+            return None
+        states = read_and_featurize(frame, None)
+        entry = (frame, states, len(frame) - 1)
+        cache[clock] = entry
+        return entry
+
     def _run_signal_path(self, h1: pd.DataFrame, t: int,
                          states, years: float, verdict: dict,
                          stats: dict,
                          forming: dict | None = None,
-                         lifecycle_routing: dict | None = None
+                         lifecycle_routing: dict | None = None,
+                         fire_entry_clock: str | None = None
                          ) -> None:
         """Verdict -> playbooks -> gate -> order (shared signal path).
 
@@ -16055,6 +14894,21 @@ class MT5Runner:
         stop), position tracked by the TickManager from the fill
         tick on.  When holding, a confirming same-direction signal
         becomes a LAYER (_try_layer), never a second position.
+
+        EVALUATION FRAME (rework 2026-11-27): each playbook is
+        evaluated on its OWN entry clock — its declared
+        trigger_tf, else the fire's entry clock (an unregistered
+        playbook), never H1 by default.  The frame AND the
+        states are the clock's own (featurized once per fire,
+        cached per clock); the judgment's reaction read rides
+        the same clock.  When the stack holds no closed bars on
+        that clock, the playbook falls back to the fire's own
+        frame (states featurized on that frame, records stamp
+        intended_tf separately from the frame used) — a
+        degraded-data fallback, not a default.  ``h1``/``t``/
+        ``states`` remain the fire's own bar (the lifecycle
+        binding and the expiry check are anchored to the H1 bar
+        the touch sits in).
 
         XD-6 contract: ``h1`` is CLOSED bars only.  ``forming``
         is reaction context (the still-open bar, labelled
@@ -16119,8 +14973,11 @@ class MT5Runner:
                 reason=f"market closed: {open_reason} — "
                        "no playbook was evaluated")
             return
-        ctx = EngineContext(df=h1, states=states, years=years,
-                            instrument=self.cfg.symbol)
+        # Per-clock evaluation frames, featurized once per fire:
+        # the H1 entry is seeded from the caller's own frame +
+        # states (no re-featurization); every other clock is
+        # built on first use by _eval_clock_frame.
+        _frame_cache: dict = {"H1": (h1, states, t)}
         engine = self._get_engine()
         # Rework decision context, computed ONCE per verdict (not
         # per playbook): the graded zone behind the setup + the
@@ -16176,8 +15033,9 @@ class MT5Runner:
         # WS3 (2026-11-04): with the handoff on and several
         # instances of one playbook armed, the fire binds the
         # CORRESPONDING instance (entry-zone bracket, then
-        # nearest entry — see _select_lifecycle_candidate);
-        # shadow instances are never routed in any mode.
+        # nearest entry — see _select_lifecycle_candidate).
+        # Every armed instance is live (the shadow lifecycle
+        # is deleted — owner order 2026-11-27).
         _lc_candidates: dict = {}
         if lifecycle_routing is not None \
                 and self._setup_store is not None:
@@ -16188,36 +15046,13 @@ class MT5Runner:
                 # directions) at fire time — the selection below
                 # sees only the fire's direction, but the record
                 # must also name what it could NOT bind and why
-                # (opposite-direction / expired / shadow).
+                # (opposite-direction / expired).
                 _armed_all = self._setup_store.active(
                     armed_only=True)
                 _bind_rules: dict = {}
                 _by_playbook: dict = {}
                 for _s in self._setup_store.active(
                         direction=_lc_dir, armed_only=True):
-                    if getattr(_s, "shadow", False):
-                        # WS3: a shadow (§G) instance is
-                        # preserved, never routed — in EVERY
-                        # mode (the authority restriction is
-                        # intrinsic to the instance, not to the
-                        # flag).  With the handoff on, the fire
-                        # is also journaled as the instance's
-                        # trigger-stage disposition, so the
-                        # shadow chain does not end at the scan
-                        # record either.
-                        if _handoff:
-                            self._journal_setup_event(
-                                _s,
-                                _setup_lc.STAGE_TRIGGER_OBSERVED,
-                                f"h1_trigger fired {_lc_dir:+d} "
-                                f"({(verdict or {}).get('trigger', '')})"
-                                f" — shadow route: trigger "
-                                f"observed for accounting; the "
-                                f"instance is preserved but never "
-                                f"routed (no order authority); it "
-                                f"remains armed until "
-                                f"invalidation or expiry")
-                        continue
                     if _s.expiry_ts is not None:
                         try:
                             if pd.Timestamp(_s.expiry_ts) \
@@ -16244,12 +15079,18 @@ class MT5Runner:
                     t=t, armed_all=_armed_all,
                     candidates=_lc_candidates, rules=_bind_rules)
         for pb in self._get_playbooks():
+            # The playbook's OWN entry clock: its declared
+            # trigger_tf, else the fire's entry clock (an
+            # unregistered playbook), never H1 by default.
+            _clock = _trigger_tf_of(pb.name) \
+                or fire_entry_clock or "H1"
+            _clock_label = f"{str(_clock).lower()}_trigger"
             if pb.name in (self.cfg.disabled_playbooks or ()):
                 # Kill switch (/set) — not evaluated (A14).  FUNNEL:
                 # the skip is a record, not a silence.
                 self._emit_eval(
-                    playbook=pb.name, evaluation_clock="h1_trigger",
-                    intended_tf=_native_tf(pb.name),
+                    playbook=pb.name, evaluation_clock=_clock_label,
+                    intended_tf=_clock,
                     outcome="not_eligible",
                     reason_code="path.kill_switch",
                     reason="disabled via /set kill switch — "
@@ -16262,17 +15103,46 @@ class MT5Runner:
                             _lc_candidates[pb.name].setup_id,
                         "terminals": []}
                 continue
+            _eval = self._eval_clock_frame(_clock, _frame_cache)
+            _eval_clock = _clock
+            if _eval is None:
+                # No closed bars on the playbook's own clock.
+                # Fall back to the fire's own frame (the seeded
+                # H1 entry): the playbook is still evaluated, on
+                # bars that exist, with states featurized on
+                # those same bars — frame and states stay on one
+                # clock.  This is a DEGRADED-DATA fallback, not
+                # a default: the clock is still the playbook's
+                # own, and the records stamp intended_tf (the
+                # clock wanted) separately from the frame
+                # actually used, so the fallback is visible in
+                # the journal, never silent.  In production the
+                # stack holds every clock, so this only fires
+                # for a partial stack (tests, or a feed gap on
+                # one clock) — the alternative, skipping the
+                # playbook, left every family setup armed
+                # forever on a partial stack (18 handoff tests).
+                self.journal.log_note(
+                    f"mt5: {pb.name} signal path fell back to "
+                    f"the fire's H1 frame: no closed bars on "
+                    f"{_clock}")
+                _eval = _frame_cache["H1"]
+                _eval_clock = "H1"
+            _frame, _states, _t = _eval
+            _ctx = EngineContext(df=_frame, states=_states,
+                                 years=years,
+                                 instrument=self.cfg.symbol)
             try:
                 _inj = _lc_candidates.get(pb.name)
                 _terms = self._run_one_playbook(
-                    pb, sig_ctx=(ctx, engine),
-                    h1=h1, t=t, verdict=verdict,
+                    pb, sig_ctx=(_ctx, engine),
+                    frame=_frame, t=_t, verdict=verdict,
                     stats=stats, zone_d=zone_d,
-                    funding=funding,
-                    injected_sig=(self._rebuild_setup_signal(_inj, t)
+                    funding=funding, eval_clock=_eval_clock,
+                    injected_sig=(self._rebuild_setup_signal(_inj, _t)
                                   if _inj is not None else None),
                     injected_provenance=(
-                        self._setup_provenance(_inj, h1, t)
+                        self._setup_provenance(_inj, _frame, _t)
                         if _inj is not None else None),
                     injected_setup_id=(_inj.setup_id
                                        if _inj is not None else None),
@@ -16294,10 +15164,13 @@ class MT5Runner:
                     f"mt5: {pb.name} signal path failed: "
                     f"{type(exc).__name__}: {exc}")
                 self._emit_eval(
-                    playbook=pb.name, evaluation_clock="h1_trigger",
-                    intended_tf=_native_tf(pb.name),
-                    actual_input_tf="H1",
-                    last_bar_ts=h1.index[t] if t < len(h1) else None,
+                    playbook=pb.name,
+                    evaluation_clock=f"{str(_eval_clock).lower()}"
+                                     "_trigger",
+                    intended_tf=_clock,
+                    actual_input_tf=_eval_clock,
+                    last_bar_ts=_frame.index[_t]
+                    if _t < len(_frame) else None,
                     outcome="exception",
                     reason_code="path.exception",
                     reason=f"{type(exc).__name__}: {exc}")
@@ -16309,8 +15182,8 @@ class MT5Runner:
                             _lc_candidates[pb.name].setup_id,
                         "terminals": []}
 
-    def _run_one_playbook(self, pb, *, sig_ctx, h1, t, verdict, stats,
-                          zone_d=None, funding=None,
+    def _run_one_playbook(self, pb, *, sig_ctx, frame, t, verdict, stats,
+                          zone_d=None, funding=None, eval_clock=None,
                           injected_sig=None, injected_provenance=None,
                           injected_setup_id=None,
                           injected_parent_setup_id=None):
@@ -16326,8 +15199,20 @@ class MT5Runner:
         evaluated playbook can execute — there is no shadow
         branch; a signal is authorized, floored, gated by a hard
         line, parked in PullbackWatch, or the playbook is off.
+
+        ``frame`` is the playbook's OWN entry-clock frame (its
+        declared trigger_tf, else the fire's entry clock) and
+        ``eval_clock`` names it — the detection, the ATR, the
+        session and the judgment's reaction read all ride this
+        frame, never H1 by default.
         """
         ctx, engine = sig_ctx
+        # The evaluation clock when the caller did not resolve
+        # it: the playbook's own trigger clock, else H1 (the
+        # frame a direct caller passed — the signal path always
+        # passes it explicitly).
+        if eval_clock is None:
+            eval_clock = _trigger_tf_of(pb.name) or "H1"
         # FUNNEL §1.1: seq snapshot — if this evaluation produces
         # no per-signal record by the end, it was a no_setup
         # evaluation and gets one (evaluated-and-empty must be
@@ -16344,7 +15229,7 @@ class MT5Runner:
         if hasattr(pb, "set_h4_frame"):
             pb.set_h4_frame(self._stack.frames.get("H4"))
         # Positional, as before: playbook live_signal signatures name
-        # the frame parameter differently (df / h1).
+        # the frame parameter differently (df / frame).
         if injected_sig is not None:
             # Lifecycle routing: the persisted candidate IS the
             # signal — no fresh re-detection, no signal-gap
@@ -16352,7 +15237,7 @@ class MT5Runner:
             # identity and dedupe).
             sigs = [injected_sig]
         else:
-            sigs = pb.live_signal(ctx.states, t, h1) or []
+            sigs = pb.live_signal(ctx.states, t, frame) or []
         for sig in sigs:
             alert_id = f"MT5-{pb.name}-{sig.index}"
             if injected_sig is None and \
@@ -16376,7 +15261,7 @@ class MT5Runner:
                 sig.setup_key = str(injected_setup_id)
                 sig.trigger_key = (
                     f"{injected_setup_id}@"
-                    f"{h1.index[t] if 0 <= t < len(h1) else t}")
+                    f"{frame.index[t] if 0 <= t < len(frame) else t}")
             # Step 18: stamp the declared management block —
             # every funnel record carries it and the order path
             # hands it to the tracked position at fill.
@@ -16392,8 +15277,8 @@ class MT5Runner:
             style_key = self._style_key_for(pb.name, zone_d)
             family = _posture_mod.family_of(
                 pb.name, str(getattr(pb, "regime_scope", "") or ""))
-            atr_h1 = float(atr14(h1)) if len(h1) else 0.0
-            _atr = atr_h1 or float(getattr(sig, "atr", 0.0) or 0.0)
+            atr_frame = float(atr14(frame)) if len(frame) else 0.0
+            _atr = atr_frame or float(getattr(sig, "atr", 0.0) or 0.0)
             stop_dist = abs(float(sig.entry_ref)
                             - float(sig.invalidation)) or _atr
             scalp_into_zone = False
@@ -16512,10 +15397,10 @@ class MT5Runner:
                     "stop_dist": stop_dist,
                     "bias_d1": (verdict or {}).get("bias_d1"),
                     "bias_h4": (verdict or {}).get("bias_h4")}
-                if t < len(h1):
+                if t < len(frame):
                     try:
                         _observed["session_bucket"] = \
-                            session_of(h1.index[t])[0]
+                            session_of(frame.index[t])[0]
                     except Exception:
                         pass
                 _inferred = {
@@ -16651,10 +15536,10 @@ class MT5Runner:
                         rejected_alternatives)
                 return self._emit_eval(
                     playbook=pb.name,
-                    evaluation_clock="h1_trigger",
-                    intended_tf=_native_tf(pb.name) or "H1",
-                    actual_input_tf="H1",
-                    last_bar_ts=h1.index[t] if t < len(h1) else None,
+                    evaluation_clock=f"{str(eval_clock).lower()}_trigger",
+                    intended_tf=eval_clock,
+                    actual_input_tf=eval_clock,
+                    last_bar_ts=frame.index[t] if t < len(frame) else None,
                     outcome="candidate_emitted",
                     reason_code=reason_code, reason=reason,
                     candidate=self._candidate_dict(
@@ -16711,7 +15596,7 @@ class MT5Runner:
                     self.journal, signal_id=alert_id, playbook=pb.name,
                     direction=int(sig.direction), score=float(sig.score),
                     decision="gated", reason=reason,
-                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    bar_ts=frame.index[t] if t < len(frame) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
                     targets=_targets_as_prices(getattr(sig, "targets", None)),
@@ -16734,7 +15619,7 @@ class MT5Runner:
                     self.journal, signal_id=alert_id, playbook=pb.name,
                     direction=int(sig.direction), score=float(sig.score),
                     decision="gated", reason=reason,
-                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    bar_ts=frame.index[t] if t < len(frame) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
                     targets=_targets_as_prices(getattr(sig, "targets", None)),
@@ -16775,7 +15660,7 @@ class MT5Runner:
                     self.journal, signal_id=alert_id, playbook=pb.name,
                     direction=int(sig.direction), score=float(sig.score),
                     decision="gated", reason=reason,
-                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    bar_ts=frame.index[t] if t < len(frame) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
                     targets=_targets_as_prices(getattr(sig, "targets", None)),
@@ -16838,7 +15723,7 @@ class MT5Runner:
                         direction=int(sig.direction),
                         score=float(sig.score), decision="gated",
                         reason=_block,
-                        bar_ts=h1.index[t] if t < len(h1) else None,
+                        bar_ts=frame.index[t] if t < len(frame) else None,
                         entry=float(sig.entry_ref),
                         stop=float(sig.invalidation),
                         targets=_targets_as_prices(
@@ -16973,7 +15858,7 @@ class MT5Runner:
                     playbook=pb.name, direction=int(sig.direction),
                     score=float(sig.score), decision="gated",
                     reason=journey["refusal"],
-                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    bar_ts=frame.index[t] if t < len(frame) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
                     targets=_targets_as_prices(getattr(sig, "targets", None)),
@@ -17006,7 +15891,7 @@ class MT5Runner:
                         score=float(sig.score), decision="watch",
                         reason="runaway: price ran from the zone — "
                                "PullbackWatch armed (§5)",
-                        bar_ts=h1.index[t] if t < len(h1) else None,
+                        bar_ts=frame.index[t] if t < len(frame) else None,
                         entry=float(sig.entry_ref),
                         stop=float(sig.invalidation),
                         targets=_targets_as_prices(getattr(sig, "targets", None)),
@@ -17035,7 +15920,7 @@ class MT5Runner:
                     self.journal, signal_id=alert_id, playbook=pb.name,
                     direction=int(sig.direction), score=float(sig.score),
                     decision="below_floor", reason=reason,
-                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    bar_ts=frame.index[t] if t < len(frame) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
                     targets=_targets_as_prices(getattr(sig, "targets", None)),
@@ -17108,7 +15993,7 @@ class MT5Runner:
                 direction=int(sig.direction), score=float(sig.score),
                 decision="accepted" if auto else "shadow",
                 confluence=float(conf),
-                bar_ts=h1.index[t] if t < len(h1) else None,
+                bar_ts=frame.index[t] if t < len(frame) else None,
                 entry=float(sig.entry_ref),
                 stop=float(sig.invalidation),
                 targets=_targets_as_prices(getattr(sig, "targets", None)),
@@ -17185,7 +16070,7 @@ class MT5Runner:
                         score=float(sig.score),
                         decision="manipulation_blocked", reason=why,
                         confluence=float(conf),
-                        bar_ts=h1.index[t] if t < len(h1) else None,
+                        bar_ts=frame.index[t] if t < len(frame) else None,
                         entry=float(sig.entry_ref),
                         stop=float(sig.invalidation),
                         targets=_targets_as_prices(getattr(sig, "targets", None)),
@@ -17223,21 +16108,19 @@ class MT5Runner:
                     # names its route — the seam's verdict record
                     # now carries authority_route + authority
                     # like every connected route's.  The route is
-                    # the playbook's own (ORDER_ROUTE_BY_PLAYBOOK):
-                    # roster playbooks ride h1_trigger, each
+                    # the playbook's own (order_route_for):
+                    # roster playbooks ride h1_roster, each
                     # family playbook rides its own route
                     # (origination, owner order 2026-11-25).
                     # An unmapped playbook (a test stub, or any
-                    # playbook outside the registry) rides the
-                    # roster route, exactly as the hardcoded
-                    # literal did before half-2 — this lookup
-                    # must never raise inside the signal path,
-                    # where the per-playbook except would swallow
-                    # it and silently drop the order (regression
-                    # caught by the full suite: KeyError 'stub'
-                    # killed three live-path order tests).
-                    route=_ORDER_ROUTE_BY_PLAYBOOK.get(
-                        pb.name, "h1_trigger"),
+                    # playbook outside the registry) rides its own
+                    # name as its route — this lookup must never
+                    # raise inside the signal path, where the
+                    # per-playbook except would swallow it and
+                    # silently drop the order (regression caught
+                    # by the full suite: KeyError 'stub' killed
+                    # three live-path order tests).
+                    route=_order_route_for(pb.name) or pb.name,
                     decision={
                         "floor_result": {
                             "floor": float(fl["floor"]),
@@ -17248,7 +16131,7 @@ class MT5Runner:
                                 score, pb.name, refused=False)}
                            if was_flipped else {})},
                     evidence=_build_ev()[0],
-                    intended_tf=_native_tf(pb.name) or "H1",
+                    intended_tf=eval_clock,
                     eval_now=self._evaluation_now())
             if _core_refusal is not None:
                 stats["judgment_refused"] = stats.get(
@@ -17263,7 +16146,7 @@ class MT5Runner:
                     score=float(sig.score),
                     decision="judgment_refused",
                     reason=_core_refusal,
-                    bar_ts=h1.index[t] if t < len(h1) else None,
+                    bar_ts=frame.index[t] if t < len(frame) else None,
                     entry=float(sig.entry_ref),
                     stop=float(sig.invalidation),
                     targets=_targets_as_prices(
@@ -17410,7 +16293,7 @@ class MT5Runner:
             # present on the fired trigger and states why no
             # scenario qualified — it no longer renders as
             # "not produced" on every section.
-            _fb_ts = h1.index[t] if t < len(h1) else None
+            _fb_ts = frame.index[t] if t < len(frame) else None
             _fb_ev = {"route": "h1_trigger",
                       "hierarchy": {
                           "bias_d1": (verdict or {}).get(
@@ -17429,9 +16312,9 @@ class MT5Runner:
                 _fb_inf.setdefault("regime", _fb_regime)
                 _fb_ev["inferred"] = _fb_inf
             self._emit_eval(
-                playbook=pb.name, evaluation_clock="h1_trigger",
-                intended_tf=_native_tf(pb.name) or "H1",
-                actual_input_tf="H1",
+                playbook=pb.name, evaluation_clock=f"{str(eval_clock).lower()}_trigger",
+                intended_tf=eval_clock,
+                actual_input_tf=eval_clock,
                 last_bar_ts=_fb_ts,
                 outcome="no_setup",
                 reason="evaluated on the fired trigger — no "
@@ -21853,7 +20736,7 @@ class MT5Runner:
 
     def _sweep_eval_one(self, spec, frame, *, clock: str,
                         intended_tf: str, actual_tf: str,
-                        source: str, shadow: bool,
+                        source: str,
                         extra_evidence: dict | None = None
                         ) -> None:
         """One scheduled-scan evaluation for one playbook.
@@ -21865,19 +20748,20 @@ class MT5Runner:
         journaled as OBSERVED candidates — evaluated; a
         candidate from a route-named playbook (roster, range,
         the five families) is eligible for execution only
-        through its declared trigger path (the trigger path /
-        native route remains the order authority), never from
-        the scan itself.
+        through its declared trigger path (the trigger path on
+        the playbook's own clock remains the order authority),
+        never from the scan itself.
 
         WS3 (owner approval 2026-11-04, flag
         ``h1_trigger_handoff_enabled``, default ON): the
         candidate is registered as a persistent setup instance
         BEFORE the record is emitted — stamped with its parent
-        thesis link (WS1 child registration) and, for an
-        observation-class scan, a shadow marker — and this
+        thesis link (WS1 child registration) — and this
         record carries the instance's registered disposition
         (legacy disposition journaled alongside).  Flag OFF
-        restores the account above byte-identically."""
+        restores the account above byte-identically.  Every
+        registered setup is LIVE (owner order 2026-11-25/27:
+        nothing shadowed)."""
         name = spec.name
         last_bar_ts = (frame.index[-1]
                        if frame is not None and len(frame) else None)
@@ -21910,8 +20794,7 @@ class MT5Runner:
         context = self._desk_context_evidence(
             last_bar_ts=last_bar_ts)
         scan_evidence = {"evaluation_kind": "scheduled_scan",
-                         "route": spec.route,
-                         "shadow": bool(shadow), **context}
+                         "route": spec.route, **context}
         if name in (self.cfg.disabled_playbooks or ()):
             self._emit_eval(
                 **base, outcome="not_eligible",
@@ -22017,16 +20900,12 @@ class MT5Runner:
                                "the closing bar; no scenario "
                                "qualified"}]})
             return
-        code = ("path.shadow_route" if shadow
-                else "path.trigger_not_fired")
-        why = ("§G shadow evaluation route: the candidate is "
-               "journaled for grading and holds NO order "
-               "authority in v1 (owner §G ruling)"
-               if shadow else
-               "scheduled scan found a candidate on the closing "
+        code = "path.trigger_not_fired"
+        why = ("scheduled scan found a candidate on the closing "
                "bar; this scan route holds no order authority "
-               "and does not run the h1_trigger streaming "
-               "evaluation — recorded as observed, never routed "
+               "and does not run the trigger-path streaming "
+               "evaluation on the playbook's own trigger clock "
+               "— recorded as observed, never routed "
                "from the scan (see Trigger decision)")
         for sig in fresh:
             # Journal auditability (owner, 2026-10-26): the old
@@ -22099,7 +20978,7 @@ class MT5Runner:
                     spec, sig, prov, frame=frame, t=t,
                     formation_ts=_formation_ts,
                     eval_now=_eval_now,
-                    intended_tf=intended_tf, shadow=shadow,
+                    intended_tf=intended_tf,
                     thesis_link=_thesis_link)
             # The record's disposition: the legacy observed /
             # shadow account, replaced (flag on, instance
@@ -22108,8 +20987,7 @@ class MT5Runner:
             # disposition journaled alongside for comparison.
             _disp_code = code
             _disp_why = why
-            _registered = (_handoff and _setup is not None
-                           and not shadow)
+            _registered = (_handoff and _setup is not None)
             if _registered:
                 _disp_code = "path.setup_registered"
                 _disp_why = (
@@ -22145,16 +21023,14 @@ class MT5Runner:
                       f"signal factor: {_f}")
             _d1 = (self._live_setup or {}).get("bias_d1")
             if _d1:
-                _suffix = (" (context only — §G: D1 never "
-                           "vetoes)" if shadow else "")
                 if int(_d1) == _dir:
                     _note(_sup, "htf_structure",
                           f"with structural D1 bias "
-                          f"{int(_d1):+d}{_suffix}")
+                          f"{int(_d1):+d}")
                 else:
                     _note(_con, "htf_structure",
                           f"against structural D1 bias "
-                          f"{int(_d1):+d}{_suffix}")
+                          f"{int(_d1):+d}")
             _obs = dict(evidence.get("observed") or {})
             _obs.update({"entry": _entry, "stop": _stop,
                          "stop_dist": abs(_entry - _stop)})
@@ -22166,11 +21042,6 @@ class MT5Runner:
                     f"persists until its trigger fires, its "
                     f"invalidation closes, or its validity "
                     f"window lapses")
-            elif shadow:
-                _scenario_status = (
-                    "observed, not routed — §G shadow "
-                    "evaluation: journaled for grading, this "
-                    "route holds no order authority")
             else:
                 _scenario_status = (
                     "observed, not routed — order authority "
@@ -22178,7 +21049,7 @@ class MT5Runner:
                     "not fire")
             decision = {
                 "result": ("registered" if _registered else
-                           "shadow" if shadow else "observed"),
+                           "observed"),
                 "reason_code": _disp_code, "reason": _disp_why,
                 "execution_eligible": False,
                 "order_result": ("pending_trigger" if _registered
@@ -22200,7 +21071,7 @@ class MT5Runner:
             if _registered:
                 # The instance's real disposition chain, with
                 # the legacy observed disposition journaled
-                # alongside as the shadow comparison (WS2 idiom).
+                # alongside as the comparison (WS2 idiom).
                 decision["setup_id"] = _setup.setup_id
                 decision["lifecycle_stage"] = _setup.stage
                 decision["thesis_id"] = _setup.thesis_id
@@ -22208,11 +21079,6 @@ class MT5Runner:
                     "result": "observed",
                     "order_result": "not_attempted",
                     "reason_code": "path.trigger_not_fired"}
-            elif _handoff and _setup is not None:
-                # Shadow preservation: the disposition
-                # vocabulary is unchanged, but the record now
-                # names the preserved instance.
-                decision["setup_id"] = _setup.setup_id
             _rec_evidence = {
                 **evidence, "observed": _obs,
                 "supporting": _sup,
@@ -22230,7 +21096,7 @@ class MT5Runner:
                 "trigger_decision":
                     _journal_audit.trigger_decision_block(
                         route=spec.route, source=source,
-                        reason_code=_disp_code, shadow=shadow,
+                        reason_code=_disp_code,
                         detector_facts=
                         _journal_audit.detector_facts(
                             sig, frame))}
@@ -22239,7 +21105,7 @@ class MT5Runner:
                 _rec_evidence["parent_setup_id"] = \
                     _setup.parent_setup_id
                 _rec_evidence["thesis_id"] = _setup.thesis_id
-            # §G promotion-evaluation wiring (2026-11-05,
+            # Route-stamped verdict wiring (2026-11-05,
             # origination 2026-11-26): a scan of a
             # route-named playbook (range + the five families)
             # stamps the tap's passive verdict with its
@@ -22249,23 +21115,11 @@ class MT5Runner:
             # unchanged; the stamp is what makes the route's
             # history identifiable as THIS route's (and
             # countable in the manifest's route table).  The
-            # stamp is keyed on route-name membership, NOT on
-            # the shadow marker: a live-registered family scan
-            # stamps its route too, or the manifest and the
-            # promotion-evaluation dataset would lose the
-            # attribution the moment a setup went live.
-            # Non-route-named scans pass no route, as before.  Pass 7a: the volatility-expansion
-            # family's scans stamp identically (their
-            # history is vol_promotion's dataset).  Pass 7b:
-            # the trend / momentum family's likewise (their
-            # history is trend_promotion's dataset).  Pass
-            # 7c: the auction / value family's likewise
-            # (their history is auction_promotion's dataset).
-            # Pass 7d: the mean reversion family's likewise
-            # (their history is reversion_promotion's
-            # dataset).  Pass 7e: the session / opening
-            # range family's likewise (their history is
-            # session_promotion's dataset).
+            # stamp is keyed on route-name membership: a
+            # live-registered family scan stamps its route too,
+            # or the manifest would lose the attribution the
+            # moment a setup went live.
+            # Non-route-named scans pass no route, as before.
             self._emit_eval(
                 **base, outcome="candidate_emitted",
                 reason_code=_disp_code, reason=_disp_why,
@@ -22315,19 +21169,17 @@ class MT5Runner:
                             # PASS 2 — the book scenario adopts
                             # the same parent link.
                             self._book_sync_setup(_setup)
-            elif not shadow and self._setup_store is not None \
+            elif self._setup_store is not None \
                     and source == _lifecycle.SOURCE_LIVE_CLOSE:
                 # Setup lifecycle (owner rulings 2026-10-30
-                # §1): a non-shadow roster candidate is
+                # §1): a roster candidate is
                 # REGISTERED, not just journaled — it persists
                 # with its trigger, invalidation and expiry
                 # facts so a later trigger fire can route it to
                 # execution evaluation.  The scan itself still
-                # never orders; shadow (§G) candidates are
-                # never registered.  (Legacy path — WS3 flag
+                # never orders.  (Legacy path — WS3 flag
                 # off; with the flag on, registration happened
-                # above, before the record, and §G candidates
-                # are preserved as shadow instances instead.)
+                # above, before the record.)
                 try:
                     self._register_scan_setup(
                         spec, sig, prov, frame=frame, t=t,
@@ -22361,7 +21213,7 @@ class MT5Runner:
             try:
                 self._sweep_eval_one(
                     spec, h1, clock="h1_close", intended_tf="H1",
-                    actual_tf="H1", source=source, shadow=False)
+                    actual_tf="H1", source=source)
             except Exception as exc:
                 self.journal.log_note(
                     f"mt5: roster close eval failed for "
@@ -22386,9 +21238,7 @@ class MT5Runner:
         consulted as permission (D1 never vetoes; §G).  Both
         stages register live setups on live closes
         (origination, owner order 2026-11-25); the scan itself
-        never orders — a registered setup orders only when its
-        declared trigger (a same-direction h1_trigger fire)
-        routes it through the signal path under its own route.
+        never orders — a registered setup orders only when its declared trigger (a same-direction fire on its own trigger clock) routes it through the signal path under its own route.
         """
         h1 = (self._stack.frames.get("H1")
               if self._stack is not None else None)
@@ -22407,7 +21257,7 @@ class MT5Runner:
             try:
                 self._sweep_eval_one(
                     spec, h1, clock=clock, intended_tf=itf,
-                    actual_tf=atf, source=source, shadow=False,
+                    actual_tf=atf, source=source,
                     extra_evidence=ctx_evidence)
             except Exception as exc:
                 self.journal.log_note(
@@ -22493,7 +21343,7 @@ class MT5Runner:
         formation clock that closed (or all of them at
         warmup), journal the arm read, then evaluate both
         playbooks on that clock via the funnel-evaluation
-        seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction h1_trigger fire) routes it through the signal path under its own route.  D1/HTF relationships are recorded
+        seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction fire on its own trigger clock) routes it through the signal path under its own route.  D1/HTF relationships are recorded
         as CONTEXT evidence only — D1 never vetoes (§G
         precedent; SPEC §6.2 handles expansion-against-HTF
         as ordinary evidence, no special branch).
@@ -22536,7 +21386,7 @@ class MT5Runner:
                         spec, frame,
                         clock=f"vol_expansion_{tf.lower()}",
                         intended_tf=tf, actual_tf=tf,
-                        source=source, shadow=False,
+                        source=source,
                         extra_evidence=ctx_evidence)
                 except Exception as exc:
                     self.journal.log_note(
@@ -22633,7 +21483,7 @@ class MT5Runner:
         each formation clock (H4 intraday / D1 swing),
         journal the arm read, then evaluate both playbooks
         on the TRIGGER clock (one step down) via the
-        funnel-evaluation seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction h1_trigger fire) routes it through the signal path under its own route.  The scans run on
+        funnel-evaluation seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction fire on its own trigger clock) routes it through the signal path under its own route.  The scans run on
         the trigger clock because the family's entries ARE
         trigger-clock events (the pullback's LTF turn, the
         acceleration's first read of a fresh formation
@@ -22674,7 +21524,7 @@ class MT5Runner:
                               f"{formation_tf.lower()}",
                         intended_tf=trigger_tf,
                         actual_tf=trigger_tf,
-                        source=source, shadow=False,
+                        source=source,
                         extra_evidence=ctx_evidence)
                 except Exception as exc:
                     self.journal.log_note(
@@ -22783,10 +21633,7 @@ class MT5Runner:
         journal evaluations (with route-stamped judgment
         verdicts), register live setups on live closes, and
         propose scenarios to the book; the scan itself never
-        orders — a registered setup orders only when its
-        declared trigger (a same-direction h1_trigger fire)
-        routes it through the signal path under its own
-        route.  The scans run on the trigger clock
+        orders — a registered setup orders only when its declared trigger (a same-direction fire on its own trigger clock) routes it through the signal path under its own route.  The scans run on the trigger clock
         because the family's entries ARE trigger-clock
         events (the retest hold, the rejection's first
         read, the LVN crossing).  The value evidence rides
@@ -22833,7 +21680,7 @@ class MT5Runner:
                               f"{formation_tf.lower()}",
                         intended_tf=trigger_tf,
                         actual_tf=trigger_tf,
-                        source=source, shadow=False,
+                        source=source,
                         extra_evidence=ctx_evidence)
                 except Exception as exc:
                     self.journal.log_note(
@@ -22949,7 +21796,7 @@ class MT5Runner:
         clock facts), then evaluate both playbooks on
         each TRIGGER clock in ``trigger_tfs`` (M15 —
         intraday instances; M5 — scalp instances) via
-        the funnel-evaluation seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction h1_trigger fire) routes it through the signal path under its own route.
+        the funnel-evaluation seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction fire on its own trigger clock) routes it through the signal path under its own route.
         The scans run on the trigger clocks because the
         family's entries ARE trigger-clock events (the
         stall's structure turn, the break's first read).
@@ -23001,7 +21848,7 @@ class MT5Runner:
                               f"{trigger_tf.lower()}",
                         intended_tf=trigger_tf,
                         actual_tf=trigger_tf,
-                        source=source, shadow=False,
+                        source=source,
                         extra_evidence=ctx_evidence)
                 except Exception as exc:
                     self.journal.log_note(
@@ -23119,7 +21966,7 @@ class MT5Runner:
         §6.5): for its formation clock (H1 — the day
         object's own clock), journal the arm read, then
         evaluate all four playbooks on the TRIGGER clock
-        (M15) via the funnel-evaluation seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction h1_trigger fire) routes it through the signal path under its own route.  The scans run on the trigger clock
+        (M15) via the funnel-evaluation seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction fire on its own trigger clock) routes it through the signal path under its own route.  The scans run on the trigger clock
         because the family's entries ARE trigger-clock
         events (the first read after a session fact
         resolves).  The day's facts are the engine's own
@@ -23169,7 +22016,7 @@ class MT5Runner:
                               f"{formation_tf.lower()}",
                         intended_tf=trigger_tf,
                         actual_tf=trigger_tf,
-                        source=source, shadow=False,
+                        source=source,
                         extra_evidence=ctx_evidence)
                 except Exception as exc:  # noqa: BLE001
                     self.journal.log_note(

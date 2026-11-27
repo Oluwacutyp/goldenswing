@@ -4,8 +4,8 @@ consumption, book-vs-S1 paired grading.
 Pinned here:
 
 - the BOOK EVALUATION: one comparison surface grading every
-  family's shadow history on the shared promotion instrument
-  (the evaluator is CONSUMED from range_promotion, never
+  family's live history on the shared evaluation instrument
+  (the evaluator is CONSUMED from evaluation, never
   re-implemented) — family rows are the family evaluations'
   own snapshot rows verbatim; the connected routes ride as
   their own group; the governing routes' stamped live
@@ -32,8 +32,9 @@ Pinned here:
 - the host: all three ride the self-audit cycle (same
   window, same state file, own keys), journal on change
   only, and surface on /status.  The pass is evaluation
-  only — no verdict here moves authority, and nothing in
-  this file touches the Pass 5 appliers.
+  only — no verdict here moves authority: every route is
+  live by declaration, and a verdict is a measurement,
+  never a promotion.
 """
 from __future__ import annotations
 
@@ -42,8 +43,7 @@ from test_step14_setup_lifecycle import _scan_runner
 from goldenswing.execution import book_evaluation as be
 from goldenswing.execution import book_grading as bg
 from goldenswing.execution import coverage_report as cr
-from goldenswing.execution import route_promotion as rtp
-from goldenswing.execution import vol_promotion as vp
+from goldenswing.execution import evaluation as _eval
 
 # ------------------------------------------------ fabricated journals
 
@@ -51,19 +51,19 @@ def _ts(i: int) -> str:
     return (f"2026-10-{1 + i // 24:02d} {i % 24:02d}:00:00+00:00")
 
 
-def _shadow(ts, playbook, decision, *, route,
+def _judged(ts, playbook, decision, *, route,
             expected_r=0.4):
     return {
-        "type": "judgment_shadow", "ts": ts,
+        "type": "judgment", "ts": ts,
         "playbook": playbook, "intended_tf": "H4",
-        "gate_result": "shadow",
-        "gate_order_result": "not_attempted",
-        "gate_reason_code": "path.shadow_route",
+        "gate_result": "registered",
+        "gate_order_result": "pending_trigger",
+        "gate_reason_code": None,
         "judgment": {"decision": decision,
                      "expected_r": expected_r,
                      "confidence": 0.5, "mode": "active",
                      "authority_route": route,
-                     "authority": "shadow_declared"},
+                     "authority": "live"},
     }
 
 
@@ -82,14 +82,14 @@ def _recon(ts, playbook, *, decision, realized_r, hit,
 
 def _arm(playbook, decision, rs, *, route, hits=None,
          start=0):
-    """Journal rows for one arm: one route-stamped shadow +
+    """Journal rows for one arm: one route-stamped judgment +
     one reconciliation per outcome, paired on (ts, playbook)
     exactly as judgment_validation.build_pairs joins them."""
     out = []
     for i, r in enumerate(rs):
         ts = _ts(start + i)
         hit = (r > 0) if hits is None else hits[i]
-        out.append(_shadow(ts, playbook, decision,
+        out.append(_judged(ts, playbook, decision,
                            route=route))
         out.append(_recon(ts, playbook, decision=decision,
                           realized_r=r, hit=hit))
@@ -99,21 +99,21 @@ def _arm(playbook, decision, rs, *, route, hits=None,
 # ------------------------------------------------ book evaluation
 
 def test_governing_history_grades_on_the_shared_instrument():
-    # sweep_reversal stamped to its GOVERNING route: the
-    # fold is the same accumulate the families use, so the
-    # row values are the evaluator's own.
+    # sweep_reversal stamped to its LIVE route (h1_roster):
+    # the fold is the same accumulate the families use, so
+    # the row values are the evaluator's own.
     records = _arm("sweep_reversal", "take",
-                   [2.0, 1.0, 0.5, -0.5], route="h1_trigger")
+                   [2.0, 1.0, 0.5, -0.5], route="h1_roster")
     snap = be.evaluate_records(records)
     group = snap["groups"][-1]
     assert group["key"] == "governing"
-    assert group["authority_posture"] == "governing"
+    assert group["authority_posture"] == "live"
     row = group["routes"]["sweep_reversal"]
     assert row["evaluated"] == 4
     assert row["take"]["paired"] == 4
     assert row["take"]["median_r"] == 0.75
     assert row["take"]["hit_rate"] == 0.75
-    assert row["authority"] == "governing"
+    assert row["authority"] == "live"
     # The window starts at the first stamped record, and the
     # comparison basis is stated on the record.
     assert group["window_start"] == _ts(0)
@@ -123,15 +123,15 @@ def test_governing_history_grades_on_the_shared_instrument():
 
 def test_governing_pooled_ready_and_inverted_never_ready():
     records = _arm("sweep_reversal", "take",
-                   [2.0] * 18 + [-0.5] * 6, route="h1_trigger")
+                   [2.0] * 18 + [-0.5] * 6, route="h1_roster")
     records += _arm("sweep_reversal", "abstain",
                     [-1.0] * 18 + [0.4] * 6,
-                    route="h1_trigger", start=200)
+                    route="h1_roster", start=200)
     group = be.evaluate_records(records)["groups"][-1]
-    assert group["pooled"]["verdict"] == "promotion_ready"
-    assert group["route_verdicts"]["promotion_ready"] == 1
+    assert group["pooled"]["verdict"] == "ready"
+    assert group["route_verdicts"]["ready"] == 1
     assert group["routes"]["sweep_reversal"][
-        "verdict"] == "promotion_ready"
+        "verdict"] == "ready"
     # Same shape, discrimination flipped: takes are mildly
     # positive but the abstains beat them on median AND hit
     # rate — inverted discrimination, never ready.
@@ -155,23 +155,33 @@ def test_governing_pooled_ready_and_inverted_never_ready():
 
 
 def test_family_rows_are_the_family_evaluations_verbatim():
-    # Fold vol history through the family's OWN cycle, then
-    # consume its state: the comparison row must equal the
-    # family snapshot's row — consumed, not recomputed.
-    vol_state = vp.new_state()
+    # Fold vol history through the family's OWN evaluator,
+    # then through the comparison's cycle over the same
+    # records: the comparison row must equal the family
+    # snapshot's row — consumed, not recomputed.
+    from goldenswing.execution.playbook_registry import (
+        VOL_SPECS, order_route_for)
     records = _arm("vol_expansion_escape", "take",
-                   [0.5] * 3, route="vol_expansion_escape")
-    vp.cycle(state=vol_state, records=records,
-             now="2026-10-02 00:00:00+00:00")
-    own = vp.snapshot(vol_state)["routes"][
-        "vol_expansion_escape"]
+                   [0.5] * 3, route="volatility_expansion")
+    own_state = _eval.new_state()
+    _eval.accumulate(
+        own_state, records,
+        routes_map={s.name: order_route_for(s.name)
+                    for s in VOL_SPECS},
+        playbooks=tuple(s.name for s in VOL_SPECS))
+    own = _eval.snapshot(
+        own_state,
+        routes_map={s.name: order_route_for(s.name)
+                    for s in VOL_SPECS},
+        playbooks=tuple(s.name for s in VOL_SPECS),
+        family="volatility expansion")["routes"][
+            "vol_expansion_escape"]
     state = be.new_state()
     rec = be.cycle(
-        state=state, records=[],
-        family_states={"vol_promotion": vol_state},
+        state=state, records=records,
         now="2026-10-02 01:00:00+00:00")
     group = next(g for g in rec["groups"] if g["key"] == "vol")
-    assert group["authority_posture"] == "shadow_declared"
+    assert group["authority_posture"] == "live"
     assert group["routes"]["vol_expansion_escape"] == own
     assert group["pooled"]["take"]["paired"] == 3
 
@@ -179,39 +189,38 @@ def test_family_rows_are_the_family_evaluations_verbatim():
 def test_connected_routes_ride_as_their_own_group():
     records = _arm("hot_scalp", "take", [1.0] * 4,
                    route="hot_scalp_promotion")
-    evaluation = rtp.evaluate_records(records)
-    route_state = {"last_evaluation": evaluation}
     rec = be.cycle(
-        state=be.new_state(), records=[],
-        family_states={"route_promotion": route_state},
+        state=be.new_state(), records=records,
         now="2026-10-02 01:00:00+00:00")
     group = next(g for g in rec["groups"]
                  if g["key"] == "connected")
-    # route_promotion's evaluation is keyed by ROUTE.
-    assert group["routes"]["hot_scalp_promotion"][
+    # The connected evaluation is keyed by PLAYBOOK.
+    assert group["routes"]["hot_scalp"][
         "evaluated"] == 4
-    assert group["routes"]["hot_scalp_promotion"][
+    assert group["routes"]["hot_scalp"][
         "playbook"] == "hot_scalp"
-    # The pooled read over binding routes is a comparison,
-    # never a second binding verdict.
+    assert group["routes"]["hot_scalp"][
+        "route"] == "hot_scalp_promotion"
+    # The pooled read is a comparison, never a binding
+    # verdict.
     assert group["pooled"]["binds"] is False
 
 
-def test_family_shadow_history_never_folds_into_governing():
-    # range_qm's shadow history is stamped with its OWN
-    # declared route (range_qm), not its governing route —
-    # it belongs to the range group, not the governing one.
+def test_family_history_folds_into_its_own_group():
+    # range_qm's history is stamped with its OWN live route
+    # (range_h4_h1), not the governing route — it belongs to
+    # the range group, not the governing one.
     records = _arm("range_qm", "take", [1.0] * 3,
-                   route="range_qm")
+                   route="range_h4_h1")
     snap = be.evaluate_records(records)
     governing = snap["groups"][-1]
-    assert governing["routes"]["range_qm"]["evaluated"] == 0
+    assert "range_qm" not in governing["routes"]
     assert governing["pooled"]["evaluated"] == 0
     range_group = snap["groups"][0]
     assert range_group["routes"]["range_qm"][
         "evaluated"] == 3
     # Unstamped history folds nowhere at all.
-    bare = [{"type": "judgment_shadow", "ts": _ts(0),
+    bare = [{"type": "judgment", "ts": _ts(0),
              "playbook": "sweep_reversal",
              "judgment": {"decision": "take"}}]
     snap = be.evaluate_records(bare)
@@ -222,10 +231,10 @@ def test_family_shadow_history_never_folds_into_governing():
 def test_inverted_family_pooled_reads_not_ready_in_render():
     records = _arm("session_drive_reversal", "take",
                    [-1.0] * 18 + [0.2] * 6,
-                   route="session_drive_reversal")
+                   route="session_range")
     records += _arm("session_drive_reversal", "abstain",
                     [1.0] * 18 + [-0.3] * 6,
-                    route="session_drive_reversal", start=200)
+                    route="session_range", start=200)
     snap = be.evaluate_records(records)
     group = next(g for g in snap["groups"]
                  if g["key"] == "session")
@@ -247,12 +256,10 @@ def test_inverted_family_pooled_reads_not_ready_in_render():
 def test_book_evaluation_journals_on_change_only():
     state = be.new_state()
     first = be.cycle(state=state, records=[],
-                     family_states={},
                      now="2026-10-02 00:00:00+00:00")
     assert first is not None  # deployment marker
     assert first["type"] == be.RECORD_TYPE
     second = be.cycle(state=state, records=[],
-                      family_states={},
                       now="2026-10-02 01:00:00+00:00")
     assert second is None
     assert state["cycles"] == 1
@@ -261,8 +268,8 @@ def test_book_evaluation_journals_on_change_only():
 def test_book_evaluation_damaged_window_degrades():
     state = be.new_state()
     out = be.cycle(state=state, records=_arm(
-        "sweep_reversal", "take", [1.0], route="h1_trigger"),
-        family_states={}, damaged_lines=3)
+        "sweep_reversal", "take", [1.0], route="h1_roster"),
+        damaged_lines=3)
     assert out is None
     assert state["damaged_cycles"] == 1
     assert state["last_comparison"] is None
@@ -545,7 +552,7 @@ def _prime_journal(runner, records):
 def test_self_audit_phase_journals_all_three_records(tmp_path):
     runner, h1 = _scan_runner(tmp_path)
     records = _arm("sweep_reversal", "take", [0.5] * 2,
-                   route="h1_trigger")
+                   route="h1_roster")
     records.append(_situation_record(_situation()))
     records.append(_gap_record())
     _prime_journal(runner, records)
@@ -597,7 +604,7 @@ def test_status_lines_render_the_three_blocks(tmp_path):
     assert "no grading cycle" in runner.book_grading_line()
     _prime_journal(runner, _arm(
         "sweep_reversal", "take", [0.5] * 2,
-        route="h1_trigger"))
+        route="h1_roster"))
     runner._self_audit_phase("2026-11-06 00:00:00+00:00", h1)
     line = runner.book_evaluation_line()
     assert "book evaluation (Pass 9)" in line

@@ -1,63 +1,64 @@
 """Route AUTHORITY (MarketSituation Pass 5; owner ruling
 2026-11-08, AMENDMENTS-1 §A5 — as amended by the owner's
-2026-11-25 order: everything goes live directly on demo,
+2026-11-25/27 orders: everything goes live directly on demo,
 no shadow, no gating, no promotion, no prove-first).
 
-Runner-level pins:
+Rewritten 2026-11-27: the promotion gate is DELETED.  The
+authority machinery this file used to pin (JUDGMENT_ROUTE_STATES,
+_judgment_route_state/source/resolution, demotion, the
+undeclared-route alarm, the per-route config step) is gone.
+What is pinned now:
 
 - COMPLETENESS: every route named anywhere in the runner
-  (seam calls, book stamps, state lookups) is declared in
-  JUDGMENT_ROUTE_STATES, and every declared route is
-  reachable from a call site, the playbook map, or the §G
-  stamp map — no route left unstamped, no stamp orphaned
-  (AST audit over the runner source, both directions).
-- FAIL-CLOSED: a route with NO declaration cannot reach the
-  order path — the seam refuses it in every mode and the
-  attempt journals an undeclared_route alarm.
-- RESOLUTION: state + source resolve declared < config,
-  with an invariant demotion binding over both until
-  released by a clean audit window or a NEW config step.
-  Promotion verdicts bind NOTHING anymore — a stale
-  "verdict" entry in the dynamic state is ignored by
-  resolution and purged by the phase.
+  (seam calls, book stamps, state lookups) is declared in the
+  registry's LIVE_ORDER_ROUTES, and every live route is
+  reachable from a call site, the playbook map, or the
+  connected-routes map — no route left unstamped, no stamp
+  orphaned (AST audit over the runner source, both
+  directions).
+- THE LIVE TABLE: every route's authority is "live", source
+  "live", governing now in active mode.
+- THE SEAM: a live route stamps the verdict with its route
+  and authority "live"; a core abstention still refuses the
+  attempt under judgment.abstain.  An unknown route name is
+  just a stamp — there is no gate left to fail closed.
 - THE PER-CYCLE RECORD: one judgment_authority record per
-  H1 close listing every route + state + source; the
+  H1 close listing every route + authority + source; the
   /status line renders the same table.
 - THE BOUNDARY: hot_scalp and the resting limit submit
   their independent demo orders through the seam like every
-  governed route — a core abstention still blocks them, and
-  a demoted route rests nothing until its invariant clears.
-- THE FULL LOOP on fabricated history through the S3 host:
-  criteria journal BEFORE the first verdict; the evaluation
-  still computes promotion_ready (measurement only — the
-  route already governs by declaration, source "declared");
-  a violation demotes; a quiet cycle (no route activity)
-  does NOT release the demotion; fresh history in a clean
-  window does, source "invariant_cleared"; a later
-  not_ready verdict changes no authority.
+  live route — a core abstention still blocks them.
 """
 from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
-import pandas as pd
-
-from goldenswing.execution import range_promotion as _range_mod
-from goldenswing.execution import route_promotion as rp
 from goldenswing.execution.mt5_runner import (
-    JUDGMENT_ROUTE_PLAYBOOK, JUDGMENT_ROUTE_STATES, MT5Runner)
-from goldenswing.live.zones import StructuralZone
+    LIVE_ORDER_ROUTES,
+    MT5Runner,
+)
+from goldenswing.execution.playbook_registry import (
+    CONNECTED_ORDER_ROUTES,
+    PLAYBOOK_REGISTRY,
+    order_route_for,
+)
+from goldenswing.live.hierarchy import TimeframeStack
 
-from test_confluence_rework import _point3_frames
-from test_confluence_rework import _runner as _az_runner
-from test_judgment_core import _candidate, _decision, _evidence
-from test_judgment_core import _runner as _jc_runner
-from test_route_promotion import _arm as _history_arm
-from test_step14_setup_lifecycle import _scan_runner
-from test_step6_hot_scalp_promotion import _candidate as _hs_cand
-from test_step6_hot_scalp_promotion import _runner as _hs_runner
-from test_step6_hot_scalp_promotion import _tick as _hs_tick
+from test_completion02_connections import (
+    _az_drive,
+    _hs_cand,
+    _hs_runner,
+    _hs_tick,
+)
+from test_judgment_core import (
+    _candidate,
+    _decision,
+    _evidence,
+    _frame,
+    _runner as _jc_runner,
+)
 
 
 def _records(runner, type_=None):
@@ -99,158 +100,111 @@ def _route_literals():
                 literals.add(kw.value.value)
                 if name == "_judgment_authority":
                     seam_routes.add(kw.value.value)
-        if name in ("_judgment_route_state",
-                    "_judgment_route_source",
-                    "_judgment_route_resolution") \
-                and node.args \
-                and isinstance(node.args[0], ast.Constant) \
-                and isinstance(node.args[0].value, str):
-            literals.add(node.args[0].value)
     return literals, seam_routes
 
 
 def test_route_audit_completeness_both_directions():
     literals, seam_routes = _route_literals()
-    table = set(JUDGMENT_ROUTE_STATES)
-    # Every route the runner names is declared.
+    table = set(LIVE_ORDER_ROUTES)
+    # Every route the runner names is declared live.
     assert literals <= table, (
-        f"routes named in the runner but not declared: "
+        f"routes named in the runner but not declared live: "
         f"{sorted(literals - table)}")
-    # Every declared route is reachable: a call-site literal,
-    # the playbook map, the §G route map, or the order-route
-    # map the trigger-path seam reads (origination: the seam
-    # names its route through ORDER_ROUTE_BY_PLAYBOOK, not a
-    # literal, so the roster route reaches through the map).
-    reachable = literals | set(JUDGMENT_ROUTE_PLAYBOOK) \
-        | set(_range_mod.RANGE_JUDGMENT_ROUTES.values()) \
-        | set(rp.ORDER_ROUTE_BY_PLAYBOOK.values())
+    # Every live route is reachable: a call-site literal, the
+    # playbook map, or the connected-routes map (hot_scalp and
+    # arrival_zone ride routes the registry does not name).
+    reachable = literals | {
+        order_route_for(spec.name) or spec.name
+        for spec in PLAYBOOK_REGISTRY} \
+        | set(CONNECTED_ORDER_ROUTES.values())
     assert table <= reachable, (
-        f"declared routes no call site can reach: "
+        f"live routes no call site can reach: "
         f"{sorted(table - reachable)}")
-    # The three owner-promoted routes govern THROUGH the seam
-    # with their route named at the call site — h1_trigger
-    # through the order-route map the seam call reads, the
-    # natives as literals at their own seam calls.
-    seam_routes |= set(rp.ORDER_ROUTE_BY_PLAYBOOK.values())
-    assert {"h1_trigger", "qm_m5_native", "qm_d1_native"} \
-        <= seam_routes
-    # The playbook map and the binding evaluation agree.
-    for route, playbook in rp.PROMOTION_ROUTES.items():
-        assert JUDGMENT_ROUTE_PLAYBOOK[route] == playbook
-        assert rp.ORDER_ROUTE_BY_PLAYBOOK[playbook] == route
+    # The seam names its routes at the call sites: the natives
+    # as literals, the families through the registry map.
+    assert {"qm_m5_native", "qm_d1_native"} <= seam_routes
+    assert "hot_scalp_promotion" in seam_routes
+    assert "resting_limit" in seam_routes
 
 
-def test_declared_table_is_the_owners_promotion_record():
-    # Owner order 2026-11-25 06:48 — everything goes live
+def test_live_table_is_the_owners_record(tmp_path):
+    # Owner orders 2026-11-25/27 — everything goes live
     # directly on demo; no shadow, no gating, no promotion.
-    # Every route in the table governs by declaration.
-    for route, state in JUDGMENT_ROUTE_STATES.items():
-        assert state == "governing", route
-    assert JUDGMENT_ROUTE_STATES["h1_trigger"] == "governing"
-    assert JUDGMENT_ROUTE_STATES["qm_m5_native"] == "governing"
-    assert JUDGMENT_ROUTE_STATES["qm_d1_native"] == "governing"
-    assert JUDGMENT_ROUTE_STATES["hot_scalp_promotion"] \
-        == "governing"
-    assert JUDGMENT_ROUTE_STATES["resting_limit"] \
-        == "governing"
-
-
-# ------------------------------------------------ resolution
-
-def test_resolution_sources(tmp_path):
-    runner = _jc_runner(tmp_path / "a")
-    assert runner._judgment_route_state("h1_trigger") \
-        == "governing"
-    assert runner._judgment_route_source("h1_trigger") \
-        == "declared"
-    # Every route governs by declaration now (owner order
-    # 2026-11-25) — hot_scalp included.
-    assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "governing"
-    assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "declared"
-    assert runner._route_declared("hot_scalp_promotion")
-    # Config is the explicit step.
-    runner = _jc_runner(
-        tmp_path / "b",
-        judgment_route_modes={"hot_scalp_promotion":
-                              "governing"})
-    assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "governing"
-    assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "config"
-    # A verdict entry is RETIRED history: it binds nothing.
-    # The route governs by declaration, source "declared" —
-    # the stale entry is ignored by resolution (and purged
-    # by the phase on the next cycle).
-    runner = _jc_runner(tmp_path / "c")
-    runner._route_authority_state()["hot_scalp_promotion"] = {
-        "state": "governing", "source": "verdict",
-        "criteria_id": rp.criteria_id_for("hot_scalp_promotion"),
-        "since": "2026-11-08 00:00:00+00:00"}
-    assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "governing"
-    assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "declared"
-    # A demotion binds over the declared state.
-    runner._route_authority_state()["h1_trigger"] = {
-        "state": "shadow_declared", "source": "demoted",
-        "kind": "duplicate_order",
-        "config_at_demotion": None,
-        "eval_cycles_at_demotion": 0,
-        "since": "2026-11-08 01:00:00+00:00"}
-    assert runner._judgment_route_state("h1_trigger") \
-        == "shadow_declared"
-    assert runner._judgment_route_source("h1_trigger") \
-        == "demoted"
-
-
-def test_undeclared_route_is_shadow_and_undeclared(tmp_path):
+    # Every route in the table is live by declaration.
     runner = _jc_runner(tmp_path)
-    assert runner._judgment_route_state("nope_route") \
-        == "shadow_declared"
-    assert runner._judgment_route_source("nope_route") \
-        == "undeclared"
-    assert not runner._route_declared("nope_route")
-    table = {r["route"] for r in runner._judgment_route_table()}
-    assert "nope_route" not in table
-    assert table == set(JUDGMENT_ROUTE_STATES)
+    table = {row["route"]: row
+             for row in runner._judgment_route_table()}
+    assert set(table) == set(LIVE_ORDER_ROUTES)
+    assert all(row["authority"] == "live"
+               for row in table.values())
+    assert all(row["governing_now"] is True
+               for row in table.values())
+    assert "hot_scalp_promotion" in table
+    assert "resting_limit" in table
 
 
-def test_undeclared_route_cannot_pass_the_seam(tmp_path):
-    for mode in ("active", "shadow"):
-        runner = _jc_runner(tmp_path / mode,
-                            judgment_mode=mode)
-        bundle, refusal = runner._judgment_authority(
-            candidate=_candidate(), decision=_decision(),
-            evidence=_evidence(), intended_tf="H1",
-            eval_now=runner._evaluation_now(),
-            route="nope_route")
-        assert refusal is not None
-        assert "undeclared" in refusal
-        alarms = _records(runner, "undeclared_route")
-        assert len(alarms) == 1
-        assert alarms[0]["route"] == "nope_route"
-        # The alarm fires once per route per run, not per
-        # attempt.
-        runner._judgment_authority(
-            candidate=_candidate(), decision=_decision(),
-            evidence=_evidence(), intended_tf="H1",
-            eval_now=runner._evaluation_now(),
-            route="nope_route")
-        assert len(_records(runner, "undeclared_route")) == 1
+# ------------------------------------------------ the seam
 
-
-def test_governing_route_seam_stamps_unchanged(tmp_path):
+def _seam_runner(tmp_path):
+    """A runner whose M5 entry clock shows a real upward
+    reaction through the _jc candidate's entry (3900): the
+    long reads as a take, the short as a fight."""
     runner = _jc_runner(tmp_path)
-    bundle, _refusal = runner._judgment_authority(
+    closes = [3880.0 + 2.0 * i for i in range(20)]
+    runner._stack = TimeframeStack.from_frames(
+        {"M5": _frame(closes, rng=2.0)})
+    return runner
+
+
+def test_live_route_seam_stamps_live(tmp_path):
+    runner = _seam_runner(tmp_path)
+    bundle, refusal = runner._judgment_authority(
         candidate=_candidate(), decision=_decision(),
         evidence=_evidence(), intended_tf="M5",
         eval_now=runner._evaluation_now(),
         route="qm_m5_native")
+    assert refusal is None
     judgment = (bundle or {}).get("judgment") or {}
+    assert judgment.get("decision") == "take"
     assert judgment.get("authority_route") == "qm_m5_native"
-    assert judgment.get("authority") == "governing"
+    assert judgment.get("authority") == "live"
+
+
+def test_seam_abstention_still_refuses(tmp_path):
+    """The gate is gone, but the verdict still governs: a
+    candidate that fights the measured structure abstains,
+    and the seam refuses the attempt under judgment.abstain."""
+    runner = _seam_runner(tmp_path)
+    short = _candidate(direction=-1, entry=3900.0, stop=3910.0,
+                       targets=[3880.0])
+    bundle, refusal = runner._judgment_authority(
+        candidate=short, decision=_decision(),
+        evidence=_evidence(), intended_tf="M5",
+        eval_now=runner._evaluation_now(),
+        route="qm_m5_native")
+    assert bundle is not None
+    assert bundle["judgment"]["decision"] == "abstain"
+    assert refusal is not None
+    assert "abstained" in refusal
+
+
+def test_unknown_route_is_just_a_stamp(tmp_path):
+    """There is no gate left to fail closed: an unknown route
+    name is stamped on the record as-is, and the verdict —
+    not the route name — decides the attempt."""
+    runner = _seam_runner(tmp_path)
+    bundle, refusal = runner._judgment_authority(
+        candidate=_candidate(), decision=_decision(),
+        evidence=_evidence(), intended_tf="M5",
+        eval_now=runner._evaluation_now(),
+        route="nope_route")
+    assert refusal is None
+    judgment = (bundle or {}).get("judgment") or {}
+    assert judgment.get("decision") == "take"
+    assert judgment.get("authority_route") == "nope_route"
+    assert judgment.get("authority") == "live"
+    alarms = _records(runner, "undeclared_route")
+    assert alarms == []
 
 
 # ------------------------------------------------ the cycle record
@@ -264,62 +218,27 @@ def test_authority_cycle_journals_once_per_h1_close(tmp_path):
     rows = _records(runner, "judgment_authority")
     assert len(rows) == 1
     table = {r["route"]: r for r in rows[0]["routes"]}
-    assert set(table) == set(JUDGMENT_ROUTE_STATES)
-    assert table["h1_trigger"]["authority"] == "governing"
-    assert table["h1_trigger"]["source"] == "declared"
-    assert table["h1_trigger"]["governing_now"] is True
-    # Every route governs by declaration now (owner order
-    # 2026-11-25) — hot_scalp included.
-    assert table["hot_scalp_promotion"]["authority"] \
-        == "governing"
-    assert table["hot_scalp_promotion"]["source"] == "declared"
-    assert table["hot_scalp_promotion"]["governing_now"] \
-        is True
-
-
-def test_authority_record_carries_the_priors_verdict(tmp_path):
-    """The abstention audit's surface: every
-    judgment_authority record carries the standing
-    calibration verdict — whether the Core's priors are
-    proven (measured_wins), unproven (insufficient_data) or
-    held (fixed_holds), with the holdout count and the bar.
-    A thin history reads insufficient_data (never a guessed
-    verdict); no verdict yet means no priors key at all."""
-    from test_judgment_calibration import _dataset
-    runner = _jc_runner(tmp_path)
-    # No calibration cycle yet: no priors key.
-    runner._authority_cycle(
-        ["H1", "M5"], "2026-11-06 01:00:00+00:00")
-    rows = _records(runner, "judgment_authority")
-    assert len(rows) == 1
+    assert set(table) == set(LIVE_ORDER_ROUTES)
+    assert table["qm_m5_native"]["authority"] == "live"
+    assert table["qm_m5_native"]["source"] == "live"
+    assert table["qm_m5_native"]["governing_now"] is True
+    # Every route is live by declaration now (owner orders
+    # 2026-11-25/27) — hot_scalp included.
+    assert table["hot_scalp_promotion"]["authority"] == "live"
+    assert table["hot_scalp_promotion"]["source"] == "live"
+    assert table["hot_scalp_promotion"]["governing_now"] is True
+    # The calibration verdict no longer rides this record:
+    # the retired core's priors are not a verdict input.
     assert "priors" not in rows[0]
-    # A thin history (10 pairs, 3 on the holdout): the
-    # verdict is insufficient_data, and the record carries it.
-    records = _dataset(10, outcome_r=1.0)
-    runner._priors_phase(records, "2026-11-06 02:00:00+00:00")
-    runner._authority_cycle(
-        ["H1", "M5"], "2026-11-06 02:00:00+00:00")
-    rows = _records(runner, "judgment_authority")
-    assert len(rows) == 2
-    priors = rows[1].get("priors")
-    assert priors is not None
-    assert priors["verdict"] == "insufficient_data"
-    assert priors["holdout_n"] < priors["min_holdout"]
-    assert priors["min_holdout"] == 20
-    # The default mode is calibrated since E3 was earned
-    # (2026-11-14, full live journal: measured_wins). A thin
-    # history still prices stated — the verdict, not the mode,
-    # is what gates the measured set.
-    assert priors["mode"] == "calibrated"
 
 
 def test_status_line_renders_the_same_table(tmp_path):
     runner = _jc_runner(tmp_path)
     line = runner.judgment_authority_line()
-    for route in JUDGMENT_ROUTE_STATES:
+    for route in LIVE_ORDER_ROUTES:
         assert route in line
-    assert "source: declared" in line
     assert "hot_scalp_promotion" in line
+    assert "live" in line
     # The commands /status surface wires the same line in.
     commands = (Path.cwd() / "goldenswing" / "execution"
                 / "mt5_commands.py").read_text()
@@ -330,13 +249,13 @@ def test_status_line_renders_the_same_table(tmp_path):
 # ------------------------------------------------ the boundary: hot scalp
 
 def test_hot_scalp_boundary_submits_at_default(tmp_path):
-    # Owner order 2026-11-25: the route governs by
+    # Owner order 2026-11-25: the route is live by
     # declaration, so at default the candidate submits
-    # through the seam like every governed route — no
-    # verdict needed, no shadow preservation.
+    # through the seam like every live route — no verdict
+    # needed, no config step.
     runner = _hs_runner(tmp_path)
     placed_before = len(runner.executor.placed)
-    assert runner._promote_hot_scalp_candidate(
+    assert runner._place_hot_scalp_candidate(
         _hs_cand(runner), _hs_tick(), {}) is True
     assert len(runner.executor.placed) == placed_before + 1
 
@@ -344,17 +263,19 @@ def test_hot_scalp_boundary_submits_at_default(tmp_path):
 def test_hot_scalp_submits_through_the_seam(tmp_path):
     runner = _hs_runner(tmp_path / "placed")
     (tmp_path / "placed").mkdir(exist_ok=True)
-    assert runner._promote_hot_scalp_candidate(
+    assert runner._place_hot_scalp_candidate(
         _hs_cand(runner), _hs_tick(), {}) is True
     assert len(runner.executor.placed) == 1
     # And through the seam means the seam still governs: a
     # core abstention blocks the route exactly like every
-    # governed route.
+    # live route.  The abstention is forced by structure — a
+    # short candidate fights the measured upward reaction.
     runner = _hs_runner(tmp_path / "abstain")
     (tmp_path / "abstain").mkdir(exist_ok=True)
-    runner.cfg.judgment_min_expected_r = 99.0
-    assert runner._promote_hot_scalp_candidate(
-        _hs_cand(runner), _hs_tick(), {}) is False
+    assert runner._place_hot_scalp_candidate(
+        _hs_cand(runner, direction=-1, entry=100.30,
+                 stop=101.60, target=99.0),
+        _hs_tick(), {}) is False
     assert runner.executor.placed == []
     evals = _evals(runner, "hot_scalp")
     assert evals[-1]["decision"]["reason_code"] \
@@ -363,39 +284,11 @@ def test_hot_scalp_submits_through_the_seam(tmp_path):
 
 # ------------------------------------------------ the boundary: resting limit
 
-_AZ_TICK = {"mid": 4122.0 + 3.6, "spread": 0.3,
-            "time": pd.Timestamp("2026-10-21 13:00",
-                                 tz="UTC")}
-
-
-def _az_drive(tmp_path, **cfg_kw):
-    runner = _az_runner(tmp_path, resting_limit_enabled=True)
-    for key, value in cfg_kw.items():
-        setattr(runner.cfg, key, value)
-    from types import SimpleNamespace
-
-    runner._stack = SimpleNamespace(frames=_point3_frames())
-    zone = StructuralZone(
-        tf="H4", side="support", level=4110.0, top=4122.0,
-        bottom=4098.0, score=85.0, tier="MAJOR", status="active",
-        touches=0, atr=12.0, displacement_atr=2.5,
-        departure_atr=2.5, swing_ts="2026-10-18T00:00:00+00:00")
-    runner._structural_zones = [zone]
-    runner._live_setup = {
-        "direction": 1, "regime": "trend", "atr_h1": 12.0,
-        "buf": 3.0, "major_zone": zone.to_dict(),
-        "zone": {"top": 4122.0, "bottom": 4098.0,
-                 "level": 4110.0},
-        "bias_d1": 0, "bias_h4": 1}
-    runner._maybe_place_resting_limit(dict(_AZ_TICK), {})
-    return runner
-
-
 def test_resting_limit_boundary_rests_at_default(tmp_path):
-    # Owner order 2026-11-25: the route governs by
+    # Owner order 2026-11-25: the route is live by
     # declaration, so at default the limit rests — no
     # verdict, no config step needed.
-    runner = _az_drive(tmp_path)
+    runner = _az_drive(tmp_path, structure="up")
     assert runner._pending_orders != {}
     evals = _evals(runner, "arrival_zone")
     assert len(evals) == 1
@@ -403,160 +296,39 @@ def test_resting_limit_boundary_rests_at_default(tmp_path):
         == "decision.resting_limit"
     # A second call inside the same approach adds no second
     # record: the pending order short-circuits the flow.
-    runner._maybe_place_resting_limit(dict(_AZ_TICK), {})
+    import pandas as pd
+    runner._maybe_place_resting_limit(
+        {"mid": 4122.0 + 3.6, "spread": 0.3,
+         "time": pd.Timestamp("2026-10-21 13:00", tz="UTC")},
+        {})
     assert runner._pending_orders != {}
     assert len(_evals(runner, "arrival_zone")) == 1
 
 
-def test_resting_limit_config_promotion_still_rests(tmp_path):
-    runner = _az_drive(
-        tmp_path,
-        judgment_route_modes={"resting_limit": "governing"})
-    assert runner._pending_orders != {}
+def test_resting_limit_abstention_refuses(tmp_path):
+    """The abstention refuses the placement under
+    judgment.abstain — the approach's one funnel record
+    terminates refused, and nothing rests."""
+    runner = _az_drive(tmp_path, structure="down")
+    assert runner._pending_orders == {}
+    evals = _evals(runner, "arrival_zone")
+    assert len(evals) == 1
+    assert evals[0]["decision"]["reason_code"] \
+        == "judgment.abstain"
 
 
-# ------------------------------------------------ the full loop (S3 host)
+# ------------------------------------------------ the live table in shadow mode
 
-def _ready_hot_history(start=0):
-    records = _history_arm("hot_scalp", "hot_scalp_promotion",
-                           "take", [0.5] * 18 + [-0.5] * 4,
-                           start=start)
-    records += _history_arm("hot_scalp", "hot_scalp_promotion",
-                            "abstain",
-                            [-0.4] * 15 + [0.3] * 6,
-                            start=start + 100)
-    return records
-
-
-def _prime(runner, records):
-    for record in records:
-        runner.journal.append(record)
-
-
-def test_full_loop_evaluation_measures_demotes_and_releases(
-        tmp_path):
-    # Owner order 2026-11-25: the evaluation is measurement
-    # only — it never binds authority.  The route governs by
-    # declaration throughout; a violation still demotes it,
-    # and a clean window releases it.
-    runner, h1 = _scan_runner(tmp_path)
-    _prime(runner, _ready_hot_history())
-    runner._self_audit_phase("2026-11-06 00:00:00+00:00", h1)
-    records = runner.journal.records()
-    criteria_at = [i for i, r in enumerate(records)
-                   if r.get("type")
-                   == rp.CRITERIA_RECORD_TYPE]
-    evaluation_at = [i for i, r in enumerate(records)
-                     if r.get("type")
-                     == rp.EVALUATION_RECORD_TYPE]
-    # A5a ordering, in the journal itself: every criteria
-    # record precedes the first verdict computed under it.
-    assert criteria_at and evaluation_at
-    assert max(criteria_at) < min(evaluation_at)
-    evaluation = records[evaluation_at[0]]
-    row = evaluation["routes"]["hot_scalp_promotion"]
-    assert row["verdict"] == "promotion_ready"
-    assert row["criteria_id"] == rp.criteria_id_for(
-        "hot_scalp_promotion")
-    # The verdict is MEASUREMENT only: the route governs by
-    # declaration, source "declared" — no authority change
-    # is journaled for a verdict anymore.
-    assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "governing"
-    assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "declared"
-    assert _records(runner, "route_authority_change") == []
-
-    # A5b: an invariant violation demotes it, with evidence.
-    runner.journal.append({
-        "type": rp.VIOLATION_RECORD_TYPE,
-        "route": "hot_scalp_promotion",
-        "kind": rp.KIND_DUPLICATE_ORDER,
-        "evidence": {"setup_id": "hs-dupe"},
-        "ts": "2026-11-06 01:00:00+00:00"})
-    runner._self_audit_phase("2026-11-06 01:00:00+00:00", h1)
-    assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "shadow_declared"
-    assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "demoted"
-    demotions = _records(runner, "route_authority_demotion")
-    assert len(demotions) == 1
-    assert demotions[0]["kind"] == "duplicate_order"
-    assert demotions[0]["evidence"]["setup_id"] == "hs-dupe"
-
-    # A quiet cycle must not release the demotion: no route
-    # activity in the window proves nothing about the
-    # invariant.
-    runner._self_audit_phase("2026-11-06 02:00:00+00:00", h1)
-    assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "demoted"
-
-    # Fresh outcomes in a clean window: the route traded
-    # clean through it, so the invariant has cleared and
-    # the demotion releases — back to governing by
-    # declaration, source "invariant_cleared", entry gone.
-    _prime(runner, _ready_hot_history(start=300))
-    runner._self_audit_phase("2026-11-06 03:00:00+00:00", h1)
-    assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "governing"
-    assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "declared"
-    assert runner._route_authority_entry(
-        "hot_scalp_promotion") is None
-    changes = _records(runner, "route_authority_change")
-    releases = [c for c in changes
-                if c["route"] == "hot_scalp_promotion"
-                and c["to"] == "governing"]
-    assert len(releases) == 1
-    assert releases[0]["source"] == "invariant_cleared"
-    assert releases[0]["kind"] == "duplicate_order"
-
-
-def test_not_ready_verdict_changes_no_authority(tmp_path):
-    # Owner order 2026-11-25: a not_ready verdict is
-    # measurement only — it demotes nothing.  The route
-    # keeps governing by declaration through the losing
-    # batch, and no authority change is journaled.
-    runner, h1 = _scan_runner(tmp_path)
-    _prime(runner, _ready_hot_history())
-    runner._self_audit_phase("2026-11-06 00:00:00+00:00", h1)
-    assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "declared"
-    # A later, larger, losing batch flips the standing
-    # verdict; the route's authority does not move with it.
-    records = _history_arm("hot_scalp", "hot_scalp_promotion",
-                           "take", [-0.6] * 30, start=500)
-    records += _history_arm("hot_scalp",
-                            "hot_scalp_promotion", "abstain",
-                            [0.7] * 30, start=600)
-    _prime(runner, records)
-    runner._self_audit_phase("2026-11-06 01:00:00+00:00", h1)
-    assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "governing"
-    assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "declared"
-    evaluations = _records(runner, rp.EVALUATION_RECORD_TYPE)
-    assert evaluations
-    assert evaluations[-1]["routes"]["hot_scalp_promotion"][
-        "verdict"] == "not_ready"
-    changes = _records(runner, "route_authority_change")
-    assert not any(c["route"] == "hot_scalp_promotion"
-                   for c in changes)
-
-
-def test_insufficient_history_changes_no_authority(tmp_path):
-    runner, h1 = _scan_runner(tmp_path)
-    runner._self_audit_phase("2026-11-06 00:00:00+00:00", h1)
-    # The first cycle still journals criteria + the opening
-    # evaluation (the deployment marker), all insufficient.
-    assert _records(runner, rp.CRITERIA_RECORD_TYPE)
-    evaluations = _records(runner, rp.EVALUATION_RECORD_TYPE)
-    assert evaluations
-    assert all(
-        row["verdict"] == "insufficient_data"
-        for row in evaluations[-1]["routes"].values())
-    assert runner._judgment_route_state("hot_scalp_promotion") \
-        == "governing"
-    assert runner._judgment_route_source(
-        "hot_scalp_promotion") == "declared"
-    assert _records(runner, "route_authority_change") == []
+def test_shadow_mode_governs_nothing_but_journals(tmp_path):
+    """Shadow mode is the global kill switch's rollback
+    posture, not a route gate: the table still lists every
+    route as live, but governing_now is False for all of
+    them — and orders proceed unjudged, never refused."""
+    runner = _jc_runner(tmp_path, judgment_mode="shadow")
+    table = {row["route"]: row
+             for row in runner._judgment_route_table()}
+    assert set(table) == set(LIVE_ORDER_ROUTES)
+    assert all(row["authority"] == "live"
+               for row in table.values())
+    assert all(row["governing_now"] is False
+               for row in table.values())

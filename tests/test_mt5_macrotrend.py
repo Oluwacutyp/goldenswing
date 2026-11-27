@@ -404,7 +404,7 @@ def _run_one(runner, *, golden: bool):
     h1 = runner._stack.frames["H1"]
     runner._run_one_playbook(pb, sig_ctx=(SimpleNamespace(states=None),
                                           engine),
-                             h1=h1, t=len(h1) - 1, verdict=verdict,
+                             frame=h1, t=len(h1) - 1, verdict=verdict,
                              stats=stats)
 
 

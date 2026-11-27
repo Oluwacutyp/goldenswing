@@ -129,7 +129,10 @@ def test_single_close_beyond_does_not_switch():
 
 def test_successful_breakout_switches_regime_then_retest():
     """2 closes beyond + M15 BOS -> BREAKOUT_TREND 0.5x; a retest
-    that holds -> 1.0x."""
+    that holds -> 1.0x.  The retest is an ENTRY-CLOCK event
+    (rework 2026-11-27): the M15 bar touches the broken edge band
+    and closes breakout-way.  The H1 bar in the same update is far
+    above the band, so only the M15 bar can hold it."""
     tr = BoundaryTracker(_range())
     events = tr.update(_h1_breakout_bars(), _m15_bos_up())
     assert _events(events, "breakout_confirmed")
@@ -137,20 +140,47 @@ def test_successful_breakout_switches_regime_then_retest():
     assert tr.breakout_direction == 1
     assert tr.breakout_edge == "high"
     assert tr.lock_remaining == 4
+    assert tr.retest_remaining == 16
     assert tr.size_mult == pytest.approx(0.5)
-    # Retest: touches the broken edge band, closes breakout way.
+    # Retest on M15: touches the broken edge band, closes breakout
+    # way.  The H1 bar added here is far above the band (no touch),
+    # so the M15 bar is the only retest detector.
     h1b = pd.concat([_h1_breakout_bars(), _frame(
-        [[4205.0, 4210.0, 4201.0, 4205.0, 1000.0]], freq="h",
+        [[4250.0, 4260.0, 4240.0, 4250.0, 1000.0]], freq="h",
         start=_h1_breakout_bars().index[-1] + pd.Timedelta(hours=1))])
-    events2 = tr.update(h1b, _frame(_bars(4, close=4230.0)))
+    m15b = _frame(
+        [[4205.0, 4210.0, 4201.0, 4205.0, 1000.0]],
+        start="2024-01-01 04:00", freq="15min")
+    events2 = tr.update(h1b, m15b)
     assert _events(events2, "retest_held")
     assert tr.retest_held
     assert tr.size_mult == pytest.approx(1.0)
 
 
-def test_no_retest_in_4_bars_stays_half_size():
+def test_h1_close_alone_does_not_hold_retest():
+    """Rework 2026-11-27: an H1 bar touching the broken edge and
+    closing breakout-way does NOT hold the retest any more — the
+    retest is an M15 event.  The 25 Nov live status waited on the
+    H1 retest while price ran $47.6 away from the edge."""
+    tr = BoundaryTracker(_range())
+    tr.update(_h1_breakout_bars(), _m15_bos_up())
+    assert tr.regime == "breakout_trend"
+    assert not tr.retest_held
+    # H1 retest bar, no new M15 bars: nothing holds the retest.
+    h1b = pd.concat([_h1_breakout_bars(), _frame(
+        [[4205.0, 4210.0, 4201.0, 4205.0, 1000.0]], freq="h",
+        start=_h1_breakout_bars().index[-1] + pd.Timedelta(hours=1))])
+    events2 = tr.update(h1b, _frame(_bars(4, close=4230.0)))
+    assert not _events(events2, "retest_held")
+    assert not tr.retest_held
+    assert tr.size_mult == pytest.approx(0.5)
+
+
+def test_no_retest_in_16_m15_bars_stays_half_size():
     """Breakout stands on 2nd close + BOS alone when no retest
-    arrives in 4 H1 bars — still 0.5x until a later retest."""
+    arrives in 16 M15 bars — still 0.5x until a later retest.
+    The window is counted on the entry clock (rework 2026-11-27):
+    16 M15 bars, the same wall time as the old 4 H1 bars."""
     tr = BoundaryTracker(_range())
     tr.update(_h1_breakout_bars(), _m15_bos_up())
     assert tr.regime == "breakout_trend"
@@ -159,7 +189,9 @@ def test_no_retest_in_4_bars_stays_half_size():
         h1 = pd.concat([h1, _frame(
             [[4250.0, 4260.0, 4240.0, 4250.0, 1000.0]], freq="h",
             start=h1.index[-1] + pd.Timedelta(hours=1))])
-    events = tr.update(h1, _frame(_bars(4, close=4230.0)))
+    m15 = _frame(_bars(16, close=4230.0),
+                 start="2024-01-01 04:00", freq="15min")
+    events = tr.update(h1, m15)
     assert _events(events, "retest_missed")
     assert tr.regime == "breakout_trend"
     assert not tr.retest_held

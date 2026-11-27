@@ -34,7 +34,7 @@ import pytest
 
 from goldenswing.alerts.commands import CommandContext
 from goldenswing.execution.assessment_render import (
-    is_shadow_record, latest_evaluations, render_assessment)
+    is_judgment_record, latest_evaluations, render_assessment)
 from goldenswing.execution.funnel import assessment_block
 from goldenswing.execution.learning import TradeJournal
 from goldenswing.execution.mt5_commands import MT5_COMMANDS
@@ -134,7 +134,7 @@ def _no_setup_record() -> dict:
     }
 
 
-def _shadow_record() -> dict:
+def _legacy_shadow_record() -> dict:
     rec = _no_setup_record()
     rec["playbook"] = "range_qm"
     rec["evaluation_clock"] = "h4_generation"
@@ -265,29 +265,29 @@ def test_render_empty_record_never_invents_prose():
     assert "VERDICT:" not in text
 
 
-# ---------------------------------------------------- (b) shadow
+# ---------------------------------------------------- (b) judgment / legacy shadow
 
-def test_shadow_record_is_labelled_and_never_a_signal():
-    rec = _shadow_record()
-    assert is_shadow_record(rec)
+def test_judgment_record_is_labelled_and_never_a_signal():
+    rec = _legacy_shadow_record()
+    assert is_judgment_record(rec)
     text = render_assessment(rec, symbol="XAUUSD")
-    assert "SHADOW EVALUATION" in text
-    assert "NO order authority" in text
+    assert "JUDGMENT RECORD" in text
+    assert "not a signal" in text
     assert "VERDICT: SIGNAL" not in text
     assert "VERDICT: WATCH" in text
 
 
-def test_shadow_verdict_signal_is_forced_down_to_watch():
-    rec = _shadow_record()
+def test_judgment_verdict_signal_is_forced_down_to_watch():
+    rec = _legacy_shadow_record()
     rec["assessment"] = dict(rec["assessment"], verdict="signal")
     text = render_assessment(rec, symbol="XAUUSD")
     assert "VERDICT: SIGNAL" not in text
     assert "VERDICT: WATCH" in text
 
 
-def test_live_record_is_not_shadow():
-    assert not is_shadow_record(_signal_record())
-    assert not is_shadow_record(_no_setup_record())
+def test_live_record_is_not_judgment():
+    assert not is_judgment_record(_signal_record())
+    assert not is_judgment_record(_no_setup_record())
 
 
 # ------------------------------------------- (d) /assess command
@@ -304,7 +304,7 @@ def _journal_with_records(tmp_path) -> TradeJournal:
     j.append(older)
     j.append(_no_setup_record())
     j.append(_signal_record())
-    j.append(_shadow_record())
+    j.append(_legacy_shadow_record())
     return j
 
 
@@ -322,10 +322,10 @@ def test_assess_default_shows_newest_plus_index(tmp_path):
     res = MT5_COMMANDS["/assess"][1](_ctx(j, tmp_path), [])
     assert "MARKET ASSESSMENT" in res.text
     # Index lists every playbook with its latest verdict; the
-    # shadow playbook is marked SHADOW in the index too.
+    # judgment playbook is marked JUDGMENT in the index too.
     assert "fvg_midline: NO-SETUP" in res.text
     assert "qm_m5: SIGNAL" in res.text
-    assert "range_qm: WATCH (SHADOW)" in res.text
+    assert "range_qm: WATCH (JUDGMENT)" in res.text
 
 
 def test_assess_one_playbook(tmp_path):
@@ -335,10 +335,10 @@ def test_assess_one_playbook(tmp_path):
     assert "displacement_break" in res.text
 
 
-def test_assess_shadow_playbook_labelled(tmp_path):
+def test_assess_judgment_playbook_labelled(tmp_path):
     j = _journal_with_records(tmp_path)
     res = MT5_COMMANDS["/assess"][1](_ctx(j, tmp_path), ["range_qm"])
-    assert "SHADOW EVALUATION" in res.text
+    assert "JUDGMENT RECORD" in res.text
     assert "VERDICT: SIGNAL" not in res.text
 
 
@@ -353,7 +353,7 @@ def test_assess_all_roster(tmp_path):
         text = res.text
     assert text.count("MARKET ASSESSMENT") == 3
     assert "VERDICT: SIGNAL" in text
-    assert "SHADOW EVALUATION" in text
+    assert "JUDGMENT RECORD" in text
 
 
 def test_assess_unknown_playbook_is_honest(tmp_path):
@@ -460,14 +460,14 @@ def test_e2e_h1_roster_no_setup_assessment(tmp_path):
 def test_e2e_range_live_assessment_labelled(tmp_path):
     # Origination (owner order 2026-11-25, all-live half-2): the
     # §G range family scans register LIVE now, so its eval records
-    # are live records — no shadow marker, no "SHADOW EVALUATION"
+    # are live records — no judgment marker, no "JUDGMENT RECORD"
     # label — carrying the live verdict.  The shadow pin is stale.
     runner = _drive_roster_and_range(tmp_path)
     recs = _evals(runner, "range_qm")
     assert recs, "the §G family must evaluate range_qm"
     for rec in recs:
-        assert not is_shadow_record(rec)
-        assert "SHADOW EVALUATION" not in rec["assessment_text"]
+        assert not is_judgment_record(rec)
+        assert "JUDGMENT RECORD" not in rec["assessment_text"]
         assert rec["assessment"]["verdict"] == "no-setup"
 
 
@@ -490,7 +490,7 @@ def test_warmup_signal_never_announces(tmp_path):
     assert [t for t in sent if "MARKET ASSESSMENT" in t] == []
 
 
-def test_announce_guards_refusals_and_shadow(tmp_path):
+def test_announce_guards_refusals_and_judgment(tmp_path):
     runner = _wire(_qm_runner(tmp_path), _m5_fixture())
     sent: list[str] = []
     runner._send_alert = lambda text, **kw: sent.append(text)
@@ -498,9 +498,9 @@ def test_announce_guards_refusals_and_shadow(tmp_path):
     refused["assessment"] = dict(refused["assessment"],
                                  verdict="rejected")
     runner._announce_assessment(refused)
-    shadow = _shadow_record()
-    shadow["evaluation_source"] = "live_close"
-    runner._announce_assessment(shadow)
+    judged = _legacy_shadow_record()
+    judged["evaluation_source"] = "live_close"
+    runner._announce_assessment(judged)
     runner._announce_assessment(None)
     runner._announce_assessment({})
     assert sent == []

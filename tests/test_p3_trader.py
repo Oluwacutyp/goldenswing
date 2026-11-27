@@ -707,7 +707,7 @@ def _drive_one(runner, pb, h1, verdict=None, zone_d=None,
                         instrument="XAUUSD")
     stats = {"signals": 0, "gated": 0}
     runner._run_one_playbook(
-        pb, sig_ctx=(ctx, _StubEngine()), h1=h1, t=len(h1) - 1,
+        pb, sig_ctx=(ctx, _StubEngine()), frame=h1, t=len(h1) - 1,
         verdict=verdict or {"bias_d1": 1, "bias_h4": 1,
                             "regime": "trend", "direction": 1,
                             "trigger": "tick-cross",
@@ -852,7 +852,15 @@ def test_qm_d1_real_order_path_on_d1_clock(tmp_path, monkeypatch):
     import goldenswing.execution.mt5_runner as mr
     monkeypatch.setattr(mr, "QMD1Playbook", _FakeQMD1)
     runner = _runner(tmp_path)
-    d1 = _frame([(4100.0, 4110.0, 4090.0, 4105.0)] * 40,
+    # The D1 frame carries the short's own structure: the last
+    # closes fall through the 4100 QM level (displacement down,
+    # acceptance below the entry, follow-through held) — the
+    # judgment reads the bars, so a flat frame abstains.
+    d1 = _frame([(4100.0, 4110.0, 4090.0, 4105.0)] * 36 + [
+        (4112.0, 4112.0, 4108.0, 4110.0),
+        (4102.0, 4102.0, 4098.0, 4100.0),
+        (4092.0, 4092.0, 4088.0, 4090.0),
+        (4082.0, 4082.0, 4078.0, 4080.0)],
                   freq="1d")
     h1 = _flat_h1(30, 4100.0)
     runner._stack = SimpleNamespace(frames={"H1": h1, "D1": d1})
@@ -879,7 +887,15 @@ def test_qm_d1_kill_switch(tmp_path, monkeypatch):
     import goldenswing.execution.mt5_runner as mr
     monkeypatch.setattr(mr, "QMD1Playbook", _FakeQMD1)
     runner = _runner(tmp_path, disabled_playbooks=("qm_d1",))
-    d1 = _frame([(4100.0, 4110.0, 4090.0, 4105.0)] * 40,
+    # The D1 frame carries the short's own structure: the last
+    # closes fall through the 4100 QM level (displacement down,
+    # acceptance below the entry, follow-through held) — the
+    # judgment reads the bars, so a flat frame abstains.
+    d1 = _frame([(4100.0, 4110.0, 4090.0, 4105.0)] * 36 + [
+        (4112.0, 4112.0, 4108.0, 4110.0),
+        (4102.0, 4102.0, 4098.0, 4100.0),
+        (4092.0, 4092.0, 4088.0, 4090.0),
+        (4082.0, 4082.0, 4078.0, 4080.0)],
                 freq="1d")
     assert runner._run_qm_d1(d1, {}) == []
     assert runner.executor.orders == []

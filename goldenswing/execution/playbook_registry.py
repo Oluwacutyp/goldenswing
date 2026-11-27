@@ -63,43 +63,35 @@ ROUTE_H1_ROSTER = "h1_roster"
 ROUTE_NATIVE = "native"
 #: Route (Phase 2, owner §G ruling): the range family's SCHEDULED
 #: evaluation contract — H4-close scenario generation + H1
-#: refinement.  The §G evaluation routes are SHADOW (they journal
-#: evaluations and analytical candidates; they hold no order
-#: authority).  Range playbooks ALSO remain members of the
-#: trigger-path roster below — that legacy order authority is a
-#: standing owner state (2026-10-22 promotion) and is NOT
-#: silently removed by declaring the §G contract here (rulings
-#: §G.2: no silent live-decision changes).  Promotion of the §G
-#: route itself is a separate owner decision.
+#: refinement.  The route is LIVE (owner order 2026-11-25/27:
+#: nothing shadowed, everything live directly): it journals
+#: evaluations and analytical candidates, proposes scenarios to
+#: the book, and its setups route to the order path on the
+#: playbook's own trigger clock.  Range playbooks are members of
+#: the trigger-path roster — that order authority is live.
 ROUTE_RANGE_H4_H1 = "range_h4_h1"
 #: Route (MarketSituation Pass 7a, SPEC §6.2): the volatility-
 #: expansion family's SCHEDULED evaluation contract — scans on
 #: each formation clock's close (H4 / H1 / M15), reading the
 #: MarketSituation's multi-TF volatility state.  The route is
-#: SHADOW (it journals evaluations, arm records and analytical
-#: candidates, proposes scenarios to the book, and holds NO
-#: order authority in any mode).  Unlike the range family,
-#: these playbooks are NOT members of the trigger-path roster:
-#: they have no legacy order authority to preserve, so they
-#: stay out of ROSTER_SPECS entirely and the trigger path
-#: never evaluates them.  Promotion is the family's own
-#: evaluation (execution/vol_promotion.py) plus the owner's
-#: separate decision — the SPEC §6 common contract.
+#: LIVE (owner order 2026-11-25/27: nothing shadowed,
+#: everything live directly): it journals evaluations, arm
+#: records and analytical candidates, proposes scenarios to the
+#: book, and its setups route to the order path on the
+#: playbook's own trigger clock.  These playbooks are members
+#: of the trigger path on their own route.
 ROUTE_VOLATILITY_EXPANSION = "volatility_expansion"
 #: Route (MarketSituation Pass 7b, SPEC §6.1): the trend /
 #: momentum family's SCHEDULED evaluation contract — scans
 #: on each TRIGGER clock's close (H1 for H4-formed trends,
 #: H4 for D1-formed), reading the MarketSituation's per-TF
-#: states and relationship kinds.  The route is SHADOW (it
-#: journals evaluations, arm records and analytical
-#: candidates, proposes scenarios to the book, and holds
-#: NO order authority in any mode).  Like the vol family,
-#: these playbooks are NOT members of the trigger-path
-#: roster: they have no legacy order authority to preserve,
-#: so they stay out of ROSTER_SPECS entirely.  Promotion
-#: is the family's own evaluation
-#: (execution/trend_promotion.py) plus the owner's separate
-#: decision — the SPEC §6 common contract.
+#: states and relationship kinds.  The route is LIVE (owner
+#: order 2026-11-25/27: nothing shadowed, everything live
+#: directly): it journals evaluations, arm records and
+#: analytical candidates, proposes scenarios to the book, and
+#: its setups route to the order path on the playbook's own
+#: trigger clock.  These playbooks are members of the trigger
+#: path on their own route.
 ROUTE_TREND_MOMENTUM = "trend_momentum"
 #: Route (MarketSituation Pass 7c, SPEC §6.3): the auction /
 #: value family's SCHEDULED evaluation contract — scans on
@@ -107,16 +99,13 @@ ROUTE_TREND_MOMENTUM = "trend_momentum"
 #: developing value area), reading the developing value
 #: state (live/developing_value.py — the §6.3 extension
 #: the situation's location.value carries) on the H1
-#: formation frame.  The route is SHADOW (it journals
-#: evaluations, arm records and analytical candidates,
-#: proposes scenarios to the book, and holds NO order
-#: authority in any mode).  Like the vol and trend
-#: families, these playbooks are NOT members of the
-#: trigger-path roster: they have no legacy order
-#: authority to preserve, so they stay out of ROSTER_SPECS
-#: entirely.  Promotion is the family's own evaluation
-#: (execution/auction_promotion.py) plus the owner's
-#: separate decision — the SPEC §6 common contract.
+#: formation frame.  The route is LIVE (owner order
+#: 2026-11-25/27: nothing shadowed, everything live
+#: directly): it journals evaluations, arm records and
+#: analytical candidates, proposes scenarios to the book,
+#: and its setups route to the order path on the playbook's
+#: own trigger clock (M15).  These playbooks are members of
+#: the trigger path on their own route.
 ROUTE_AUCTION_VALUE = "auction_value"
 #: Route (MarketSituation Pass 7d, SPEC §6.4): the mean
 #: reversion family's SCHEDULED evaluation contract —
@@ -124,17 +113,14 @@ ROUTE_AUCTION_VALUE = "auction_value"
 #: the H1-formed extension episodes), reading the
 #: developing value state (live/developing_value.py —
 #: the §6.3 extension) and the trend core's momentum
-#: read on the H1 formation frame.  The route is SHADOW
-#: (it journals evaluations, arm records — including the
-#: regime gate's refusals — and analytical candidates,
-#: proposes scenarios to the book, and holds NO order
-#: authority in any mode).  Like the vol, trend and
-#: auction families, these playbooks are NOT members of
-#: the trigger-path roster: they have no legacy order
-#: authority to preserve, so they stay out of ROSTER_SPECS
-#: entirely.  Promotion is the family's own evaluation
-#: (execution/reversion_promotion.py) plus the owner's
-#: separate decision — the SPEC §6 common contract.
+#: read on the H1 formation frame.  The route is LIVE
+#: (owner order 2026-11-25/27: nothing shadowed,
+#: everything live directly): it journals evaluations,
+#: arm records and analytical candidates, proposes
+#: scenarios to the book, and its setups route to the
+#: order path on the playbook's own trigger clock (M15
+#: intraday / M5 scalp).  These playbooks are members of
+#: the trigger path on their own route.
 ROUTE_MEAN_REVERSION = "mean_reversion"
 #: Route (MarketSituation Pass 7e, SPEC §6.5): the session /
 #: opening range family's SCHEDULED evaluation contract —
@@ -142,17 +128,13 @@ ROUTE_MEAN_REVERSION = "mean_reversion"
 #: day's session facts (the frozen Initial Balance, the
 #: Asia range, prior-day value) on the H1 formation frame
 #: via the engine's own session organs (live/day_context.py,
-#: live/session_range.py).  The route is SHADOW (it journals
-#: evaluations, arm records — including the family's standing
-#: abstentions: no-range days and past-cutoff resolutions —
-#: and analytical candidates, proposes scenarios to the book,
-#: and holds NO order authority in any mode).  Like the vol,
-#: trend, auction and reversion families, these playbooks are
-#: NOT members of the trigger-path roster: they have no
-#: legacy order authority to preserve, so they stay out of
-#: ROSTER_SPECS entirely.  Promotion is the family's own
-#: evaluation (execution/session_promotion.py) plus the
-#: owner's separate decision — the SPEC §6 common contract.
+#: live/session_range.py).  The route is LIVE (owner order
+#: 2026-11-25/27: nothing shadowed, everything live
+#: directly): it journals evaluations, arm records and
+#: analytical candidates, proposes scenarios to the book,
+#: and its setups route to the order path on the playbook's
+#: own trigger clock (M15).  These playbooks are members of
+#: the trigger path on their own route.
 ROUTE_SESSION_RANGE = "session_range"
 
 
@@ -166,24 +148,37 @@ class PlaybookSpec:
     ``native_tf`` is the playbook's GENERATION clock (the frame
     its patterns form on); ``refinement_tf`` is set only where a
     second clock refines entries (the range family: H4 generates,
-    H1 refines).  ``shadow_evaluation`` marks a scheduled
-    evaluation route that journals but holds no order authority
-    (the §G range routes in v1)."""
+    H1 refines).  ``trigger_tf`` is the playbook's OWN entry
+    clock — the timeframe whose closes fire its trigger at a zone
+    of that timeframe (owner order 2026-11-27: H1 is NOT the
+    trigger; each playbook triggers on its own declared clock).
+    None means the trigger clock is the generation clock
+    (native_tf).  ``trigger_kind`` is derived from trigger_tf,
+    never a hardcoded H1 default: ``<tf>_trigger_fire``."""
     name: str
     playbook_class: type
     native_tf: str
     route: str
     manageable: bool = True
     refinement_tf: str | None = None
-    shadow_evaluation: bool = False
+    trigger_tf: str | None = None
+
+    @property
+    def trigger_kind(self) -> str:
+        """The trigger event kind, derived from the playbook's own
+        trigger clock — ``<tf>_trigger_fire``.  No H1 default: a
+        playbook whose trigger clock is H1 says so by declaring
+        it, not by falling back to it."""
+        return f"{(self.trigger_tf or self.native_tf).lower()}_trigger_fire"
+
     #: Setup-lifecycle contract (owner rulings 2026-10-30 §1):
     #: how many native-clock bars a scan-detected candidate stays
-    #: a live, routable setup, and which trigger routes it.  Only
-    #: the H1 roster's scheduled scans register setups in v1;
-    #: native routes keep their candidate_lifecycle windows and
-    #: the §G range scans stay journal-only shadow.
+    #: a live, routable setup, and which trigger routes it.  Every
+    #: registered playbook's scheduled scan registers live,
+    #: routable setups (owner order 2026-11-25/27: nothing
+    #: shadowed, everything live directly); native routes keep
+    #: their candidate_lifecycle windows.
     validity_bars: int = 6
-    trigger_kind: str = "h1_trigger_fire"
     #: Step 15 (owner rulings 2026-10-30 §2): the playbook's declared
     #: ENTRY THESIS — "limit" (the setup enters when price returns to
     #: its level: pullback / mitigation / retracement / return-to-zone)
@@ -276,24 +271,21 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
                  ROUTE_H1_ROSTER),
     # Range family (§G contract): scenarios GENERATE on H4
     # closes, entries REFINE on H1 closes, D1 is context only.
-    # The scheduled §G evaluations are shadow in v1 (see
-    # ROUTE_RANGE_H4_H1); trigger-path membership is retained.
+    # The scheduled §G evaluations are LIVE (owner order
+    # 2026-11-25/27); trigger-path membership is retained.
     PlaybookSpec("range_sweep_reclaim", RangeSweepReclaimPlaybook,
-                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1",
-                 shadow_evaluation=False,
+                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1", trigger_tf="H1",
                  chart_studies=("atr_band",)),
     PlaybookSpec("range_qm", RangeQMPlaybook,
-                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1",
-                 shadow_evaluation=False,
+                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1", trigger_tf="H1",
                  chart_studies=("atr_band",)),
     PlaybookSpec("range_mean_reversion", RangeMeanReversionPlaybook,
-                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1",
-                 shadow_evaluation=False,
+                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1", trigger_tf="H1",
                  chart_studies=("atr_band",)),
     PlaybookSpec("range_compression_breakout",
                  RangeCompressionBreakoutPlaybook,
-                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1",
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H4", ROUTE_RANGE_H4_H1, refinement_tf="H1", trigger_tf="H1",
+                 entry_thesis="market",
                  chart_studies=("atr_band",)),
     PlaybookSpec("narrative", NarrativePlaybook, "H1",
                  ROUTE_H1_ROSTER),
@@ -308,11 +300,11 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # (SPEC §6.2).
     PlaybookSpec("vol_expansion_escape", VolExpansionEscapePlaybook,
                  "H1", ROUTE_VOLATILITY_EXPANSION,
-                 shadow_evaluation=False, entry_thesis="market",
+                 entry_thesis="market",
                  chart_studies=("bollinger",)),
     PlaybookSpec("vol_failed_expansion", VolFailedExpansionPlaybook,
                  "H1", ROUTE_VOLATILITY_EXPANSION,
-                 shadow_evaluation=False, entry_thesis="market",
+                 entry_thesis="market",
                  chart_studies=("bollinger",)),
     # Trend / momentum family (MarketSituation Pass 7b,
     # SPEC §6.1): the trend STATE defined on its formation
@@ -332,13 +324,13 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # overlay — phase by structure, never an EMA read.
     PlaybookSpec("trend_impulse_pullback",
                  TrendImpulsePullbackPlaybook,
-                 "H4", ROUTE_TREND_MOMENTUM,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H4", ROUTE_TREND_MOMENTUM, trigger_tf="H1",
+                 entry_thesis="market",
                  chart_studies=("atr_band",)),
     PlaybookSpec("trend_momentum_acceleration",
                  TrendMomentumAccelerationPlaybook,
-                 "H4", ROUTE_TREND_MOMENTUM,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H4", ROUTE_TREND_MOMENTUM, trigger_tf="H1",
+                 entry_thesis="market",
                  chart_studies=("atr_band",)),
     # Auction / value family (MarketSituation Pass 7c, SPEC
     # §6.3): the developing value area defined on its
@@ -355,18 +347,18 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # is day-bound.
     PlaybookSpec("auction_value_acceptance",
                  AuctionValueAcceptancePlaybook,
-                 "H1", ROUTE_AUCTION_VALUE,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H1", ROUTE_AUCTION_VALUE, trigger_tf="M15",
+                 entry_thesis="market",
                  chart_studies=("volume_profile",)),
     PlaybookSpec("auction_value_rejection",
                  AuctionValueRejectionPlaybook,
-                 "H1", ROUTE_AUCTION_VALUE,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H1", ROUTE_AUCTION_VALUE, trigger_tf="M15",
+                 entry_thesis="market",
                  chart_studies=("volume_profile",)),
     PlaybookSpec("auction_lvn_traversal",
                  AuctionLVNTraversalPlaybook,
-                 "H1", ROUTE_AUCTION_VALUE,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H1", ROUTE_AUCTION_VALUE, trigger_tf="M15",
+                 entry_thesis="market",
                  chart_studies=("volume_profile",)),
     # Mean reversion family (MarketSituation Pass 7d, SPEC
     # §6.4): extension episodes defined on the formation
@@ -384,13 +376,13 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # default (SPEC §6.4).
     PlaybookSpec("mean_reversion_extension_fade",
                  MeanReversionExtensionFadePlaybook,
-                 "H1", ROUTE_MEAN_REVERSION,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H1", ROUTE_MEAN_REVERSION, trigger_tf="M15",
+                 entry_thesis="market",
                  chart_studies=("volume_profile",)),
     PlaybookSpec("mean_reversion_failed_continuation",
                  MeanReversionFailedContinuationPlaybook,
-                 "H1", ROUTE_MEAN_REVERSION,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H1", ROUTE_MEAN_REVERSION, trigger_tf="M15",
+                 entry_thesis="market",
                  chart_studies=("volume_profile",)),
     # Session / opening range family (MarketSituation Pass
     # 7e, SPEC §6.5): the day's session facts defined on the
@@ -411,23 +403,23 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # day itself, not a StudySpec kind.
     PlaybookSpec("session_opening_breakout",
                  SessionOpeningBreakoutPlaybook,
-                 "H1", ROUTE_SESSION_RANGE,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H1", ROUTE_SESSION_RANGE, trigger_tf="M15",
+                 entry_thesis="market",
                  chart_studies=("atr_band",)),
     PlaybookSpec("session_opening_failure",
                  SessionOpeningFailurePlaybook,
-                 "H1", ROUTE_SESSION_RANGE,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H1", ROUTE_SESSION_RANGE, trigger_tf="M15",
+                 entry_thesis="market",
                  chart_studies=("atr_band",)),
     PlaybookSpec("session_drive_reversal",
                  SessionDriveReversalPlaybook,
-                 "H1", ROUTE_SESSION_RANGE,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H1", ROUTE_SESSION_RANGE, trigger_tf="M15",
+                 entry_thesis="market",
                  chart_studies=("atr_band",)),
     PlaybookSpec("session_asia_sweep",
                  SessionAsiaSweepPlaybook,
-                 "H1", ROUTE_SESSION_RANGE,
-                 shadow_evaluation=False, entry_thesis="market",
+                 "H1", ROUTE_SESSION_RANGE, trigger_tf="M15",
+                 entry_thesis="market",
                  chart_studies=("atr_band",)),
     # Native-clock routes: evaluated by dedicated runner paths on
     # their own frames (M5 closes / D1 closes).  They are NOT in
@@ -544,44 +536,52 @@ FLOOR_AUTHORITY: dict[str, str] = {
         "roster floor (the flat floor was removed in the "
         "confluence rework)",
     ROUTE_RANGE_H4_H1:
-        "shadow evaluation route: no floor, no order authority. "
-        "When the legacy trigger path fires for a range "
-        "playbook, the ROUTE_H1_ROSTER floor authority applies",
+        "live route (owner order 2026-11-25/27): when the "
+        "trigger path fires for a range playbook, the route's "
+        "OWN floor authority applies — the per-style Asymmetry "
+        "floors of _run_one_playbook for the range family, "
+        "route-stamped under the playbook's own route (never "
+        "the H1 roster's floor)",
     ROUTE_VOLATILITY_EXPANSION:
         "live route (origination, owner order 2026-11-25): "
         "when the trigger path fires for a volatility-"
-        "expansion playbook, the ROUTE_H1_ROSTER floor "
-        "authority applies — the Asymmetry floors of "
-        "_run_one_playbook, route-stamped under the "
-        "playbook's own judgment route",
+        "expansion playbook, the route's OWN floor authority "
+        "applies — the per-style Asymmetry floors of "
+        "_run_one_playbook for the volatility-expansion family, "
+        "route-stamped under the playbook's own route (never "
+        "the H1 roster's floor)",
     ROUTE_TREND_MOMENTUM:
         "live route (origination, owner order 2026-11-25): "
         "when the trigger path fires for a trend / momentum "
-        "playbook, the ROUTE_H1_ROSTER floor authority "
-        "applies — the Asymmetry floors of _run_one_playbook, "
-        "route-stamped under the playbook's own judgment "
-        "route",
+        "playbook, the route's OWN floor authority applies — "
+        "the per-style Asymmetry floors of _run_one_playbook "
+        "for the trend / momentum family, route-stamped under "
+        "the playbook's own route (never the H1 roster's "
+        "floor)",
     ROUTE_AUCTION_VALUE:
         "live route (origination, owner order 2026-11-25): "
         "when the trigger path fires for an auction / value "
-        "playbook, the ROUTE_H1_ROSTER floor authority "
-        "applies — the Asymmetry floors of _run_one_playbook, "
-        "route-stamped under the playbook's own judgment "
-        "route",
+        "playbook, the route's OWN floor authority applies — "
+        "the per-style Asymmetry floors of _run_one_playbook "
+        "for the auction / value family, route-stamped under "
+        "the playbook's own route (never the H1 roster's "
+        "floor)",
     ROUTE_MEAN_REVERSION:
         "live route (origination, owner order 2026-11-25): "
         "when the trigger path fires for a mean reversion "
-        "playbook, the ROUTE_H1_ROSTER floor authority "
-        "applies — the Asymmetry floors of _run_one_playbook, "
-        "route-stamped under the playbook's own judgment "
-        "route",
+        "playbook, the route's OWN floor authority applies — "
+        "the per-style Asymmetry floors of _run_one_playbook "
+        "for the mean reversion family, route-stamped under "
+        "the playbook's own route (never the H1 roster's "
+        "floor)",
     ROUTE_SESSION_RANGE:
         "live route (origination, owner order 2026-11-25): "
         "when the trigger path fires for a session / opening "
-        "range playbook, the ROUTE_H1_ROSTER floor authority "
-        "applies — the Asymmetry floors of _run_one_playbook, "
-        "route-stamped under the playbook's own judgment "
-        "route",
+        "range playbook, the route's OWN floor authority "
+        "applies — the per-style Asymmetry floors of "
+        "_run_one_playbook for the session / opening range "
+        "family, route-stamped under the playbook's own route "
+        "(never the H1 roster's floor)",
     ROUTE_NATIVE + ":qm_m5":
         "NO score floor (judgment route): the weighed Asymmetry "
         "evidence decides; the sleeve base score (60.0) is a "
@@ -619,6 +619,35 @@ MANAGEABLE_NAMES: tuple[str, ...] = tuple(
 def spec_for(name: str) -> PlaybookSpec | None:
     """The registry entry for ``name`` (None when unregistered)."""
     return _BY_NAME.get(str(name))
+
+
+#: Order routes for the two connected paths outside the registry:
+#: hot_scalp runs its own M5 research engine, arrival_zone is the
+#: resting-limit path's journal name.  Both are live order routes
+#: (owner order 2026-11-25/27), not promotion-gated.
+CONNECTED_ORDER_ROUTES: dict[str, str] = {
+    "hot_scalp": "hot_scalp_promotion",
+    "arrival_zone": "resting_limit",
+}
+
+
+def order_route_for(playbook: str) -> str | None:
+    """The order route a playbook's orders ride — the playbook's
+    OWN route, never an H1 default.
+
+    Registered specs ride their own registry route (native specs
+    ride ``<name>_native``); the two connected paths ride their
+    own routes above.  An unregistered playbook returns None —
+    the caller stamps the playbook's own name as the route label
+    (a test stub's orders are still attributable) and must never
+    silently fall back to an H1 route: the H1 funnel is gone
+    (owner order 2026-11-27)."""
+    spec = spec_for(playbook)
+    if spec is not None:
+        if spec.route == ROUTE_NATIVE:
+            return f"{spec.name}_native"
+        return spec.route
+    return CONNECTED_ORDER_ROUTES.get(str(playbook))
 
 
 #: Step 18: the management horizons a setup may declare.
@@ -762,3 +791,14 @@ def native_tf_of(name: str) -> str | None:
     """A playbook's native clock (None when unregistered)."""
     spec = _BY_NAME.get(str(name))
     return spec.native_tf if spec is not None else None
+
+
+def trigger_tf_of(name: str) -> str | None:
+    """A playbook's own entry clock: its declared trigger_tf,
+    else its native clock (None when unregistered — the
+    caller falls back to the fire's entry clock, never to
+    H1 by default)."""
+    spec = _BY_NAME.get(str(name))
+    if spec is None:
+        return None
+    return spec.trigger_tf or spec.native_tf

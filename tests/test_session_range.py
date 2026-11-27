@@ -44,17 +44,17 @@ The family's ground, distinct from every sibling:
 - the runner wiring: scheduled formation-clock scans
   journal evaluations (situation-stamped, family +
   volume-basis evidence with the basis NAMED),
-  route-stamped judgment_shadow verdicts, arm records
+  route-stamped judgment verdicts, arm records
   (corroborated transitions, invalidations AND the
   standing abstentions), and book scenarios — and place
   no orders;
 - the situation wiring: location carries opening_range,
   the frozen IB as the situation's own measurement,
   from the same day object the family reads;
-- the promotion evaluation
-  (execution/session_promotion.py): the shared evaluator
-  over the family's own route-stamped history;
-  promotion_ready is a recommendation, binds nothing.
+- the evaluation (execution/evaluation.py): the shared
+  S4-pairing measurement — route-stamped judgment
+  verdicts + their +4h reconciliations, paired per arm;
+  the verdict is a measurement only, never an action.
 """
 from __future__ import annotations
 
@@ -65,9 +65,9 @@ import pytest
 from test_step14_setup_lifecycle import _scan_runner
 
 import goldenswing.execution.mt5_runner as mt5_runner
-from goldenswing.execution import range_promotion, session_promotion
+from goldenswing.execution import evaluation as _eval
+from test_evaluation import _arm_records
 from goldenswing.execution.mt5_runner import (
-    JUDGMENT_ROUTE_PLAYBOOK,
     management_block_for,
 )
 from goldenswing.execution.playbook_registry import (
@@ -82,6 +82,7 @@ from goldenswing.execution.playbook_registry import (
     TREND_SPECS,
     VOL_SPECS,
 )
+from goldenswing.execution.playbook_registry import order_route_for
 from goldenswing.execution.scenario_book import ScenarioBook
 from goldenswing.execution.setup_lifecycle import TrackedSetup
 from goldenswing.live import session_range as sr
@@ -636,7 +637,7 @@ def test_registry_partition_covers_session():
         assert spec in PLAYBOOK_REGISTRY
         assert spec not in ROSTER_SPECS
         assert spec.playbook_class.live is True
-        assert spec.shadow_evaluation is False
+        assert spec.trigger_kind == "m15_trigger_fire"
     assert {s.name for s in ROSTER_SPECS} | {
         s.name for s in NATIVE_SPECS} | {
         s.name for s in VOL_SPECS} | {
@@ -646,11 +647,15 @@ def test_registry_partition_covers_session():
         s.name for s in SESSION_SPECS} == {
         s.name for s in PLAYBOOK_REGISTRY}
     assert len(PLAYBOOK_REGISTRY) == 31
-    assert "ROUTE_H1_ROSTER floor authority applies" in \
+    assert "never the H1 roster's floor" in \
         FLOOR_AUTHORITY[ROUTE_SESSION_RANGE]
 
 
 def test_routes_declared_governing(tmp_path):
+    """Every route governs (owner order 2026-11-25/27 — the
+    promotion gate is deleted, no route is shadowed or
+    demoted): the family's playbooks ride their own route,
+    live, and the manifest's per-route table says so."""
     runner, _ = _scan_runner(tmp_path)
     table = {row["route"]: row
              for row in runner._judgment_route_table()}
@@ -658,54 +663,29 @@ def test_routes_declared_governing(tmp_path):
                  "session_opening_failure",
                  "session_drive_reversal",
                  "session_asia_sweep"):
-        assert runner._judgment_route_state(name) == \
-            "governing"
-        assert runner._judgment_route_source(name) == "declared"
-        assert table[name]["governing_now"] is True
-        assert JUDGMENT_ROUTE_PLAYBOOK[name] == name
-    assert set(session_promotion.SESSION_JUDGMENT_ROUTES) == \
+        route = order_route_for(name)
+        assert route == ROUTE_SESSION_RANGE
+        assert table[route]["authority"] == "live"
+        assert table[route]["source"] == "live"
+        assert table[route]["governing_now"] is True
+    # The runner's tables agree with the registry: the
+    # family's playbooks are the registry's own specs.
+    assert {s.name for s in SESSION_SPECS} == \
         set(mt5_runner.SESSION_JUDGMENT_ROUTE_NAMES)
 
 
 def test_family_attributed_to_own_route():
-    """The route_promotion order table (order attribution
-    for the violation scan) maps each family playbook to
-    its OWN route, so a violation attributed to the
-    playbook demotes that route — and the route governs
-    by declaration since the owner's 2026-11-25 order."""
-    from goldenswing.execution.route_promotion import (
-        ORDER_ROUTE_BY_PLAYBOOK)
+    """The registry maps each family playbook to its OWN
+    family's route — never the H1 roster's — so a violation
+    attributed to the playbook lands on that route, and the
+    route governs by declaration (owner order
+    2026-11-25/27)."""
     for name in ("session_opening_breakout",
                  "session_opening_failure",
                  "session_drive_reversal",
                  "session_asia_sweep"):
-        assert ORDER_ROUTE_BY_PLAYBOOK[name] == name
+        assert order_route_for(name) == ROUTE_SESSION_RANGE
 
-
-def test_undeclared_names_still_fail_closed(tmp_path):
-    from test_route_authority import (
-        _candidate, _decision, _evidence, _jc_runner)
-    runner, _ = _scan_runner(tmp_path)
-    assert runner._judgment_route_state(
-        "session_typo") == "shadow_declared"
-    assert runner._judgment_route_source(
-        "session_typo") == "undeclared"
-    for mode in ("active", "shadow"):
-        jc = _jc_runner(tmp_path / mode, judgment_mode=mode)
-        _bundle, refusal = jc._judgment_authority(
-            candidate=_candidate(), decision=_decision(),
-            evidence=_evidence(), intended_tf="H1",
-            eval_now=jc._evaluation_now(),
-            route="session_typo")
-        assert refusal is not None
-        assert "undeclared" in refusal
-        alarms = [r for r in jc.journal.records()
-                  if r["type"] == "undeclared_route"]
-        assert len(alarms) == 1
-        assert alarms[0]["route"] == "session_typo"
-
-
-# ------------------------------------------------------- management (P6)
 
 def test_management_block_intraday_standard_on_formation_clock():
     h1 = _accept_h1()
@@ -837,15 +817,15 @@ def test_runner_scan_journals_evaluations_verdicts_and_book(
     assert emitted[0]["evidence"]["volume_basis"] == "tick_volume"
     assert "tick-volume" in \
         emitted[0]["evidence"]["volume_basis_role"]
-    # The §G stamp: the scan's passive verdict is journaled
-    # as a judgment_shadow identifiable as THIS route's
+    # The route stamp: the scan's passive verdict is journaled
+    # as a judgment record identifiable as THIS route's
     # history.
-    shadows = [r for r in records if r["type"] == "judgment_shadow"
+    judged = [r for r in records if r["type"] == "judgment"
                and (r.get("judgment") or {}).get(
                    "authority_route")
                == "session_opening_breakout"]
-    assert len(shadows) == 1
-    assert shadows[0]["judgment"]["authority"] == "governing"
+    assert len(judged) == 1
+    assert judged[0]["judgment"]["authority"] == "live"
     # The scenario entered the book as a governing proposal
     # (origination) with the family's clocks and BOTH targets
     # (the measured extension, then the situation zone).
@@ -856,7 +836,7 @@ def test_runner_scan_journals_evaluations_verdicts_and_book(
     book = runner._scenario_book_get()
     sc = book.scenarios[setups[0].setup_id]
     assert sc["family"] == "session_opening_breakout"
-    assert sc["authority"] == "governing"
+    assert sc["authority"] == "live"
     assert sc["horizon"] == "intraday"
     assert sc["clocks"]["formation_tf"] == "H1"
     assert sc["clocks"]["management_tf"] == "H1"
@@ -966,86 +946,63 @@ def test_situation_location_carries_opening_range(tmp_path):
     assert blocks["location"]["day_levels"]["ib_high"] == 2002.0
 
 
-# ------------------------------------------------- promotion evaluation
+# ------------------------------------------------- evaluation (S4 pairing)
 
-def _arm_records(route, take_rs, abstain_rs, *, start=0):
-    """Route-stamped shadow verdicts + judgment
-    reconciliations in the evaluator's own record shapes —
-    the §G suite's fabricators, re-pointed at this family's
-    playbooks."""
-    from test_range_promotion_evaluation import _arm as _rp_arm
-    return (_rp_arm(route, "take", take_rs, start=start)
-            + _rp_arm(route, "abstain", abstain_rs,
-                      start=start + 1000))
+# The measurement the deleted session_promotion module shared,
+# now in execution/evaluation.py: route-stamped judgment
+# verdicts + their +4h reconciliations, paired per arm.
+# The verdict is a measurement only — it grants, promotes,
+# demotes and changes nothing.  The host cycle that journals
+# it lives in book_evaluation.py (test_book_evaluation.py);
+# there is no per-family phase anymore.
+
+def _routes_map():
+    return {s.name: s.name for s in SESSION_SPECS}
 
 
-def test_promotion_evaluation_insufficient_then_ready_binds_nothing(
-        tmp_path):
+def _playbooks():
+    return tuple(s.name for s in SESSION_SPECS)
+
+
+def test_evaluation_insufficient_then_ready(tmp_path):
     route = "session_opening_breakout"
-    state = session_promotion.new_state()
+    state = _eval.new_state()
     few = _arm_records(route, [1.0] * 6, [0.0] * 6)
-    rec = session_promotion.cycle(
-        state=state, records=few, now=None,
-        bar="2026-11-03 00:00")
-    assert rec is not None and \
-        rec["type"] == "session_promotion_evaluation"
-    row = rec["routes"][route]
-    assert row["verdict"] == range_promotion.VERDICT_INSUFFICIENT
+    snap = _eval.accumulate(
+        state, few, now=None, routes_map=_routes_map(),
+        playbooks=_playbooks(), family="session")
+    row = snap["routes"][route]
+    assert row["verdict"] == _eval.VERDICT_INSUFFICIENT
     many = _arm_records(route, [1.2] * 22, [-0.3] * 22,
                         start=5000)
-    rec2 = session_promotion.cycle(
-        state=state, records=many, now=None,
-        bar="2026-11-04 00:00")
-    assert rec2 is not None
-    row = rec2["routes"][route]
-    assert row["verdict"] == range_promotion.VERDICT_READY
+    snap2 = _eval.accumulate(
+        state, many, now=None, routes_map=_routes_map(),
+        playbooks=_playbooks(), family="session")
+    row = snap2["routes"][route]
+    assert row["verdict"] == _eval.VERDICT_READY
     assert row["take"]["median_r"] == pytest.approx(1.2)
-    # binds=False made visible: the verdict speaks as a
-    # RECOMMENDATION, never as an effect.
-    assert "RECOMMENDATION" in row["verdict_reason"]
-    text = "\n".join(session_promotion.render_lines(state))
-    assert "PROMOTION READY (recommendation only)" in text
+    assert "a measurement, never an action" in row["verdict_reason"]
+    # The verdict changed nothing about the route's state:
+    # still live, still governing.
     runner, _ = _scan_runner(tmp_path)
-    assert runner._judgment_route_state(route) == "governing"
+    table = {r["route"]: r for r in runner._judgment_route_table()}
+    assert table[order_route_for(route)]["governing_now"] is True
 
 
-def test_promotion_host_phase_journals_and_persists(tmp_path):
-    """The runner host (the §G arrangement): one self-audit
-    window in -> a dated session_promotion_evaluation
-    record in the journal, state persisted under its own
-    key in the audit state file, and /status renders the
-    block."""
-    runner, _ = _scan_runner(tmp_path)
-    records = _arm_records("session_asia_sweep",
-                           [1.0] * 3, [0.0] * 3)
-    runner._session_promotion_phase(
-        records, "2026-11-03 00:00",
-        window={"records": len(records)})
-    out = [r for r in runner.journal.records()
-           if r["type"] == "session_promotion_evaluation"]
-    assert len(out) == 1
-    assert out[0]["routes"]["session_asia_sweep"][
-        "verdict"] == range_promotion.VERDICT_INSUFFICIENT
-    assert "session_promotion" in runner._audit_state()
-    assert "session range promotion (Pass 7e)" in \
-        runner.session_promotion_line()
-
-
-def test_promotion_evaluation_one_shot_ignores_other_routes():
+def test_evaluation_one_shot_ignores_other_routes():
     records = _arm_records("session_asia_sweep",
                            [1.0] * 22, [0.0] * 22)
-    snap = session_promotion.evaluate_records(records)
-    assert snap["routes"]["session_asia_sweep"][
-        "verdict"] == range_promotion.VERDICT_READY
-    assert snap["routes"]["session_opening_breakout"][
-        "verdict"] == range_promotion.VERDICT_INSUFFICIENT
-    # The other families' histories never leak in either.
-    for other in ("range_qm", "vol_expansion_escape",
-                  "trend_impulse_pullback",
-                  "auction_value_acceptance",
-                  "mean_reversion_extension_fade"):
-        snap2 = session_promotion.evaluate_records(
-            _arm_records(other, [1.0] * 22, [0.0] * 22))
-        assert all(row["verdict"] ==
-                   range_promotion.VERDICT_INSUFFICIENT
-                   for row in snap2["routes"].values())
+    snap = _eval.evaluate_records(
+        records, routes_map=_routes_map(),
+        playbooks=_playbooks())
+    assert snap["routes"]["session_asia_sweep"]["verdict"] == \
+        _eval.VERDICT_READY
+    assert snap["routes"]["session_opening_breakout"]["verdict"] == \
+        _eval.VERDICT_INSUFFICIENT
+    # Another family's history never leaks in either.
+    snap2 = _eval.evaluate_records(
+        _arm_records("range_qm", [1.0] * 22, [0.0] * 22),
+        routes_map=_routes_map(), playbooks=_playbooks())
+    assert all(row["verdict"] ==
+               _eval.VERDICT_INSUFFICIENT
+               for row in snap2["routes"].values())

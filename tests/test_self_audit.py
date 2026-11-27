@@ -64,24 +64,42 @@ def _evaluation(playbook="qm_m5", decision=None, outcome="candidate_emitted",
 
 
 def _shadow(ts=T0, playbook="qm_m5", decision="take",
-            order_result="filled", groups_for=("htf_structure",),
-            groups_against=(), score=None, confidence=0.5,
-            expected_r=0.4, gate_reason_code=None):
+            order_result="filled", reads=("htf_bias",),
+            confidence=0.5, expected_r=0.4, gate_reason_code=None,
+            legacy=False):
+    """A judgment record in the LIVE shape (type "judgment",
+    the code rung's measured reads on structure.reads) — or,
+    with legacy=True, the pre-rework shape (type
+    "judgment_shadow", evidence_balance groups + score +
+    thresholds) for the audit's legacy fallback."""
+    if legacy:
+        return {
+            "type": "judgment_shadow", "ts": ts, "playbook": playbook,
+            "gate_result": "accepted",
+            "gate_order_result": order_result,
+            "gate_reason_code": gate_reason_code,
+            "judgment": {
+                "decision": decision, "expected_r": expected_r,
+                "confidence": confidence,
+                "evidence_balance": {
+                    "support": 1.5, "against": 0.0,
+                    "groups_for": list(reads),
+                    "groups_against": []},
+                "score": {"total": 72.0, "floor": 50.0,
+                          "edge": None},
+                "thresholds": {"min_expected_r": 0.05,
+                               "min_confidence": 0.15}}}
     return {
-        "type": "judgment_shadow", "ts": ts, "playbook": playbook,
+        "type": "judgment", "ts": ts, "playbook": playbook,
         "gate_result": "accepted", "gate_order_result": order_result,
         "gate_reason_code": gate_reason_code,
         "judgment": {
             "decision": decision, "expected_r": expected_r,
             "confidence": confidence,
-            "evidence_balance": {
-                "support": 1.5, "against": 0.0,
-                "groups_for": list(groups_for),
-                "groups_against": list(groups_against)},
-            "score": {"total": score, "floor": 50.0,
-                      "edge": None},
-            "thresholds": {"min_expected_r": 0.05,
-                           "min_confidence": 0.15}}}
+            "structure": {
+                "reads": [{"name": name, "direction": 1,
+                           "note": f"{name} favours LONG"}
+                          for name in reads]}}}
 
 
 def _recon(ts=T0, playbook="qm_m5", realized_r=-1.2, move=-12.0,
@@ -203,25 +221,24 @@ def test_pair_resolves_across_windows_and_rerun_adds_nothing():
 # ------------------------------------------------------- (c) weak setups
 def test_weak_setup_names_the_groups_that_never_voted():
     st = new_state()
-    weak = _shadow(groups_for=("htf_structure",), score=None)
+    weak = _shadow(reads=("htf_bias",))
     strong = _shadow(
         ts="2026-11-03T01:00:00Z",
-        groups_for=("htf_structure", "journey_geometry",
-                    "zone_context"),
-        score=80.0)
+        reads=("displacement", "acceptance", "htf_bias",
+               "asymmetry"))
     not_an_attempt = _shadow(
         ts="2026-11-03T02:00:00Z", order_result=None,
         gate_reason_code="floor.total",
-        groups_for=("htf_structure",), score=None)
+        reads=("htf_bias",))
     rec = audit_cycle(state=st,
                       records=[weak, strong, not_an_attempt],
                       bars=[], now=_now("2026-11-03T06:00:00Z"))
     cat = rec["categories"]["weak_setups"]
     assert cat["found"] == 1
     item = cat["items"][0]
-    assert item["engaged_groups"] == ["htf_structure"]
-    assert "asymmetry_score" in item["absent_groups"]
-    assert "journey_geometry" in item["absent_groups"]
+    assert item["engaged_groups"] == ["htf_bias"]
+    assert "asymmetry" in item["absent_groups"]
+    assert "displacement" in item["absent_groups"]
     fb = route_feedback(st)["qm_m5"]
     assert fb["attempts"] == 2 and fb["weak_setup_rate"] == 0.5
 
@@ -378,10 +395,8 @@ def test_corrupt_region_degrades_every_category(tmp_path):
 def test_none_found_is_a_measured_zero():
     st = new_state()
     quiet = _evaluation(outcome="no_setup", decision=None)
-    strong = _shadow(groups_for=("htf_structure",
-                                  "journey_geometry",
-                                  "zone_context"),
-                     score=80.0)
+    strong = _shadow(reads=("displacement", "acceptance",
+                             "htf_bias", "asymmetry"))
     rec = audit_cycle(state=st, records=[quiet, strong], bars=[],
                       now=_now("2026-11-03T06:00:00Z"))
     for cat in self_audit.CATEGORIES:
@@ -425,7 +440,7 @@ def test_runner_cycle_journals_once_and_renders(tmp_path):
     died = _evaluation(decision={
         "result": "refused", "reason_code": "floor.total",
         "reason_category": 7})
-    weak = _shadow(groups_for=("htf_structure",), score=None)
+    weak = _shadow(reads=("htf_bias",))
     runner.journal.append(died)
     runner.journal.append(weak)
     closes = [3900.0] * 20

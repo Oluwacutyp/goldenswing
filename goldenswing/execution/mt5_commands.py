@@ -614,75 +614,6 @@ def _mt5_status(ctx: CommandContext, args: list[str]) -> CommandResult:
             lines.append(fmt_section("🩺", "Self-Audit"))
             lines.append(self_audit())
             lines.append("")
-    # §G range promotion evaluation: per-route verdicts over
-    # the range family's own route-stamped shadow history —
-    # from the runner's range_promotion_line, beside the
-    # self-audit it rides on.  Guarded — old runners lack it.
-    if ctrl is not None:
-        range_promotion = getattr(ctrl, "range_promotion_line",
-                                  None)
-        if callable(range_promotion):
-            lines.append(fmt_section("📐", "Range Promotion"))
-            lines.append(range_promotion())
-            lines.append("")
-    # Pass 7a vol-expansion promotion evaluation: the same
-    # arrangement for the volatility-expansion routes —
-    # from the runner's vol_promotion_line.  Guarded — old
-    # runners lack it.
-    if ctrl is not None:
-        vol_promotion = getattr(ctrl, "vol_promotion_line",
-                                None)
-        if callable(vol_promotion):
-            lines.append(fmt_section("🌀", "Vol Promotion"))
-            lines.append(vol_promotion())
-            lines.append("")
-    # Pass 7b trend / momentum promotion evaluation: the
-    # same arrangement for the trend routes — from the
-    # runner's trend_promotion_line.  Guarded — old runners
-    # lack it.
-    if ctrl is not None:
-        trend_promotion = getattr(ctrl, "trend_promotion_line",
-                                  None)
-        if callable(trend_promotion):
-            lines.append(fmt_section("📈", "Trend Promotion"))
-            lines.append(trend_promotion())
-            lines.append("")
-    # Pass 7c auction / value promotion evaluation: the
-    # same arrangement for the auction routes — from the
-    # runner's auction_promotion_line.  Guarded — old
-    # runners lack it.
-    if ctrl is not None:
-        auction_promotion = getattr(ctrl,
-                                    "auction_promotion_line",
-                                    None)
-        if callable(auction_promotion):
-            lines.append(fmt_section("🔨", "Auction Promotion"))
-            lines.append(auction_promotion())
-            lines.append("")
-    # Pass 7d mean reversion promotion evaluation: the
-    # same arrangement for the reversion routes — from
-    # the runner's reversion_promotion_line.  Guarded —
-    # old runners lack it.
-    if ctrl is not None:
-        reversion_promotion = getattr(ctrl,
-                                      "reversion_promotion_line",
-                                      None)
-        if callable(reversion_promotion):
-            lines.append(fmt_section("🧲", "Mean Reversion Promotion"))
-            lines.append(reversion_promotion())
-            lines.append("")
-    # Pass 7e session / opening range promotion
-    # evaluation: the same arrangement for the session
-    # routes — from the runner's session_promotion_line.
-    # Guarded — old runners lack it.
-    if ctrl is not None:
-        session_promotion = getattr(ctrl,
-                                    "session_promotion_line",
-                                    None)
-        if callable(session_promotion):
-            lines.append(fmt_section("🌅", "Session Range Promotion"))
-            lines.append(session_promotion())
-            lines.append("")
     # Pass 9 self-evaluation: the whole-book comparison
     # table (every family + the governing routes on the one
     # shared instrument), beside it.  Guarded — old runners
@@ -859,7 +790,7 @@ def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
     index; ``/assess <playbook>`` one playbook in full;
     ``/assess all`` the whole roster (a document when the text
     would exceed a Telegram message, the /recap pattern)."""
-    from .assessment_render import (is_shadow_record,
+    from .assessment_render import (is_judgment_record,
                                     latest_evaluations,
                                     record_provenance,
                                     render_assessment)
@@ -886,7 +817,7 @@ def _mt5_assess(ctx: CommandContext, args: list[str]) -> CommandResult:
     def _index_line(name: str, rec: dict) -> str:
         a = rec.get("assessment") or {}
         verdict = str(a.get("verdict") or "?").upper()
-        mark = " (SHADOW)" if is_shadow_record(rec) else ""
+        mark = " (JUDGMENT)" if is_judgment_record(rec) else ""
         line = (f"  {name}: {verdict}{mark} · "
                 f"bar {rec.get('last_bar_ts') or '?'}")
         # Runtime Truth item 3: the index carries the freshness

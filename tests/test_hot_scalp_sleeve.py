@@ -1,12 +1,12 @@
 """Completion-03 (owner program 2026-11-05): the Hot Scalp
 sleeve is multi-position.
 
-Flat-only v1 (promotion.flat_only_holding) is superseded: a
+Flat-only v1 (hot_scalp.flat_only_holding) is superseded: a
 triggered candidate may STACK onto held sleeve positions when
 
 - it is independently justified — its own setup instance from
   the candidate chain; the same setup_id never opens twice;
-- a stack on the SAME parent thesis revalidates at promotion
+- a stack on the SAME parent thesis revalidates at placement
   time, read fresh from the setup store (thesis not invalidated,
   zone not consumed) — a stale trigger riding a dead thesis read
   is refused under its own reason;
@@ -21,7 +21,7 @@ friction, margin) are untouched and still bind downstream.
 
 Harness note: ``runner._hs_parents`` is populated by chain
 events in the live loop (``_hs_chain_from_event``) before
-promotion runs; these tests call promotion directly, so they
+placement runs; these tests call placement directly, so they
 record the same mapping explicitly after each open.
 """
 
@@ -94,20 +94,32 @@ class _MarketExec:
                            volume=request.volume)
 
 
+def _up_m5_frame():
+    """M5 frame with a real upward reaction through 100.30:
+    closes rise 99.6 -> 101.6 on tight ranges, so the judgment
+    measures strong displacement up, acceptance above the entry
+    and follow-through held for a long candidate."""
+    import numpy as np
+    idx = pd.date_range("2026-10-27T00:00:00Z", periods=10,
+                        freq="5min")
+    close = np.linspace(99.6, 101.6, 10)
+    return pd.DataFrame(
+        {"open": close - 0.05, "high": close + 0.1,
+         "low": close - 0.1, "close": close,
+         "volume": np.full(10, 100.0)}, index=idx)
+
+
 def _runner(tmp_path, *, equity=1100.0):
-    # PASS 5 (owner ruling 2026-11-08): this suite pins the
-    # sleeve's stacking / risk mechanics, which operate on
-    # placed orders — so its runners carry the owner's
-    # explicit config promotion for the route.  The boundary
-    # at the declared posture is pinned in
-    # tests/test_route_authority.py.
+    # This suite pins the sleeve's stacking / risk mechanics,
+    # which operate on placed orders.  The route is live by
+    # declaration (owner order 2026-11-25) — no config step
+    # promotes it; the boundary at the declared posture is
+    # pinned in tests/test_route_authority.py.
     cfg = MT5RunnerConfig(
         journal_path=tmp_path / "mt5_journal.jsonl",
         risk_state_path=tmp_path / "mt5_risk.json",
         kill_switch_path=tmp_path / "mt5_KILL",
-        news_pause_enabled=False, hot_scalp_live_enabled=True,
-        judgment_route_modes={"hot_scalp_promotion":
-                              "governing"})
+        news_pause_enabled=False, hot_scalp_live_enabled=True)
     feed = SimpleNamespace(
         account_state=lambda: {"equity": equity, "balance": equity,
                                "free_margin": equity},
@@ -117,7 +129,12 @@ def _runner(tmp_path, *, equity=1100.0):
     runner._market_open = lambda: (True, "test")
     runner._stack = TimeframeStack.from_frames({
         "H1": _frame(60, "2026-10-27T00:00:00Z", 60),
-        "M5": _frame(5, "2026-10-27T00:00:00Z", 10),
+        # The M5 frame is the entry clock the judgment reads:
+        # a real upward leg through the entry (closes 99.6 ->
+        # 101.6, tight ranges) — displacement up, acceptance
+        # above the entry, follow-through held — so the long
+        # candidates this suite places read as a take.
+        "M5": _up_m5_frame(),
         "M15": _frame(15, "2026-10-26T12:15:00Z", 50)})
     runner._hot_scalp_aux_frames = {
         "M1": _frame(1, "2026-10-27T00:00:00Z", 50)}
@@ -151,7 +168,7 @@ def _candidate(runner, *, setup_id, parent_id, entry=100.30, stop=90.30,
     claim = store.claim_trigger(setup_id, "process-A", NOW)
     assert claim is not None, "test setup claim must succeed"
     return {
-        "event": "candidate_shadow", "setup_id": setup_id,
+        "event": "candidate", "setup_id": setup_id,
         "parent_setup_id": parent_id, "strategy": "breakout_retest",
         "direction": direction, "entry_reference": entry,
         "structural_stop": stop, "target_reference": target,
@@ -165,7 +182,7 @@ def _tick(*, mid=100.30):
 
 
 def _promote(runner, cand):
-    # Each promotion lands on its own bar, as in the live loop —
+    # Each placement lands on its own bar, as in the live loop —
     # the signal index feeds the alert id, and two fills sharing
     # an alert id would collide in the step-17 identity map.
     counter = getattr(runner, "_bar_counter", None)
@@ -173,13 +190,13 @@ def _promote(runner, cand):
         counter = runner._bar_counter = itertools.count(100)
     runner._current_h1_bar = lambda: next(counter)
     # The live loop's chain events record the setup -> parent
-    # mapping (_hs_chain_from_event) BEFORE promotion runs; the
+    # mapping (_hs_chain_from_event) BEFORE placement runs; the
     # direct-call harness records it at the same point.
     parents = getattr(runner, "_hs_parents", None)
     if parents is None:
         parents = runner._hs_parents = {}
     parents[cand["setup_id"]] = cand["parent_setup_id"]
-    return runner._promote_hot_scalp_candidate(cand, _tick(), {})
+    return runner._place_hot_scalp_candidate(cand, _tick(), {})
 
 
 def _status(runner, setup_id):
@@ -202,7 +219,7 @@ def _chain_records(runner, *, stage=None, chain_id=None):
 
 
 def _refusals(runner, setup_id):
-    return [r for r in _chain_records(runner, stage="promotion",
+    return [r for r in _chain_records(runner, stage="placement",
                                       chain_id=setup_id)
             if r.get("execution_status") in ("refused", "withheld")]
 
@@ -309,7 +326,7 @@ def test_parent_risk_budget_refuses_third_same_thesis_stack(tmp_path):
     assert len(runner.executor.placed) == 2
     refusals = _refusals(runner, "hs-x3")
     assert [r["reason_code"] for r in refusals] == \
-        ["promotion.parent_risk_budget"]
+        ["hot_scalp.parent_risk_budget"]
     rec = refusals[0]
     # The journal carries authorized vs aggregate, distinguishable.
     assert rec["authorized_envelope"] == pytest.approx(22.0)
@@ -341,7 +358,7 @@ def test_sleeve_risk_budget_refuses_across_theses(tmp_path):
     assert len(runner.executor.placed) == 3
     refusals = _refusals(runner, "hs-p4")
     assert [r["reason_code"] for r in refusals] == \
-        ["promotion.sleeve_risk_budget"]
+        ["hot_scalp.sleeve_risk_budget"]
     assert refusals[0]["authorized_envelope"] == pytest.approx(66.0)
     assert refusals[0]["aggregate_exposure"] > 66.0
     assert _status(runner, "hs-p4") == "touched"
@@ -355,12 +372,12 @@ def test_same_setup_never_opens_twice(tmp_path):
     assert _promote(runner, a) is True
     refire = dict(a)
     refire["claim"] = {"claimant": "process-A", "fencing_token": 999}
-    assert runner._promote_hot_scalp_candidate(refire, _tick(), {}) \
+    assert runner._place_hot_scalp_candidate(refire, _tick(), {}) \
         is False
     assert len(runner.executor.placed) == 1
     refusals = _refusals(runner, "hs-a")
     assert refusals[-1]["reason_code"] == \
-        "promotion.setup_already_open"
+        "hot_scalp.setup_already_open"
 
 
 # --------------------------------------- (d) same-thesis revalidation
@@ -381,7 +398,7 @@ def test_same_thesis_stack_refused_after_thesis_invalidation(tmp_path):
     assert len(runner.executor.placed) == 1
     refusals = _refusals(runner, "hs-x2")
     assert [r["reason_code"] for r in refusals] == \
-        ["promotion.thesis_invalidated"]
+        ["hot_scalp.thesis_invalidated"]
     # The dead setup stays dead — the refusal must not resurrect
     # it to touched.
     assert _status(runner, "hs-x2") == "invalidated"
@@ -398,7 +415,7 @@ def test_same_thesis_stack_refused_when_zone_consumed(tmp_path):
     assert len(runner.executor.placed) == 1
     refusals = _refusals(runner, "hs-x2")
     assert [r["reason_code"] for r in refusals] == \
-        ["promotion.zone_already_consumed"]
+        ["hot_scalp.zone_already_consumed"]
     assert _status(runner, "hs-x2") == "touched"
 
 

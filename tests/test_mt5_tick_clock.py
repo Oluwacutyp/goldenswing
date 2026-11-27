@@ -5,9 +5,12 @@ CONTAINMENT FIRST — the H1 reference level on the zone side must
 nest inside the H4 POI zone (± buf) or the setup never arms.
 Then ARMED on a tick whose price sits AT the H4 POI band, and
 CONFIRMED when a POI confirmation-family shape fires on the
-entry-TF bars composing the forming H1 bar (M15 in killzone, M30
-elsewhere).  Disarm if price exits the zone (through the stop, or
-ran away the other side) or the H1 close lapses the window.
+entry-TF bars in the pending's own confirmation window (M15 in
+killzone, M30 elsewhere), counted from the touch.  Disarm if
+price exits the zone (through the stop, or ran away the other
+side) or the entry-clock TTL (3 entry bars) lapses without
+confirmation.  The H1 close never expires an armed pending
+(rework 2026-11-27): the pending belongs to its own entry clock.
 Frames below are hand-built so the setup is armed: D1/H4 bias +1,
 H4 support 2000.0, H1 ref_low 1998.5 nesting in the zone, and the
 M15 breaker bar (10:30) confirms the entry.
@@ -615,17 +618,19 @@ def test_runner_confirm_after_exit_does_not_fire(tmp_path):
     assert runner._pending is None
 
 
-def test_runner_confirm_after_window_lapse_does_not_fire(tmp_path):
-    # Arm, H1 close lapses the window, THEN the confirming entry
-    # bars arrive on a tick outside the zone: no fire.  A later
-    # re-touch is a NEW setup, not this one.
+def test_runner_confirm_after_h1_close_still_fires(tmp_path):
+    # Rework 2026-11-27: the H1 close no longer lapses the
+    # confirmation window — the pending belongs to its own entry
+    # clock.  Arm, let an H1 close pass, THEN the confirming entry
+    # bars arrive: the setup fires.  (The old test pinned the
+    # opposite: the H1 close killed the pending at 2/3.)
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
     _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
-    runner._on_h1_close(_tick("2026-10-14 09:00", 2003.0), stats)
-    assert runner._pending is None  # window lapsed
-    assert stats["invalidated"] == 1
+    runner._on_h1_close(_tick("2026-10-14 09:00", 2000.3), stats)
+    assert runner._pending is not None  # survives the H1 close
+    assert stats.get("invalidated", 0) == 0
     fired = []
     runner._run_live_signal = lambda pend, tick, st: fired.append(
         pend["trigger"])
@@ -640,10 +645,9 @@ def test_runner_confirm_after_window_lapse_does_not_fire(tmp_path):
                     "M5": empty, "H4": empty, "D1": empty}
 
     runner.feed = FakeFeed()
-    runner._refresh_bars(_tick("2026-10-14 09:00", 2003.0), stats)
-    _eval(runner, _tick("2026-10-14 09:00", 2003.0), stats)
-    assert fired == []
-    assert runner._pending is None
+    runner._refresh_bars(_tick("2026-10-14 09:00", 2000.3), stats)
+    assert fired == ["bos"]
+    assert runner._pending is None  # consumed by the confirmation
 
 
 def _flat_m15_feed(bars):
@@ -669,21 +673,22 @@ def _quiet_bars(times):
 
 
 def test_runner_armed_setup_expires_after_ttl_without_confirmation(tmp_path):
-    # Armed TTL (owner rule, 2026-10-15): two M15 closes without
-    # confirmation (armed_ttl_bars = 2, mirroring score_decay_bars)
-    # disarm the touch as stale — price lingered in the zone
-    # without reacting (absorbed, edge decayed).  The quiet bars
-    # close without confirmation and without failing the setup
-    # (above invalidation, below the zone).
+    # Armed TTL (owner rule, 2026-10-15, reworked 2026-11-27):
+    # THREE M15 closes without confirmation (armed_ttl_bars = 3 —
+    # the confirmation family can need a 3rd entry bar) disarm the
+    # touch as stale — price lingered in the zone without reacting
+    # (absorbed, edge decayed).  The quiet bars close without
+    # confirmation and without failing the setup (above
+    # invalidation, below the zone).
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
     _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
     assert runner._pending["armed_bars"] == 0
-    flat = _quiet_bars(pd.date_range("2026-10-14 08:00", periods=2,
+    flat = _quiet_bars(pd.date_range("2026-10-14 08:00", periods=3,
                                      freq="15min", tz="UTC"))
     runner.feed = _flat_m15_feed(flat)
-    runner._refresh_bars(_tick("2026-10-14 08:30", 2000.3), stats)
+    runner._refresh_bars(_tick("2026-10-14 08:45", 2000.3), stats)
     assert runner._pending is None  # disarmed as stale
     assert stats["invalidated"] == 1
     journal = _journal_text(tmp_path)
@@ -705,18 +710,26 @@ def test_runner_confirm_after_ttl_expiry_does_not_fire(tmp_path):
     stats: dict = {"bars": 0}
     _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
-    flat = _quiet_bars(pd.date_range("2026-10-14 08:00", periods=2,
+    flat = _quiet_bars(pd.date_range("2026-10-14 08:00", periods=3,
                                      freq="15min", tz="UTC"))
     runner.feed = _flat_m15_feed(flat)
-    runner._refresh_bars(_tick("2026-10-14 08:30", 2000.3), stats)
-    assert runner._pending is None  # stale
+    runner._refresh_bars(_tick("2026-10-14 08:45", 2000.3), stats)
+    assert runner._pending is None  # stale (3 closes, no confirm)
     fired = []
     runner._run_live_signal = lambda pend, tick, st: fired.append(
         pend["trigger"])
-    breaker = _frames(m15_n=24, shift_hours=-2)["M15"].iloc[22:23]
+    # A hand-built breaker bar (the real breaker's OHLC, on a fresh
+    # 08:45 bar — the 08:30 bar is one of the quiet bars now): it
+    # WOULD confirm if the pending were still armed.
+    breaker = pd.DataFrame(
+        {"open": [1999.0], "high": [2000.8], "low": [1999.0],
+         "close": [2000.8], "volume": [100], "real_volume": [0],
+         "spread": [30]},
+        index=pd.DatetimeIndex(
+            [pd.Timestamp("2026-10-14 08:45", tz="UTC")]))
     runner.feed = _flat_m15_feed(breaker)
-    runner._refresh_bars(_tick("2026-10-14 08:45", 2003.0), stats)
-    _eval(runner, _tick("2026-10-14 08:45", 2003.0), stats)
+    runner._refresh_bars(_tick("2026-10-14 09:00", 2003.0), stats)
+    _eval(runner, _tick("2026-10-14 09:00", 2003.0), stats)
     assert fired == []
     assert runner._pending is None
 
@@ -729,11 +742,11 @@ def test_runner_rearm_only_after_exit_and_reentry(tmp_path):
     stats: dict = {"bars": 0}
     _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
     assert runner._pending is not None
-    flat = _quiet_bars(pd.date_range("2026-10-14 08:00", periods=2,
+    flat = _quiet_bars(pd.date_range("2026-10-14 08:00", periods=3,
                                      freq="15min", tz="UTC"))
     runner.feed = _flat_m15_feed(flat)
-    runner._refresh_bars(_tick("2026-10-14 08:30", 2000.3), stats)
-    assert runner._pending is None  # stale
+    runner._refresh_bars(_tick("2026-10-14 08:45", 2000.3), stats)
+    assert runner._pending is None  # stale (3 closes, no confirm)
     assert runner._stale_zone is not None
     # Still inside the zone: no re-arm.
     _eval(runner, _tick("2026-10-14 08:35", 2000.5), stats)
@@ -755,7 +768,9 @@ def test_runner_rearm_only_after_exit_and_reentry(tmp_path):
 
 def test_runner_ttl_counts_one_bar_at_a_time(tmp_path):
     # One M15 close without confirmation: armed_bars = 1, still
-    # armed.  The TTL binds at the SECOND close, not the first.
+    # armed.  The TTL binds at the THIRD close, not the first or
+    # the second (rework 2026-11-27: the confirmation family can
+    # need a 3rd entry bar).
     runner = _runner(tmp_path, m15_n=20, shift_hours=-2)
     stats: dict = {"bars": 0}
     _eval(runner, _tick("2026-10-14 08:05", 2000.3), stats)
@@ -767,27 +782,42 @@ def test_runner_ttl_counts_one_bar_at_a_time(tmp_path):
     assert runner._pending is not None  # still armed after 1 bar
     assert runner._pending["armed_bars"] == 1
     assert stats.get("invalidated", 0) == 0
-    # The second close without confirmation expires it.
+    # The second close without confirmation: still armed (2/3).
     flat2 = _quiet_bars(pd.date_range("2026-10-14 08:15", periods=1,
                                       freq="15min", tz="UTC"))
     runner.feed = _flat_m15_feed(flat2)
     runner._refresh_bars(_tick("2026-10-14 08:30", 2000.3), stats)
+    assert runner._pending is not None  # still armed after 2 bars
+    assert runner._pending["armed_bars"] == 2
+    assert stats.get("invalidated", 0) == 0
+    # The third close without confirmation expires it.
+    flat3 = _quiet_bars(pd.date_range("2026-10-14 08:30", periods=1,
+                                      freq="15min", tz="UTC"))
+    runner.feed = _flat_m15_feed(flat3)
+    runner._refresh_bars(_tick("2026-10-14 08:45", 2000.3), stats)
     assert runner._pending is None
     assert stats["invalidated"] == 1
     assert "trigger invalidated (stale)" in _journal_text(tmp_path)
 
 
-def test_runner_h1_close_expires_pending_without_erasing(tmp_path):
+def test_runner_h1_close_does_not_expire_pending(tmp_path):
+    # Rework 2026-11-27: the H1 close no longer expires an armed
+    # pending — the pending belongs to its own entry clock and dies
+    # only on its TTL or a genuine invalidation.  The 25–27 Nov
+    # live statuses showed setups dying at 2/3 confirmations on
+    # the H1 close, never firing.  (The old test pinned the
+    # opposite: the H1 close killed the pending.)
     runner = _runner(tmp_path)
     stats: dict = {}
     _eval(runner, _tick("2026-10-14 10:05", 2000.3), stats)
     assert runner._pending is not None
     assert runner._pending["armed"] is True
     runner._on_h1_close(_tick("2026-10-14 11:00", 2001.5), stats)
-    assert runner._pending is None
-    assert stats["invalidated"] == 1
+    assert runner._pending is not None  # survives the H1 close
+    assert runner._pending["armed"] is True
+    assert stats.get("invalidated", 0) == 0
     journal = _journal_text(tmp_path)
-    assert "h1_close_without_entry_confirm" in journal
+    assert "h1_close_without_entry_confirm" not in journal
     assert "trigger fired" not in journal  # never fired: logged, never erased
     # The new forming bar starts with the boundary tick.
     assert runner._forming["open"] == pytest.approx(2001.5)
@@ -796,7 +826,11 @@ def test_runner_h1_close_expires_pending_without_erasing(tmp_path):
     # Volume starts at zero: the tick evaluator owns accumulation,
     # so the boundary tick is counted exactly once (there).
     assert runner._forming["volume"] == 0.0
-    _eval(runner, _tick("2026-10-14 11:00", 2001.5), stats)
+    # Evaluation continues on the NEW bar: a tick inside the zone
+    # leaves the pending armed (it is not re-armed, not killed).
+    _eval(runner, _tick("2026-10-14 11:00", 2000.3), stats)
+    assert runner._pending is not None
+    assert runner._pending["armed"] is True
     assert runner._forming["volume"] == pytest.approx(5.0)
 
 
@@ -894,6 +928,22 @@ def test_runner_full_live_path_places_order(tmp_path):
     the layering pipeline, which is a different test.
     """
     runner = _runner(tmp_path, m15_n=23, shift_hours=-2)
+    # The H1 frame must carry the long's own structure: the last
+    # closes rise through the 2001.8 entry (displacement up,
+    # acceptance above the entry, follow-through held) — the
+    # judgment reads the bars, so a flat frame abstains and no
+    # order places.  (Rework 2026-11-27: the verdict comes from
+    # measured structure, never from the stub's score alone.)
+    _h1 = runner._stack.frames["H1"]
+    _leg = pd.DataFrame(
+        {"open": [2001.5, 2002.0, 2003.0],
+         "high": [2002.5, 2003.0, 2004.0],
+         "low": [2001.0, 2001.5, 2002.5],
+         "close": [2002.0, 2002.5, 2003.5],
+         "volume": [100, 100, 100], "real_volume": [0, 0, 0],
+         "spread": [30, 30, 30]},
+        index=_h1.index[-3:])
+    runner._stack.frames["H1"] = pd.concat([_h1.iloc[:-3], _leg])
     stats: dict = {"ticks": 0, "bars": 0, "signals": 0, "executed": 0,
                    "shadow": 0, "gated": 0, "hierarchy_blocked": 0,
                    "tick_actions": 0, "reconciled_closed": 0,

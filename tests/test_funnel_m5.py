@@ -388,7 +388,9 @@ def test_m5_counter_bias_evaluated_not_suppressed(tmp_path):
     # Under the core's active authority (promotion, 2026-11-05)
     # the same weighed evidence is the core's to decide on, and
     # it abstains — that outcome is pinned in
-    # tests/test_judgment_promotion.py.
+    # tests/test_judgment_core.py (structure-driven abstention)
+    # and tests/test_completion02_connections.py (abstain
+    # refuses the attempt).
     runner = _qm_runner(tmp_path, judgment_mode="shadow")
     # The fixture is a SHORT; structural D1/H4 bias is LONG.
     runner._live_setup = {"bias_d1": 1, "bias_h4": 1,
