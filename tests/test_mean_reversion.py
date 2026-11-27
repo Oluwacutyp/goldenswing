@@ -612,8 +612,8 @@ def test_registry_partition_covers_reversion():
         s.name for s in SESSION_SPECS} == {
         s.name for s in PLAYBOOK_REGISTRY}
     assert len(PLAYBOOK_REGISTRY) == 31
-    assert "no order authority" in FLOOR_AUTHORITY[
-        ROUTE_MEAN_REVERSION]
+    assert "ROUTE_H1_ROSTER floor authority applies" in \
+        FLOOR_AUTHORITY[ROUTE_MEAN_REVERSION]
 
 
 def test_routes_declared_governing(tmp_path):
@@ -821,14 +821,14 @@ def test_runner_scan_journals_evaluations_verdicts_and_book(
                == "mean_reversion_extension_fade"]
     assert len(shadows) == 1
     assert shadows[0]["judgment"]["authority"] == "governing"
-    # The scenario entered the book as a shadow proposal
-    # with the family's clocks.
+    # The scenario entered the book as a governing proposal
+    # (origination) with the family's clocks.
     setups = runner._setup_store.active()
     assert len(setups) == 1
     book = runner._scenario_book_get()
     sc = book.scenarios[setups[0].setup_id]
     assert sc["family"] == "mean_reversion_extension_fade"
-    assert sc["authority"] == "shadow"
+    assert sc["authority"] == "governing"
     assert sc["horizon"] == "intraday"
     assert sc["clocks"]["formation_tf"] == "H1"
     assert sc["clocks"]["management_tf"] == "H1"

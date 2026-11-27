@@ -646,8 +646,8 @@ def test_registry_partition_covers_session():
         s.name for s in SESSION_SPECS} == {
         s.name for s in PLAYBOOK_REGISTRY}
     assert len(PLAYBOOK_REGISTRY) == 31
-    assert "no order authority" in FLOOR_AUTHORITY[
-        ROUTE_SESSION_RANGE]
+    assert "ROUTE_H1_ROSTER floor authority applies" in \
+        FLOOR_AUTHORITY[ROUTE_SESSION_RANGE]
 
 
 def test_routes_declared_governing(tmp_path):
@@ -846,9 +846,9 @@ def test_runner_scan_journals_evaluations_verdicts_and_book(
                == "session_opening_breakout"]
     assert len(shadows) == 1
     assert shadows[0]["judgment"]["authority"] == "governing"
-    # The scenario entered the book as a shadow proposal
-    # with the family's clocks and BOTH targets (the
-    # measured extension, then the situation zone).
+    # The scenario entered the book as a governing proposal
+    # (origination) with the family's clocks and BOTH targets
+    # (the measured extension, then the situation zone).
     setups = runner._setup_store.active()
     assert len(setups) == 1
     assert setups[0].targets == [pytest.approx(2006.0),
@@ -856,7 +856,7 @@ def test_runner_scan_journals_evaluations_verdicts_and_book(
     book = runner._scenario_book_get()
     sc = book.scenarios[setups[0].setup_id]
     assert sc["family"] == "session_opening_breakout"
-    assert sc["authority"] == "shadow"
+    assert sc["authority"] == "governing"
     assert sc["horizon"] == "intraday"
     assert sc["clocks"]["formation_tf"] == "H1"
     assert sc["clocks"]["management_tf"] == "H1"

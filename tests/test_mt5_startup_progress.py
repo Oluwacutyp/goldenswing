@@ -23,7 +23,9 @@ from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
 # the hardcoded count went stale.  Deriving it from the registry
 # asserts the real invariant — warmup covers the whole H1 roster —
 # and cannot drift again.
-from goldenswing.execution.playbook_registry import ROSTER_SPECS
+from goldenswing.execution.playbook_registry import (
+    AUCTION_SPECS, REVERSION_SPECS, ROSTER_SPECS, SESSION_SPECS,
+    TREND_SPECS, VOL_SPECS)
 from goldenswing.feed.mt5 import MT5Feed, MT5FeedConfig
 from mt5_fakes import FakeMT5
 
@@ -104,7 +106,10 @@ def test_progress_content(tmp_path):
     zones = texts[_idx(texts, "MT5 engine: zones built")]
     assert "zones)" in zones
     pb = texts[_idx(texts, "MT5 engine: playbooks warmed")]
-    assert f"({len(ROSTER_SPECS)} playbooks)" in pb
+    # Origination (owner order 2026-11-25, all-live half-2): the
+    # trigger path warms the roster PLUS the five families (29),
+    # not the 16-roster count this pinned before.
+    assert f"({len(ROSTER_SPECS + VOL_SPECS + TREND_SPECS + AUCTION_SPECS + REVERSION_SPECS + SESSION_SPECS)} playbooks)" in pb
     # Final "started" ping still exactly once.
     assert sum(1 for t in texts if t.startswith("MT5 engine started")) == 1
 
@@ -130,7 +135,10 @@ def test_no_senders_no_crash_console_progress(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "MT5 startup: MT5 engine starting" in out
     assert "MT5 startup: building zones" in out
-    assert f"MT5 startup: warming {len(ROSTER_SPECS)} playbooks" in out
+    # Origination (owner order 2026-11-25, all-live half-2): 29
+    # trigger-path playbooks warm now (roster + five families),
+    # not the 16-roster count this pinned before.
+    assert f"MT5 startup: warming {len(ROSTER_SPECS + VOL_SPECS + TREND_SPECS + AUCTION_SPECS + REVERSION_SPECS + SESSION_SPECS)} playbooks" in out
 
 
 def test_replay_logs_each_playbook_on_console(tmp_path, capsys):

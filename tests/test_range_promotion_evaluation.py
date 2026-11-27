@@ -410,17 +410,19 @@ def test_range_scan_journals_route_stamped_governing(
     runner = _drive_range_scan(tmp_path, monkeypatch)
     evals = _scan_evals(runner)
     assert evals
-    # The §G disposition is exactly as before the wiring.
-    assert evals[-1]["decision"]["result"] == "shadow"
+    # Origination (owner order 2026-11-25): the §G disposition
+    # is now the registered one — the scan registers a live
+    # setup, and the route stamp stays on the verdict.
+    assert evals[-1]["decision"]["result"] == "registered"
     assert evals[-1]["decision"]["order_result"] \
-        == "not_attempted"
-    assert evals[-1]["reason_code"] == "path.shadow_route"
+        == "pending_trigger"
+    assert evals[-1]["reason_code"] == "path.setup_registered"
     shadows = _scan_shadows(runner)
     assert len(shadows) == 1
     judgment = shadows[0]["judgment"]
     assert judgment["authority_route"] == "range_qm"
     assert judgment["authority"] == "governing"
-    assert shadows[0]["gate_result"] == "shadow"
+    assert shadows[0]["gate_result"] == "registered"
     # The candidate's honest gap rides along: no asymmetry
     # breakdown exists on the scan path, and none is invented.
     assert evals[-1]["candidate"]["asymmetry_score"] is None

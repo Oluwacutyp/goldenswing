@@ -585,7 +585,9 @@ def test_registry_partition_and_posture():
         assert spec.shadow_evaluation is False
         assert spec.entry_thesis == "market"
         assert spec.management_horizon == "intraday"
-        # NOT on the trigger path: the roster is untouched.
+        # Not in the roster tuple: the family partition is
+        # separate (though on the trigger path since
+        # origination, owner order 2026-11-25).
         assert spec not in ROSTER_SPECS
         assert spec.playbook_class.live is True
     assert {s.name for s in ROSTER_SPECS} | {
@@ -596,8 +598,8 @@ def test_registry_partition_and_posture():
         s.name for s in REVERSION_SPECS} | {
         s.name for s in SESSION_SPECS} == {
         s.name for s in PLAYBOOK_REGISTRY}
-    assert "no order authority" in FLOOR_AUTHORITY[
-        ROUTE_TREND_MOMENTUM]
+    assert "ROUTE_H1_ROSTER floor authority applies" in \
+        FLOOR_AUTHORITY[ROUTE_TREND_MOMENTUM]
 
 
 def test_routes_declared_governing(tmp_path):
@@ -893,14 +895,15 @@ def test_runner_scan_journals_evaluations_verdicts_and_book(tmp_path):
                    "authority_route") == "trend_impulse_pullback"]
     assert len(shadows) == 1
     assert shadows[0]["judgment"]["authority"] == "governing"
-    # The scenario entered the book as a shadow proposal
-    # with the instance's clocks + declared horizon.
+    # The scenario entered the book as a governing proposal
+    # (origination) with the instance's clocks + declared
+    # horizon.
     setups = runner._setup_store.active()
     assert len(setups) == 1
     book = runner._scenario_book_get()
     sc = book.scenarios[setups[0].setup_id]
     assert sc["family"] == "trend_impulse_pullback"
-    assert sc["authority"] == "shadow"
+    assert sc["authority"] == "governing"
     assert sc["horizon"] == "intraday"
     assert sc["clocks"]["formation_tf"] == "H4"
     assert sc["clocks"]["management_tf"] == "H4"

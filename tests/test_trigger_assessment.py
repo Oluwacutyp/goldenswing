@@ -265,7 +265,12 @@ def test_sweep_candidate_range_shadow_objects(tmp_path):
     assert "VERDICT: SIGNAL" not in text
 
 
-def test_range_no_setup_shadow_carries_context(tmp_path):
+def test_range_no_setup_live_carries_context(tmp_path):
+    # Origination (owner order 2026-11-25, all-live half-2): the
+    # live-close family scan registers LIVE now, so its no_setup
+    # record is a live record, not a shadow one.  The assessment
+    # content is unchanged: D1 bias, regime and the "not formed"
+    # scenario still ride on the record.
     runner, _h1 = _sweep_runner(tmp_path)
     runner._run_range_family("h4_generation", {},
                              source="live_close")
@@ -273,7 +278,7 @@ def test_range_no_setup_shadow_carries_context(tmp_path):
             if r["outcome"] == "no_setup"]
     assert recs
     rec = recs[-1]
-    assert is_shadow_record(rec)
+    assert not is_shadow_record(rec)
     a = rec["assessment"]
     assert a["htf_context"].get("d1_bias_context") == 1
     assert a["structure_read"].get("regime") == "trend"

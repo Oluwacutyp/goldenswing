@@ -11,7 +11,7 @@ alerts use (photo failure falls back honestly, never silently).
 from __future__ import annotations
 
 import io
-from datetime import date
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 from PIL import Image
@@ -166,7 +166,13 @@ class _Ctrl:
 
 def _today_journal(tmp_path):
     """A journal whose one close lands TODAY (the /desk day)."""
-    today = date.today().isoformat()
+    # The /desk command renders the UTC day; the test must use
+    # the UTC date too — local date.today() is yesterday once
+    # UTC has crossed midnight (same class as the deskdraft fix).
+    # NOTE: timezone.utc, NOT datetime.UTC — this file imports
+    # the datetime CLASS, and the UTC alias lives on the
+    # datetime MODULE, not the class.
+    today = datetime.now(timezone.utc).date().isoformat()
     journal = TradeJournal(tmp_path / "today.jsonl")
     journal.append({"type": "open", "alert_id": "t1",
                     "instrument": "XAUUSD", "playbook": "fvg_limit",
@@ -223,7 +229,7 @@ def test_desk_handler_stale_guard_day_drops_drawdown(tmp_path):
                          live_positions=[])
     res = MT5_COMMANDS["/desk"][1](ctx, [])
     expect = render_desk_card(daily_recap_image_stats(
-        journal, date.today(),
+        journal, datetime.now(timezone.utc).date(),
         vitals=dict(vitals, drawdown_pct=None), open_count=0))
     assert res.photo == expect
     fresh = _Ctrl(vitals=vitals, guard_day=today)

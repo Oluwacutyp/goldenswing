@@ -301,10 +301,11 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # SPEC §6.2): vol-state-defined on any of its formation
     # clocks (H4/H1/M15 — the scan threads the clock per
     # evaluation; native_tf is the family's home clock for
-    # bare/research use).  Scheduled shadow route only;
-    # entry thesis is market (the premise is the accepted
-    # escape / the rejection itself — a resting limit
-    # contradicts it).  Horizon intraday (SPEC §6.2).
+    # bare/research use).  Live route since origination
+    # (owner order 2026-11-25); entry thesis is market (the
+    # premise is the accepted escape / the rejection itself
+    # — a resting limit contradicts it).  Horizon intraday
+    # (SPEC §6.2).
     PlaybookSpec("vol_expansion_escape", VolExpansionEscapePlaybook,
                  "H1", ROUTE_VOLATILITY_EXPANSION,
                  shadow_evaluation=False, entry_thesis="market",
@@ -318,14 +319,14 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # clocks (H4 intraday / D1 swing — the scan threads the
     # clock per evaluation; native_tf is the family's
     # intraday home clock), entered on the trigger clock
-    # one step down.  Scheduled shadow route only; entry
-    # thesis is market (the premise is the trigger turn /
-    # the acceleration break itself — a resting limit
-    # contradicts it).  The registry horizon is the §6.1
-    # default (intraday); a D1-formed instance declares
-    # "swing" on its own signal (the additive declared-
-    # horizon read in management_block_for / the book), so
-    # its management resolves to the swing policy.
+    # one step down.  Live route since origination (owner
+    # order 2026-11-25); entry thesis is market (the premise
+    # is the trigger turn / the acceleration break itself —
+    # a resting limit contradicts it).  The registry horizon
+    # is the §6.1 default (intraday); a D1-formed instance
+    # declares "swing" on its own signal (the additive
+    # declared-horizon read in management_block_for / the
+    # book), so its management resolves to the swing policy.
     # chart_studies is empty by declaration: the family
     # reads structure and velocity, never an indicator
     # overlay — phase by structure, never an EMA read.
@@ -343,14 +344,15 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # §6.3): the developing value area defined on its
     # formation clock (H1 — the day's bars; native_tf is
     # the family's formation clock), entered on the
-    # trigger clock one step down (M15).  Scheduled shadow
-    # route only; entry thesis is market (the premise is
-    # the auction's answer itself — acceptance's retest
-    # hold, rejection's first read, the traversal's
-    # crossing — a resting limit contradicts it).  Horizon
-    # intraday (SPEC §6.3): the registry default, declared
-    # here by the absence of an override — every instance
-    # is intraday because every sequence is day-bound.
+    # trigger clock one step down (M15).  Live route since
+    # origination (owner order 2026-11-25); entry thesis is
+    # market (the premise is the auction's answer itself —
+    # acceptance's retest hold, rejection's first read, the
+    # traversal's crossing — a resting limit contradicts
+    # it).  Horizon intraday (SPEC §6.3): the registry
+    # default, declared here by the absence of an override
+    # — every instance is intraday because every sequence
+    # is day-bound.
     PlaybookSpec("auction_value_acceptance",
                  AuctionValueAcceptancePlaybook,
                  "H1", ROUTE_AUCTION_VALUE,
@@ -374,11 +376,12 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # intraday / M5 scalp — the instance declares its
     # horizon on its own signal, the additive declared-
     # horizon read in management_block_for / the book, so
-    # its management resolves per instance).  Scheduled
-    # shadow route only; entry thesis is market (the
-    # premise is the stall's turn / the break's first
-    # read itself — a resting limit contradicts it).
-    # Horizon intraday by registry default (SPEC §6.4).
+    # its management resolves per instance).  Live route
+    # since origination (owner order 2026-11-25); entry
+    # thesis is market (the premise is the stall's turn /
+    # the break's first read itself — a resting limit
+    # contradicts it).  Horizon intraday by registry
+    # default (SPEC §6.4).
     PlaybookSpec("mean_reversion_extension_fade",
                  MeanReversionExtensionFadePlaybook,
                  "H1", ROUTE_MEAN_REVERSION,
@@ -399,13 +402,13 @@ PLAYBOOK_REGISTRY: tuple[PlaybookSpec, ...] = (
     # declares a horizon and no signal carries one: the
     # registry default resolves management, and the
     # management clock is the formation clock, declared on
-    # the signal's context.  Scheduled shadow route only;
-    # entry thesis is market (the premise is the session
-    # fact's own resolution — a resting limit contradicts
-    # it).  No chart studies: the family's references are
-    # session LEVELS (frozen IB / Asia range / prior
-    # value), geometry computed from the day itself, not
-    # a StudySpec kind.
+    # the signal's context.  Live route since origination
+    # (owner order 2026-11-25); entry thesis is market (the
+    # premise is the session fact's own resolution — a
+    # resting limit contradicts it).  No chart studies: the
+    # family's references are session LEVELS (frozen IB /
+    # Asia range / prior value), geometry computed from the
+    # day itself, not a StudySpec kind.
     PlaybookSpec("session_opening_breakout",
                  SessionOpeningBreakoutPlaybook,
                  "H1", ROUTE_SESSION_RANGE,
@@ -453,16 +456,18 @@ RANGE_SPECS: tuple[PlaybookSpec, ...] = tuple(
 #: The trigger-path roster: every playbook the H1-clocked signal
 #: path evaluates when the trigger lifecycle fires — the pure H1
 #: roster PLUS the range family (whose scheduled §G evaluation
-#: contract above is additional, shadow, and separate).  This is
-#: the set ``_get_playbooks`` builds, in registry order.  (Named
+#: contract above is additional) PLUS the five families
+#: (origination, owner order 2026-11-25: their scheduled scans
+#: register live setups, and the trigger path routes them under
+#: their own routes).  This is the set ``_get_playbooks`` builds,
+#: in registry order — ROSTER_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ∪
+#: AUCTION_SPECS ∪ REVERSION_SPECS ∪ SESSION_SPECS.  (Named
 #: ROSTER_SPECS for continuity with the Phase 1 invariant —
 #: extended at Passes 7a, 7b, 7c, 7d and 7e: ROSTER_SPECS ∪
 #: NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ∪ AUCTION_SPECS ∪
-#: REVERSION_SPECS ∪ SESSION_SPECS == the full registry, the
-#: VOL/TREND/AUCTION/REVERSION/SESSION partitions being the
-#: ones that are scheduled-shadow only and therefore
-#: deliberately NOT in
-#: this trigger-path set.)
+#: REVERSION_SPECS ∪ SESSION_SPECS == the full registry; the
+#: only partition NOT on the trigger path is NATIVE_SPECS,
+#: whose playbooks run on their own clocks.)
 ROSTER_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route in (ROUTE_H1_ROSTER, ROUTE_RANGE_H4_H1))
@@ -472,16 +477,17 @@ NATIVE_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY if s.route == ROUTE_NATIVE)
 
 #: The volatility-expansion family specs (Pass 7a): the
-#: scheduled-shadow partition.  The registry partition is
-#: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS == the full
-#: registry (the Phase 1 invariant, extended by the one
-#: route class that is neither trigger-path nor native).
+#: scheduled partition — on the trigger path since origination
+#: (owner order 2026-11-25); its playbooks ride their own
+#: judgment routes.  The registry partition is ROSTER_SPECS
+#: ∪ NATIVE_SPECS ∪ VOL_SPECS == the full registry.
 VOL_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route == ROUTE_VOLATILITY_EXPANSION)
 
 #: The trend / momentum family specs (Pass 7b): the second
-#: scheduled-shadow partition.  The registry partition is
+#: scheduled partition (on the trigger path since origination,
+#: owner order 2026-11-25).  The registry partition is
 #: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ==
 #: the full registry (extended at Pass 7c by AUCTION_SPECS,
 #: at Pass 7d by REVERSION_SPECS and at Pass 7e by
@@ -491,7 +497,8 @@ TREND_SPECS: tuple[PlaybookSpec, ...] = tuple(
     if s.route == ROUTE_TREND_MOMENTUM)
 
 #: The auction / value family specs (Pass 7c): the third
-#: scheduled-shadow partition.  The registry partition is
+#: scheduled partition (on the trigger path since origination,
+#: owner order 2026-11-25).  The registry partition is
 #: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ∪
 #: AUCTION_SPECS == the full registry (extended at Pass 7d
 #: by REVERSION_SPECS and at Pass 7e by SESSION_SPECS
@@ -501,7 +508,8 @@ AUCTION_SPECS: tuple[PlaybookSpec, ...] = tuple(
     if s.route == ROUTE_AUCTION_VALUE)
 
 #: The mean reversion family specs (Pass 7d): the fourth
-#: scheduled-shadow partition.  The registry partition is
+#: scheduled partition (on the trigger path since origination,
+#: owner order 2026-11-25).  The registry partition is
 #: ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS ∪
 #: AUCTION_SPECS ∪ REVERSION_SPECS == the full registry
 #: (extended at Pass 7e by SESSION_SPECS below).
@@ -510,10 +518,11 @@ REVERSION_SPECS: tuple[PlaybookSpec, ...] = tuple(
     if s.route == ROUTE_MEAN_REVERSION)
 
 #: The session / opening range family specs (Pass 7e): the
-#: fifth scheduled-shadow partition.  The registry partition
-#: is ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS ∪ TREND_SPECS
-#: ∪ AUCTION_SPECS ∪ REVERSION_SPECS ∪ SESSION_SPECS == the
-#: full registry.
+#: fifth scheduled partition (on the trigger path since
+#: origination, owner order 2026-11-25).  The registry
+#: partition is ROSTER_SPECS ∪ NATIVE_SPECS ∪ VOL_SPECS
+#: ∪ TREND_SPECS ∪ AUCTION_SPECS ∪ REVERSION_SPECS ∪
+#: SESSION_SPECS == the full registry.
 SESSION_SPECS: tuple[PlaybookSpec, ...] = tuple(
     s for s in PLAYBOOK_REGISTRY
     if s.route == ROUTE_SESSION_RANGE)
@@ -539,30 +548,40 @@ FLOOR_AUTHORITY: dict[str, str] = {
         "When the legacy trigger path fires for a range "
         "playbook, the ROUTE_H1_ROSTER floor authority applies",
     ROUTE_VOLATILITY_EXPANSION:
-        "shadow evaluation route (Pass 7a): no floor, no order "
-        "authority in any mode — the family is not on the "
-        "trigger path; its candidates are journaled, judged "
-        "in shadow and proposed to the scenario book only",
+        "live route (origination, owner order 2026-11-25): "
+        "when the trigger path fires for a volatility-"
+        "expansion playbook, the ROUTE_H1_ROSTER floor "
+        "authority applies — the Asymmetry floors of "
+        "_run_one_playbook, route-stamped under the "
+        "playbook's own judgment route",
     ROUTE_TREND_MOMENTUM:
-        "shadow evaluation route (Pass 7b): no floor, no order "
-        "authority in any mode — the family is not on the "
-        "trigger path; its candidates are journaled, judged "
-        "in shadow and proposed to the scenario book only",
+        "live route (origination, owner order 2026-11-25): "
+        "when the trigger path fires for a trend / momentum "
+        "playbook, the ROUTE_H1_ROSTER floor authority "
+        "applies — the Asymmetry floors of _run_one_playbook, "
+        "route-stamped under the playbook's own judgment "
+        "route",
     ROUTE_AUCTION_VALUE:
-        "shadow evaluation route (Pass 7c): no floor, no order "
-        "authority in any mode — the family is not on the "
-        "trigger path; its candidates are journaled, judged "
-        "in shadow and proposed to the scenario book only",
+        "live route (origination, owner order 2026-11-25): "
+        "when the trigger path fires for an auction / value "
+        "playbook, the ROUTE_H1_ROSTER floor authority "
+        "applies — the Asymmetry floors of _run_one_playbook, "
+        "route-stamped under the playbook's own judgment "
+        "route",
     ROUTE_MEAN_REVERSION:
-        "shadow evaluation route (Pass 7d): no floor, no order "
-        "authority in any mode — the family is not on the "
-        "trigger path; its candidates are journaled, judged "
-        "in shadow and proposed to the scenario book only",
+        "live route (origination, owner order 2026-11-25): "
+        "when the trigger path fires for a mean reversion "
+        "playbook, the ROUTE_H1_ROSTER floor authority "
+        "applies — the Asymmetry floors of _run_one_playbook, "
+        "route-stamped under the playbook's own judgment "
+        "route",
     ROUTE_SESSION_RANGE:
-        "shadow evaluation route (Pass 7e): no floor, no order "
-        "authority in any mode — the family is not on the "
-        "trigger path; its candidates are journaled, judged "
-        "in shadow and proposed to the scenario book only",
+        "live route (origination, owner order 2026-11-25): "
+        "when the trigger path fires for a session / opening "
+        "range playbook, the ROUTE_H1_ROSTER floor authority "
+        "applies — the Asymmetry floors of _run_one_playbook, "
+        "route-stamped under the playbook's own judgment "
+        "route",
     ROUTE_NATIVE + ":qm_m5":
         "NO score floor (judgment route): the weighed Asymmetry "
         "evidence decides; the sleeve base score (60.0) is a "

@@ -117,14 +117,21 @@ def test_route_audit_completeness_both_directions():
         f"routes named in the runner but not declared: "
         f"{sorted(literals - table)}")
     # Every declared route is reachable: a call-site literal,
-    # the playbook map, or the §G route map.
+    # the playbook map, the §G route map, or the order-route
+    # map the trigger-path seam reads (origination: the seam
+    # names its route through ORDER_ROUTE_BY_PLAYBOOK, not a
+    # literal, so the roster route reaches through the map).
     reachable = literals | set(JUDGMENT_ROUTE_PLAYBOOK) \
-        | set(_range_mod.RANGE_JUDGMENT_ROUTES.values())
+        | set(_range_mod.RANGE_JUDGMENT_ROUTES.values()) \
+        | set(rp.ORDER_ROUTE_BY_PLAYBOOK.values())
     assert table <= reachable, (
         f"declared routes no call site can reach: "
         f"{sorted(table - reachable)}")
     # The three owner-promoted routes govern THROUGH the seam
-    # with their route named at the call site.
+    # with their route named at the call site — h1_trigger
+    # through the order-route map the seam call reads, the
+    # natives as literals at their own seam calls.
+    seam_routes |= set(rp.ORDER_ROUTE_BY_PLAYBOOK.values())
     assert {"h1_trigger", "qm_m5_native", "qm_d1_native"} \
         <= seam_routes
     # The playbook map and the binding evaluation agree.

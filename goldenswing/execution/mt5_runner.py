@@ -237,6 +237,8 @@ from .playbook_registry import (FLOOR_AUTHORITY as _FLOOR_AUTHORITY,
                                 policy_params_for as
                                 _policy_params_for,
                                 spec_for as _spec_for)
+from .route_promotion import (
+    ORDER_ROUTE_BY_PLAYBOOK as _ORDER_ROUTE_BY_PLAYBOOK)
 from .risk import RiskConfig, RiskGuards
 from .tick_manager import (DEFAULT_TIME_EXIT_BARS, TickAction, TickConfig,
                           TickManager, sl_level_valid)
@@ -2011,13 +2013,34 @@ class MT5Runner:
         ``qm_d1`` in :meth:`_run_qm_d1` (real D1 frame, every D1
         close) — one playbook, one clock, one route.
 
-        FUNNEL §3: the roster is DERIVED from the one registry
-        (``playbook_registry.ROSTER_SPECS``) — the same registry
-        the config whitelist, /playbooks and /set validation are
-        derived from, so the lists cannot drift apart again."""
+        Origination (owner order 2026-11-25, all-live half-2):
+        the five families are on this path now — their
+        scheduled scans register live setups, and a
+        same-direction h1_trigger fire routes them through
+        this loop under their own routes (see
+        :meth:`_judgment_authority`).  Fresh evaluation on
+        the fire path is safe for them: the four
+        two-clock families (trend / auction / reversion /
+        session) return nothing from ``live_signal`` until
+        their formation frame is threaded (their ``_scan``
+        returns early on a missing formation frame), so on
+        the fire path they evaluate only by injection; the
+        vol family runs a genuine H1 evaluation (its
+        ``_scan`` reads only the passed H1 frame and its
+        ``_tf``, default H1).
+
+        FUNNEL §3: the trigger-path set is DERIVED from the
+        one registry (``playbook_registry``) — the roster
+        plus the five families, in registry order — the same
+        registry the config whitelist, /playbooks and /set
+        validation are derived from, so the lists cannot
+        drift apart again."""
         if self._playbooks is None:
             self._playbooks = [spec.playbook_class()
-                               for spec in ROSTER_SPECS]
+                               for spec in ROSTER_SPECS
+                               + VOL_SPECS + TREND_SPECS
+                               + AUCTION_SPECS + REVERSION_SPECS
+                               + SESSION_SPECS]
         return self._playbooks
 
     # ------------------------------------------------- blocked-leg stats
@@ -2268,12 +2291,17 @@ class MT5Runner:
     def _book_authority_for(self, setup) -> str:
         """A book scenario's authority stamp: a shadow instance
         is shadow intrinsically (WS3); a lifecycle-routed setup
-        rides the h1_trigger route, so its stamp is that
-        route's declared state."""
+        rides its OWN route (ORDER_ROUTE_BY_PLAYBOOK — roster
+        playbooks h1_trigger, each family playbook its own
+        route), so its stamp is that route's declared state.
+        A demoted family route must not stamp governing just
+        because the roster route governs."""
         if getattr(setup, "shadow", False):
             return "shadow"
+        _route = _ORDER_ROUTE_BY_PLAYBOOK.get(
+            getattr(setup, "playbook", ""), "h1_trigger")
         return ("governing" if self._judgment_route_state(
-            "h1_trigger") == "governing" else "shadow")
+            _route) == "governing" else "shadow")
 
     def _book_propose_setup(self, setup) -> None:
         book = self._scenario_book_get()
@@ -3889,7 +3917,8 @@ class MT5Runner:
                             evidence, intended_tf, eval_now,
                             route: str | None = None):
         """The promotion seam, called by every order route the
-        core evaluates (H1 roster trigger path, qm_m5, qm_d1)
+        core evaluates (the H1 trigger path — roster AND the
+        five families, each under its own route — qm_m5, qm_d1)
         at its order decision point — after the route's own
         facts and gates, BEFORE any order dispatch.  The shared
         safeguard stack inside the order path (friction gate,
@@ -3916,10 +3945,15 @@ class MT5Runner:
           reason) — fail closed: no core record, no order; the
           caller's refusal record states the failure.
 
-        PER-ROUTE authority (completion-02): a caller naming a
-        route declared "shadow_declared" (hot_scalp promotion,
-        the resting limit) gets the evaluation WITHOUT the
-        authority: active mode evaluates and returns
+        PER-ROUTE authority (post-half-1 truth, all-live
+        2026-11-26): every declared route governs — the
+        completion-02 shadow tier is gone, and the
+        ``shadow_declared`` branch below is reachable only for
+        a route demoted by config or by a verdict (a
+        demotion releases only by a clean audit window with
+        activity, source ``invariant_cleared``).  A caller
+        naming such a demoted route gets the evaluation WITHOUT
+        the authority: active mode evaluates and returns
         (bundle, None) whatever the verdict — the caller
         proceeds on its own gate stack and journals the bundle
         as its record's precomputed_judgment, so the verdict
@@ -3927,11 +3961,10 @@ class MT5Runner:
         route's.  An evaluation failure there returns a bundle
         carrying "evaluation_error" and no refusal: observation
         must never fail a route it does not govern.  In shadow
-        (global) mode a shadow-declared route returns
-        (None, None) like every route — its terminal record's
-        tap journals the verdict.  A route promoted to
-        "governing" by the explicit config step takes the
-        ordinary active path below, route-stamped.
+        (global) mode a demoted route returns (None, None) like
+        every route — its terminal record's tap journals the
+        verdict.  A route that governs takes the ordinary
+        active path below, route-stamped.
 
         PASS 5: a caller naming a route NO authority source
         declares (not in JUDGMENT_ROUTE_STATES, no config
@@ -9303,7 +9336,8 @@ class MT5Runner:
                                    source="live_close")
         # Pass 7a: the volatility-expansion family evaluates
         # on EACH formation clock's own close (H4/H1/M15) —
-        # shadow scans: journal + book, never orders.
+        # live scans: journal + book; orders come only from
+        # the trigger path.
         _vol_tfs = [tf for tf in appended
                     if tf in FORMATION_TFS_VOL]
         if _vol_tfs:
@@ -9312,8 +9346,9 @@ class MT5Runner:
         # Pass 7b: the trend / momentum family evaluates on
         # each TRIGGER clock's close (H1 closes drive the
         # H4-formed scans, H4 closes the D1-formed ones) —
-        # its entries are trigger-clock events; shadow
-        # scans: journal + book, never orders.
+        # its entries are trigger-clock events; live scans:
+        # journal + book; orders come only from the trigger
+        # path.
         _trend_formations = [
             tf for tf in FORMATION_TFS_TREND
             if TRIGGER_TF_DOWN_TREND[tf] in appended]
@@ -9323,8 +9358,8 @@ class MT5Runner:
         # Pass 7c: the auction / value family evaluates on
         # each TRIGGER clock's close (M15 closes drive the
         # H1-formed scans) — its entries are trigger-clock
-        # events; shadow scans: journal + book, never
-        # orders.
+        # events; live scans: journal + book; orders come
+        # only from the trigger path.
         _auction_formations = [
             tf for tf in FORMATION_TFS_AUCTION
             if TRIGGER_TF_DOWN_AUCTION[tf] in appended]
@@ -9334,8 +9369,9 @@ class MT5Runner:
         # Pass 7d: the mean reversion family evaluates on
         # each TRIGGER clock's close (M15 closes drive the
         # intraday scans, M5 closes the scalp scans) —
-        # its entries are trigger-clock events; shadow
-        # scans: journal + book, never orders.
+        # its entries are trigger-clock events; live scans:
+        # journal + book; orders come only from the trigger
+        # path.
         _reversion_triggers = [
             tf for tf in TRIGGER_TFS_REVERSION
             if tf in appended]
@@ -9345,8 +9381,8 @@ class MT5Runner:
         # Pass 7e: the session / opening range family
         # evaluates on each TRIGGER clock's close (M15
         # closes drive the H1-formed scans) — its entries
-        # are trigger-clock events; shadow scans: journal
-        # + book, never orders.
+        # are trigger-clock events; live scans: journal
+        # + book; orders come only from the trigger path.
         _session_formations = [
             tf for tf in FORMATION_TFS_SESSION
             if TRIGGER_TF_DOWN_SESSION[tf] in appended]
@@ -15107,7 +15143,24 @@ class MT5Runner:
                       + (f"; order {ores}" if ores else ""))
             self._transition_setup(
                 setup, _setup_lc.STAGE_EVALUATED, detail)
-            if ores in ("filled", "layer_filled"):
+            if code == "judgment.abstain":
+                # A Judgment Core abstention refuses THIS
+                # attempt only — the seam's own contract
+                # ("the candidate's lifecycle is untouched
+                # beyond this attempt") and the hot_scalp
+                # precedent (an abstain is a transient
+                # refusal).  The setup stays live for a later
+                # fire inside its validity window; REJECTED
+                # (terminal) is for a verdict on the setup,
+                # not on this attempt's evidence.
+                self._transition_setup(
+                    setup, _setup_lc.STAGE_ARMED,
+                    "re-armed after judgment abstention "
+                    f"({detail}; still within validity)")
+                out.append(
+                    f"{setup.setup_id}: judgment abstained; "
+                    "re-armed")
+            elif ores in ("filled", "layer_filled"):
                 self._transition_setup(
                     setup, _setup_lc.STAGE_FILLED, detail,
                     alert_id=term.get("alert_id"))
@@ -17166,11 +17219,25 @@ class MT5Runner:
                         sig, breakdown,
                         injected_provenance
                         if injected_sig is not None else None),
-                    # Pass 5 (§5.4 item 1): the roster path names
-                    # its route — the seam's verdict record now
-                    # carries authority_route + authority like
-                    # every connected route's.
-                    route="h1_trigger",
+                    # Pass 5 (§5.4 item 1): the trigger path
+                    # names its route — the seam's verdict record
+                    # now carries authority_route + authority
+                    # like every connected route's.  The route is
+                    # the playbook's own (ORDER_ROUTE_BY_PLAYBOOK):
+                    # roster playbooks ride h1_trigger, each
+                    # family playbook rides its own route
+                    # (origination, owner order 2026-11-25).
+                    # An unmapped playbook (a test stub, or any
+                    # playbook outside the registry) rides the
+                    # roster route, exactly as the hardcoded
+                    # literal did before half-2 — this lookup
+                    # must never raise inside the signal path,
+                    # where the per-playbook except would swallow
+                    # it and silently drop the order (regression
+                    # caught by the full suite: KeyError 'stub'
+                    # killed three live-path order tests).
+                    route=_ORDER_ROUTE_BY_PLAYBOOK.get(
+                        pb.name, "h1_trigger"),
                     decision={
                         "floor_result": {
                             "floor": float(fl["floor"]),
@@ -21795,20 +21862,22 @@ class MT5Runner:
         the roster instances carry streaming cursors owned by the
         trigger lifecycle, and letting a scan advance them would
         eat the trigger path's signals.  Signals found are
-        journaled as OBSERVED candidates — evaluated, truthfully
-        ineligible for execution from this route (the trigger
-        path / native route remains the order authority; the §G
-        range routes are shadow).
+        journaled as OBSERVED candidates — evaluated; a
+        candidate from a route-named playbook (roster, range,
+        the five families) is eligible for execution only
+        through its declared trigger path (the trigger path /
+        native route remains the order authority), never from
+        the scan itself.
 
         WS3 (owner approval 2026-11-04, flag
         ``h1_trigger_handoff_enabled``, default ON): the
         candidate is registered as a persistent setup instance
         BEFORE the record is emitted — stamped with its parent
-        thesis link (WS1 child registration) and, for the §G
-        routes, a shadow marker — and this record carries the
-        instance's registered disposition (legacy disposition
-        journaled alongside).  Flag OFF restores the account
-        above byte-identically."""
+        thesis link (WS1 child registration) and, for an
+        observation-class scan, a shadow marker — and this
+        record carries the instance's registered disposition
+        (legacy disposition journaled alongside).  Flag OFF
+        restores the account above byte-identically."""
         name = spec.name
         last_bar_ts = (frame.index[-1]
                        if frame is not None and len(frame) else None)
@@ -22170,17 +22239,23 @@ class MT5Runner:
                 _rec_evidence["parent_setup_id"] = \
                     _setup.parent_setup_id
                 _rec_evidence["thesis_id"] = _setup.thesis_id
-            # §G promotion-evaluation wiring (2026-11-05): a
-            # shadow scan of a range playbook stamps the tap's
-            # passive verdict with its declared judgment route,
-            # exactly like the completion-02 seams stamp theirs
-            # — the verdict, the evidence and the scan's own
-            # decision are unchanged; the stamp is what makes
-            # the §G shadow history identifiable as THIS route's
-            # (and countable in the manifest's route table).
-            # Non-range and non-shadow scans pass no route, as
-            # before.  Pass 7a: the volatility-expansion
-            # family's shadow scans stamp identically (their
+            # §G promotion-evaluation wiring (2026-11-05,
+            # origination 2026-11-26): a scan of a
+            # route-named playbook (range + the five families)
+            # stamps the tap's passive verdict with its
+            # declared judgment route, exactly like the
+            # completion-02 seams stamp theirs — the verdict,
+            # the evidence and the scan's own decision are
+            # unchanged; the stamp is what makes the route's
+            # history identifiable as THIS route's (and
+            # countable in the manifest's route table).  The
+            # stamp is keyed on route-name membership, NOT on
+            # the shadow marker: a live-registered family scan
+            # stamps its route too, or the manifest and the
+            # promotion-evaluation dataset would lose the
+            # attribution the moment a setup went live.
+            # Non-route-named scans pass no route, as before.  Pass 7a: the volatility-expansion
+            # family's scans stamp identically (their
             # history is vol_promotion's dataset).  Pass 7b:
             # the trend / momentum family's likewise (their
             # history is trend_promotion's dataset).  Pass
@@ -22197,13 +22272,12 @@ class MT5Runner:
                 candidate=candidate_dict,
                 decision=decision, evidence=_rec_evidence,
                 judgment_route=(
-                    name if shadow
-                    and (name in RANGE_JUDGMENT_ROUTE_NAMES
-                         or name in VOL_JUDGMENT_ROUTE_NAMES
-                         or name in TREND_JUDGMENT_ROUTE_NAMES
-                         or name in AUCTION_JUDGMENT_ROUTE_NAMES
-                         or name in REVERSION_JUDGMENT_ROUTE_NAMES
-                         or name in SESSION_JUDGMENT_ROUTE_NAMES)
+                    name if (name in RANGE_JUDGMENT_ROUTE_NAMES
+                             or name in VOL_JUDGMENT_ROUTE_NAMES
+                             or name in TREND_JUDGMENT_ROUTE_NAMES
+                             or name in AUCTION_JUDGMENT_ROUTE_NAMES
+                             or name in REVERSION_JUDGMENT_ROUTE_NAMES
+                             or name in SESSION_JUDGMENT_ROUTE_NAMES)
                     else None))
             if _handoff:
                 # The judgment cycle inside this record's own
@@ -22310,7 +22384,11 @@ class MT5Runner:
         refines entries against the current H4 context.  D1 bias
         is recorded as CONTEXT evidence only — it is never
         consulted as permission (D1 never vetoes; §G).  Both
-        stages are shadow: they journal, they never order.
+        stages register live setups on live closes
+        (origination, owner order 2026-11-25); the scan itself
+        never orders — a registered setup orders only when its
+        declared trigger (a same-direction h1_trigger fire)
+        routes it through the signal path under its own route.
         """
         h1 = (self._stack.frames.get("H1")
               if self._stack is not None else None)
@@ -22329,7 +22407,7 @@ class MT5Runner:
             try:
                 self._sweep_eval_one(
                     spec, h1, clock=clock, intended_tf=itf,
-                    actual_tf=atf, source=source, shadow=True,
+                    actual_tf=atf, source=source, shadow=False,
                     extra_evidence=ctx_evidence)
             except Exception as exc:
                 self.journal.log_note(
@@ -22415,11 +22493,7 @@ class MT5Runner:
         formation clock that closed (or all of them at
         warmup), journal the arm read, then evaluate both
         playbooks on that clock via the funnel-evaluation
-        seam — shadow: the scans journal evaluations (with
-        route-stamped judgment verdicts), register shadow
-        setups on live closes, and propose scenarios to the
-        book; they NEVER order (no order path exists for
-        this partition).  D1/HTF relationships are recorded
+        seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction h1_trigger fire) routes it through the signal path under its own route.  D1/HTF relationships are recorded
         as CONTEXT evidence only — D1 never vetoes (§G
         precedent; SPEC §6.2 handles expansion-against-HTF
         as ordinary evidence, no special branch).
@@ -22462,7 +22536,7 @@ class MT5Runner:
                         spec, frame,
                         clock=f"vol_expansion_{tf.lower()}",
                         intended_tf=tf, actual_tf=tf,
-                        source=source, shadow=True,
+                        source=source, shadow=False,
                         extra_evidence=ctx_evidence)
                 except Exception as exc:
                     self.journal.log_note(
@@ -22559,11 +22633,7 @@ class MT5Runner:
         each formation clock (H4 intraday / D1 swing),
         journal the arm read, then evaluate both playbooks
         on the TRIGGER clock (one step down) via the
-        funnel-evaluation seam — shadow: the scans journal
-        evaluations (with route-stamped judgment verdicts),
-        register shadow setups on live closes, and propose
-        scenarios to the book; they NEVER order (no order
-        path exists for this partition).  The scans run on
+        funnel-evaluation seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction h1_trigger fire) routes it through the signal path under its own route.  The scans run on
         the trigger clock because the family's entries ARE
         trigger-clock events (the pullback's LTF turn, the
         acceleration's first read of a fresh formation
@@ -22604,7 +22674,7 @@ class MT5Runner:
                               f"{formation_tf.lower()}",
                         intended_tf=trigger_tf,
                         actual_tf=trigger_tf,
-                        source=source, shadow=True,
+                        source=source, shadow=False,
                         extra_evidence=ctx_evidence)
                 except Exception as exc:
                     self.journal.log_note(
@@ -22709,12 +22779,14 @@ class MT5Runner:
         its formation clock (H1 — the developing value
         area's own clock), journal the arm read, then
         evaluate all three playbooks on the TRIGGER clock
-        (M15) via the funnel-evaluation seam — shadow: the
-        scans journal evaluations (with route-stamped
-        judgment verdicts), register shadow setups on live
-        closes, and propose scenarios to the book; they
-        NEVER order (no order path exists for this
-        partition).  The scans run on the trigger clock
+        (M15) via the funnel-evaluation seam: the scans
+        journal evaluations (with route-stamped judgment
+        verdicts), register live setups on live closes, and
+        propose scenarios to the book; the scan itself never
+        orders — a registered setup orders only when its
+        declared trigger (a same-direction h1_trigger fire)
+        routes it through the signal path under its own
+        route.  The scans run on the trigger clock
         because the family's entries ARE trigger-clock
         events (the retest hold, the rejection's first
         read, the LVN crossing).  The value evidence rides
@@ -22761,7 +22833,7 @@ class MT5Runner:
                               f"{formation_tf.lower()}",
                         intended_tf=trigger_tf,
                         actual_tf=trigger_tf,
-                        source=source, shadow=True,
+                        source=source, shadow=False,
                         extra_evidence=ctx_evidence)
                 except Exception as exc:
                     self.journal.log_note(
@@ -22877,11 +22949,7 @@ class MT5Runner:
         clock facts), then evaluate both playbooks on
         each TRIGGER clock in ``trigger_tfs`` (M15 —
         intraday instances; M5 — scalp instances) via
-        the funnel-evaluation seam — shadow: the scans
-        journal evaluations (with route-stamped judgment
-        verdicts), register shadow setups on live closes,
-        and propose scenarios to the book; they NEVER
-        order (no order path exists for this partition).
+        the funnel-evaluation seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction h1_trigger fire) routes it through the signal path under its own route.
         The scans run on the trigger clocks because the
         family's entries ARE trigger-clock events (the
         stall's structure turn, the break's first read).
@@ -22933,7 +23001,7 @@ class MT5Runner:
                               f"{trigger_tf.lower()}",
                         intended_tf=trigger_tf,
                         actual_tf=trigger_tf,
-                        source=source, shadow=True,
+                        source=source, shadow=False,
                         extra_evidence=ctx_evidence)
                 except Exception as exc:
                     self.journal.log_note(
@@ -23051,12 +23119,7 @@ class MT5Runner:
         §6.5): for its formation clock (H1 — the day
         object's own clock), journal the arm read, then
         evaluate all four playbooks on the TRIGGER clock
-        (M15) via the funnel-evaluation seam — shadow:
-        the scans journal evaluations (with route-stamped
-        judgment verdicts), register shadow setups on
-        live closes, and propose scenarios to the book;
-        they NEVER order (no order path exists for this
-        partition).  The scans run on the trigger clock
+        (M15) via the funnel-evaluation seam: the scans journal evaluations (with route-stamped judgment verdicts), register live setups on live closes, and propose scenarios to the book; the scan itself never orders — a registered setup orders only when its declared trigger (a same-direction h1_trigger fire) routes it through the signal path under its own route.  The scans run on the trigger clock
         because the family's entries ARE trigger-clock
         events (the first read after a session fact
         resolves).  The day's facts are the engine's own
@@ -23106,7 +23169,7 @@ class MT5Runner:
                               f"{formation_tf.lower()}",
                         intended_tf=trigger_tf,
                         actual_tf=trigger_tf,
-                        source=source, shadow=True,
+                        source=source, shadow=False,
                         extra_evidence=ctx_evidence)
                 except Exception as exc:  # noqa: BLE001
                     self.journal.log_note(

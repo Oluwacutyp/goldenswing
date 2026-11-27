@@ -174,9 +174,9 @@ def test_scan_candidate_registers_setup(tmp_path):
 def test_warmup_and_shadow_scans_register_nothing(tmp_path):
     # Amended for WS3 (2026-11-04): pinned under the LEGACY
     # (handoff flag OFF) behavior — warmup scans never register
-    # in any mode, and shadow (§G) candidates register only with
-    # the handoff on, as preserved shadow instances (pinned in
-    # tests/test_h1_trigger_handoff.py).
+    # in any mode, and shadow-marked candidates register only
+    # with the handoff on, as preserved shadow instances
+    # (pinned in tests/test_h1_trigger_handoff.py).
     runner, frame = _scan_runner(
         tmp_path, h1_trigger_handoff_enabled=False)
     _sweep(runner, frame, source="warmup_scan")

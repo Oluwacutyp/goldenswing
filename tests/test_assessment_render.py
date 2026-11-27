@@ -457,14 +457,18 @@ def test_e2e_h1_roster_no_setup_assessment(tmp_path):
     assert "fvg_midline · H1" in text
 
 
-def test_e2e_range_shadow_assessment_labelled(tmp_path):
+def test_e2e_range_live_assessment_labelled(tmp_path):
+    # Origination (owner order 2026-11-25, all-live half-2): the
+    # §G range family scans register LIVE now, so its eval records
+    # are live records — no shadow marker, no "SHADOW EVALUATION"
+    # label — carrying the live verdict.  The shadow pin is stale.
     runner = _drive_roster_and_range(tmp_path)
     recs = _evals(runner, "range_qm")
     assert recs, "the §G family must evaluate range_qm"
     for rec in recs:
-        assert is_shadow_record(rec)
-        assert "SHADOW EVALUATION" in rec["assessment_text"]
-        assert "VERDICT: SIGNAL" not in rec["assessment_text"]
+        assert not is_shadow_record(rec)
+        assert "SHADOW EVALUATION" not in rec["assessment_text"]
+        assert rec["assessment"]["verdict"] == "no-setup"
 
 
 def test_live_signal_announces_its_assessment(tmp_path):

@@ -484,11 +484,15 @@ def test_registry_consistency_and_killability(tmp_path):
     assert unknown_disabled_names(
         {"disabled_playbooks":
          sorted(PLAYBOOK_NAMES) + ["bogus_pb"]}) == ["bogus_pb"]
-    # Roster identity: the runner builds exactly the registry's
-    # roster, in registry order.
+    # Trigger-path identity (origination, owner order 2026-11-25,
+    # all-live half-2): the runner builds exactly the registry's
+    # trigger-path set — the roster PLUS the five families — in
+    # registry order.  The 16-roster pin is stale: the families
+    # ride the trigger path under their own routes now.
     runner = _qm_runner(tmp_path)
     assert [pb.name for pb in runner._get_playbooks()] == [
-        s.name for s in ROSTER_SPECS]
+        s.name for s in ROSTER_SPECS + VOL_SPECS + TREND_SPECS
+        + AUCTION_SPECS + REVERSION_SPECS + SESSION_SPECS]
 
 
 def test_range_playbook_kill_switch_records_not_eligible(tmp_path):

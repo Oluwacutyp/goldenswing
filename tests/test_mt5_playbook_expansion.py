@@ -19,6 +19,9 @@ from types import SimpleNamespace
 import pandas as pd
 
 from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
+from goldenswing.execution.playbook_registry import (
+    AUCTION_SPECS, REVERSION_SPECS, ROSTER_SPECS, SESSION_SPECS,
+    TREND_SPECS, VOL_SPECS)
 from goldenswing.execution.risk import gold_spec
 from goldenswing.playbooks.base import EngineContext
 
@@ -82,17 +85,15 @@ def test_mt5_execute_set_defaults_to_all_evaluated(tmp_path):
     assert MT5RunnerConfig().execute_playbooks is None
     runner = _runner(tmp_path)
     evaluated = {pb.name for pb in runner._get_playbooks()}
-    # FUNNEL §2/§3: the H1 roster is 16 — qm_m5 left for its
-    # native M5 route (_run_qm_m5), like qm_d1 on the D1 route.
-    # Both native routes stay execute-eligible by default.
-    assert evaluated == {"sweep_reversal", "fvg_midline",
-                         "trendline_retest", "fvg_limit",
-                         "inversion", "killzone_open", "judas_swing",
-                         "turtle_soup", "v_reversal",
-                         "retracement_trap", "order_block",
-                         "range_sweep_reclaim", "range_qm",
-                         "range_mean_reversion",
-                         "range_compression_breakout", "narrative"}
+    # FUNNEL §2/§3 (origination, owner order 2026-11-25,
+    # all-live half-2): the trigger path is the registry's roster
+    # PLUS the five families (29) — qm_m5 left for its native M5
+    # route (_run_qm_m5), like qm_d1 on the D1 route.  Both native
+    # routes stay execute-eligible by default.  The 16-roster pin
+    # is stale: the families ride the trigger path now.
+    assert evaluated == {
+        s.name for s in ROSTER_SPECS + VOL_SPECS + TREND_SPECS
+        + AUCTION_SPECS + REVERSION_SPECS + SESSION_SPECS}
     # Evaluated set == execute set under the default config —
     # including the playbooks the old tier kept shadow
     # (turtle_soup, v_reversal, retracement_trap, order_block).

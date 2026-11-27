@@ -24,6 +24,9 @@ from goldenswing.execution.mt5_commands import (
     mt5_control_keyboard, mt5_control_with_next, mt5_router,
     parse_mt5_callback)
 from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
+from goldenswing.execution.playbook_registry import (
+    AUCTION_SPECS, REVERSION_SPECS, ROSTER_SPECS, SESSION_SPECS,
+    TREND_SPECS, VOL_SPECS)
 from goldenswing.execution.risk import gold_spec
 from goldenswing.live.hierarchy import TimeframeStack
 
@@ -265,25 +268,20 @@ class FakeApi:
 
 # ------------------------------------------------------- playbook wiring
 
-def test_get_playbooks_instantiates_all_sixteen(tmp_path):
-    # FUNNEL §2/§3: the H1 roster is the registry's ROSTER_SPECS —
-    # 16 playbooks.  qm_m5 is NOT here any more: it left the H1
-    # roster for its native M5 route (_run_qm_m5), exactly as
-    # qm_d1 runs on the D1 route; feeding either the H1 frame was
-    # the verified timeframe defect.
+def test_get_playbooks_instantiates_trigger_path_set(tmp_path):
+    # FUNNEL §2/§3 (origination, owner order 2026-11-25,
+    # all-live half-2): the H1 trigger path is the registry's
+    # ROSTER_SPECS PLUS the five families (29 playbooks).
+    # qm_m5 is NOT here: it left the H1 roster for its native M5
+    # route (_run_qm_m5), exactly as qm_d1 runs on the D1 route;
+    # feeding either the H1 frame was the verified timeframe
+    # defect.  The all-sixteen pin is stale: the families ride
+    # the trigger path under their own routes now.
     runner = _runner(tmp_path)
     names = {pb.name for pb in runner._get_playbooks()}
-    assert names == {"sweep_reversal", "fvg_midline", "trendline_retest",
-                     "fvg_limit", "inversion", "killzone_open",
-                     "judas_swing", "turtle_soup", "v_reversal",
-                     "retracement_trap", "order_block",
-                     "range_sweep_reclaim", "range_qm",
-                     "range_mean_reversion",
-                     "range_compression_breakout",
-                     # CHUNK 3: NarrativePlaybook is wired into the
-                     # runner (fill -> management plan, close ->
-                     # STATE 7).
-                     "narrative"}
+    assert names == {
+        s.name for s in ROSTER_SPECS + VOL_SPECS + TREND_SPECS
+        + AUCTION_SPECS + REVERSION_SPECS + SESSION_SPECS}
     assert "qm_m5" not in names and "qm_d1" not in names
     # A14: the default config carries NO execute list — None means
     # every evaluated playbook executes (the shadow tier is gone);

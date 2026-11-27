@@ -36,6 +36,14 @@ default ON):
   scan disposition vocabulary is unchanged, a same-direction
   fire journals a trigger_observed disposition WITHOUT
   routing it, and upkeep ends it journaled;
+- origination (owner order 2026-11-25): a live-registered
+  family/range setup IS routed — a same-direction fire binds
+  it, the seam takes it under the playbook's OWN route, the
+  order is submitted/filled with the route stamp on the
+  funnel record, and the filled setup's broker ticket lands
+  on its book scenario; a Judgment Core abstention refuses
+  this attempt under judgment.abstain and re-arms the setup
+  for a later fire;
 - flag OFF: the scan evaluation record is the legacy record,
   byte for byte in its stable fields.
 """
@@ -45,6 +53,7 @@ import json
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from goldenswing.execution import setup_lifecycle as slc
 from goldenswing.execution.judgment_thesis import (
@@ -529,6 +538,176 @@ def test_shadow_instance_preserved_never_routed(tmp_path):
     assert s2.stage == slc.STAGE_INVALIDATED
     assert [h["stage"] for h in s2.history] == [
         slc.STAGE_DETECTED, slc.STAGE_ARMED, slc.STAGE_INVALIDATED]
+
+
+# ------------------------------------------- origination: family order path
+
+#: The 13 family playbooks (registry order within each family),
+#: each with its registry route.  Each playbook's judgment
+#: route is its own name (ORDER_ROUTE_BY_PLAYBOOK).
+FAMILY_PLAYBOOKS = [
+    ("vol_expansion_escape", "volatility_expansion"),
+    ("vol_failed_expansion", "volatility_expansion"),
+    ("trend_impulse_pullback", "trend_momentum"),
+    ("trend_momentum_acceleration", "trend_momentum"),
+    ("auction_value_acceptance", "auction_value"),
+    ("auction_value_rejection", "auction_value"),
+    ("auction_lvn_traversal", "auction_value"),
+    ("mean_reversion_extension_fade", "mean_reversion"),
+    ("mean_reversion_failed_continuation", "mean_reversion"),
+    ("session_opening_breakout", "session_range"),
+    ("session_opening_failure", "session_range"),
+    ("session_drive_reversal", "session_range"),
+    ("session_asia_sweep", "session_range"),
+]
+
+
+def _family_fire_runner(tmp_path, name, route):
+    """One armed LIVE family setup, ready for a same-direction
+    h1_trigger fire."""
+    frame = _flat_frame(2000.0)
+    runner = _basic_runner(tmp_path, frame,
+                           execute_playbooks=(name,))
+    runner._score_for = lambda **kw: _FakeScore(70.0, 25.0, 15.0)
+    _sweep(runner, frame, name=name, shadow=False, route=route,
+           entry_zone=(1995.0, 2005.0))
+    setup = runner._setup_store.active()[0]
+    assert setup.shadow is False
+    assert setup.stage == slc.STAGE_ARMED
+    runner._get_playbooks = lambda: [_StubPB(name, _sig(index=0))]
+    return runner, frame, setup
+
+
+def _fire(runner, frame):
+    routing: dict = {}
+    stats = {"signals": 0, "gated": 0}
+    runner._run_signal_path(frame, len(frame) - 1, [], 1.0,
+                            _verdict(1, entry=2000.0), stats,
+                            lifecycle_routing=routing)
+    return routing
+
+
+def _shadows(runner, playbook):
+    return [r for r in runner.journal.records()
+            if r.get("type") == "judgment_shadow"
+            and r.get("playbook") == playbook]
+
+
+def test_live_family_instance_routes_on_fire(tmp_path):
+    """Origination (owner order 2026-11-25): the routed pin.  A
+    range_qm scan registers a LIVE setup now (shadow=False is
+    the production shape — the §G shadow contract is gone),
+    and a same-direction fire binds it, routes it, and advances
+    it to a terminal disposition, with an order placed under
+    the playbook's own route."""
+    frame = _flat_frame(2000.0)
+    runner = _basic_runner(tmp_path, frame,
+                           execute_playbooks=("range_qm",))
+    runner._score_for = lambda **kw: _FakeScore(70.0, 25.0, 15.0)
+    _sweep(runner, frame, name="range_qm", shadow=False,
+           route="range_h4_h1", clock="h4_generation",
+           intended_tf="H4", entry_zone=(1995.0, 2005.0))
+    active = runner._setup_store.active()
+    assert len(active) == 1
+    s = active[0]
+    assert s.shadow is False and s.stage == slc.STAGE_ARMED
+    rec = _scan_records(runner, "range_qm")[-1]
+    assert rec["reason_code"] == "path.setup_registered"
+    assert rec["decision"]["result"] == "registered"
+    assert rec["decision"]["order_result"] == "pending_trigger"
+
+    runner._get_playbooks = lambda: [
+        _StubPB("range_qm", _sig(index=0))]
+    routing = _fire(runner, frame)
+    assert routing["range_qm"]["setup_id"] == s.setup_id
+    runner._apply_lifecycle_routing(routing, 1)
+    assert runner._setup_store.get(s.setup_id).stage in (
+        slc.STAGE_SUBMITTED, slc.STAGE_FILLED, slc.STAGE_REJECTED)
+    assert len(runner.executor.orders) == 1
+
+
+@pytest.mark.parametrize("name,route", FAMILY_PLAYBOOKS)
+def test_family_setup_routes_and_orders_under_own_route(
+        tmp_path, name, route):
+    """Origination, one per family playbook: scan -> armed live
+    setup -> same-direction h1_trigger fire -> bound -> seam
+    take under the playbook's OWN route -> order submitted /
+    filled with the route stamp on the funnel record."""
+    runner, frame, setup = _family_fire_runner(tmp_path, name,
+                                                route)
+    routing = _fire(runner, frame)
+    assert routing[name]["setup_id"] == setup.setup_id
+    runner._apply_lifecycle_routing(routing, 1)
+    assert runner._setup_store.get(setup.setup_id).stage in (
+        slc.STAGE_SUBMITTED, slc.STAGE_FILLED, slc.STAGE_REJECTED)
+    # An order was actually placed.
+    assert len(runner.executor.orders) == 1
+    # The seam took under the family's own route: the funnel
+    # record's judgment carries the route stamp with a take
+    # decision and a filled/submitted order result (the scan's
+    # own shadow record carries pending_trigger instead).
+    shadows = _shadows(runner, name)
+    assert any(
+        (sh.get("judgment") or {}).get("authority_route") == name
+        and (sh.get("judgment") or {}).get("decision") == "take"
+        and sh.get("gate_order_result") in ("filled", "submitted")
+        for sh in shadows)
+
+
+@pytest.mark.parametrize("name,route", FAMILY_PLAYBOOKS)
+def test_family_setup_abstain_refuses_and_rearms(
+        tmp_path, name, route):
+    """Origination, abstain variant: with the core forced to
+    abstain, the attempt is refused under judgment.abstain, no
+    order is placed, and the setup is re-armed for a later fire
+    (a transient refusal, not a terminal rejection)."""
+    runner, frame, setup = _family_fire_runner(tmp_path, name,
+                                                route)
+    runner.cfg.judgment_min_expected_r = 99.0
+    routing = _fire(runner, frame)
+    assert routing[name]["setup_id"] == setup.setup_id
+    frags = runner._apply_lifecycle_routing(routing, 1)
+    s = runner._setup_store.get(setup.setup_id)
+    assert s.stage == slc.STAGE_ARMED
+    assert [h["stage"] for h in s.history] == [
+        slc.STAGE_DETECTED, slc.STAGE_ARMED,
+        slc.STAGE_TRIGGER_FIRED, slc.STAGE_EVALUATED,
+        slc.STAGE_ARMED]
+    assert not runner.executor.orders
+    assert any("abstain" in f for f in frags)
+    # The refusal is journaled under judgment.abstain.
+    evs = _evals(runner, name)
+    assert any((r.get("decision") or {}).get("reason_code")
+               == "judgment.abstain" for r in evs)
+
+
+def test_filled_family_setup_ticket_lands_on_scenario(tmp_path):
+    """Step 6: a filled family setup's broker ticket lands on
+    its book scenario.  The routing transition stamps the
+    alert_id; the book cycle resolves the ticket through the
+    step-17 open-identity map (alert_id -> setup key) onto the
+    scenario, which becomes ENTERED."""
+    name, route = "vol_expansion_escape", "volatility_expansion"
+    runner, frame, setup = _family_fire_runner(tmp_path, name,
+                                                route)
+    routing = _fire(runner, frame)
+    runner._apply_lifecycle_routing(routing, 1)
+    assert runner._setup_store.get(setup.setup_id).stage == \
+        slc.STAGE_FILLED
+    assert len(runner.executor.orders) == 1
+    ticket = runner.executor.orders[0]["ticket"]
+    # Before the book cycle, the scenario has no ticket yet —
+    # the routing transition carries the alert_id, not the
+    # ticket; the ticket resolves at the book cycle.
+    book = runner._scenario_book_get()
+    assert book.scenarios[setup.setup_id].get("ticket") is None
+    runner._book_cycle(["H1"], str(frame.index[-1]))
+    sc = book.scenarios[setup.setup_id]
+    assert sc["ticket"] == ticket
+    # The cycle's position reconciliation carries the entered
+    # scenario into managing — the ticket is what this pins,
+    # and the state is a position state either way.
+    assert sc["state"] in ("entered", "managing")
 
 
 # ------------------------------------------- registration failure
