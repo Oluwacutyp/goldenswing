@@ -142,6 +142,43 @@ def _bias_alignment(observed: dict, direction: int) -> tuple[int, bool]:
 
 
 # ------------------------------------------------------------ the measurement
+#: How many recent entry-clock candles ride the chart read
+#: the brain is handed.  A presentation window, not a
+#: decision input — the brain reads the recent chart the way
+#: a trader does; the verdict never counts these bars.
+CHART_BARS = 12
+
+
+def _chart_bars(frame) -> list[dict]:
+    """The entry-clock frame's recent candles as plain data
+    (most recent last): time, open, high, low, close.  The
+    chart the brain reads — the bars themselves, not just
+    the computed numbers.  [] when there is no frame."""
+    if frame is None:
+        return []
+    try:
+        tail = frame.tail(CHART_BARS)
+        out = []
+        for pos, (idx, row) in enumerate(tail.iterrows()):
+            # A timestamp index reads as ISO; anything else
+            # (a RangeIndex, a plain int) reads as its position.
+            stamp = (idx.isoformat() if hasattr(idx, "isoformat")
+                     else pos)
+            out.append({
+                "t": stamp,
+                "o": round(float(row["open"]), 2),
+                "h": round(float(row["high"]), 2),
+                "l": round(float(row["low"]), 2),
+                "c": round(float(row["close"]), 2),
+            })
+        return out
+    except Exception:  # noqa: BLE001 - a frame that cannot be
+        # read as candles is no chart, never a crash: the
+        # reaction reads are absent with it, and the chart
+        # is absent with them.
+        return []
+
+
 @dataclass
 class DecisionStructure:
     """The market's own measured evidence at decision time —
@@ -180,6 +217,12 @@ class DecisionStructure:
     entry_level: float | None = None
     stop_level: float | None = None
     target_level: float | None = None
+    # The recent entry-clock candles (the chart the brain
+    # reads) and the clock they belong to.  [] / None when
+    # there was no frame — the reaction reads are absent
+    # then, and the chart is absent with them, never invented.
+    bars: list = field(default_factory=list)
+    chart_tf: str | None = None
     reads: list = field(default_factory=list)
 
     def reads_for(self, direction: int) -> list:
@@ -214,6 +257,7 @@ class DecisionStructure:
             "entry_level": self.entry_level,
             "stop_level": self.stop_level,
             "target_level": self.target_level,
+            "chart": {"tf": self.chart_tf, "bars": self.bars},
             "reads": [{"name": r[0], "direction": r[1],
                        "note": r[2]} for r in self.reads],
         }
@@ -407,11 +451,22 @@ def measure_decision_structure(*, candidate: dict,
 
     # Reaction reads from the entry-clock bars (live path).
     entry_frame = None
+    chart_tf = None
     if frames:
         tf = entry_tf or candidate.get("intended_tf") or "H1"
         entry_frame = frames.get(tf)
-        if entry_frame is None:
+        if entry_frame is not None:
+            chart_tf = tf
+        else:
             entry_frame = frames.get("H1")
+            if entry_frame is not None:
+                chart_tf = "H1"
+    # The chart the brain reads: the recent entry-clock
+    # candles around the level, most recent last — the bars
+    # themselves, not just the computed numbers.  No frame =
+    # no chart, never invented.
+    structure.chart_tf = chart_tf
+    structure.bars = _chart_bars(entry_frame)
     if entry is not None and stop is not None and stop_dist:
         reaction = _measure_reaction(
             entry_frame, entry=entry, stop=stop,

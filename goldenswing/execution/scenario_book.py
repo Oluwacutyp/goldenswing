@@ -912,6 +912,17 @@ class ScenarioBook:
             stop=scenario["geometry"]["stop"],
             targets=scenario["geometry"]["targets"],
             direction=scenario["direction"])
+        if _reason == "no target" and initial_state == "armed":
+            # An armed sleeve setup has no targets YET by
+            # design — its targets arrive at trigger time, when
+            # the candidate event syncs them in as a geometry
+            # patch.  Refusing it here would mean no sleeve
+            # setup could ever be mirrored armed (the sleeve
+            # only knows its targets at trigger), so the book
+            # could never hold the armed leg of a sleeve life.
+            # The scenario is not orderable until triggered,
+            # and the trigger sync still has to bring targets.
+            _reason = None
         if _reason is not None:
             # Same gate as the lifecycle bridge: an insane
             # geometry is refused with a journaled reason.

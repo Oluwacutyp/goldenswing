@@ -35,7 +35,7 @@ from .engine import run_engine
 def load_ohlc(path: str, tz: str) -> pd.DataFrame:
     """Load a CSV with time,open,high,low,close,volume → tz-aware UTC index."""
     df = pd.read_csv(path)
-    tcol = next(c for c in df.columns if c.lower() in ("time", "timestamp", "date", "datetime"))
+    tcol = next(c for c in df.columns if c.lower() in ("time", "timestamp", "date", "datetime", "ts"))
     ts = pd.to_datetime(df[tcol], utc=True)  # mixed -04:00/-05:00 offsets → UTC
     df = df.rename(columns={c: c.lower() for c in df.columns})
     df.index = ts.dt.tz_convert("UTC")

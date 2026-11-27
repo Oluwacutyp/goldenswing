@@ -3596,13 +3596,15 @@ class MT5Runner:
                 structure.to_dict(), candidate, provider)
             if brain_verdict is not None:
                 # The brain calls the direction; the payoff
-                # and the agreement share stay the measured
-                # structure's own numbers — the brain never
-                # invents a price.
+                # and the market-state picture stay the
+                # measured structure's own numbers — the brain
+                # never invents a price.  The confidence is the
+                # brain's own when it stated one, and ABSENT
+                # when it did not — never the code rung's
+                # agreement share wearing the brain's name.
                 brain_verdict["expected_r"] = code_verdict.get(
                     "expected_r")
-                brain_verdict["confidence"] = code_verdict.get(
-                    "confidence")
+                brain_verdict.setdefault("confidence", None)
                 brain_verdict["market_state"] = code_verdict.get(
                     "market_state")
                 brain_verdict["structure"] = structure.to_dict()

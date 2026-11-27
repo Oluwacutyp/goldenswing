@@ -3,15 +3,43 @@
 Fetches 2 years of hourly bars once and caches them as CSV under the
 repo's ``data/`` directory (git-ignored).  GC=F is a futures proxy for
 spot XAUUSD — spreads/rolls differ slightly from a spot feed.
+
+When the cache is absent and yfinance is unavailable (or the fetch
+fails), the loader falls back to the vendored OANDA spot feed
+(``data/OANDA_XAU_USD_H1_20241001_20261012.csv``, shipped with the
+repo) — same shape, recorded in ``df.attrs["feed"]``.  The vendored
+feed is NEVER written into the GCF cache path: spot bars must not
+be mislabelled as futures.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pandas as pd
 
+logger = logging.getLogger(__name__)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CACHE = REPO_ROOT / "data" / "GCF_H1_2y.csv"
+#: Vendored OANDA spot H1 feed, shipped with the repo (2024-10-01 ->
+#: 2026-10-11).  The fallback when the GC=F cache is absent and
+#: yfinance cannot fetch — the GC=F cache is a git-ignored fetch
+#: artifact that never ships, so a fresh checkout has no cache.
+VENDORED_OANDA_H1 = REPO_ROOT / "data" / "OANDA_XAU_USD_H1_20241001_20261012.csv"
+
+
+def _load_oanda_h1() -> pd.DataFrame:
+    """The vendored OANDA spot H1 feed, in the loader's shape:
+    lowercase OHLC + volume, UTC DatetimeIndex, sorted."""
+    df = pd.read_csv(VENDORED_OANDA_H1)
+    df.index = pd.to_datetime(df["ts"], utc=True)
+    df = df.drop(columns=["ts"])
+    df.columns = [str(c).lower() for c in df.columns]
+    df = df[["open", "high", "low", "close", "volume"]]
+    df = df.dropna(subset=["open", "high", "low", "close"]).sort_index()
+    df.attrs["feed"] = "oanda_vendored"
+    return df
 
 
 def fetch_gold_h1(cache_path: Path = DEFAULT_CACHE) -> pd.DataFrame:
@@ -35,14 +63,39 @@ def fetch_gold_h1(cache_path: Path = DEFAULT_CACHE) -> pd.DataFrame:
 
 def load_gold_h1(cache_path: Path = DEFAULT_CACHE,
                  refresh: bool = False) -> pd.DataFrame:
+    """Gold H1, preferring the GC=F cache, then a yfinance fetch,
+    then the vendored OANDA spot feed.
+
+    The GC=F cache is a git-ignored fetch artifact that never
+    ships, and yfinance is not installed in every environment —
+    so a fresh checkout has neither, and the loader used to die
+    on ModuleNotFoundError.  The vendored OANDA feed is the
+    fallback: same shape, and the feed used is recorded in
+    ``df.attrs["feed"]`` ("gcf_cache" | "gcf_yfinance" |
+    "oanda_vendored") so a caller can tell spot bars from
+    futures bars.  The OANDA data is never written into the GCF
+    cache path."""
     if cache_path.exists() and not refresh:
         df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
         # CSV round-trip can yield an object index of mixed-offset aware
         # datetimes (DST transitions); normalise to a UTC DatetimeIndex.
         df.index = pd.to_datetime(df.index, utc=True)
         if len(df) > 1000:
+            df.attrs["feed"] = "gcf_cache"
             return df
-    return fetch_gold_h1(cache_path)
+    try:
+        df = fetch_gold_h1(cache_path)
+    except Exception as exc:  # yfinance missing, or the fetch failed
+        logger.warning(
+            "GC=F fetch failed (%s); falling back to the vendored "
+            "OANDA H1 feed", exc)
+        if not VENDORED_OANDA_H1.exists():
+            raise RuntimeError(
+                "no GC=F cache, yfinance fetch failed, and the "
+                "vendored OANDA H1 feed is missing") from exc
+        return _load_oanda_h1()
+    df.attrs["feed"] = "gcf_yfinance"
+    return df
 
 
 # ------------------------------------------------------------- RS peers

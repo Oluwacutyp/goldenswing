@@ -363,7 +363,13 @@ def test_regression_vs_godce():
     from goldenswing.godce.params import GodceParams
 
     root = Path(__file__).resolve().parents[1]
-    df = load_ohlc(str(root / "data" / "GCF_H1_2y.csv"), "America/New_York")
+    # The vendored OANDA spot H1 feed: the GCF_H1_2y.csv cache is a
+    # git-ignored yfinance fetch artifact that never ships, so this
+    # test cannot load it.  The assertions cross-check two trap
+    # implementations on the SAME bars, so the feed identity does
+    # not affect them — what matters is real H1 gold bars.
+    df = load_ohlc(str(root / "data" / "OANDA_XAU_USD_H1_20241001_20261012.csv"),
+                   "America/New_York")
     dxy = load_ohlc(str(root / "data" / "DOLLAR_H1_2y.csv"), "UTC")
     _, feat, _ = build_features(df, dxy, GodceParams())
 

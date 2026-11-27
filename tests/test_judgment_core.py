@@ -23,6 +23,7 @@ Two rungs, both full, pinned here:
   verdict can never steer the path it observes).
 """
 import json
+from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
@@ -435,3 +436,170 @@ def test_judgment_flag_off_and_evaluation_record_identical(tmp_path):
         on_eval[0].pop(key, None)
         off_eval[0].pop(key, None)
     assert on_eval[0] == off_eval[0]
+
+
+# ------------------------------------------------------------ the brain governs
+def _authority_runner(tmp_path, frame):
+    """A runner with the entry-clock stack the seam reads."""
+    from goldenswing.live.hierarchy import TimeframeStack
+
+    runner = _runner(tmp_path)
+    runner._stack = TimeframeStack.from_frames({"H1": frame})
+    return runner
+
+
+def _authority(runner, *, candidate=None, evidence=None,
+               decision=None, entry_tf="H1"):
+    return runner._judgment_authority(
+        candidate=candidate or _candidate(),
+        decision=decision or _decision(),
+        evidence=evidence or _evidence(),
+        intended_tf=entry_tf,
+        eval_now=datetime(2026, 1, 5, 10, 0, tzinfo=timezone.utc),
+        route="h1_trigger")
+
+
+def _brain_payload(**kw):
+    reply = {"direction": 1, "decision": "take",
+             "reason": "brain call: the chart favours long"}
+    reply.update(kw)
+    return {"choices": [{"message": {"content": json.dumps(reply)}}]}
+
+
+def test_brain_governs_over_code_take(monkeypatch, tmp_path):
+    """The pin: the code rung TAKES (strong long displacement,
+    HTF with, score over floor — its confidence is 1.0) and
+    the brain says abstain.  The order path refuses on the
+    BRAIN's verdict, and the confidence is the brain's own
+    (0.8), not the code rung's agreement share."""
+    monkeypatch.setenv("GS_JUDGMENT_BRAIN_API_KEY", "k")
+    monkeypatch.setenv("GS_JUDGMENT_BRAIN_MODEL", "m")
+    monkeypatch.setattr(
+        "goldenswing.execution.judgment_brain.urllib.request.urlopen",
+        _fake_urlopen(_brain_payload(
+            decision="abstain",
+            reason="brain call: abstain — the reaction does not "
+                   "confirm the candidate",
+            confidence=0.8)))
+    frame = _frame([3895.0] * 17 + [3898.0, 3902.0, 3905.0])
+    bundle, refusal = _authority(_authority_runner(tmp_path, frame))
+    assert bundle is not None
+    judgment = bundle["judgment"]
+    assert judgment["rung"] == "brain"
+    assert judgment["decision"] == "abstain"
+    assert judgment["confidence"] == 0.8
+    assert refusal is not None
+    assert refusal.startswith("judgment core abstained")
+
+
+def test_brain_governs_over_code_abstain(monkeypatch, tmp_path):
+    """The mirror pin: the code rung ABSTAINS (the structure
+    reads short against a long candidate) and the brain says
+    take.  The order path proceeds on the BRAIN's verdict."""
+    monkeypatch.setenv("GS_JUDGMENT_BRAIN_API_KEY", "k")
+    monkeypatch.setenv("GS_JUDGMENT_BRAIN_MODEL", "m")
+    monkeypatch.setattr(
+        "goldenswing.execution.judgment_brain.urllib.request.urlopen",
+        _fake_urlopen(_brain_payload(
+            decision="take",
+            reason="brain call: take — the chart favours long",
+            confidence=0.7)))
+    frame = _frame([3905.0] * 17 + [3902.0, 3898.0, 3895.0])
+    evidence = _evidence(
+        observed={"entry": 3900.0, "stop": 3890.0, "stop_dist": 10.0,
+                  "bias_d1": -1, "bias_h4": -1,
+                  "session_bucket": "overlap"},
+        inferred={"score_total": 40.0, "score_flipped": False,
+                  "regime": "clean_trend", "posture": "TREND_PULLBACK",
+                  "journey_state": "with_journey", "room_r": 2.0})
+    bundle, refusal = _authority(
+        _authority_runner(tmp_path, frame), evidence=evidence)
+    assert bundle is not None
+    judgment = bundle["judgment"]
+    assert judgment["rung"] == "brain"
+    assert judgment["decision"] == "take"
+    assert judgment["confidence"] == 0.7
+    assert refusal is None
+
+
+def test_no_model_code_fallback_says_so_plainly(monkeypatch, tmp_path):
+    """No brain configured (no key, no model): the code rung
+    decides, and the record says plainly that the brain's
+    part is missing — never silence, never a faked verdict."""
+    for name in ("GS_JUDGMENT_BRAIN_API_KEY",
+                 "GS_JUDGMENT_BRAIN_MODEL",
+                 "GS_JUDGMENT_BRAIN_URL",
+                 "GS_JUDGMENT_BRAIN_PROVIDER"):
+        monkeypatch.delenv(name, raising=False)
+    frame = _frame([3895.0] * 17 + [3898.0, 3902.0, 3905.0])
+    bundle, refusal = _authority(_authority_runner(tmp_path, frame))
+    assert bundle is not None
+    judgment = bundle["judgment"]
+    assert judgment["rung"] == "code"
+    assert judgment["decision"] == "take"
+    assert refusal is None
+    assert "no brain model up" in judgment.get("brain_note", "")
+
+
+def test_chart_rides_the_structure_the_brain_is_handed():
+    """The brain is handed the chart, not just the computed
+    numbers: the recent entry-clock candles ride the chart
+    read, most recent last, with the clock named.  No frame
+    = no chart, never invented."""
+    frame = _frame([3900.0] * 17 + [3901.0, 3903.0, 3905.0])
+    structure = measure_decision_structure(
+        candidate=_candidate(), evidence=_evidence(),
+        context=_TREND_CTX, frames={"H1": frame}, entry_tf="H1",
+        decision=_decision())
+    data = structure.to_dict()
+    json.dumps(data)  # plain data, as before
+    chart = data["chart"]
+    assert chart["tf"] == "H1"
+    assert len(chart["bars"]) == 12
+    assert chart["bars"][-1]["c"] == 3905.0
+    assert chart["bars"][0]["c"] == 3900.0
+    assert set(chart["bars"][-1]) == {"t", "o", "h", "l", "c"}
+    no_frame = measure_decision_structure(
+        candidate=_candidate(), evidence=_evidence(),
+        context=_TREND_CTX, decision=_decision()).to_dict()
+    assert no_frame["chart"] == {"tf": None, "bars": []}
+
+
+def test_brain_receives_the_chart(monkeypatch):
+    """The request the brain rung actually sends carries the
+    chart — the candles reach the model, not just the
+    structure object."""
+    seen = {}
+
+    class _CapResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {
+                "content": json.dumps({
+                    "direction": 1, "decision": "take",
+                    "reason": "chart read favours long"})}}]}).encode(
+                        "utf-8")
+
+    def _capture(request, timeout=None):
+        seen["body"] = json.loads(request.data.decode("utf-8"))
+        return _CapResp()
+
+    monkeypatch.setattr(
+        "goldenswing.execution.judgment_brain.urllib.request.urlopen",
+        _capture)
+    frame = _frame([3900.0] * 17 + [3901.0, 3903.0, 3905.0])
+    structure = measure_decision_structure(
+        candidate=_candidate(), evidence=_evidence(),
+        context=_TREND_CTX, frames={"H1": frame}, entry_tf="H1",
+        decision=_decision()).to_dict()
+    out = judge_with_brain(structure, _candidate(), _provider())
+    assert out is not None and out["decision"] == "take"
+    sent = json.loads(seen["body"]["messages"][1]["content"])
+    assert sent["structure"]["chart"]["tf"] == "H1"
+    assert len(sent["structure"]["chart"]["bars"]) == 12
+    assert sent["structure"]["chart"]["bars"][-1]["c"] == 3905.0

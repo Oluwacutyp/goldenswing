@@ -571,7 +571,14 @@ def test_population_audit_funnel_wide(tmp_path):
                          parent_id="hp-audit-1")
     row = runner._hot_scalp.store.get("hs-audit-1")
     real_engine = runner._hot_scalp
-    armed_event = {"event": "setup_armed", "setup": dict(row)}
+    # The armed event's setup is the SETUP dict, not the store
+    # row: store.get() nests the setup under "payload" (level /
+    # stop / zone live there), and the book mirror reads them at
+    # the top level — as the live sleeve emits them.  Handing it
+    # the row proposed entry 0.0 / stop 0.0 and the book refused
+    # the scenario as insane geometry.
+    armed_event = {"event": "setup_armed",
+                   "setup": dict(row["payload"])}
     runner._hot_scalp = SimpleNamespace(
         on_tick=lambda **kw: [armed_event],
         store=real_engine.store)
@@ -597,7 +604,13 @@ def test_population_audit_funnel_wide(tmp_path):
         "time": pd.Timestamp("2026-11-04 06:00:00", tz="UTC")}
     frame = _episode_frame()
     warm_sig = _episode_sig(frame)
-    warm_sig.entry_ref = 3900.0  # a distinct instance key
+    # A distinct instance key that keeps the short's geometry
+    # sane: the signal's target (3924.99) stays ahead of entry
+    # and its stop (3999.33) stays above it.  The old 3900.0 put
+    # the target ABOVE the entry for a short, so the book's
+    # geometry gate rightly refused the scenario and the audit
+    # counted a candidate with no scenario.
+    warm_sig.entry_ref = 3950.0  # a distinct instance key
     runner._sweep_eval_one(
         _episode_spec(warm_sig), frame, clock="h1_close",
         intended_tf="H1", actual_tf="H1", source="warmup")

@@ -222,10 +222,12 @@ def test_runner_accepted_signal_carries_reasoning_and_study(tmp_path):
     assert "DXY correlation -0.85" in rec["reasoning"]
     assert rec["study"]["entry"] == pytest.approx(2000.0)
     assert rec["study"]["risk_reward"] == pytest.approx(3.0)
-    # The Telegram alert carries the reasoning + the chart PNG.
-    # (A second photo follows: the fill alert, after the order
-    # placed — the signal alert is photos[0].)
-    assert len(sender.photos) == 2
+    # The Telegram alert carries the reasoning + the chart PNGs.
+    # (3-PNG charts, owner order 2026-10-31: each alert sends
+    # three panels — H4 carrying the text, H1 context, entry.
+    # The signal alert is photos[0:3], the fill alert
+    # photos[3:6] — six photos, not two.)
+    assert len(sender.photos) == 6
     png, caption = sender.photos[0]
     assert png  # chart attached
     assert "Why LONG" in caption

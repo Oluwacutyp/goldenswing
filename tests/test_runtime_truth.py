@@ -43,6 +43,13 @@ from goldenswing.live.sizing import size_for_risk
 from test_p3_trader import _runner
 
 FRI_CLOSE = datetime(2026, 10, 23, 21, 30, tzinfo=timezone.utc)
+# Friday 15:00 UTC — the same Friday, but the market is OPEN
+# (weekly session runs Sun 22:00 UTC -> Fri 21:00 UTC).  The
+# open-market / unknown-state cases must be read at an open
+# time: FRI_CLOSE sits inside the weekly close, so the calendar
+# rightly calls it closed_expected and those cases never
+# exercised an open market at all.
+OPEN_TIME = datetime(2026, 10, 23, 15, 0, tzinfo=timezone.utc)
 
 
 # ============================================================ item 1
@@ -63,11 +70,11 @@ def test_closed_market_old_tick_is_not_a_breach():
 
 def test_open_market_old_tick_is_a_breach():
     h = HealthMonitor()
-    h.note_tick(FRI_CLOSE - timedelta(seconds=2501))
+    h.note_tick(OPEN_TIME - timedelta(seconds=2501))
     h.note_market_open(True)
-    assert h.tick_state(FRI_CLOSE) == "stale"
-    assert "tick_stale" in h.breaches(FRI_CLOSE)
-    assert "BREACH: tick_stale" in h.describe(FRI_CLOSE)
+    assert h.tick_state(OPEN_TIME) == "stale"
+    assert "tick_stale" in h.breaches(OPEN_TIME)
+    assert "BREACH: tick_stale" in h.describe(OPEN_TIME)
 
 
 def test_unknown_market_state_keeps_the_fail_loud_breach():
@@ -75,9 +82,9 @@ def test_unknown_market_state_keeps_the_fail_loud_breach():
     pre-first-refresh moment lives in): stale still breaches —
     the reconciliation never silences a possibly-real failure."""
     h = HealthMonitor()
-    h.note_tick(FRI_CLOSE - timedelta(seconds=2501))
-    assert h.tick_state(FRI_CLOSE) == "stale"
-    assert "tick_stale" in h.breaches(FRI_CLOSE)
+    h.note_tick(OPEN_TIME - timedelta(seconds=2501))
+    assert h.tick_state(OPEN_TIME) == "stale"
+    assert "tick_stale" in h.breaches(OPEN_TIME)
 
 
 def test_no_ticks_closed_vs_open():
@@ -86,8 +93,8 @@ def test_no_ticks_closed_vs_open():
     assert h.tick_state(FRI_CLOSE) == "closed_expected"
     assert "tick_stale" not in h.breaches(FRI_CLOSE)
     h.note_market_open(True)
-    assert h.tick_state(FRI_CLOSE) == "no_ticks"
-    assert "tick_stale" in h.breaches(FRI_CLOSE)
+    assert h.tick_state(OPEN_TIME) == "no_ticks"
+    assert "tick_stale" in h.breaches(OPEN_TIME)
 
 
 def test_feed_line_agrees_with_health_on_closure():

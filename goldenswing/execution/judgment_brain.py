@@ -26,14 +26,32 @@ says so plainly — the no-model rule: the deterministic
 part plus an honest note, never a faked brain call).
 
 The brain is handed the measured structure (the chart
-read, plain numbers — the body) and the candidate's
-geometry, and returns a JSON verdict.  The reply is
-VALIDATED before it is trusted: direction in {1, -1, 0},
-decision in {take, abstain}, and a take only when the
-direction is the candidate's own direction.  An
-incoherent, unparseable, or unreachable reply is not a
-verdict — it is None, and the code rung decides.  Never
-a stub, never a fake brain call.
+read, plain numbers — the body) AND the recent entry-clock
+candles around the level (structure.chart — the chart
+itself, most recent last, with the clock named), plus the
+candidate's geometry, and returns a JSON verdict.  The
+reply is VALIDATED before it is trusted: direction in
+{1, -1, 0}, decision in {take, abstain}, an optional
+confidence in 0..1, and a take only when the direction is
+the candidate's own direction.  An incoherent,
+unparseable, or unreachable reply is not a verdict — it
+is None, and the code rung decides.  Never a stub, never
+a fake brain call.
+
+What the box needs for the brain to be up (nothing is
+assumed — an unconfigured brain is unavailable, and the
+code rung decides every judgment with a plain brain_note
+on the record):
+
+    GS_JUDGMENT_BRAIN_API_KEY   the key (a Groq key, by default)
+    GS_JUDGMENT_BRAIN_MODEL     the model name (e.g. a Groq model)
+
+GS_JUDGMENT_BRAIN_PROVIDER defaults to groq (its URL
+defaults to Groq's OpenAI-compatible endpoint); set
+GS_JUDGMENT_BRAIN_URL only for another OpenAI-compatible
+endpoint.  Without the key AND the model, no brain verdict
+is ever attempted — the code rung is the verdict, and the
+record says so.
 """
 from __future__ import annotations
 
@@ -86,18 +104,26 @@ class BrainJudgmentProvider:
 
 
 _PROMPT = (
-    "You are a trader reading a chart. Below is the market's "
-    "measured structure at decision time — displacement, "
+    "You are a trader reading a chart. Below is the market at "
+    "decision time: the recent entry-clock candles around the "
+    "level (structure.chart — tf names the clock, bars are "
+    "most recent last, each with time, open, high, low, "
+    "close), the measured structure reads — displacement, "
     "acceptance-by-closes, follow-through, phase, HTF biases, "
     "the Asymmetry score — and one candidate trade (direction, "
-    "entry, stop, first structural target). Read the structure "
-    "and call it: which side does the market favour, and does "
-    "the candidate take it? Reply with JSON only, exactly "
-    "this shape: {\"direction\": 1 | -1 | 0, \"decision\": "
-    "\"take\" | \"abstain\", \"reason\": \"one plain sentence "
-    "naming the reads that decided it\"}. direction is the "
-    "side the market favours (1 = LONG, -1 = SHORT, 0 = no "
-    "side measured). decision is take only when the candidate "
+    "entry, stop, first structural target). Read the CANDLES "
+    "first, like a trader looking at the chart: where price "
+    "came from, whether the pullback held, whether the last "
+    "closes confirm or reject the level — then check the "
+    "measured reads against what the chart shows, and call "
+    "it: which side does the market favour, and does the "
+    "candidate take it? Reply with JSON only, exactly this "
+    "shape: {\"direction\": 1 | -1 | 0, \"decision\": \"take\" | "
+    "\"abstain\", \"reason\": \"one plain sentence naming the "
+    "reads that decided it\", \"confidence\": 0..1 (optional, "
+    "your own confidence in the call)}. direction is the side "
+    "the market favours (1 = LONG, -1 = SHORT, 0 = no side "
+    "measured). decision is take only when the candidate "
     "agrees with the measured direction and the reaction "
     "confirms it; otherwise abstain."
 )
@@ -159,10 +185,23 @@ def _brain_verdict(structure: dict, candidate: dict,
         # A take in the opposite direction is incoherent —
         # not a verdict.
         return None
-    return {"mode": "live", "rung": "brain",
-            "decision": decision, "direction": direction,
-            "reason": reason.strip(),
-            "reason_category": verdict.get("reason_category")}
+    out = {"mode": "live", "rung": "brain",
+           "decision": decision, "direction": direction,
+           "reason": reason.strip(),
+           "reason_category": verdict.get("reason_category")}
+    # The brain's own confidence, when it stated one —
+    # validated 0..1.  Absent = absent (the caller never
+    # fills it with the code rung's agreement share).
+    confidence = verdict.get("confidence")
+    if confidence is not None:
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            return None
+        if not 0.0 <= confidence <= 1.0:
+            return None
+        out["confidence"] = confidence
+    return out
 
 
 def judge_with_brain(structure: dict, candidate: dict,

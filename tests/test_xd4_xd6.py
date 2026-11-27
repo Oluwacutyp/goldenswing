@@ -21,6 +21,7 @@ import pytest
 
 from goldenswing.execution.executor import OrderResult, Position
 from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
+from goldenswing.execution.tick_manager import TickConfig
 from goldenswing.features.engine import read_and_featurize
 from goldenswing.live.hierarchy import TimeframeStack
 from goldenswing.live.management_profiles import (
@@ -125,6 +126,13 @@ class _Pos:
 class _TickMgr:
     def __init__(self, pos):
         self._pos = pos
+        # The runner's earned-profit-lock read
+        # (_manage_positions_bar_close) reaches tick_cfg on the
+        # tick manager — the real TickManager carries it
+        # (TickManager.tick_cfg, a TickConfig).  This stub
+        # predates that read; it must carry the same interface
+        # or every management pass dies on AttributeError.
+        self.tick_cfg = TickConfig()
 
     def tickets(self):
         return [11]
