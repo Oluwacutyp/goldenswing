@@ -1,10 +1,15 @@
-"""The judgment's brain rung (owner order 2026-11-27).
+"""The judgment's explanation drafting (owner orders
+2026-10-23 + 2026-11-27).
 
-The code rung (execution/judgment.py) is the deterministic
-floor.  This is what makes the judgment a real trader, not
-a formula: the brain reads the SAME measured structure
-evidence the code rung reads and returns the verdict, the
-way a trader reads a chart and calls it.
+No AI judges a trade.  The verdict is CODE, always
+(execution/judgment.py) — the live order path never
+consults this module, and it returns no verdict.  What
+this module does, and all it does: when a brain is
+configured, it drafts a plain-words explanation of a
+verdict ALREADY DECIDED, from the same measured structure
+evidence the code verdict read.  The drafted explanation
+never changes the verdict; when no brain is up, the
+verdict's own reason stands (the code's plain words).
 
 This module is the smallest real version of the brain
 plumbing: the GS repo has NO LLM machinery at all (no
@@ -20,28 +25,22 @@ an OpenAI-compatible chat endpoint, configured by env:
 
 With provider=groq and no URL, the URL defaults to Groq's
 OpenAI-compatible endpoint (a documented fact, not a
-guess).  No provider configured -> the brain rung is
-unavailable and the code rung is the verdict (the runner
-says so plainly — the no-model rule: the deterministic
-part plus an honest note, never a faked brain call).
+guess).  No provider configured -> no drafting (None),
+never a faked explanation.
 
 The brain is handed the measured structure (the chart
 read, plain numbers — the body) AND the recent entry-clock
 candles around the level (structure.chart — the chart
 itself, most recent last, with the clock named), plus the
-candidate's geometry, and returns a JSON verdict.  The
-reply is VALIDATED before it is trusted: direction in
-{1, -1, 0}, decision in {take, abstain}, an optional
-confidence in 0..1, and a take only when the direction is
-the candidate's own direction.  An incoherent,
-unparseable, or unreachable reply is not a verdict — it
-is None, and the code rung decides.  Never a stub, never
-a fake brain call.
+candidate's geometry AND the verdict the code already
+reached.  The reply is VALIDATED before it is trusted: a
+non-empty plain-words explanation string.  An incoherent,
+unparseable, or unreachable reply is not an explanation —
+it is None, and the code's reason stands.  Never a stub,
+never a fake brain call.
 
-What the box needs for the brain to be up (nothing is
-assumed — an unconfigured brain is unavailable, and the
-code rung decides every judgment with a plain brain_note
-on the record):
+What the box needs for drafting to be up (nothing is
+assumed — an unconfigured brain drafts nothing):
 
     GS_JUDGMENT_BRAIN_API_KEY   the key (a Groq key, by default)
     GS_JUDGMENT_BRAIN_MODEL     the model name (e.g. a Groq model)
@@ -49,9 +48,8 @@ on the record):
 GS_JUDGMENT_BRAIN_PROVIDER defaults to groq (its URL
 defaults to Groq's OpenAI-compatible endpoint); set
 GS_JUDGMENT_BRAIN_URL only for another OpenAI-compatible
-endpoint.  Without the key AND the model, no brain verdict
-is ever attempted — the code rung is the verdict, and the
-record says so.
+endpoint.  These env vars configure the drafting provider
+only — they gate no trade decision.
 """
 from __future__ import annotations
 
@@ -61,7 +59,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
-# The marker: this judgment entry point needs a brain.
+# The marker: this drafting tool needs a brain (a model
+# to draft with).  It never decides a trade.
 # (The Devon repo's ToolSpec.needs_brain, in GS's shape.)
 needs_brain = True
 
@@ -104,36 +103,33 @@ class BrainJudgmentProvider:
 
 
 _PROMPT = (
-    "You are a trader reading a chart. Below is the market at "
-    "decision time: the recent entry-clock candles around the "
-    "level (structure.chart — tf names the clock, bars are "
-    "most recent last, each with time, open, high, low, "
-    "close), the measured structure reads — displacement, "
-    "acceptance-by-closes, follow-through, phase, HTF biases, "
-    "the Asymmetry score — and one candidate trade (direction, "
-    "entry, stop, first structural target). Read the CANDLES "
-    "first, like a trader looking at the chart: where price "
-    "came from, whether the pullback held, whether the last "
-    "closes confirm or reject the level — then check the "
-    "measured reads against what the chart shows, and call "
-    "it: which side does the market favour, and does the "
-    "candidate take it? Reply with JSON only, exactly this "
-    "shape: {\"direction\": 1 | -1 | 0, \"decision\": \"take\" | "
-    "\"abstain\", \"reason\": \"one plain sentence naming the "
-    "reads that decided it\", \"confidence\": 0..1 (optional, "
-    "your own confidence in the call)}. direction is the side "
-    "the market favours (1 = LONG, -1 = SHORT, 0 = no side "
-    "measured). decision is take only when the candidate "
-    "agrees with the measured direction and the reaction "
-    "confirms it; otherwise abstain."
+    "You are a trader explaining a decision that is already "
+    "made. Below is the market at decision time: the recent "
+    "entry-clock candles around the level (structure.chart — "
+    "tf names the clock, bars are most recent last, each with "
+    "time, open, high, low, close), the measured structure "
+    "reads — displacement, acceptance-by-closes, "
+    "follow-through, phase, HTF biases, the Asymmetry score — "
+    "one candidate trade (direction, entry, stop, first "
+    "structural target), and the verdict the system already "
+    "reached (decision, direction, reason). Do NOT decide — "
+    "the decision is made and you cannot change it. Explain "
+    "it in plain words, one or two sentences, naming the "
+    "reads that decided it, the way a trader would tell "
+    "another trader why this trade was taken or passed. "
+    "Reply with JSON only, exactly this shape: "
+    "{\"explanation\": \"plain words\"}."
 )
 
 
-def _brain_verdict(structure: dict, candidate: dict,
-                   provider: BrainJudgmentProvider) -> dict | None:
-    """The brain's raw verdict, validated.  None = no verdict
-    (unavailable, unreachable, unparseable, or incoherent) —
-    the caller falls back to the code rung."""
+def _draft_explanation(structure: dict, verdict: dict,
+                       candidate: dict,
+                       provider: BrainJudgmentProvider
+                       ) -> str | None:
+    """The brain's drafted explanation of the decided
+    verdict, validated.  None = no explanation (unavailable,
+    unreachable, unparseable, or incoherent) — the caller
+    keeps the code verdict's own reason."""
     body = {
         "model": provider.model,
         "messages": [
@@ -147,6 +143,11 @@ def _brain_verdict(structure: dict, candidate: dict,
                     "targets": candidate.get("targets"),
                     "asymmetry_score": candidate.get(
                         "asymmetry_score"),
+                },
+                "verdict": {
+                    "decision": verdict.get("decision"),
+                    "direction": verdict.get("direction"),
+                    "reason": verdict.get("reason"),
                 }}, default=str)},
         ],
         "temperature": 0,
@@ -167,49 +168,24 @@ def _brain_verdict(structure: dict, candidate: dict,
         return None
     try:
         content = payload["choices"][0]["message"]["content"]
-        verdict = json.loads(content)
+        reply = json.loads(content)
     except (KeyError, IndexError, TypeError, ValueError):
         return None
-    direction = verdict.get("direction")
-    decision = verdict.get("decision")
-    reason = verdict.get("reason")
-    if direction not in (1, -1, 0):
+    explanation = reply.get("explanation")
+    if not isinstance(explanation, str) or not explanation.strip():
         return None
-    if decision not in ("take", "abstain"):
-        return None
-    if not isinstance(reason, str) or not reason.strip():
-        return None
-    candidate_direction = candidate.get("direction")
-    if decision == "take" and (
-            direction != candidate_direction or direction == 0):
-        # A take in the opposite direction is incoherent —
-        # not a verdict.
-        return None
-    out = {"mode": "live", "rung": "brain",
-           "decision": decision, "direction": direction,
-           "reason": reason.strip(),
-           "reason_category": verdict.get("reason_category")}
-    # The brain's own confidence, when it stated one —
-    # validated 0..1.  Absent = absent (the caller never
-    # fills it with the code rung's agreement share).
-    confidence = verdict.get("confidence")
-    if confidence is not None:
-        try:
-            confidence = float(confidence)
-        except (TypeError, ValueError):
-            return None
-        if not 0.0 <= confidence <= 1.0:
-            return None
-        out["confidence"] = confidence
-    return out
+    return explanation.strip()
 
 
-def judge_with_brain(structure: dict, candidate: dict,
-                     provider: BrainJudgmentProvider | None
-                     ) -> dict | None:
-    """The brain rung: the brain reads the measured structure
-    and returns the verdict.  None = no brain verdict — the
-    caller uses the code rung and says so plainly."""
+def draft_judgment_explanation(structure: dict, verdict: dict,
+                               candidate: dict,
+                               provider: BrainJudgmentProvider | None
+                               ) -> str | None:
+    """Draft a plain-words explanation of the ALREADY-DECIDED
+    verdict.  The brain explains; it never decides.  None =
+    no explanation drafted — the caller keeps the code
+    verdict's own reason."""
     if provider is None or not provider.available():
         return None
-    return _brain_verdict(structure, candidate, provider)
+    return _draft_explanation(structure, verdict, candidate,
+                              provider)

@@ -1,21 +1,23 @@
-"""Judgment (owner order 2026-11-27 — the formula core is
-RETIRED, no priors, no weights, no threshold bars).
+"""Judgment (owner orders 2026-10-23 + 2026-11-27 — the
+formula core is RETIRED, and no AI judges a trade).
 
-Two rungs, both full, pinned here:
-- the CODE rung (goldenswing/execution/judgment.py): the
-  verdict is computed from the market's own measured
+One verdict, code only, pinned here:
+- the CODE verdict (goldenswing/execution/judgment.py):
+  the scenarios compete on the market's own measured
   evidence — displacement / acceptance / follow-through
   read off the entry-clock bars, HTF bias, the Asymmetry
-  score's edge over its floor — never a hand-set constant.
-  The proof: the same setup under two different
-  market-structure inputs gets two different verdicts.
-  The 26 Nov acceptance case (a pullback SELL against an
-  upward displacement reads BUY, not SELL) is pinned.
-- the BRAIN rung (goldenswing/execution/judgment_brain.py):
-  the brain reads the same measured structure and calls
-  it; an unconfigured / unreachable / unparseable /
-  incoherent brain is not a verdict — the code rung
-  decides and the record says so.
+  score's edge over its floor.  The proof: the same setup
+  under two different market-structure inputs gets two
+  different verdicts.  The 26 Nov acceptance case (a
+  pullback SELL against an upward displacement reads BUY,
+  not SELL) is pinned — the evidence reads buy AND the
+  verdict follows it.
+- the BRAIN is explanation drafting only
+  (goldenswing/execution/judgment_brain.py): it drafts a
+  plain-words explanation of a verdict already decided,
+  never the decision.  A configured brain calling the other
+  way never overrides the code verdict — the live order
+  path never consults it.
 - the runner wiring: a candidate-bearing live funnel record
   gains a judgment record, warmup/non-candidate records do
   not, the flag turns it off, and the evaluation record
@@ -35,7 +37,7 @@ from goldenswing.execution.judgment import (
 )
 from goldenswing.execution.judgment_brain import (
     BrainJudgmentProvider,
-    judge_with_brain,
+    draft_judgment_explanation,
 )
 from goldenswing.execution.mt5_runner import MT5Runner, MT5RunnerConfig
 
@@ -241,9 +243,9 @@ def test_confidence_is_the_agreement_share():
         agreeing / present)
 
 
-def test_structure_is_plain_data_for_the_brain():
+def test_structure_is_plain_data_for_the_record():
     """The measured structure serialises to plain data — the
-    same evidence the brain rung is handed, verbatim."""
+    record's evidence, verbatim."""
     up = _frame([3900.0] * 17 + [3901.0, 3903.0, 3905.0])
     structure = measure_decision_structure(
         candidate=_candidate(), evidence=_evidence(),
@@ -257,7 +259,7 @@ def test_structure_is_plain_data_for_the_brain():
     assert data["follow_through"] == "held"
 
 
-# ------------------------------------------------------------ brain rung
+# ------------------------------------------------------------ explanation drafting
 def _fake_urlopen(payload, status=200):
     class _Resp:
         def __enter__(self):
@@ -293,26 +295,42 @@ def test_brain_provider_from_env(monkeypatch):
     assert BrainJudgmentProvider.from_env() is None
 
 
-def test_brain_rung_returns_a_verdict(monkeypatch):
+def test_brain_drafts_an_explanation_of_the_decided_verdict(
+        monkeypatch):
+    """The brain explains; it never decides.  Given the
+    structure AND the verdict the code already reached, it
+    returns a plain-words explanation — a string, never a
+    verdict — and the decided verdict is untouched."""
     payload = {"choices": [{"message": {"content": json.dumps({
-        "direction": 1, "decision": "take",
-        "reason": "displacement up, closes accepted, bias with"})}}]}
+        "explanation": "displacement up, closes accepted "
+                       "above the level, bias with — the "
+                       "pullback held and the long takes it"})}}]}
     monkeypatch.setattr(
         "goldenswing.execution.judgment_brain.urllib.request.urlopen",
         _fake_urlopen(payload))
     structure = measure_decision_structure(
         candidate=_candidate(), evidence=_evidence(),
         context=_TREND_CTX, decision=_decision()).to_dict()
-    out = judge_with_brain(structure, _candidate(), _provider())
-    assert out is not None
-    assert out["rung"] == "brain"
-    assert out["decision"] == "take"
-    assert out["direction"] == 1
+    # A decided TAKE verdict: the up structure (strong long
+    # displacement, accepted, held) behind it.
+    up = _frame([3900.0] * 17 + [3901.0, 3903.0, 3905.0])
+    verdict = _judge(frames={"H1": up}, entry_tf="H1")
+    assert verdict["decision"] == "take"
+    out = draft_judgment_explanation(
+        structure, verdict, _candidate(), _provider())
+    assert isinstance(out, str)
+    assert "pullback held" in out
+    # The decided verdict is untouched by the drafting.
+    assert verdict["decision"] == "take"
+    assert verdict["direction"] == 1
 
 
-def test_brain_rung_incoherent_reply_is_not_a_verdict(monkeypatch):
-    # A take in the OPPOSITE direction is incoherent — not a
-    # verdict.  The caller falls back to the code rung.
+def test_brain_drafting_incoherent_reply_is_no_explanation(
+        monkeypatch):
+    # A verdict-shaped reply (direction/decision, no
+    # explanation) is not an explanation — the brain never
+    # decides, so a reply that tries to is discarded.  The
+    # caller keeps the code verdict's own reason.
     payload = {"choices": [{"message": {"content": json.dumps({
         "direction": -1, "decision": "take",
         "reason": "sell it anyway"})}}]}
@@ -322,11 +340,11 @@ def test_brain_rung_incoherent_reply_is_not_a_verdict(monkeypatch):
     structure = measure_decision_structure(
         candidate=_candidate(), evidence=_evidence(),
         context=_TREND_CTX, decision=_decision()).to_dict()
-    assert judge_with_brain(structure, _candidate(),
-                            _provider()) is None
+    assert draft_judgment_explanation(
+        structure, _judge(), _candidate(), _provider()) is None
 
 
-def test_brain_rung_unreachable_is_not_a_verdict(monkeypatch):
+def test_brain_drafting_unreachable_is_no_explanation(monkeypatch):
     import urllib.error
 
     def _raise(request, timeout=None):
@@ -338,15 +356,16 @@ def test_brain_rung_unreachable_is_not_a_verdict(monkeypatch):
     structure = measure_decision_structure(
         candidate=_candidate(), evidence=_evidence(),
         context=_TREND_CTX, decision=_decision()).to_dict()
-    assert judge_with_brain(structure, _candidate(),
-                            _provider()) is None
+    assert draft_judgment_explanation(
+        structure, _judge(), _candidate(), _provider()) is None
 
 
-def test_brain_rung_unconfigured_is_not_a_verdict():
+def test_brain_drafting_unconfigured_is_no_explanation():
     structure = measure_decision_structure(
         candidate=_candidate(), evidence=_evidence(),
         context=_TREND_CTX, decision=_decision()).to_dict()
-    assert judge_with_brain(structure, _candidate(), None) is None
+    assert draft_judgment_explanation(
+        structure, _judge(), _candidate(), None) is None
 
 
 # ------------------------------------------------------------ wiring
@@ -438,7 +457,7 @@ def test_judgment_flag_off_and_evaluation_record_identical(tmp_path):
     assert on_eval[0] == off_eval[0]
 
 
-# ------------------------------------------------------------ the brain governs
+# ------------------------------------------------------------ the code governs
 def _authority_runner(tmp_path, frame):
     """A runner with the entry-clock stack the seam reads."""
     from goldenswing.live.hierarchy import TimeframeStack
@@ -459,51 +478,46 @@ def _authority(runner, *, candidate=None, evidence=None,
         route="h1_trigger")
 
 
-def _brain_payload(**kw):
-    reply = {"direction": 1, "decision": "take",
-             "reason": "brain call: the chart favours long"}
-    reply.update(kw)
-    return {"choices": [{"message": {"content": json.dumps(reply)}}]}
+def _never_called_urlopen(request, timeout=None):
+    """The verdict path must never consult the brain — if the
+    seam (or anything on it) calls out, this fires."""
+    raise AssertionError(
+        "the verdict path consulted the brain")
 
 
-def test_brain_governs_over_code_take(monkeypatch, tmp_path):
-    """The pin: the code rung TAKES (strong long displacement,
-    HTF with, score over floor — its confidence is 1.0) and
-    the brain says abstain.  The order path refuses on the
-    BRAIN's verdict, and the confidence is the brain's own
-    (0.8), not the code rung's agreement share."""
+def test_code_governs_over_brain_abstain(monkeypatch, tmp_path):
+    """The pin (owner, 2026-11-27 — no AI judges a trade):
+    the code TAKES (strong long displacement, HTF with,
+    score over floor) and a configured brain would say
+    abstain.  The verdict is the CODE's take — the order
+    path proceeds — and the brain is never even consulted
+    (the stub fires if it is)."""
     monkeypatch.setenv("GS_JUDGMENT_BRAIN_API_KEY", "k")
     monkeypatch.setenv("GS_JUDGMENT_BRAIN_MODEL", "m")
     monkeypatch.setattr(
         "goldenswing.execution.judgment_brain.urllib.request.urlopen",
-        _fake_urlopen(_brain_payload(
-            decision="abstain",
-            reason="brain call: abstain — the reaction does not "
-                   "confirm the candidate",
-            confidence=0.8)))
+        _never_called_urlopen)
     frame = _frame([3895.0] * 17 + [3898.0, 3902.0, 3905.0])
     bundle, refusal = _authority(_authority_runner(tmp_path, frame))
     assert bundle is not None
     judgment = bundle["judgment"]
-    assert judgment["rung"] == "brain"
-    assert judgment["decision"] == "abstain"
-    assert judgment["confidence"] == 0.8
-    assert refusal is not None
-    assert refusal.startswith("judgment core abstained")
+    assert judgment["rung"] == "code"
+    assert judgment["decision"] == "take"
+    assert "brain_note" not in judgment
+    assert refusal is None
 
 
-def test_brain_governs_over_code_abstain(monkeypatch, tmp_path):
-    """The mirror pin: the code rung ABSTAINS (the structure
-    reads short against a long candidate) and the brain says
-    take.  The order path proceeds on the BRAIN's verdict."""
+def test_code_governs_over_brain_take(monkeypatch, tmp_path):
+    """The mirror pin: the code ABSTAINS (the structure
+    reads short against a long candidate) and a configured
+    brain would say take.  The verdict is the CODE's
+    abstain — the order path refuses — and the brain is
+    never even consulted."""
     monkeypatch.setenv("GS_JUDGMENT_BRAIN_API_KEY", "k")
     monkeypatch.setenv("GS_JUDGMENT_BRAIN_MODEL", "m")
     monkeypatch.setattr(
         "goldenswing.execution.judgment_brain.urllib.request.urlopen",
-        _fake_urlopen(_brain_payload(
-            decision="take",
-            reason="brain call: take — the chart favours long",
-            confidence=0.7)))
+        _never_called_urlopen)
     frame = _frame([3905.0] * 17 + [3902.0, 3898.0, 3895.0])
     evidence = _evidence(
         observed={"entry": 3900.0, "stop": 3890.0, "stop_dist": 10.0,
@@ -516,16 +530,19 @@ def test_brain_governs_over_code_abstain(monkeypatch, tmp_path):
         _authority_runner(tmp_path, frame), evidence=evidence)
     assert bundle is not None
     judgment = bundle["judgment"]
-    assert judgment["rung"] == "brain"
-    assert judgment["decision"] == "take"
-    assert judgment["confidence"] == 0.7
-    assert refusal is None
+    assert judgment["rung"] == "code"
+    assert judgment["decision"] == "abstain"
+    assert "brain_note" not in judgment
+    assert refusal is not None
+    assert refusal.startswith("judgment core abstained")
 
 
-def test_no_model_code_fallback_says_so_plainly(monkeypatch, tmp_path):
-    """No brain configured (no key, no model): the code rung
-    decides, and the record says plainly that the brain's
-    part is missing — never silence, never a faked verdict."""
+def test_no_brain_configured_code_decides_with_no_brain_note(
+        monkeypatch, tmp_path):
+    """No brain configured (no key, no model): the code
+    decides, and the record carries no brain_note at all —
+    there is no brain part to be missing.  The record is
+    the verdict + its evidence."""
     for name in ("GS_JUDGMENT_BRAIN_API_KEY",
                  "GS_JUDGMENT_BRAIN_MODEL",
                  "GS_JUDGMENT_BRAIN_URL",
@@ -538,14 +555,14 @@ def test_no_model_code_fallback_says_so_plainly(monkeypatch, tmp_path):
     assert judgment["rung"] == "code"
     assert judgment["decision"] == "take"
     assert refusal is None
-    assert "no brain model up" in judgment.get("brain_note", "")
+    assert "brain_note" not in judgment
 
 
-def test_chart_rides_the_structure_the_brain_is_handed():
-    """The brain is handed the chart, not just the computed
-    numbers: the recent entry-clock candles ride the chart
-    read, most recent last, with the clock named.  No frame
-    = no chart, never invented."""
+def test_chart_rides_the_structure_record():
+    """The chart rides the record's evidence: the recent
+    entry-clock candles ride the chart read, most recent
+    last, with the clock named.  No frame = no chart, never
+    invented."""
     frame = _frame([3900.0] * 17 + [3901.0, 3903.0, 3905.0])
     structure = measure_decision_structure(
         candidate=_candidate(), evidence=_evidence(),
@@ -565,10 +582,12 @@ def test_chart_rides_the_structure_the_brain_is_handed():
     assert no_frame["chart"] == {"tf": None, "bars": []}
 
 
-def test_brain_receives_the_chart(monkeypatch):
-    """The request the brain rung actually sends carries the
-    chart — the candles reach the model, not just the
-    structure object."""
+def test_drafting_request_carries_the_chart_and_the_decided_verdict(
+        monkeypatch):
+    """The request the drafting brain actually sends carries
+    the chart AND the verdict already decided — the candles
+    and the decision reach the model; the reply is an
+    explanation, never a verdict."""
     seen = {}
 
     class _CapResp:
@@ -581,8 +600,8 @@ def test_brain_receives_the_chart(monkeypatch):
         def read(self):
             return json.dumps({"choices": [{"message": {
                 "content": json.dumps({
-                    "direction": 1, "decision": "take",
-                    "reason": "chart read favours long"})}}]}).encode(
+                    "explanation": "the pullback held and the "
+                                   "long takes it"})}}]}).encode(
                         "utf-8")
 
     def _capture(request, timeout=None):
@@ -597,9 +616,14 @@ def test_brain_receives_the_chart(monkeypatch):
         candidate=_candidate(), evidence=_evidence(),
         context=_TREND_CTX, frames={"H1": frame}, entry_tf="H1",
         decision=_decision()).to_dict()
-    out = judge_with_brain(structure, _candidate(), _provider())
-    assert out is not None and out["decision"] == "take"
+    verdict = _judge(frames={"H1": frame}, entry_tf="H1")
+    out = draft_judgment_explanation(
+        structure, verdict, _candidate(), _provider())
+    assert isinstance(out, str)
+    assert "pullback held" in out
     sent = json.loads(seen["body"]["messages"][1]["content"])
     assert sent["structure"]["chart"]["tf"] == "H1"
     assert len(sent["structure"]["chart"]["bars"]) == 12
     assert sent["structure"]["chart"]["bars"][-1]["c"] == 3905.0
+    assert sent["verdict"]["decision"] == "take"
+    assert sent["verdict"]["direction"] == 1

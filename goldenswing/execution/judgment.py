@@ -1,48 +1,59 @@
-"""Judgment (owner order 2026-11-27 — the formula core is RETIRED).
+"""Judgment (owner order 2026-11-27 — the formula core is
+RETIRED, and no AI judges a trade).
 
-"What you build is just code-set conditions you align together
-for it to follow" — that shape is dead.  Do NOT patch it, re-weight
-it, or rebuild it with different numbers.  The judgment he wants
-is like a real trader, in two rungs, both full:
+"What you build is just code-set conditions you align
+together for it to follow" — that shape is dead.  "You just
+need to fix the code" (owner, 2026-11-27) — the brain
+having to use a key is a drag, and an AI looking at the
+market is not a system.  So the judgment is CODE, always.
+No LLM/AI judges a trade (owner ruling 2026-10-23: LLM out
+of the live decision path, explanation drafting only).
 
-CODE RUNG (the floor, this module): the verdict is computed
-from the market's own measured evidence, using HIS rules —
-never from constants the builder picks.  His rules, from the
-recorded doctrine: structure determines (the stop, the read),
-volatility is only the buffer; the engine reads market
-REACTION — displacement vs absorption, acceptance-by-closes
-vs rejection, follow-through; a level is a question, the
-candle sequence is the answer; phase is set by STRUCTURE,
-never an EMA read; HTF-bias/LTF-trigger with each playbook's
-own entry clock, entries at a zone OF THE ENTRY TIMEFRAME;
-main-bias hierarchy Swing D1, Intraday H4, Scalp H1; M5
-counter-D1 is penalty/evidence, NEVER a hard block; hard
-veto OFF.  The verdict must change when that evidence
-changes — the test proves it (same setup, two different
-market-structure inputs, verdict changes), and the 26 Nov
-screenshot case is the acceptance case (a pullback sell
-against an upward displacement reads BUY, not SELL).
+The judgment, in his words (2026-10-23): market-state
+estimation → competing scenarios → evidence evaluation →
+decision/abstention.
 
-The measurement (``measure_decision_structure``) reads the
-bars at decision time through the organs that already
-measure them (live/displacement.py's thresholds,
-live/asymmetry.py's score, the funnel's HTF biases and
-regime label) — never a hand-set prior, weight, or bar.
-The verdict (``verdict_from_structure``) is the reads
-themselves: the measured direction is the side with more
-reads, the payoff is the structure's own geometry, and a
-take needs the candidate to agree with the measured
-direction on at least one reaction read.  No priors, no
-weights, no min_expected_r / min_confidence bars — those
-went with the retired core.
+CODE (this module) — the verdict is the scenarios
+competing on the market's own measured evidence:
+- Market-state estimation: the measured evidence
+  (``DecisionStructure``) — displacement vs absorption,
+  acceptance-by-closes, follow-through, phase by structure,
+  HTF bias, Asymmetry.  The measurement reads the bars at
+  decision time through the organs that already measure them
+  (live/displacement.py's thresholds, live/asymmetry.py's
+  score, the funnel's HTF biases and regime label) — never
+  a hand-set prior, weight, or bar.
+- Competing scenarios: LONG and SHORT.  The evidence
+  supports the scenario with more reads behind it.  A tie
+  is a conflict; no reads is no evidence.  The support
+  comparison is the competition — not a threshold (no
+  minimum count, no ratio bar).  The 26 Nov case is the
+  proof it must be support, not unanimity: the evidence
+  supported LONG 3-to-2 and the verdict followed LONG.
+- Evidence evaluation: the decision follows the supported
+  scenario — but only when the candle sequence has answered
+  at the level (a reaction read for the candidate): a level
+  is a question, the candle sequence is the answer.
+  Confirmations are evidence, never vetoes.  The payoff is
+  the structure's own geometry, recorded, never a verdict
+  condition — "no target" is not a trade-existence fact.
+- Decision/abstention: take when the supported scenario is
+  the candidate's and the reaction has answered; abstain
+  when the evidence supports neither, conflicts, fights
+  the candidate, or the reaction has not answered.
+- Hard stops ONLY for trade-existence facts.  The verdict
+  must change when the evidence changes — the test proves
+  it (same setup, two different market-structure inputs,
+  verdict changes), and the 26 Nov screenshot case is the
+  acceptance case (a pullback sell against an upward
+  displacement reads BUY, not SELL).
 
-BRAIN RUNG (execution/judgment_brain.py): the brain reads
-the SAME measured structure evidence and returns the
-verdict, the way a trader reads a chart and calls it.  The
-code rung is the deterministic fallback when no model is
-up — and when the brain is down the engine says so plainly
-and gives the code rung's verdict as the solid part, never
-a faked brain call.
+EXPLANATION DRAFTING (execution/judgment_brain.py): a
+brain, if one is configured, drafts a plain-words
+explanation of a verdict ALREADY DECIDED — never the
+decision.  The live order path never consults it.  The
+GS_JUDGMENT_BRAIN_* env vars configure the drafting
+provider only; they gate no trade decision.
 
 Hard risk invariants stay OUTSIDE this model (the ruling):
 the friction gate, RiskGuards/RiskPool and the drawdown
@@ -142,17 +153,17 @@ def _bias_alignment(observed: dict, direction: int) -> tuple[int, bool]:
 
 
 # ------------------------------------------------------------ the measurement
-#: How many recent entry-clock candles ride the chart read
-#: the brain is handed.  A presentation window, not a
-#: decision input — the brain reads the recent chart the way
-#: a trader does; the verdict never counts these bars.
+#: How many recent entry-clock candles ride the chart read.
+#: A presentation window, not a decision input — the verdict
+#: never counts these bars; they are the record's evidence
+#: of the chart at decision time.
 CHART_BARS = 12
 
 
 def _chart_bars(frame) -> list[dict]:
     """The entry-clock frame's recent candles as plain data
     (most recent last): time, open, high, low, close.  The
-    chart the brain reads — the bars themselves, not just
+    chart the record carries — the bars themselves, not just
     the computed numbers.  [] when there is no frame."""
     if frame is None:
         return []
@@ -182,14 +193,16 @@ def _chart_bars(frame) -> list[dict]:
 @dataclass
 class DecisionStructure:
     """The market's own measured evidence at decision time —
-    the one object both rungs read.  Every field is a
+    the one object the verdict reads.  Every field is a
     measurement (from the bars, the zones, the Asymmetry
     score, the HTF biases) or None (absent, never invented).
 
     ``reads`` is the verdict's raw material: one entry per
     measured read — (name, direction, note) — where direction
     is +1 (favours LONG), -1 (favours SHORT) or 0 (no read).
-    The verdict counts them; it never re-weighs them."""
+    The verdict is the scenarios competing on them: the
+    scenario with more reads behind it is the one the
+    evidence supports.  It never re-weighs them."""
     # Reaction reads from the entry-clock bars (when frames given).
     displacement: str = "absent"  # absent | none | weak | strong
     displacement_direction: int = 0
@@ -217,8 +230,8 @@ class DecisionStructure:
     entry_level: float | None = None
     stop_level: float | None = None
     target_level: float | None = None
-    # The recent entry-clock candles (the chart the brain
-    # reads) and the clock they belong to.  [] / None when
+    # The recent entry-clock candles (the chart the record
+    # carries) and the clock they belong to.  [] / None when
     # there was no frame — the reaction reads are absent
     # then, and the chart is absent with them, never invented.
     bars: list = field(default_factory=list)
@@ -232,8 +245,8 @@ class DecisionStructure:
         return [r for r in self.reads if r[1] == -direction]
 
     def to_dict(self) -> dict:
-        """The chart read, plain data — what the brain rung is
-        handed, verbatim (the same evidence the code rung
+        """The chart read, plain data — the record's
+        evidence, verbatim (the same evidence the verdict
         reads)."""
         out = {
             "displacement": self.displacement,
@@ -262,8 +275,7 @@ class DecisionStructure:
                        "note": r[2]} for r in self.reads],
         }
         if self.situation:
-            # The brain rung reads the same picture the code
-            # rung read — the situation rides along, never a vote.
+            # The situation rides along, never a vote.
             out["situation"] = self.situation
         return out
 
@@ -461,7 +473,7 @@ def measure_decision_structure(*, candidate: dict,
             entry_frame = frames.get("H1")
             if entry_frame is not None:
                 chart_tf = "H1"
-    # The chart the brain reads: the recent entry-clock
+    # The chart the record carries: the recent entry-clock
     # candles around the level, most recent last — the bars
     # themselves, not just the computed numbers.  No frame =
     # no chart, never invented.
@@ -547,13 +559,43 @@ def measure_decision_structure(*, candidate: dict,
 # ------------------------------------------------------------ the verdict
 def verdict_from_structure(structure: DecisionStructure,
                            candidate: dict) -> dict:
-    """The code rung's verdict from the measured structure.
-    The measured direction is the side with more reads; the
-    payoff is the structure's own geometry; a take needs the
-    candidate to agree with the measured direction on at
-    least one reaction read (displacement / acceptance /
-    follow-through — the market's reaction, not a label).
-    No priors, no weights, no threshold bars."""
+    """The verdict, from his definition (owner, 2026-10-23):
+    market-state estimation → competing scenarios → evidence
+    evaluation → decision/abstention.  No AI judges a trade;
+    the code is the judgment, always.
+
+    1. Market-state estimation is already done — the
+       structure's reads are the evidence.
+    2. Competing scenarios: LONG and SHORT.  The evidence
+       supports the scenario with more reads behind it.  A
+       tie is a conflict; no reads is no evidence.  The
+       support comparison IS the competition — not a
+       threshold (no minimum count, no ratio bar).  The 26
+       Nov case is the proof it must be support, not
+       unanimity: the evidence supported LONG 3-to-2 and the
+       verdict followed LONG.
+    3. Evidence evaluation: the decision follows the
+       supported scenario — but only when the candle sequence
+       has answered at the level (a reaction read for the
+       candidate): a level is a question, the candle sequence
+       is the answer.  Confirmations are evidence, never
+       vetoes.  The payoff is the structure's own geometry,
+       recorded, never a verdict condition — "no target" is
+       not a trade-existence fact, so it cannot abstain a
+       trade.
+    4. Decision/abstention: take when the supported scenario
+       is the candidate's and the reaction has answered;
+       abstain when the evidence supports neither, conflicts,
+       fights the candidate, or the reaction has not
+       answered.  Hard stops ONLY for trade-existence facts
+       (no valid stop geometry here — the other hard stops
+       live in the runner's safeguard stack, outside this
+       module).
+
+    ``confidence`` is the share of measured reads behind the
+    supported scenario — a report for the audit's
+    calibration, never a verdict input.  It decides nothing.
+    """
     candidate = candidate or {}
     direction = int(candidate.get("direction") or 0)
     entry = _f(candidate.get("entry"))
@@ -586,6 +628,8 @@ def verdict_from_structure(structure: DecisionStructure,
         # rides the record exactly as the evidence carried it.
         market_state["situation"] = structure.situation
 
+    # 1. Trade-existence: no direction, no entry, no stop,
+    # or a zero stop distance — there is no trade to judge.
     if direction not in (1, -1) or entry is None \
             or stop is None or not stop_dist:
         return {
@@ -600,23 +644,27 @@ def verdict_from_structure(structure: DecisionStructure,
             "reason_category": CATEGORY_INVALID_GEOMETRY,
         }
 
-    # The measured direction: the side with more reads.
-    long_reads = structure.reads_for(1)
-    short_reads = structure.reads_for(-1)
-    if len(long_reads) > len(short_reads):
-        measured = 1
-    elif len(short_reads) > len(long_reads):
-        measured = -1
-    else:
-        measured = 0
+    # 2. The scenarios compete on the evidence: each
+    # scenario's support is the reads favouring it.
+    long_support = len(structure.reads_for(1))
+    short_support = len(structure.reads_for(-1))
     present = len(structure.reads)
-    agreeing = len(long_reads) if measured == 1 \
-        else len(short_reads) if measured == -1 else 0
+    if long_support > short_support:
+        supported = 1
+    elif short_support > long_support:
+        supported = -1
+    else:
+        supported = 0
+    # The report, never an input: the share of measured
+    # reads behind the supported scenario.
+    agreeing = long_support if supported == 1 \
+        else short_support if supported == -1 else 0
     confidence = round(agreeing / present, 4) if present else 0.0
 
     # The payoff is the structure's own geometry: first
     # target over the structural stop.  No target -> the
     # journey room; neither -> absent, never invented.
+    # Recorded as evidence only — it never gates the verdict.
     expected_r = None
     if structure.target_level is not None and stop_dist:
         expected_r = round(
@@ -629,55 +677,70 @@ def verdict_from_structure(structure: DecisionStructure,
                                 "follow_through")
                     and r[1] == direction]
     side = "LONG" if direction == 1 else "SHORT"
-    measured_side = ("LONG" if measured == 1 else
-                     "SHORT" if measured == -1 else "none")
+    supported_side = ("LONG" if supported == 1 else
+                      "SHORT" if supported == -1 else "none")
     reads_text = "; ".join(
         f"{name} {('LONG' if d == 1 else 'SHORT' if d == -1 else '—')} "
         f"({note})" for name, d, note in structure.reads) \
         or "no reads measured"
 
-    if measured == direction and reaction_for and expected_r \
-            and expected_r > 0:
-        verdict = "take"
-        reason = (f"structure reads {side}: {reads_text} — "
-                  f"the candidate agrees with the measured "
-                  f"direction on {len(reaction_for)} reaction "
-                  f"read(s); payoff {expected_r}R to the first "
-                  f"structural target")
-        category = CATEGORY_QUALITY
-    else:
-        verdict = "abstain"
-        if measured != 0 and measured != direction:
-            category = CATEGORY_DIRECTION
-            reason = (f"structure reads {measured_side} "
-                      f"({reads_text}) — the candidate is {side} "
-                      f"and fights the measured direction")
-        elif measured == 0:
-            category = CATEGORY_REGIME
-            reason = (f"no measured direction ({reads_text}) — "
-                      f"the reads disagree or are absent; there "
-                      f"is no trade to take")
-        elif not reaction_for:
-            category = CATEGORY_QUALITY
-            reason = (f"structure reads {side} but no reaction "
-                      f"read confirms it ({reads_text}) — "
-                      f"displacement / acceptance / follow-"
-                      f"through have not shown the move")
-        else:
-            category = CATEGORY_QUALITY
-            reason = (f"no measurable payoff ({reads_text}) — "
-                      f"the first structural target is not "
-                      f"beyond the entry in the {side} direction")
-    return {
-        "mode": "live", "rung": "code",
-        "decision": verdict, "direction": measured,
-        "expected_r": expected_r,
-        "confidence": confidence,
-        "market_state": market_state,
-        "structure": structure.to_dict(),
-        "reason": reason,
-        "reason_category": category,
-    }
+    def _block(decision, category, reason):
+        return {
+            "mode": "live", "rung": "code",
+            "decision": decision, "direction": supported,
+            "expected_r": expected_r,
+            "confidence": confidence,
+            "market_state": market_state,
+            "structure": structure.to_dict(),
+            "reason": reason,
+            "reason_category": category,
+        }
+
+    # The evidence supports neither side — there is no
+    # scenario to follow.
+    if supported == 0 and present == 0:
+        return _block(
+            "abstain", CATEGORY_REGIME,
+            f"no measured direction ({reads_text}) — no reads "
+            f"measured; the evidence supports neither side and "
+            f"there is no trade to take")
+    # The evidence supports both sides equally — the
+    # scenarios conflict, and a conflict is a wait.
+    if supported == 0:
+        return _block(
+            "abstain", CATEGORY_REGIME,
+            f"no measured direction ({reads_text}) — the reads "
+            f"split evenly; the evidence conflicts and supports "
+            f"both scenarios")
+    # The supported scenario is the other side — the
+    # candidate fights the market.
+    if supported != direction:
+        return _block(
+            "abstain", CATEGORY_DIRECTION,
+            f"structure reads {supported_side} "
+            f"({reads_text}) — the candidate is {side} "
+            f"and fights the measured direction")
+    # The reaction has not answered at the level — the
+    # candle sequence has not shown the move.  Context
+    # alone (bias, score) never takes a trade.
+    if not reaction_for:
+        return _block(
+            "abstain", CATEGORY_QUALITY,
+            f"structure reads {side} but no reaction "
+            f"read confirms it ({reads_text}) — "
+            f"displacement / acceptance / follow-"
+            f"through have not shown the move")
+    # The supported scenario is the candidate's and the
+    # reaction has answered: take.
+    payoff_text = (f"payoff {expected_r}R to the first "
+                   f"structural target") if expected_r is not None \
+        else ("no first target measured — the trade rides "
+              "its stop and the room")
+    return _block(
+        "take", CATEGORY_QUALITY,
+        f"structure reads {side}: {reads_text} — the "
+        f"candidate agrees with the supported scenario on "
+        f"{len(reaction_for)} reaction read(s); {payoff_text}")
 
 
 def evaluate_judgment(*, candidate: dict, decision: dict | None,
@@ -685,16 +748,17 @@ def evaluate_judgment(*, candidate: dict, decision: dict | None,
                       frames: dict | None = None,
                       entry_tf: str | None = None) -> dict:
     """One judgment for one evaluated candidate — the code
-    rung (the floor).  Pure: same measured structure in,
-    same verdict out.  The returned block is journaled on
-    the ``judgment`` record, with the runner overstamping
-    ``mode`` with the effective authority mode (see the
-    module docstring).  ``decision`` (the gate stack's
-    floor result) rides the record as evidence; it does not
-    weigh the verdict — the verdict is the structure's
-    reads.  ``frames`` is the live path's bars; without
-    them the reaction reads are absent and the verdict
-    reads the funnel's measured structure only."""
+    verdict, the judgment, always.  Pure: same measured
+    structure in, same verdict out.  The returned block is
+    journaled on the ``judgment`` record, with the runner
+    overstamping ``mode`` with the effective authority mode
+    (see the module docstring).  ``decision`` (the gate
+    stack's floor result) rides the record as evidence; it
+    does not weigh the verdict — the verdict is the
+    scenarios competing on the structure's reads.  ``frames``
+    is the live path's bars; without them the reaction reads
+    are absent and the verdict reads the funnel's measured
+    structure only."""
     structure = measure_decision_structure(
         candidate=candidate, evidence=evidence,
         context=context, frames=frames, entry_tf=entry_tf,

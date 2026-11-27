@@ -466,16 +466,18 @@ class MT5RunnerConfig:
     # decision path.  Rides the book's gates (silent when the
     # book or the situation program is off).
     judgment_book_enabled: bool = True
-    # JUDGMENT (owner order 2026-11-27 — the formula core is
-    # RETIRED: no priors, no weights, no min_expected_r /
-    # min_confidence bars): the verdict is computed from the
-    # market's own measured structure/reaction (the code rung,
-    # execution/judgment.py) and, at the order decision point,
-    # the brain reads the same measured structure and calls it
-    # (the brain rung, execution/judgment_brain.py; active
-    # only when a provider is configured).  Journaled as
-    # judgment records.  Hard risk invariants stay outside
-    # the model, in risk/friction, in every mode.
+    # JUDGMENT (owner orders 2026-10-23 + 2026-11-27 — the
+    # formula core is RETIRED, and no AI judges a trade): the
+    # verdict is CODE, always (execution/judgment.py — the
+    # scenarios competing on the market's own measured
+    # structure/reaction).  The brain is explanation drafting
+    # only (execution/judgment_brain.py): it drafts a
+    # plain-words explanation of a verdict already decided,
+    # never the decision — the live order path never consults
+    # it, and the GS_JUDGMENT_BRAIN_* env vars gate no trade
+    # decision.  Journaled as judgment records.  Hard risk
+    # invariants stay outside the model, in risk/friction, in
+    # every mode.
     judgment_record_enabled: bool = True
     # JUDGMENT MODE — the kill switch (owner decision
     # 2026-11-05).  "active" (default): on every route the core
@@ -3500,12 +3502,13 @@ class MT5Runner:
         except Exception:  # noqa: BLE001 - annotation is evidence
             return None
 
-    def _brain_rung_configured(self) -> bool:
-        """Whether the brain rung has a provider configured —
-        the manifest's plain fact, never an assumption.  The
-        provider is built lazily at the first order decision
-        point, so this reads the env directly when no provider
-        has been built yet."""
+    def _brain_drafting_configured(self) -> bool:
+        """Whether an explanation-drafting brain provider is
+        configured — the manifest's plain fact, never an
+        assumption, never a decision input.  The provider is
+        built lazily at the first drafting call, so this reads
+        the env directly when no provider has been built yet.
+        The live order path never consults it."""
         provider = getattr(self, "_brain_judgment_provider", None)
         if provider is not None:
             return bool(provider.available())
@@ -3518,8 +3521,7 @@ class MT5Runner:
 
     def _judgment_evaluate(self, *, candidate, decision,
                            evidence, intended_tf, eval_now,
-                           route: str | None = None,
-                           use_brain: bool = False):
+                           route: str | None = None):
         """ONE core evaluation of one candidate, in the exact
         shape the journal carries: returns the bundle
         {"judgment": <block, effective mode stamped over the
@@ -3531,19 +3533,15 @@ class MT5Runner:
         failure: the _emit_eval tap logs its note as before;
         the authority seam catches and fails closed.
 
-        Two rungs (owner order 2026-11-27 — the formula core
-        is RETIRED, no priors, no weights, no threshold bars):
-        the CODE rung measures the structure from the bars at
-        decision time (judgment.measure_decision_structure)
-        and the verdict is the reads themselves.  The BRAIN
-        rung (judgment_brain.judge_with_brain) reads the SAME
-        measured structure and calls it — it runs only at
-        the order decision point (use_brain=True, from the
-        seam), never on the passive _emit_eval tap, and only
-        when a provider is configured.  No brain verdict
-        (unconfigured, unreachable, unparseable, incoherent)
-        -> the code rung decides and the record says so
-        plainly (brain_note), never a faked brain call."""
+        The verdict is CODE, always (owner orders 2026-10-23
+        + 2026-11-27 — no AI judges a trade): the code verdict
+        (judgment.measure_decision_structure +
+        verdict_from_structure) is the judgment.  The brain
+        (judgment_brain) is explanation drafting only — it
+        drafts a plain-words explanation of a verdict already
+        decided, never the decision — and the live order path
+        never consults it.  There is no brain fallback, no
+        brain note: the record is the verdict + its evidence."""
         from .judgment import (
             measure_decision_structure,
             verdict_from_structure,
@@ -3579,42 +3577,12 @@ class MT5Runner:
             candidate=candidate, evidence=judgment_evidence,
             context=self._decision_context(), frames=frames,
             entry_tf=intended_tf, decision=decision)
-        code_verdict = verdict_from_structure(
+        # The verdict is the code's, always — no brain is
+        # consulted on the decision path, and there is no
+        # fallback and no note: the record is the verdict +
+        # its evidence.
+        judgment = verdict_from_structure(
             structure, candidate)
-        judgment = code_verdict
-        if use_brain:
-            from .judgment_brain import (
-                BrainJudgmentProvider,
-                judge_with_brain,
-            )
-            provider = getattr(
-                self, "_brain_judgment_provider", None)
-            if provider is None:
-                provider = BrainJudgmentProvider.from_env()
-                self._brain_judgment_provider = provider
-            brain_verdict = judge_with_brain(
-                structure.to_dict(), candidate, provider)
-            if brain_verdict is not None:
-                # The brain calls the direction; the payoff
-                # and the market-state picture stay the
-                # measured structure's own numbers — the brain
-                # never invents a price.  The confidence is the
-                # brain's own when it stated one, and ABSENT
-                # when it did not — never the code rung's
-                # agreement share wearing the brain's name.
-                brain_verdict["expected_r"] = code_verdict.get(
-                    "expected_r")
-                brain_verdict.setdefault("confidence", None)
-                brain_verdict["market_state"] = code_verdict.get(
-                    "market_state")
-                brain_verdict["structure"] = structure.to_dict()
-                brain_verdict["rung"] = "brain"
-                judgment = brain_verdict
-            else:
-                judgment["brain_note"] = (
-                    "no brain model up (provider unconfigured "
-                    "or unreachable) — the code rung's verdict "
-                    "is the solid part")
         judgment["mode"] = self._judgment_mode()
         if route is not None:
             # Completion-02: a route-stamped verdict — the
@@ -3671,14 +3639,13 @@ class MT5Runner:
         if self._judgment_mode() != "active":
             return None, None
         try:
-            # The order decision point is where the brain rung
-            # runs (use_brain=True): the brain reads the same
-            # measured structure and calls it; no brain verdict
-            # -> the code rung decides and the record says so.
+            # The order decision point is where the code verdict
+            # governs: no brain is consulted, the verdict is
+            # the code's, always.
             bundle = self._judgment_evaluate(
                 candidate=candidate, decision=decision,
                 evidence=evidence, intended_tf=intended_tf,
-                eval_now=eval_now, route=route, use_brain=True)
+                eval_now=eval_now, route=route)
         except Exception as exc:  # noqa: BLE001 - fail closed
             return {"judgment": None, "forecast_evidence": None}, (
                 "judgment core evaluation failed at the order "
@@ -5760,14 +5727,11 @@ class MT5Runner:
                         f"k={float(self.cfg.risk_pct)}, C=1.0 (held)"),
                     "min_score": self.cfg.min_score,
                     "floor_authority": dict(_FLOOR_AUTHORITY),
-                    # Judgment (owner order 2026-11-27 — the
-                    # formula core is RETIRED): the verdict is
-                    # computed from the market's own measured
-                    # structure/reaction (the code rung) and,
-                    # at the order decision point, the brain
-                    # reads the same measured structure and
-                    # calls it (the brain rung, active only
-                    # when a provider is configured).  The
+                    # Judgment (owner orders 2026-10-23 +
+                    # 2026-11-27 — the formula core is RETIRED,
+                    # and no AI judges a trade): the verdict is
+                    # CODE, always, computed from the market's
+                    # own measured structure/reaction.  The
                     # manifest journals the EFFECTIVE mode (the
                     # kill switch's real state), the configured
                     # value verbatim, and the authority
@@ -5805,10 +5769,12 @@ class MT5Runner:
                         "enabled": bool(getattr(
                             self.cfg, "judgment_record_enabled",
                             True)),
-                        # The brain rung: configured (a provider
-                        # is set) or not — never assumed.
-                        "brain_rung":
-                            self._brain_rung_configured(),
+                        # The explanation-drafting brain:
+                        # configured (a provider is set) or
+                        # not — never assumed, never a
+                        # decision input.
+                        "brain_drafting":
+                            self._brain_drafting_configured(),
                         "thesis": (
                             self._thesis_keeper.status()
                             if getattr(self, "_thesis_keeper",
