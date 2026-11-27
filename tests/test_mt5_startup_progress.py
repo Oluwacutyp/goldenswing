@@ -108,8 +108,13 @@ def test_progress_content(tmp_path):
     pb = texts[_idx(texts, "MT5 engine: playbooks warmed")]
     # Origination (owner order 2026-11-25, all-live half-2): the
     # trigger path warms the roster PLUS the five families (29),
-    # not the 16-roster count this pinned before.
-    assert f"({len(ROSTER_SPECS + VOL_SPECS + TREND_SPECS + AUCTION_SPECS + REVERSION_SPECS + SESSION_SPECS)} playbooks)" in pb
+    # not the 16-roster count this pinned before.  Warmup fix
+    # (owner correction 2026-11-27): the count is honest —
+    # warmed/total, so a playbook whose scan never ran cannot
+    # hide in the total.
+    _n_pb = len(ROSTER_SPECS + VOL_SPECS + TREND_SPECS
+                + AUCTION_SPECS + REVERSION_SPECS + SESSION_SPECS)
+    assert f"({_n_pb}/{_n_pb} playbooks)" in pb
     # Final "started" ping still exactly once.
     assert sum(1 for t in texts if t.startswith("MT5 engine started")) == 1
 
@@ -146,7 +151,12 @@ def test_replay_logs_each_playbook_on_console(tmp_path, capsys):
     runner = _runner(tmp_path, sender=sender)
     runner.run(max_ticks=1)
     out = capsys.readouterr().out
-    assert "MT5 startup: warmed sweep_reversal in " in out
-    assert "MT5 startup: warmed narrative in " in out
+    assert "MT5 startup: warmed sweep_reversal (H1, " in out
+    assert "MT5 startup: warmed narrative (H1, " in out
+    # Warmup fix (owner correction 2026-11-27): the per-playbook
+    # line names the playbook's own trigger clock — the M15
+    # families warm on M15, never on H1.
+    assert "MT5 startup: warmed auction_value_acceptance (M15, " in out
+    assert "MT5 startup: warmed session_asia_sweep (M15, " in out
     # Per-playbook lines stay on console only — never 17 TG messages.
     assert sum(1 for t in sender.texts if "warmed sweep_reversal" in t) == 0

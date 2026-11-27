@@ -1893,6 +1893,187 @@ class MT5Runner:
                                + SESSION_SPECS]
         return self._playbooks
 
+    def _warm_playbooks(self) -> list[dict]:
+        """Warm the trigger path's persistent playbooks over history.
+
+        Owner correction 2026-11-27 ("29 fucking H1
+        playbooks?????"): the old loop drove ALL 29 through H1
+        bars and printed "warmed {name}" for each — but only 20
+        trigger on H1 (9 trigger on M15), and the 11 two-clock
+        family playbooks (trend 2, auction 3, reversion 2,
+        session 4) return NOTHING from live_signal without a
+        formation frame, so they were "warmed" without ever
+        scanning.  This method warms each playbook on ITS OWN
+        trigger clock, derived from the registry
+        (trigger_tf_of — never hardcoded), with its formation
+        frame threaded the way the scheduled scans thread it
+        (_sweep_eval_one's FORMATION_TF_UP ladders), and
+        reports honestly: a playbook counts as warmed only
+        when its scan actually ran over its trigger frame's
+        bars; anything else is reported NOT warmed with the
+        reason, never printed as warmed.
+
+        Warmup-only threading: the formation frame / situation
+        are threaded for the warmup drive and then RESTORED —
+        the persistent instances return to their live state
+        (no formation frame: on the fire path the families
+        evaluate only by injection, per _get_playbooks).
+        The streaming cursor (_processed) stays advanced —
+        that is the warmup.  The second rungs (trend's
+        D1-formed swing, reversion's M5 scalp) are NOT warmed
+        here: the registry declares one trigger clock per
+        playbook (H1 / M15); the other rungs are evaluated by
+        the scheduled family passes (7b / 7d) on their own
+        clocks.
+
+        Returns one row per playbook: playbook, clock,
+        formation_tf (None when the playbook needs none),
+        bars (trigger bars driven), signals (found — past
+        signals are discarded, only the latest close trades),
+        warmed, reason ("" when warmed).  A playbook whose
+        scan raises is NOT warmed and does not kill startup:
+        one playbook's warmup failure is reported, and the
+        rest warm on.
+        """
+        frames = (self._stack.frames
+                  if self._stack is not None else {})
+        states_by_clock: dict[str, list] = {}
+        report: list[dict] = []
+        for pb in self._get_playbooks():
+            name = pb.name
+            clock = _trigger_tf_of(name) or "H1"
+            row = {"playbook": name, "clock": clock,
+                   "formation_tf": None, "bars": 0,
+                   "signals": 0, "warmed": False, "reason": ""}
+            t0 = time.perf_counter()
+            try:
+                frame = frames.get(clock)
+                if frame is None or len(frame) == 0:
+                    row["reason"] = (f"{clock} frame unavailable "
+                                     "— no bars to warm on")
+                else:
+                    # Resolve the formation clock BEFORE
+                    # threading anything: a playbook that
+                    # cannot be threaded is reported
+                    # not-warmed with its state untouched.
+                    formation_tf = None
+                    formation_frame = None
+                    if hasattr(pb, "set_formation"):
+                        formation_tf = (
+                            FORMATION_TF_UP_TREND.get(clock)
+                            or FORMATION_TF_UP_AUCTION.get(clock)
+                            or FORMATION_TF_UP_REVERSION.get(clock)
+                            or FORMATION_TF_UP_SESSION.get(clock))
+                        if formation_tf is None:
+                            row["reason"] = (
+                                "no formation clock for trigger "
+                                f"{clock}")
+                        else:
+                            formation_frame = frames.get(
+                                formation_tf)
+                            if formation_frame is None \
+                                    or len(formation_frame) == 0:
+                                row["reason"] = (
+                                    "formation frame "
+                                    f"{formation_tf} unavailable")
+                    if not row["reason"]:
+                        if clock not in states_by_clock:
+                            states_by_clock[clock] = (
+                                read_and_featurize(frame, None))
+                        states = states_by_clock[clock]
+                        # Thread what the scan needs, mirroring
+                        # _sweep_eval_one's idiom (additive,
+                        # hasattr-guarded — no pre-7a playbook
+                        # defines the setters).  Snapshot first:
+                        # the threading is warmup-only and is
+                        # restored in the finally below.
+                        restore: dict = {}
+                        try:
+                            if hasattr(pb, "set_h4_frame"):
+                                pb.set_h4_frame(frames.get("H4"))
+                            if hasattr(pb, "set_situation"):
+                                restore["situation"] = getattr(
+                                    pb, "_situation", None)
+                                pb.set_situation(
+                                    self._current_situation())
+                            if hasattr(pb, "set_formation_tf"):
+                                restore["trigger_tf"] = getattr(
+                                    pb, "_trigger_tf", None)
+                                pb.set_formation_tf(clock)
+                            if hasattr(pb, "set_formation"):
+                                restore["formation_frame"] = \
+                                    getattr(pb, "_formation_frame",
+                                            None)
+                                restore["formation_tf"] = \
+                                    getattr(pb, "_formation_tf",
+                                            None)
+                                pb.set_formation(
+                                    formation_frame, formation_tf)
+                                row["formation_tf"] = formation_tf
+                            # ONE live_signal call over the whole
+                            # frame, not one per bar: a call scans
+                            # from _processed+1 to t, and the
+                            # detection at each bar is causal
+                            # (it reads only bars <= itself), so
+                            # one call finds exactly what the
+                            # per-bar replay would — with one
+                            # PreparedFrame build instead of one
+                            # per bar (the per-bar shape rebuilds
+                            # the frame's swings / levels / day
+                            # context on EVERY bar: ~50s for 29
+                            # playbooks on 132 H1 bars, and
+                            # quadratic on the live history's
+                            # ~2000 H1 / ~8000 M15 bars).  The
+                            # cursor still ends at the last bar.
+                            sigs = pb.live_signal(
+                                states, len(frame) - 1, frame) or []
+                            row["signals"] = len(sigs)
+                            row["bars"] = len(frame)
+                            row["warmed"] = True
+                        finally:
+                            # Restore the live state: the
+                            # families evaluate on the fire
+                            # path only by injection — a
+                            # formation frame left threaded
+                            # here would let the persistent
+                            # instance fresh-detect on the
+                            # fire path.
+                            if "formation_frame" in restore:
+                                pb.set_formation(
+                                    restore["formation_frame"],
+                                    restore["formation_tf"])
+                            if "situation" in restore:
+                                pb.set_situation(
+                                    restore["situation"])
+                            if "trigger_tf" in restore \
+                                    and restore["trigger_tf"] \
+                                    is not None:
+                                pb.set_formation_tf(
+                                    restore["trigger_tf"])
+            except Exception as exc:  # noqa: BLE001
+                row["reason"] = (f"warmup failed: "
+                                 f"{type(exc).__name__}: {exc}")
+                row["warmed"] = False
+            self._print_warm_row(row, t0)
+            report.append(row)
+        return report
+
+    @staticmethod
+    def _print_warm_row(row: dict, t0: float) -> None:
+        """One console line per playbook warmup — the honest
+        report: warmed rows name their clock, bars and
+        signals; not-warmed rows name the reason."""
+        dt = time.perf_counter() - t0
+        if row["warmed"]:
+            print(f"MT5 startup: warmed {row['playbook']} "
+                  f"({row['clock']}, {row['bars']} bars, "
+                  f"{row['signals']} signals) in {dt:.1f}s",
+                  flush=True)
+        else:
+            print(f"MT5 startup: NOT warmed {row['playbook']} "
+                  f"({row['clock']}): {row['reason']}",
+                  flush=True)
+
     # ------------------------------------------------- blocked-leg stats
     def _record_blocked(self, reason: str, playbook: str | None = None
                         ) -> None:
@@ -6095,23 +6276,23 @@ class MT5Runner:
 
             # Fast-forward playbook streaming state over history; past
             # signals are discarded — only the latest close trades.
-            # Range playbooks get the native H4 frame (no resample).
-            states = read_and_featurize(h1, None)
+            # Each playbook warms on its OWN trigger clock (see
+            # _warm_playbooks): H1 is not the trigger, and a
+            # playbook whose scan never ran is reported NOT
+            # warmed, never printed as warmed.
             _playbooks = self._get_playbooks()
             print(f"MT5 startup: warming {len(_playbooks)} "
                   "playbooks over history…", flush=True)
-            for pb in _playbooks:
-                if hasattr(pb, "set_h4_frame"):
-                    pb.set_h4_frame(
-                        self._stack.frames.get("H4"))
-                _pb_t0 = time.perf_counter()
-                for t2 in range(len(h1)):
-                    pb.live_signal(states, t2, h1)
-                print(f"MT5 startup: warmed {pb.name} "
-                      f"in {time.perf_counter() - _pb_t0:.1f}s", flush=True)
+            _warm_report = self._warm_playbooks()
+            _warmed = [r for r in _warm_report if r["warmed"]]
+            _not_warmed = [r for r in _warm_report
+                           if not r["warmed"]]
             self._send_startup_progress(
                 "MT5 engine: playbooks warmed "
-                f"({len(_playbooks)} playbooks)")
+                f"({len(_warmed)}/{len(_warm_report)} playbooks)"
+                + (f"; not warmed: "
+                   f"{', '.join(r['playbook'] for r in _not_warmed)}"
+                   if _not_warmed else ""))
             # Adopt positions the broker already holds with our magic
             # (restart sync — MT5 is the source of truth for open trades).
             self._adopt_existing(executor)
