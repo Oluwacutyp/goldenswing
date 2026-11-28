@@ -17,9 +17,19 @@ built from the touching bar + the setup's own geometry
 order path are the production code, unmodified.  The roster
 close evals run on H1 closes, so roster setups compete for
 the one position alongside the families — the binding counts
-are measured in the live competition, and the order counts
-are the binding's downstream effect, not a live-competition
-fill rate.
+are measured in the live competition.  The lifecycle is
+DRIVEN, not frozen (fill-funnel lane 2026-11-27): every M15
+step runs the production tick management + reconcile and
+the broker simulation (pendings fill on touch, positions
+close on stop/target), so the orders/fills ARE a replay
+fill rate — before this, the probe never ran the tick pump,
+the first order froze the one-position slot for the rest
+of the window, and the probe measured "1 order in 30 days".
+Two honest limits stay: the lifecycle resolves on M15 bars
+(a wick inside the bar is a touch; the intrabar order of a
+stop-vs-target touch in one bar is assumed stop-first) and
+the wall-clock cooldowns/caps (entry-gate cooldown, scalp
+holding cap) run on wall time, not replay time.
 
 Coverage (rework 2026-11-27): ALL 33 playbooks.  The 29 on
 the trigger path go through the fire / binding loop below —
@@ -111,12 +121,28 @@ FAMILY_OF = ROUTE_OF
 
 
 class _FakeExecutor:
-    """Fill-everything executor (mirrors the test harness)."""
+    """A broker simulator (fill-funnel lane 2026-11-27).
+
+    The old fake filled EVERY order the instant it was placed —
+    market and pending alike — and never resolved anything
+    after, so the first order froze the one-position slot for
+    the rest of the replay and the probe measured "1 order in
+    30 days".  This one models the broker: market orders fill
+    at once; pending LIMIT/STOP orders REST until a replayed
+    bar touches their level; positions close when a bar
+    touches their stop or target (stop first when both touch
+    — the intrabar order is unknown, so the loss is assumed,
+    never the win).  The probe drives it once per M15 step
+    via broker_step(); the engine's own _manage_tick /
+    _reconcile then record the fills and closes.
+    """
 
     def __init__(self):
         self.orders = []
         self._ticket = 9000
         self._positions = []
+        self._pending = {}
+        self._closed = {}
 
     def symbol_spec(self, symbol):
         return gold_spec()
@@ -124,37 +150,129 @@ class _FakeExecutor:
     def positions(self, symbol=None):
         return list(self._positions)
 
+    def pending_orders(self, symbol=None):
+        pend = list(self._pending.values())
+        if symbol is None:
+            return pend
+        return [p for p in pend if p.symbol == symbol]
+
+    def closing_deal(self, ticket):
+        return self._closed.get(ticket)
+
     def place_order(self, request):
-        from goldenswing.execution.executor import OrderResult, Position
+        from goldenswing.execution.executor import OrderResult, PendingOrder, Position
         self._ticket += 1
+        ticket = self._ticket
         self.orders.append({
-            "ticket": self._ticket,
+            "ticket": ticket,
             "volume": request.volume,
             "kind": request.order_kind,
             "alert_id": request.alert_id,
             "targets": list(request.targets or [])})
-        self._positions.append(Position(
-            ticket=self._ticket, symbol=request.symbol,
-            direction=request.direction, volume=request.volume,
-            entry_price=request.entry_ref or request.order_price,
-            sl=request.stop_loss, tp=request.take_profit,
-            magic=request.magic, alert_id=request.alert_id))
-        return OrderResult(True, ticket=self._ticket,
+        if request.order_kind == "market":
+            self._positions.append(Position(
+                ticket=ticket, symbol=request.symbol,
+                direction=request.direction, volume=request.volume,
+                entry_price=request.entry_ref or request.order_price,
+                sl=request.stop_loss, tp=request.take_profit,
+                magic=request.magic, alert_id=request.alert_id))
+        else:
+            # A pending order RESTS — it is not a position until
+            # the market touches its level (broker_step).
+            self._pending[ticket] = PendingOrder(
+                ticket=ticket, symbol=request.symbol,
+                kind=request.order_kind,
+                direction=request.direction,
+                price=float(request.order_price),
+                volume=request.volume,
+                sl=request.stop_loss, tp=request.take_profit,
+                magic=request.magic, alert_id=request.alert_id)
+        return OrderResult(True, ticket=ticket,
                            price=request.entry_ref
                            or request.order_price,
                            volume=request.volume)
 
     def modify_sl(self, ticket, sl, tp=None):
         from goldenswing.execution.executor import OrderResult
+        for p in self._positions:
+            if p.ticket == ticket:
+                p.sl = sl
+                if tp is not None:
+                    p.tp = tp
+                break
+        else:
+            pend = self._pending.get(ticket)
+            if pend is not None:
+                pend.sl = sl
+                if tp is not None:
+                    pend.tp = tp
         return OrderResult(True, ticket=ticket)
 
     def cancel_pending(self, ticket):
         from goldenswing.execution.executor import OrderResult
+        self._pending.pop(ticket, None)
         return OrderResult(True, ticket=ticket)
 
     def close_position(self, ticket, volume=None):
         from goldenswing.execution.executor import OrderResult
+        for p in list(self._positions):
+            if p.ticket != ticket:
+                continue
+            if volume is None or float(volume) >= float(p.volume):
+                self._positions.remove(p)
+            else:
+                p.volume = float(p.volume) - float(volume)
+            return OrderResult(True, ticket=ticket)
         return OrderResult(True, ticket=ticket)
+
+    def broker_step(self, high, low):
+        """One replayed bar through the broker: fill touched
+        pendings, close SL/TP-touched positions.  Returns
+        (filled, closed): filled = [(ticket, kind, price)],
+        closed = [(ticket, price, reason)]."""
+        from goldenswing.execution.executor import Position
+        filled = []
+        for ticket, pend in list(self._pending.items()):
+            touched = (
+                (pend.direction > 0 and pend.kind == "limit"
+                 and low <= pend.price)
+                or (pend.direction > 0 and pend.kind == "stop"
+                    and high >= pend.price)
+                or (pend.direction < 0 and pend.kind == "limit"
+                    and high >= pend.price)
+                or (pend.direction < 0 and pend.kind == "stop"
+                    and low <= pend.price))
+            if not touched:
+                continue
+            del self._pending[ticket]
+            self._positions.append(Position(
+                ticket=ticket, symbol=pend.symbol,
+                direction=pend.direction, volume=pend.volume,
+                entry_price=float(pend.price),
+                sl=pend.sl, tp=pend.tp,
+                magic=pend.magic, alert_id=pend.alert_id))
+            filled.append((ticket, pend.kind, float(pend.price)))
+        closed = []
+        for p in list(self._positions):
+            sl_hit = (p.sl is not None and (
+                (p.direction > 0 and low <= float(p.sl))
+                or (p.direction < 0 and high >= float(p.sl))))
+            tp_hit = (p.tp is not None and (
+                (p.direction > 0 and high >= float(p.tp))
+                or (p.direction < 0 and low <= float(p.tp))))
+            if sl_hit:
+                self._positions.remove(p)
+                self._closed[p.ticket] = {
+                    "price": float(p.sl), "profit": 0.0,
+                    "reason": "stop", "time": None}
+                closed.append((p.ticket, float(p.sl), "stop"))
+            elif tp_hit:
+                self._positions.remove(p)
+                self._closed[p.ticket] = {
+                    "price": float(p.tp), "profit": 0.0,
+                    "reason": "target", "time": None}
+                closed.append((p.ticket, float(p.tp), "target"))
+        return filled, closed
 
 
 def _feed():
@@ -277,6 +395,24 @@ def main() -> int:
     orders: Counter = Counter()
     native_orders: Counter = Counter()
     stages: dict[str, Counter] = defaultdict(Counter)
+    # FULL FUNNEL (fill-funnel lane 2026-11-27): every refusal
+    # counted at the step where it happens, so the funnel
+    # armed -> fires -> binds -> orders submitted -> filled is
+    # accounted, not asserted.  Merged from the per-fire stats
+    # dicts (the signal path's own counters) + the lifecycle
+    # terminals + the journal's judgment-abstain reasons.
+    funnel: Counter = Counter()
+    abstain_reasons: Counter = Counter()
+    terminal_outcomes: Counter = Counter()
+    first_order: dict = {}
+    # Lifecycle accumulators (fill-funnel lane 2026-11-27):
+    # the per-step _manage_tick / _reconcile counters, and the
+    # broker's own fill/close log.  Kept separate from the
+    # fire-loop stats — the lifecycle runs on every M15 step,
+    # the fire loop only on H1 closes with a touch.
+    lc_stats: Counter = Counter()
+    lc_filled: list = []
+    lc_closed: list = []
     h1_closes = 0
     t0 = time.time()
 
@@ -316,6 +452,24 @@ def main() -> int:
                 "ask": float(m15_frame["close"].iloc[-1]) + 0.1,
                 "spread": 0.2, "time": ts}
         runner._last_tick = tick
+        # Lifecycle (fill-funnel lane 2026-11-27): the broker +
+        # the tick manager advance on the replayed bars.  The
+        # probe previously never ran them — positions never
+        # closed and pendings never filled or expired, so the
+        # first order froze the one-position slot for the rest
+        # of the window and the probe measured "1 order in 30
+        # days".  Order mirrors production per tick: manage on
+        # the close first, then the broker on the bar range
+        # (wick touches the close missed), then reconcile
+        # records what the broker did.
+        _bar = m15_frame.iloc[-1]
+        runner._manage_tick(float(_bar["close"]), lc_stats,
+                            bid=tick["bid"], ask=tick["ask"])
+        _filled, _closed = runner.executor.broker_step(
+            float(_bar["high"]), float(_bar["low"]))
+        lc_filled.extend(_filled)
+        lc_closed.extend(_closed)
+        runner._reconcile(float(_bar["close"]), lc_stats)
         minute = ts.minute
         is_h1 = minute == 45
         is_h4 = is_h1 and ts.hour % 4 == 3
@@ -414,9 +568,67 @@ def main() -> int:
             orders_before = len(runner.executor.orders)
             stats: dict = {"signals": 0, "gated": 0}
             routing: dict = {}
+            # Funnel snapshot: holding / pending state BEFORE
+            # this fire — the one-position rule routes a held
+            # position to layers only, and a working pending
+            # refuses the next one.
+            holding_before = len(runner.tick_manager.tickets())
+            pending_before = len(runner._pending_orders)
+            funnel["signal_path_calls"] += 1
+            funnel["fires_while_holding" if holding_before
+                   else "fires_while_flat"] += 1
+            funnel["fires_with_pending" if pending_before
+                   else "fires_without_pending"] += 1
             runner._run_signal_path(
                 h1_frame, len(h1_frame) - 1, [], 1.0, verdict,
                 stats, lifecycle_routing=routing)
+            # Merge this fire's own counters (friction, floor,
+            # sizing, gates, ineligible, thesis, duplicate,
+            # invalidated, executed, pending, ...).
+            for key, val in stats.items():
+                if isinstance(val, (int, float)):
+                    funnel[f"stats.{key}"] += val
+            # Judgment takes/abstains, from the journal's own
+            # judgment records (a separate record per evaluation:
+            # type "judgment", judgment.decision take/abstain).
+            # Abstains bucketed by the verdict's own reason text
+            # (the condition that abstained).
+            for r in runner.journal.records()[before:]:
+                if r.get("type") != "judgment":
+                    continue
+                j = r.get("judgment") or {}
+                if j.get("decision") == "take":
+                    funnel["judgment_take_total"] += 1
+                elif j.get("decision") == "abstain":
+                    funnel["judgment_abstain_total"] += 1
+                    reason = str(j.get("reason") or "")
+                    if "invalid geometry" in reason:
+                        bucket = "invalid_geometry"
+                    elif "no reads measured" in reason:
+                        bucket = "no_reads"
+                    elif "split evenly" in reason:
+                        bucket = "conflict_tie"
+                    elif "fights the measured direction" in reason:
+                        bucket = "fights_market"
+                    elif "no reaction read confirms it" in reason:
+                        bucket = "no_reaction"
+                    else:
+                        bucket = "other:" + reason[:60]
+                    abstain_reasons[bucket] += 1
+            # First order: when it landed, in what state.
+            if not first_order and \
+                    len(runner.executor.orders) > orders_before:
+                first_order.update({
+                    "h1_close_index": h1_closes,
+                    "ts": str(ts),
+                    "holding_before": holding_before,
+                    "pending_before": pending_before,
+                    "playbook": str(
+                        runner.executor.orders[orders_before]
+                        .get("alert_id", "")),
+                    "kind": str(
+                        runner.executor.orders[orders_before]
+                        .get("kind", ""))})
             # Binding rules, from the journal's own records
             # (kind=trigger_binding, evidence.binding.bound).
             for r in runner.journal.records()[before:]:
@@ -433,6 +645,13 @@ def main() -> int:
             for pb, res in routing.items():
                 if pb not in FAMILY_SET:
                     continue
+                # Terminal outcome accounting: every evaluated
+                # setup's (result, reason_code, order_result).
+                for term in res.get("terminals") or []:
+                    terminal_outcomes[(
+                        str(term.get("result") or ""),
+                        str(term.get("reason_code") or ""),
+                        str(term.get("order_result") or ""))] += 1
                 st = runner._setup_store.get(
                     res.get("setup_id") or "")
                 stages[pb][st.stage if st is not None
@@ -454,6 +673,27 @@ def main() -> int:
     # One final book cycle so the last close's fills resolve
     # their tickets onto their scenarios.
     runner._book_cycle(["H1"], str(steps.index[-1]))
+
+    # Fills + closes, from the journal's own open/close records
+    # (fill-funnel lane 2026-11-27): an "open" record is a new
+    # position (market fill or pending fill — both log_open);
+    # layer fills ride the held position and carry no open
+    # record, so they are not new trades and are excluded here.
+    # The close record carries the alert_id, not the playbook —
+    # resolved from its MT5-<playbook>-<index> form.
+    fills: Counter = Counter()
+    closes: Counter = Counter()
+    for r in runner.journal.records():
+        if r.get("type") == "open":
+            _pb = str(r.get("playbook") or "")
+            if _pb in ALL_PLAYBOOKS:
+                fills[_pb] += 1
+        elif r.get("type") == "close":
+            _aid = str(r.get("alert_id", ""))
+            if _aid.startswith("MT5-"):
+                _pb = _aid.split("-")[1]
+                if _pb in ALL_PLAYBOOKS:
+                    closes[_pb] += 1
 
     print(f"\nDone: {h1_closes} H1 closes in "
           f"{time.time() - t0:.0f}s; data ends {end}")
@@ -479,19 +719,65 @@ def main() -> int:
             "bindings": binds[name],
             "rules": dict(rules[name]),
             "orders": n_orders,
+            "fills": fills[name],
+            "closes": closes[name],
             "stages": dict(stages[name]),
             "note": note,
         })
     print(f"{'playbook':38s} {'armed':>5s} {'fires':>5s} "
-          f"{'binds':>5s} {'orders':>6s}  rules / stages")
+          f"{'binds':>5s} {'orders':>6s} {'fills':>5s} "
+          f"{'closes':>6s}  rules / stages")
     for r in rows:
         print(f"{r['playbook']:38s} {r['armed']:5d} {r['fires']:5d} "
-              f"{r['bindings']:5d} {r['orders']:6d}  "
+              f"{r['bindings']:5d} {r['orders']:6d} {r['fills']:5d} "
+              f"{r['closes']:6d}  "
               f"{r['rules']} {r['stages']}"
               + (f"  [{r['note']}]" if r["note"] else ""))
     out = tmp / "binding_counts.json"
     out.write_text(json.dumps(rows, indent=2))
     print(f"wrote {out}")
+    # FULL FUNNEL (fill-funnel lane 2026-11-27).
+    kind_counts: Counter = Counter()
+    for o in runner.executor.orders:
+        kind_counts[str(o.get("kind", "?"))] += 1
+    funnel_doc = {
+        "signal_path_calls": funnel["signal_path_calls"],
+        "fires_while_flat": funnel["fires_while_flat"],
+        "fires_while_holding": funnel["fires_while_holding"],
+        "fires_with_pending": funnel["fires_with_pending"],
+        "fires_without_pending": funnel["fires_without_pending"],
+        "judgment_take_total": funnel["judgment_take_total"],
+        "judgment_abstain_total":
+            funnel["judgment_abstain_total"],
+        "abstain_reasons": dict(abstain_reasons),
+        "stats": {k: v for k, v in sorted(funnel.items())
+                  if k.startswith("stats.")},
+        "terminal_outcomes": {
+            " | ".join(key): val
+            for key, val in sorted(terminal_outcomes.items())},
+        "executor_orders_by_kind": dict(kind_counts),
+        "first_order": first_order,
+        "tickets_held_at_end": len(runner.tick_manager.tickets()),
+        "pending_active_at_end": len(runner._pending_orders),
+        # Lifecycle (fill-funnel lane 2026-11-27): the broker +
+        # tick-manager counters from the per-step lifecycle
+        # driving, the broker's own fill/close log, and the
+        # journal's fills/closes (new positions opened/closed).
+        "lifecycle_stats": dict(lc_stats),
+        "broker_fills": len(lc_filled),
+        "broker_closes": len(lc_closed),
+        "broker_close_reasons": dict(Counter(
+            r for _, _, r in lc_closed)),
+        "fills_total": sum(fills.values()),
+        "closes_total": sum(closes.values()),
+        "fills_by_playbook": {k: v for k, v in sorted(fills.items())
+                              if v},
+    }
+    print("\nFUNNEL:")
+    print(json.dumps(funnel_doc, indent=2))
+    fout = tmp / "funnel_counts.json"
+    fout.write_text(json.dumps(funnel_doc, indent=2))
+    print(f"wrote {fout}")
     return 0
 
 
