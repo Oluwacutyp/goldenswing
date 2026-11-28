@@ -34,6 +34,11 @@ class SweepReversalPlaybook(Playbook):
     )
     live = True
     live_threshold = 60.0
+    #: The scan path must featurize: live_signal evaluates the
+    #: featurized MarketState at bar t (states[t]) — with the scan's
+    #: [] it returns [] on every bar and the playbook can never arm.
+    #: The runner threads real states for playbooks that declare this.
+    needs_states = True
     context_description = (
         "Validated on XAUUSD H1 (GC=F, Oct 2024–Oct 2026): sweep → "
         "displacement + CHoCH/BOS confirmation, daily-bias veto, score ≥ 60 "

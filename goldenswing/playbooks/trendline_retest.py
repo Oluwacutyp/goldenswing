@@ -53,6 +53,11 @@ class TrendlineRetestPlaybook(Playbook):
     )
     live = True   # paper-live: real live_signal, parity-proven
     live_threshold = 0.0  # every retest is graded
+    #: The scan path must featurize: live_signal reads the featurized
+    #: MarketState at bar t (states[t]) — with the scan's [] it returns
+    #: [] on every bar and the playbook can never arm.  The runner
+    #: threads real states for playbooks that declare this.
+    needs_states = True
     context_description = (
         "Break of a respected trendline (≥1 touch) → price spends 2 bars "
         "away → first return touch within 12 bars (wick reaches the line, "

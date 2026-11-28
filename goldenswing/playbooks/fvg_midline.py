@@ -60,6 +60,11 @@ class FVGMidlinePlaybook(Playbook):
     )
     live = True   # paper-live: real live_signal, parity-proven
     live_threshold = 0.0  # every fill is graded
+    #: The scan path must featurize: live_signal reads the featurized
+    #: MarketState at bar t (states[t]) — with the scan's [] it returns
+    #: [] on every bar and the playbook can never arm.  The runner
+    #: threads real states for playbooks that declare this.
+    needs_states = True
     context_description = (
         "Fresh CHoCH (≤24 bars at setup) + untraded FVG midline on the "
         "pullback side + stop 0.25–4.0 ATR (experiments/CHoCH_FVG_MID_OB.md). "

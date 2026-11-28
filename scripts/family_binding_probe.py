@@ -32,15 +32,12 @@ the wall-clock cooldowns/caps (entry-gate cooldown, scalp
 holding cap) run on wall time, not replay time.
 
 Coverage (rework 2026-11-27): ALL 33 playbooks.  The 29 on
-the trigger path go through the fire / binding loop below —
-20 on their H1 trigger clock (roster 12 + range 4 + vol 2 +
-trend 2) and 9 on their M15 trigger clock (auction 3 +
-reversion 2 + session 4); the split is the registry's
-(trigger_tf_of), never H1 for all.  The two natives run
-their own routes on their own clocks: qm_m5 on M5 closes
-(real M5 CSV), qm_d1 on D1 closes (real D1 frame resampled
-from H1) — their orders are counted from the executor, not
-the fire loop.  The last
+the trigger path (roster 12 + range 4 + vol 2 + trend 2 +
+auction 3 + reversion 2 + session 4) go through the fire /
+binding loop below.  The two natives run their own routes on
+their own clocks: qm_m5 on M5 closes (real M5 CSV), qm_d1 on
+D1 closes (real D1 frame resampled from H1) — their orders
+are counted from the executor, not the fire loop.  The last
 two cannot be replayed from these bars and are reported as
 such, not faked: hot_scalp needs M1 closes (no M1 CSV on
 disk — its live path is proven by tests/test_hot_scalp_*.py
@@ -337,6 +334,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--frame-bars", type=int, default=400)
+    ap.add_argument("--tmpdir", default=None,
+                    help="probe state dir (default: "
+                    "tmp/family_binding_probe under the repo root); "
+                    "pass a separate dir to run a second replay "
+                    "beside a running one — the probe wipes its "
+                    "state dir at startup, so two runs MUST NOT "
+                    "share one.")
     args = ap.parse_args()
 
     h1_all = _load("OANDA_XAU_USD_H1_20241001_20261012.csv")
@@ -359,7 +363,8 @@ def main() -> int:
           f"H4: {len(h4)}; D1: {len(d1)}",
           flush=True)
 
-    tmp = REPO_ROOT / "tmp" / "family_binding_probe"
+    tmp = (Path(args.tmpdir) if args.tmpdir else
+           REPO_ROOT / "tmp" / "family_binding_probe")
     tmp.mkdir(parents=True, exist_ok=True)
     # Fresh replay every run: the runner restores its persistent
     # state from this dir (setup lifecycle, scenario book,
